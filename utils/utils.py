@@ -27,7 +27,7 @@ _DATASETS = {
         },
     "PubMedQA": 
         {'dataset_name': "qiaojin/PubMedQA",
-         'training_set_filepath': "pqa_artificial",
+         'train_set_filepath': "pqa_artificial",
          'test_set_filepath': "pqa_labeled",
         'format': 'huggingface',
         },
@@ -43,8 +43,10 @@ def load_dataset(dataset, start_index=None, end_index=None, split='test'):
         raise ValueError("Dataset not found in _DATASETS.")
     if _DATASETS[dataset]['format'] == 'huggingface':
         path = _DATASETS[dataset][f'{split}_set_filepath'] 
-        data = datasets.load_dataset(_DATASETS[dataset]['dataset_name'], path)
+        data = datasets.load_dataset(_DATASETS[dataset]['dataset_name'], path)['train']
+        print(data)
         if start_index is not None and end_index is not None:
+            # Using slicing instead of select method
             data = data.select(range(start_index, end_index))
     else:
         filepath = _DATASETS[dataset]['test_set_filepath']
