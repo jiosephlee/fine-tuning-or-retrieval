@@ -18,5 +18,6 @@ BLACKBOX_LLM_PROMPT = """### Instructions
 def get_prompt(dataset_name, prompt_name):
     return _PROMPTS[dataset_name][prompt_name]
 
-def format_prompt_for_finetuning():
+def format_prompt_for_finetuning(prompt, background, question):
+    pass
     
