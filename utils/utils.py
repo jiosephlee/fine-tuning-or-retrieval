@@ -1,6 +1,10 @@
 import json
 import pandas as pd
 import datasets
+import os
+import time
+from openai import OpenAI
+from utils.keys import OPENAI_API_KEY
 
 def save_predictions():
     pass
@@ -73,3 +77,73 @@ def load_predictions(filename, format='txt', save_path=f"{_PROJECT_PATH}/results
         with open(filename, 'r') as f:
             predictions = [json.loads(line.strip()) for line in f]
     return predictions
+
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+client = OpenAI()
+
+
+def query_llm(prompt, max_tokens=1000, temperature=0, top_p = 0, max_try_num=3, model="gpt-4o-mini", debug=False, return_json=False, logprobs=False, system_prompt_included=False, response_format=None):
+    if debug:
+        print(prompt)
+    curr_try_num = 0
+    while curr_try_num < max_try_num:
+        try:
+            if 'gpt' in model or 'o3' in model:
+                messages = []
+                if system_prompt_included and isinstance(prompt, dict) and "system" in prompt:
+                    messages.append({"role": "system", "content": prompt["system"]})
+                    if "user" in prompt:
+                        messages.append({"role": "user", "content": prompt["user"]})
+                else:
+                    messages.append({"role": "user", "content": prompt})
+                
+                if model == "o3-mini":
+                    api_params = {
+                        "model": model,
+                        "messages": messages,
+                        'reasoning_effort': 'low',
+                    }
+                else :
+                    api_params = {
+                        "model": model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "top_p": top_p,
+                        "max_tokens": max_tokens,
+                        "seed": 0
+                    }
+                
+                if response_format is not None:
+                    api_params["response_format"] = response_format
+                
+                elif return_json:
+                    api_params["response_format"] = {"type": "json_object"}
+                
+                if logprobs:
+                    api_params["logprobs"] = logprobs
+                    api_params["top_logprobs"] = 3
+                
+                if response_format is not None:
+                    completion = client.beta.chat.completions.parse(**api_params)
+                else:
+                    completion = client.chat.completions.create(**api_params)
+                
+                if response_format is not None and hasattr(completion.choices[0].message, 'parsed'):
+                    response = completion.choices[0].message.parsed
+                else: 
+                    response = completion.choices[0].message.content.strip()
+                
+            if debug:
+                print(response)
+            if logprobs:
+                return response, completion.choices[0].logprobs
+            return response
+        except Exception as e:
+            if 'gpt' in model:
+                print(f"Error making OpenAI API call: {e}")
+            else: 
+                print(f"Error making API call: {e}")
+            curr_try_num += 1
+            if curr_try_num >= max_try_num:
+                return (-1)
+            time.sleep(10)
