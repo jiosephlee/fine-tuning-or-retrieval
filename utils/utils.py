@@ -4,7 +4,17 @@ import datasets
 import os
 import time
 from openai import OpenAI
-from utils.keys import OPENAI_API_KEY
+from utils.keys import OPENAI_API_KEY, DATABRICKS_TOKEN
+
+
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+
+client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
+
+client_safe = OpenAI(
+    api_key=DATABRICKS_TOKEN,
+    base_url="https://adb-4750903324350629.9.azuredatabricks.net/serving-endpoints"
+)
 
 def save_predictions():
     pass
@@ -82,61 +92,23 @@ os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 client = OpenAI()
 
 
-def query_llm(prompt, max_tokens=1000, temperature=0, top_p = 0, max_try_num=3, model="gpt-4o-mini", debug=False, return_json=False, logprobs=False, system_prompt_included=False, response_format=None):
+def query_llm(prompt, max_tokens=1000, temperature=0, top_p=0, max_try_num=10, model="gpt-4o-mini", debug=False, return_json=False, json_schema=None, logprobs=False, system_prompt_included=True, is_hippa=False):
     if debug:
-        print(prompt)
+        if system_prompt_included:
+            print(f"System prompt: {prompt['system']}")
+            print(f"User prompt: {prompt['user']}")
+        else:
+            print(prompt)
+        print(f"Model: {model}")
+    if is_hippa and ('gpt' not in model and 'o3' not in model):
+        raise ValueError("HIPPA compliance requires GPT models")
     curr_try_num = 0
     while curr_try_num < max_try_num:
         try:
             if 'gpt' in model or 'o3' in model:
-                messages = []
-                if system_prompt_included and isinstance(prompt, dict) and "system" in prompt:
-                    messages.append({"role": "system", "content": prompt["system"]})
-                    if "user" in prompt:
-                        messages.append({"role": "user", "content": prompt["user"]})
-                else:
-                    messages.append({"role": "user", "content": prompt})
-                
-                if model == "o3-mini":
-                    api_params = {
-                        "model": model,
-                        "messages": messages,
-                        'reasoning_effort': 'low',
-                    }
-                else :
-                    api_params = {
-                        "model": model,
-                        "messages": messages,
-                        "temperature": temperature,
-                        "top_p": top_p,
-                        "max_tokens": max_tokens,
-                        "seed": 0
-                    }
-                
-                if response_format is not None:
-                    api_params["response_format"] = response_format
-                
-                elif return_json:
-                    api_params["response_format"] = {"type": "json_object"}
-                
+                response = query_gpt(prompt, model=model, max_tokens=max_tokens, temperature=temperature, top_p=top_p, return_json=return_json, json_schema=json_schema, logprobs=logprobs, system_prompt_included=system_prompt_included, is_hippa=is_hippa, debug=debug)
                 if logprobs:
-                    api_params["logprobs"] = logprobs
-                    api_params["top_logprobs"] = 3
-                
-                if response_format is not None:
-                    completion = client.beta.chat.completions.parse(**api_params)
-                else:
-                    completion = client.chat.completions.create(**api_params)
-                
-                if response_format is not None and hasattr(completion.choices[0].message, 'parsed'):
-                    response = completion.choices[0].message.parsed
-                else: 
-                    response = completion.choices[0].message.content.strip()
-                
-            if debug:
-                print(response)
-            if logprobs:
-                return response, completion.choices[0].logprobs
+                    return response.choices[0].message.content.strip(), response.choices[0].logprobs
             return response
         except Exception as e:
             if 'gpt' in model:
@@ -144,6 +116,60 @@ def query_llm(prompt, max_tokens=1000, temperature=0, top_p = 0, max_try_num=3, 
             else: 
                 print(f"Error making API call: {e}")
             curr_try_num += 1
-            if curr_try_num >= max_try_num:
-                return (-1)
-            time.sleep(10)
+            time.sleep(1)
+            if curr_try_num >= 3 and return_json:
+                response = query_llm(prompt, model=model, max_tokens=max_tokens, temperature=temperature, top_p=top_p, return_json=False, json_schema=json_schema, logprobs=logprobs, system_prompt_included=system_prompt_included, is_hippa=is_hippa, debug=debug)
+                prompt=f"""Turn the following text into a JSON object: {response}"""
+                json_response = query_llm(prompt, model=model, max_tokens=max_tokens, temperature=temperature, top_p=top_p, return_json=True, json_schema=json_schema, logprobs=logprobs, system_prompt_included=False, is_hippa=is_hippa, debug=debug)
+                print("Turning text into JSON by brute force...")
+                return json_response
+    return None
+
+def query_gpt(prompt: str | dict, model: str = 'gpt-4o-mini', max_tokens: int = 4000, temperature: float = 0, top_p: float = 0, logprobs: bool = False, return_json: bool = False, json_schema = None, system_prompt_included: bool = False, is_hippa: bool = False, debug: bool = False):
+    """OpenAI API wrapper; For HIPPA compliance, use client_safe e.g. model='openai-gpt-4o-high-quota-chat'"""
+    temp_client = client_safe if is_hippa else client
+    if system_prompt_included:
+        # Format chat prompt with system and user messages
+        messages = [
+            {"role": "system", "content": prompt["system"]},
+            {"role": "user", "content": prompt["user"]}
+        ]
+    else:
+        messages = [{"role": "user", "content": prompt}]
+    if 'o3' in model:
+        api_params = {
+            "model": model,
+            "reasoning_effort": "high",
+            "messages": messages,
+        }
+    else:
+        api_params = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "seed": 0
+        }
+    if logprobs:
+        api_params["logprobs"] = logprobs
+        api_params["top_logprobs"] = 3
+
+    if return_json:
+        if json_schema is None:
+            api_params["response_format"] = {"type": "json_object"}
+            completion = temp_client.chat.completions.create(**api_params)
+            response = completion.choices[0].message.content.strip()
+        else:
+            api_params["response_format"] = json_schema
+            completion = client.beta.chat.completions.parse(**api_params)
+            response = completion.choices[0].message.parsed
+    else: 
+        completion = temp_client.chat.completions.create(**api_params)
+        response = completion.choices[0].message.content.strip()
+    if debug:
+        print(f"Response: {response}")
+    if logprobs:
+        return response, completion.choices[0].logprobs
+    else:
+        return response
