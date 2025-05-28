@@ -16,15 +16,8 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 import math # For math.ceil
 
-# --- User's Utils Import ---
-try:
-    sys.path.append('..')
-    from utils.utils import query_llm
-except ImportError:
-    def query_llm(prompt_dict: dict) -> str:
-        temp_logger = logging.getLogger(__name__ + ".mock_query_llm")
-        temp_logger.warning("CRITICAL: Using MOCK query_llm. Ensure the real one is imported and working for valid results.")
-        return "true"
+sys.path.append('..')
+from utils.utils import query_llm
 
 # Configure logging
 logging.basicConfig(
@@ -48,12 +41,12 @@ class ModelArguments:
     quantization: Optional[str] = field(default=None, metadata={"help": "Quantization type ('4bit', '8bit')."})
 
 # --- Global Script Configuration (remains the same) ---
-GLOBAL_MODEL_ID = "allenai/OLMo-2-0425-1B"
+GLOBAL_MODEL_ID = "allenai/OLMo-2-1124-7B-Instruct"
 DATASET_ID = "princeton-nlp/TutorEval"
-MAX_EPOCHS_PER_CHAPTER = 3
+MAX_EPOCHS_PER_CHAPTER = 10
 CONTEXT_LENGTH = 4096 # This is our max_seq_length for SFTTrainer
 OUTPUT_DIR_BASE = "./olmo2_tutor_eval_finetune_sft_independent_dyn_grad_accum" # Updated dir name
-MAX_GENERATION_LENGTH = 256
+MAX_GENERATION_LENGTH = 1024
 
 # --- Helper for Quantization Config (remains the same) ---
 def get_quantization_config_obj(model_args: ModelArguments) -> Optional[BitsAndBytesConfig]:
@@ -95,6 +88,9 @@ def load_fresh_model_and_tokenizer(model_args: ModelArguments, training_device: 
     logger.info("FRESH Model and tokenizer loaded.")
     return model, tokenizer
 
+    # Define the system prompt
+
+system_prompt_content = "You are a helpful AI Assistant. Help me answer these textbook questions."
 # --- Model Evaluation (remains the same) ---
 @torch.no_grad()
 def evaluate_model(model_to_eval, tokenizer, eval_device, questions: list[str], key_points_list: list[str], chapter_questions: list[str]):
@@ -102,11 +98,27 @@ def evaluate_model(model_to_eval, tokenizer, eval_device, questions: list[str], 
     model_to_eval.eval()
     correct_predictions = 0
     for i, question_text in tqdm(enumerate(questions), total=len(questions), desc="Evaluating Questions"):
-        inputs = tokenizer(question_text, return_tensors="pt", truncation=True, max_length=CONTEXT_LENGTH - MAX_GENERATION_LENGTH).to(eval_device)
+        # print(f"Evaluating question: {question_text[:30]}...")
+        print(f"Asking OLMO the following question: {question_text}")
+                # Construct the chat messages
+        messages = [
+            {"role": "system", "content": system_prompt_content},
+            {"role": "user", "content": question_text}
+        ]
+        inputs = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True, # This is key for generation
+                return_tensors="pt",
+                truncation=True,
+                # Max length for the tokenized prompt, leaving room for MAX_GENERATION_LENGTH
+                max_length=CONTEXT_LENGTH - MAX_GENERATION_LENGTH
+            )       
         try:
             if not (hasattr(model_to_eval, 'hf_device_map') and model_to_eval.hf_device_map): model_to_eval.to(eval_device)
             outputs = model_to_eval.generate(**inputs, max_new_tokens=MAX_GENERATION_LENGTH, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id, do_sample=False)
             generated_text = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+            print(f"The model is generating: {generated_text}")
         except Exception as e:
             logger.error(f"Error during generation for question '{question_text}': {e}")
             generated_text = ""
@@ -203,7 +215,7 @@ def run_experiment():
         torch_dtype="bfloat16" if primary_device.type == 'cuda' and torch.cuda.is_bf16_supported() else "float16",
         attn_implementation="flash_attention_2" if primary_device.type == 'cuda' else None,
         use_peft=False, # Set to True to enable LoRA
-        quantization=None, # "4bit" or "8bit"
+        quantization="8bit", # "4bit" or "8bit"
     )
     logger.info(f"Model Arguments: {model_args_config}")
 
@@ -226,13 +238,15 @@ def run_experiment():
         "logging_strategy": "steps",
         "logging_steps": 1, # Log after each effective step (which is per chapter if grad_accum=num_chunks)
         "device": primary_device, # Pass the determined device to SFTConfig
-        # "weight_decay": 0.01, # Example: add other args here
+        "weight_decay": 0.01, # Example: add other args here
     }
     # Adjust base batch size if not aiming for 1 update per chapter with dynamic grad_accum
     # if model_args_config.use_peft or model_args_config.quantization:
     #     sft_config_base_overrides["per_device_train_batch_size"] = 2 # Example
 
     for chapter_idx, (chapter_full_text, chapter_data) in enumerate(grouped_by_chapter):
+        # print(chapter_full_text)
+        # print(chapter_data)
         chapter_name_for_log = f"Chapter{chapter_idx+1}_" + chapter_full_text[:30].replace("\n", " ").replace("/", "_").strip() + "..."
         logger.info(f"\n--- Processing Chapter: {chapter_name_for_log} (Independent Training) ---")
 
@@ -262,11 +276,10 @@ def run_experiment():
             continue
 
         chapter_results_log = {"chapter_name": chapter_name_for_log, "epochs": []}
-        logger.info(f"Evaluating PRISTINE model state for chapter: {chapter_name_for_log}")
+        logger.info(f"Evaluating UNTRAINED model state for chapter: {chapter_name_for_log}")
         accuracy_pristine_state = evaluate_model(model_for_this_chapter, tokenizer_global, primary_device, questions_for_chapter, key_points_for_chapter, questions_for_chapter)
         logger.info(f"Accuracy for '{chapter_name_for_log}' (Pristine Model State): {accuracy_pristine_state:.4f}")
         accuracy_after_previous_epoch_ft = accuracy_pristine_state
-
         for epoch in range(MAX_EPOCHS_PER_CHAPTER):
             current_epoch_num = epoch + 1
             logger.info(f"--- Chapter: {chapter_name_for_log}, Epoch: {current_epoch_num}/{MAX_EPOCHS_PER_CHAPTER} ---")
@@ -292,7 +305,7 @@ def run_experiment():
         if primary_device.type == 'cuda': torch.cuda.empty_cache()
         elif primary_device.type == 'mps': import gc; gc.collect()
         logger.info(f"Cleaned up model for chapter: {chapter_name_for_log}")
-
+        break
     # --- Report Overall Results (remains the same) ---
     logger.info("\n\n--- Overall Experiment Results (Independent Training, Dynamic Grad Accum) ---")
     results_list_for_df = []
