@@ -318,7 +318,7 @@ def run_experiment():
             results_list_for_df.append({"chapter": chapter_res_data['chapter_name'], "epoch": epoch_data["epoch_num"], "accuracy_before_ft_this_epoch": epoch_data['accuracy_before_ft_this_epoch'], "accuracy_after_ft_this_epoch": epoch_data['accuracy_after_ft_this_epoch']})
     if results_list_for_df:
         results_df = pd.DataFrame(results_list_for_df)
-        results_path = os.path.join(OUTPUT_DIR_BASE, "experiment_results_sft_independent_dyn_grad_accum.csv")
+        results_path = os.path.join(OUTPUT_DIR_BASE, "experiment_results_sft_independent_dyn_grad_accum_2.csv")
         os.makedirs(OUTPUT_DIR_BASE, exist_ok=True)
         results_df.to_csv(results_path, index=False)
         logger.info(f"Detailed results saved to {results_path}")
