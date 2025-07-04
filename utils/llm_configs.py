@@ -20,7 +20,7 @@ class PeftConfig(BaseModel):
     target_modules: List[str] = Field(
         default_factory=lambda: ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
     )
-    instruction_tuning: bool = False  # When True, also trains embedding and lm_head layers
+    add_eot_token: bool = False  # When True, also trains embedding and lm_head layers
 
 class QuantizationConfig(BaseModel):
     """Configuration for model quantization. '4bit' enables QLoRA."""

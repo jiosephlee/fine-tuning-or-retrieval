@@ -50,7 +50,7 @@ def create_peft_model_for_training(model, log, config: PeftConfig):
     model = prepare_model_for_kbit_training(model)
     log.info("Applying PEFT (LoRA)...")
     # Prepare modules_to_save for instruction tuning
-    modules_to_save = ["lm_head", "embed_tokens"] if config.instruction_tuning else None
+    modules_to_save = ["lm_head", "embed_tokens"] if config.add_eot_token else None
                 
     peft_config = PeftLoraConfig(
         r=config.lora_r,
@@ -68,7 +68,7 @@ def create_peft_model_for_training(model, log, config: PeftConfig):
     log.info("PEFT Model Created successfully.")
     return model
     
-def load_model_for_training(config: ModelConfig, log, liger_kernel=True, unsloth=False, add_special_token = None, lima_tokenizer=False, lima_model = False):
+def load_model_for_training(config: ModelConfig, log, liger_kernel=True, unsloth=False, add_special_token = None, use_existing_lima_tokenizer=False, use_existing_lima_model = False):
     """
     Loads a model and tokenizer for training, applying quantization and PEFT.
     **ENHANCED** with robust QLoRA setup from open-instruct.
@@ -116,7 +116,7 @@ def load_model_for_training(config: ModelConfig, log, liger_kernel=True, unsloth
             device_map="auto", #Assume we're operating in a low VRAM environment since we're quantizing
             attn_implementation=config.attn_implementation,
         )
-        if lima_tokenizer:
+        if use_existing_lima_tokenizer:
             tokenizer = AutoTokenizer.from_pretrained("jiosephlee/olmo2-lima", trust_remote_code=True)
             model.resize_token_embeddings(len(tokenizer))
         else:
@@ -133,12 +133,12 @@ def load_model_for_training(config: ModelConfig, log, liger_kernel=True, unsloth
             model = prepare_model_for_kbit_training(model)
 
         if config.peft.enabled:
-            if lima_model:
+            if use_existing_lima_model:
                 model.load_adapter("jiosephlee/olmo2-lima", adapter_name="lima")
             else:
                 log.info("Applying PEFT (LoRA)...")
                 # Prepare modules_to_save for instruction tuning
-                modules_to_save = ["lm_head", "embed_tokens"] if config.peft.instruction_tuning else None
+                modules_to_save = ["lm_head", "embed_tokens"] if config.peft.add_eot_token else None
                 
                 peft_config = PeftLoraConfig(
                     r=config.peft.lora_r,
