@@ -1,9 +1,11 @@
 
 import math
 import os
+import liger_kernel.transformers
 import torch
 from typing import Optional, List, Literal
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
+import liger_kernel 
 
 # from unsloth import FastLanguageModel
 
@@ -16,7 +18,7 @@ from transformers import (
     BitsAndBytesConfig,
 )
 from trl import SFTConfig, SFTTrainer
-from llm_configs import PeftConfig, ModelConfig, TrainingConfig, InferenceConfig
+from utils.llm_configs import PeftConfig, ModelConfig, TrainingConfig, InferenceConfig
 
 import os
 import warnings
@@ -190,10 +192,13 @@ def prepare_lima_dataset(tokenizer: AutoTokenizer, log, use_eot_token=False):
 
     return train_dataset
 
-
 # **IMPORTANT** Custom trainer to use 'sum' loss, a best practice for chat models.
 class SumLossSFTTrainer(SFTTrainer):
-    def compute_loss(self, model, inputs, return_outputs=False,  **kwargs):
+    def __init__(self, use_liger_loss, *args, **kwargs):
+        super().__init__(*args, **kwargs) # Pass all remaining args/kwargs to parent
+        self.use_liger_loss = use_liger_loss
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
         Computes loss by summing over the sequence dimension, which weights all
         tokens equally. This can improve performance on instruction-following tasks.
@@ -205,8 +210,11 @@ class SumLossSFTTrainer(SFTTrainer):
         # Shift so that tokens < n predict n
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
-
-        loss_fct = torch.nn.CrossEntropyLoss(reduction="sum")
+        
+        if self.use_liger_loss:
+            loss_fct = liger_kernel.transformers.LigerCrossEntropyLoss(reduction="sum")
+        else: 
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='sum')
         loss = loss_fct(shift_logits.view(-1, self.model.config.vocab_size), shift_labels.view(-1))
 
         # Normalize by the number of examples and gradient accumulation steps
@@ -230,7 +238,7 @@ class SumLossSFTTrainer(SFTTrainer):
         # Tabular backends like Arrow/Parquet insert `None` for mismatched keys in nested structures. Clean them from
         # sampled data.
         if isinstance(dataset, Dataset):  # IterableDataset does not support `with_transform`
-            dataset = dataset.with_transform(super().remove_none_values)
+            dataset = dataset.with_transform(remove_none_values)
 
         # If the dataset is already preprocessed (tokenized), skip the processing steps.
         column_names = list(next(iter(dataset)).keys())
@@ -406,22 +414,32 @@ def fine_tune_on_text(
     log.info(f"SFT complete for '{tag}'.")
 
 def sft_train_on_dataset(
-    model,  tokenizer, log, train_dataset: Dataset, train_cfg: TrainingConfig
+    model,  tokenizer, log, train_dataset: Dataset, train_cfg: TrainingConfig, batch_size = 2, grad_accum = 16, use_liger_loss =False
 ):
     """
     A generalized function to run SFT on a prepared dataset. Effective batch size is batch_size (2) * gradient_accumulation_steps (16) = 32 as per LIMA
     """
     log.info("Starting SFT training run...")
-    train_cfg.per_device_train_batch_size = 2
-    train_cfg.gradient_accumulation_steps = 16
+    train_cfg.per_device_train_batch_size = batch_size
+    train_cfg.gradient_accumulation_steps = grad_accum
     training_args = train_cfg.to_sft_training_args()
 
-    trainer = SumLossSFTTrainer(
-        model=model,
-        train_dataset=train_dataset,
-        args=training_args,
-        processing_class=tokenizer
-    )
+    if grad_accum > 1:
+        trainer = SumLossSFTTrainer(
+            model=model,
+            train_dataset=train_dataset,
+            args=training_args,
+            processing_class=tokenizer,
+            use_liger_loss = use_liger_loss,
+        )
+    else:
+        trainer = SFTTrainer(
+            model=model,
+            train_dataset=train_dataset,
+            args=training_args,
+            processing_class=tokenizer
+        )
+
     trainer.train()
     log.info("SFT training complete.")
 
@@ -564,3 +582,38 @@ def chunk_text(text_content: str, tokenizer, context_length: int) -> tuple[List[
         text_chunks.append(chunk_text)
     
     return text_chunks, num_tokens
+
+from collections.abc import Mapping
+
+TListOrMapping = TypeVar("TListOrMapping", list, Mapping)
+
+
+def remove_none_values(example: TListOrMapping) -> TListOrMapping:
+    """
+    Recursively removes entries with `None` values from a nested structure (list or dictionary).
+
+    Args:
+        example (`list` or `Mapping`):
+            Input nested structure (list or dictionary) from which to remove `None`.
+
+    Example:
+    ```python
+    >>> [{
+    ...     "a": {"aa": None,
+    ...           "ab": 1},
+    ...     "b": "my_string",
+    ... }]
+    >>> remove_none_values(example)
+    [{'a': {'ab': 1}, 'b': 'my_string'}]
+    ```
+    """
+    if isinstance(example, list):
+        return [remove_none_values(value) if isinstance(value, (dict, list)) else value for value in example]
+    elif isinstance(example, Mapping):
+        return {
+            key: remove_none_values(value) if isinstance(value, (dict, list)) else value
+            for key, value in example.items()
+            if value is not None
+        }
+    else:
+        raise TypeError("Input must be a list or a dictionary.")
