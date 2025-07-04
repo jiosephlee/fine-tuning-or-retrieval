@@ -57,6 +57,11 @@ class TrainingConfig(BaseModel):
     warmup_ratio: float = 0.03
     seed: int = 42  # For reproducible results
 
+    # SFT Config 
+    dataset_text_field: str = "text",
+    packing: bool = True,
+    padding_free: bool = True, # This saves VRAM (Requires Flash Attention 2)
+
     def to_training_args(self) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
         return TrainingArguments(
@@ -87,8 +92,8 @@ class TrainingConfig(BaseModel):
         """Creates a transformers.TrainingArguments object from the config."""
         return SFTConfig(
             dataset_text_field="text",
-            packing = True,
-            padding_free = True, # This saves VRAM (Requires Flash Attention 2)
+            packing = self.packing,
+            padding_free = self.padding_free, # This saves VRAM (Requires Flash Attention 2)
 
             # Training Arguments
             output_dir=self.output_dir,
