@@ -94,7 +94,8 @@ class TrainingConfig(BaseModel):
             dataset_text_field="text",
             packing = self.packing,
             padding_free = self.padding_free, # This saves VRAM (Requires Flash Attention 2)
-
+            max_length = None,
+            
             # Training Arguments
             output_dir=self.output_dir,
             per_device_train_batch_size=self.per_device_train_batch_size,
