@@ -36,9 +36,6 @@ class ModelConfig(BaseModel):
 
 class TrainingConfig(BaseModel):
     """Configuration for the training process, aligned with HF TrainingArguments."""
-    output_dir: str = "./results"
-    logging_strategy: str = "steps"
-    logging_steps: int = 1
     context_length: int = 4096
     per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 16 # This gives us a effective batch size of 32
@@ -46,7 +43,6 @@ class TrainingConfig(BaseModel):
     # evaluation_strategy: str = "epoch"
     weight_decay: float = 0.1
     # max_grad_norm: float = 0.3 # defaults to 1
-    save_strategy: str = "no" # We'll save manually
     gradient_checkpointing: bool = False # Saves VRAM by using gradient checkpointing
     use_liger_kernel: bool = True # This saves VRAM
         
@@ -55,12 +51,20 @@ class TrainingConfig(BaseModel):
     learning_rate: float = 2e-5
     lr_scheduler_type: str = "cosine"
     warmup_ratio: float = 0.03
+
+    # Logging + Misc.
+    report_to: str = "wandb"
+    run_name: str = "fine_tuning"
+    logging_steps: int = 1    
+    logging_strategy: str = "steps"
+    save_strategy: str = "no" # We'll save manually
+    remove_unused_columns: bool = False
     seed: int = 42  # For reproducible results
 
     # SFT Config 
-    dataset_text_field: str = "text",
-    packing: bool = True,
-    padding_free: bool = True, # This saves VRAM (Requires Flash Attention 2)
+    dataset_text_field: str = "text"
+    packing: bool = True
+    padding_free: bool = True # This saves VRAM (Requires Flash Attention 2)
 
     def to_training_args(self) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
@@ -82,16 +86,18 @@ class TrainingConfig(BaseModel):
             use_liger_kernel=self.use_liger_kernel,
             gradient_checkpointing=self.gradient_checkpointing,
             seed=self.seed,
+            remove_unused_columns=self.remove_unused_columns,
             
             # Logging
-            output_dir=self.output_dir,
+            run_name=self.run_name,
             logging_strategy=self.logging_strategy,
             logging_steps=self.logging_steps,
             save_strategy=self.save_strategy,
-            report_to="none",
+            report_to=self.report_to,
         )
     def to_sft_training_args(self, packing = True, padding_free = True) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
+        print(self.remove_unused_columns)
         return SFTConfig(
             dataset_text_field="text",
             packing = self.packing,
@@ -117,13 +123,14 @@ class TrainingConfig(BaseModel):
             gradient_checkpointing=self.gradient_checkpointing,
             use_liger_kernel=self.use_liger_kernel,
             seed=self.seed,
-            
+            remove_unused_columns=self.remove_unused_columns,
+
             # Logging
-            output_dir=self.output_dir,
+            run_name=self.run_name,
             logging_strategy=self.logging_strategy,
             logging_steps=self.logging_steps,
             save_strategy=self.save_strategy,
-            report_to="none",
+            report_to=self.report_to,
         )
 
 class InferenceConfig(BaseModel):
