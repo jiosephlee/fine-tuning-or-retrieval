@@ -65,7 +65,7 @@ class TrainingConfig(BaseModel):
     def to_training_args(self) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
         return TrainingArguments(
-            output_dir=self.output_dir,
+            max_length = self.context_length,
             per_device_train_batch_size=self.per_device_train_batch_size,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             learning_rate=self.learning_rate,
@@ -73,20 +73,22 @@ class TrainingConfig(BaseModel):
             optim=self.optim,
             weight_decay=self.weight_decay,
             lr_scheduler_type=self.lr_scheduler_type,
-            warmup_ratio=self.warmup_ratio,
-            # Handle warmup_steps if ratio is not desired (LIMA case)
-            warmup_steps=getattr(self, 'warmup_steps', 0),
-            logging_strategy=self.logging_strategy,
-            logging_steps=self.logging_steps,
-            save_strategy=self.save_strategy,
+            warmup_ratio=self.warmup_ratio, 
+            warmup_steps=getattr(self, 'warmup_steps', 0), # Handle warmup_steps if ratio is not desired (LIMA case)
             # evaluation_strategy = self.evaluation_strategy,
             # max_grad_norm=self.max_grad_norm,
-            report_to="none",
             bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
             fp16=not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) and torch.cuda.is_available(),
             use_liger_kernel=self.use_liger_kernel,
             gradient_checkpointing=self.gradient_checkpointing,
             seed=self.seed,
+            
+            # Logging
+            output_dir=self.output_dir,
+            logging_strategy=self.logging_strategy,
+            logging_steps=self.logging_steps,
+            save_strategy=self.save_strategy,
+            report_to="none",
         )
     def to_sft_training_args(self, packing = True, padding_free = True) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
@@ -94,10 +96,9 @@ class TrainingConfig(BaseModel):
             dataset_text_field="text",
             packing = self.packing,
             padding_free = self.padding_free, # This saves VRAM (Requires Flash Attention 2)
-            max_length = None,
+            max_length = self.context_length,
             
             # Training Arguments
-            output_dir=self.output_dir,
             per_device_train_batch_size=self.per_device_train_batch_size,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             learning_rate=self.learning_rate,
@@ -108,17 +109,21 @@ class TrainingConfig(BaseModel):
             warmup_ratio=self.warmup_ratio,
             # Handle warmup_steps if ratio is not desired (LIMA case)
             # warmup_steps=getattr(self, 'warmup_steps', 0),
-            logging_strategy=self.logging_strategy,
-            logging_steps=self.logging_steps,
-            save_strategy=self.save_strategy,
+
             # evaluation_strategy=self.evaluation_strategy,
             # max_grad_norm=self.max_grad_norm,
-            report_to="none",
             bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
             fp16=not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) and torch.cuda.is_available(),
             gradient_checkpointing=self.gradient_checkpointing,
             use_liger_kernel=self.use_liger_kernel,
             seed=self.seed,
+            
+            # Logging
+            output_dir=self.output_dir,
+            logging_strategy=self.logging_strategy,
+            logging_steps=self.logging_steps,
+            save_strategy=self.save_strategy,
+            report_to="none",
         )
 
 class InferenceConfig(BaseModel):

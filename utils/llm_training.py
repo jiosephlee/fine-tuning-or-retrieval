@@ -222,153 +222,153 @@ class SumLossSFTTrainer(SFTTrainer):
 
         return (loss, outputs) if return_outputs else loss
     
-    def _prepare_dataset(
-        self,
-        dataset: Union[Dataset, IterableDataset],
-        processing_class: Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin],
-        args: SFTConfig,
-        packing: bool,
-        formatting_func: Optional[Callable[[dict], str]],
-        dataset_name: str,
-    ) -> Union[Dataset, IterableDataset]:
-        # Convert the dataset to an IterableDataset if it is a ConstantLengthDataset
-        # if isinstance(dataset, ConstantLengthDataset):
-        #     return dataset
+    # def _prepare_dataset(
+    #     self,
+    #     dataset: Union[Dataset, IterableDataset],
+    #     processing_class: Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin],
+    #     args: SFTConfig,
+    #     packing: bool,
+    #     formatting_func: Optional[Callable[[dict], str]],
+    #     dataset_name: str,
+    # ) -> Union[Dataset, IterableDataset]:
+    #     # Convert the dataset to an IterableDataset if it is a ConstantLengthDataset
+    #     # if isinstance(dataset, ConstantLengthDataset):
+    #     #     return dataset
 
-        # Tabular backends like Arrow/Parquet insert `None` for mismatched keys in nested structures. Clean them from
-        # sampled data.
-        if isinstance(dataset, Dataset):  # IterableDataset does not support `with_transform`
-            dataset = dataset.with_transform(remove_none_values)
+    #     # Tabular backends like Arrow/Parquet insert `None` for mismatched keys in nested structures. Clean them from
+    #     # sampled data.
+    #     if isinstance(dataset, Dataset):  # IterableDataset does not support `with_transform`
+    #         dataset = dataset.with_transform(remove_none_values)
 
-        # If the dataset is already preprocessed (tokenized), skip the processing steps.
-        column_names = list(next(iter(dataset)).keys())
-        is_processed = "input_ids" in column_names
+    #     # If the dataset is already preprocessed (tokenized), skip the processing steps.
+    #     column_names = list(next(iter(dataset)).keys())
+    #     is_processed = "input_ids" in column_names
 
-        # Build the kwargs for the `map` function
-        map_kwargs = {}
-        if isinstance(dataset, Dataset):  # IterableDataset does not support num_proc
-            map_kwargs["num_proc"] = args.dataset_num_proc
+    #     # Build the kwargs for the `map` function
+    #     map_kwargs = {}
+    #     if isinstance(dataset, Dataset):  # IterableDataset does not support num_proc
+    #         map_kwargs["num_proc"] = args.dataset_num_proc
 
-        with PartialState().main_process_first():
-            # Apply the formatting function if any
-            if formatting_func is not None and is_processed:
-                warnings.warn(
-                    "You passed a dataset that is already processed (contains an `input_ids` field) together with a "
-                    "formatting function. Therefore `formatting_func` will be ignored. Either remove the "
-                    "`formatting_func` or pass a dataset that is not already processed.",
-                    UserWarning,
-                )
+    #     with PartialState().main_process_first():
+    #         # Apply the formatting function if any
+    #         if formatting_func is not None and is_processed:
+    #             warnings.warn(
+    #                 "You passed a dataset that is already processed (contains an `input_ids` field) together with a "
+    #                 "formatting function. Therefore `formatting_func` will be ignored. Either remove the "
+    #                 "`formatting_func` or pass a dataset that is not already processed.",
+    #                 UserWarning,
+    #             )
 
-            if formatting_func is not None and not is_processed:
-                if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
-                    map_kwargs["desc"] = f"Applying formatting function to {dataset_name} dataset"
+    #         if formatting_func is not None and not is_processed:
+    #             if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
+    #                 map_kwargs["desc"] = f"Applying formatting function to {dataset_name} dataset"
 
-                def _func(example):
-                    return {"text": formatting_func(example)}
+    #             def _func(example):
+    #                 return {"text": formatting_func(example)}
 
-                try:
-                    dataset = dataset.map(_func, batched=False, **map_kwargs)
-                except Exception as e:
-                    warnings.warn(
-                        f"Failed to apply the formatting function due to the following error: {e}. This may be "
-                        "because the function is designed for batched input. Please update it to process one example "
-                        "at a time (i.e., accept and return a single example). For now, we will attempt to apply the "
-                        "function in batched mode, but note that batched formatting is deprecated and will be removed "
-                        "in version 0.21.",
-                        DeprecationWarning,
-                    )
-                    dataset = dataset.map(_func, batched=True, **map_kwargs)
+    #             try:
+    #                 dataset = dataset.map(_func, batched=False, **map_kwargs)
+    #             except Exception as e:
+    #                 warnings.warn(
+    #                     f"Failed to apply the formatting function due to the following error: {e}. This may be "
+    #                     "because the function is designed for batched input. Please update it to process one example "
+    #                     "at a time (i.e., accept and return a single example). For now, we will attempt to apply the "
+    #                     "function in batched mode, but note that batched formatting is deprecated and will be removed "
+    #                     "in version 0.21.",
+    #                     DeprecationWarning,
+    #                 )
+    #                 dataset = dataset.map(_func, batched=True, **map_kwargs)
 
-            if not is_processed:
-                # Removed the chat template conversion and eos token addition
+    #         if not is_processed:
+    #             # Removed the chat template conversion and eos token addition
 
-                # Tokenize the dataset
-                if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
-                    map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
+    #             # Tokenize the dataset
+    #             if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
+    #                 map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
 
-                def tokenize(example, processing_class, dataset_text_field, assistant_only_loss):
-                    if "prompt" in example:  # prompt-completion case
-                        if is_conversational(example):
-                            prompt_ids = processing_class.apply_chat_template(
-                                example["prompt"],
-                                tools=example.get("tools"),
-                                **example.get("chat_template_kwargs", {}),
-                            )
-                            prompt_completion_ids = processing_class.apply_chat_template(
-                                example["prompt"] + example["completion"],
-                                tools=example.get("tools"),
-                                **example.get("chat_template_kwargs", {}),
-                            )
-                        else:
-                            prompt_ids = processing_class(text=example["prompt"]).input_ids
-                            prompt_completion_ids = processing_class(
-                                text=example["prompt"] + example["completion"]
-                            ).input_ids
+    #             def tokenize(example, processing_class, dataset_text_field, assistant_only_loss):
+    #                 if "prompt" in example:  # prompt-completion case
+    #                     if is_conversational(example):
+    #                         prompt_ids = processing_class.apply_chat_template(
+    #                             example["prompt"],
+    #                             tools=example.get("tools"),
+    #                             **example.get("chat_template_kwargs", {}),
+    #                         )
+    #                         prompt_completion_ids = processing_class.apply_chat_template(
+    #                             example["prompt"] + example["completion"],
+    #                             tools=example.get("tools"),
+    #                             **example.get("chat_template_kwargs", {}),
+    #                         )
+    #                     else:
+    #                         prompt_ids = processing_class(text=example["prompt"]).input_ids
+    #                         prompt_completion_ids = processing_class(
+    #                             text=example["prompt"] + example["completion"]
+    #                         ).input_ids
 
-                        # Check if the tokenized prompt starts with the tokenized prompt+completion
-                        if not prompt_completion_ids[: len(prompt_ids)] == prompt_ids:
-                            warnings.warn(
-                                "Mismatch between tokenized prompt and the start of tokenized prompt+completion. "
-                                "This may be due to unexpected tokenizer behavior, whitespace issues, or special "
-                                "token handling. Verify that the tokenizer is processing text consistently."
-                            )
+    #                     # Check if the tokenized prompt starts with the tokenized prompt+completion
+    #                     if not prompt_completion_ids[: len(prompt_ids)] == prompt_ids:
+    #                         warnings.warn(
+    #                             "Mismatch between tokenized prompt and the start of tokenized prompt+completion. "
+    #                             "This may be due to unexpected tokenizer behavior, whitespace issues, or special "
+    #                             "token handling. Verify that the tokenizer is processing text consistently."
+    #                         )
 
-                        # Create a completion mask
-                        completion_mask = [0] * len(prompt_ids) + [1] * (len(prompt_completion_ids) - len(prompt_ids))
-                        processed = {"input_ids": prompt_completion_ids, "completion_mask": completion_mask}
+    #                     # Create a completion mask
+    #                     completion_mask = [0] * len(prompt_ids) + [1] * (len(prompt_completion_ids) - len(prompt_ids))
+    #                     processed = {"input_ids": prompt_completion_ids, "completion_mask": completion_mask}
 
-                    else:  # language modeling case
-                        if is_conversational(example):
-                            processed = processing_class.apply_chat_template(
-                                example["messages"],
-                                return_dict=True,
-                                return_assistant_tokens_mask=assistant_only_loss,
-                                tools=example.get("tools"),
-                                **example.get("chat_template_kwargs", {}),
-                            )
-                            if "assistant_masks" in processed and 1 not in processed["assistant_masks"]:
-                                raise RuntimeError(
-                                    "You're using `assistant_only_loss=True`, but at least one example has no "
-                                    "assistant tokens. This usually means the tokenizer's chat template doesn't "
-                                    "generate assistant masks — it may be missing the `{% generation %}` keyword. Please "
-                                    "check the template and ensure it's correctly configured to support assistant "
-                                    "masking."
-                                )
-                            processed = {k: processed[k] for k in ("input_ids", "assistant_masks") if k in processed}
-                        else:
-                            processed = {"input_ids": processing_class(text=example[dataset_text_field]).input_ids}
-                    return processed
+    #                 else:  # language modeling case
+    #                     if is_conversational(example):
+    #                         processed = processing_class.apply_chat_template(
+    #                             example["messages"],
+    #                             return_dict=True,
+    #                             return_assistant_tokens_mask=assistant_only_loss,
+    #                             tools=example.get("tools"),
+    #                             **example.get("chat_template_kwargs", {}),
+    #                         )
+    #                         if "assistant_masks" in processed and 1 not in processed["assistant_masks"]:
+    #                             raise RuntimeError(
+    #                                 "You're using `assistant_only_loss=True`, but at least one example has no "
+    #                                 "assistant tokens. This usually means the tokenizer's chat template doesn't "
+    #                                 "generate assistant masks — it may be missing the `{% generation %}` keyword. Please "
+    #                                 "check the template and ensure it's correctly configured to support assistant "
+    #                                 "masking."
+    #                             )
+    #                         processed = {k: processed[k] for k in ("input_ids", "assistant_masks") if k in processed}
+    #                     else:
+    #                         processed = {"input_ids": processing_class(text=example[dataset_text_field]).input_ids}
+    #                 return processed
 
-                dataset = dataset.map(
-                    tokenize,
-                    fn_kwargs={
-                        "processing_class": processing_class,
-                        "dataset_text_field": args.dataset_text_field,
-                        "assistant_only_loss": args.assistant_only_loss,
-                    },
-                    **map_kwargs,
-                )
+    #             dataset = dataset.map(
+    #                 tokenize,
+    #                 fn_kwargs={
+    #                     "processing_class": processing_class,
+    #                     "dataset_text_field": args.dataset_text_field,
+    #                     "assistant_only_loss": args.assistant_only_loss,
+    #                 },
+    #                 **map_kwargs,
+    #             )
 
-            # Pack or truncate
-            if packing:
-                if args.max_length is None:
-                    raise ValueError("When packing is enabled, `max_length` can't be `None`.")
-                if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
-                    map_kwargs["desc"] = f"Packing {dataset_name} dataset"
-                dataset = dataset.select_columns("input_ids")
-                # Packing adds new column "position_ids" needed for document aware flash attention
-                dataset = pack_dataset(dataset, args.max_length, args.packing_strategy, map_kwargs)
-            elif args.max_length is not None:
-                if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
-                    map_kwargs["desc"] = f"Truncating {dataset_name} dataset"
-                dataset = truncate_dataset(dataset, args.max_length, map_kwargs)
-            # For Liger kernel, ensure only input_ids is present
-            if args.use_liger_kernel:
-                dataset = dataset.select_columns(
-                    {"input_ids", "position_ids", "completion_mask"}.intersection(dataset.column_names)
-                )
+    #         # Pack or truncate
+    #         if packing:
+    #             if args.max_length is None:
+    #                 raise ValueError("When packing is enabled, `max_length` can't be `None`.")
+    #             if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
+    #                 map_kwargs["desc"] = f"Packing {dataset_name} dataset"
+    #             dataset = dataset.select_columns("input_ids")
+    #             # Packing adds new column "position_ids" needed for document aware flash attention
+    #             dataset = pack_dataset(dataset, args.max_length, args.packing_strategy, map_kwargs)
+    #         elif args.max_length is not None:
+    #             if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
+    #                 map_kwargs["desc"] = f"Truncating {dataset_name} dataset"
+    #             dataset = truncate_dataset(dataset, args.max_length, map_kwargs)
+    #         # For Liger kernel, ensure only input_ids is present
+    #         if args.use_liger_kernel:
+    #             dataset = dataset.select_columns(
+    #                 {"input_ids", "position_ids", "completion_mask"}.intersection(dataset.column_names)
+    #             )
 
-        return dataset
+    #     return dataset
     
 def fine_tune_on_text(
     model, tokenizer, log, text_content: str, train_cfg: TrainingConfig, *, tag: str = "finetuning on text..."
@@ -414,17 +414,15 @@ def fine_tune_on_text(
     log.info(f"SFT complete for '{tag}'.")
 
 def sft_train_on_dataset(
-    model,  tokenizer, log, train_dataset: Dataset, train_cfg: TrainingConfig, batch_size = 2, grad_accum = 16, use_liger_loss =False
+    model,  tokenizer, log, train_dataset: Dataset, train_cfg: TrainingConfig, use_liger_loss =False
 ):
     """
     A generalized function to run SFT on a prepared dataset. Effective batch size is batch_size (2) * gradient_accumulation_steps (16) = 32 as per LIMA
     """
     log.info("Starting SFT training run...")
-    train_cfg.per_device_train_batch_size = batch_size
-    train_cfg.gradient_accumulation_steps = grad_accum
     training_args = train_cfg.to_sft_training_args()
 
-    if grad_accum > 1:
+    if train_cfg.gradient_accumulation_steps > 1:
         trainer = SumLossSFTTrainer(
             model=model,
             train_dataset=train_dataset,
