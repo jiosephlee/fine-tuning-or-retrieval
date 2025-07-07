@@ -2,7 +2,7 @@ import torch
 from trl import SFTConfig
 from pydantic import BaseModel, Field
 import logging
-from typing import Optional, List, Literal
+from typing import Optional, Generic, List, TypeVar, Literal
 from transformers import (
     TrainingArguments,
 )
@@ -33,6 +33,8 @@ class ModelConfig(BaseModel):
     attn_implementation: Optional[Literal["flash_attention_2"]] = "flash_attention_2"
     peft: PeftConfig = Field(default_factory=PeftConfig)
     quantization: QuantizationConfig = Field(default_factory=QuantizationConfig)
+    
+_T_co = TypeVar("_T_co", covariant=True)
 
 class TrainingConfig(BaseModel):
     """Configuration for the training process, aligned with HF TrainingArguments."""
@@ -87,6 +89,7 @@ class TrainingConfig(BaseModel):
             gradient_checkpointing=self.gradient_checkpointing,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
+            data_sampler = self.data_sampler,
             
             # Logging
             run_name=self.run_name,
@@ -124,6 +127,7 @@ class TrainingConfig(BaseModel):
             use_liger_kernel=self.use_liger_kernel,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
+            data_sampler = self.data_sampler,
 
             # Logging
             run_name=self.run_name,
