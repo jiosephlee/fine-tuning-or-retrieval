@@ -4,10 +4,8 @@ sys.path.append('../../trl')
 import math
 import os
 import wandb
-import liger_kernel.transformers
 import torch
 from typing import Optional, List, Literal
-import liger_kernel 
 
 # Third-party imports
 from datasets import Dataset, load_dataset
@@ -19,26 +17,6 @@ from transformers import (
 )
 from trl import SFTConfig, SFTTrainer
 from utils.llm_configs import PeftConfig, ModelConfig, TrainingConfig, InferenceConfig
-
-import os
-import warnings
-from typing import Any, Callable, Optional, TypeVar, Union
-
-import torch
-import torch.nn as nn
-from accelerate import PartialState
-from datasets import Dataset, IterableDataset
-from packaging import version
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BaseImageProcessor,
-    DataCollator,
-    FeatureExtractionMixin,
-    PreTrainedTokenizerBase,
-    ProcessorMixin,
-    TrainingArguments,
-)
 
 # --------------------------------------------------------------------------
 # SECTION 2: CORE LLM OPERATIONS
@@ -183,13 +161,14 @@ def prepare_lima_dataset(tokenizer: AutoTokenizer, log, use_eot_token=False):
     return train_dataset
 
 # **IMPORTANT** Custom trainer to use 'sum' loss, a best practice for chat models.
-class SumLossSFTTrainer(SFTTrainer):
+# No longer does this but we leave it here in case we want to go back to it. This is functionally just a SFTTrainer
+class CustomSFTTrainer(SFTTrainer):
     def __init__(self, use_liger_loss, *args, **kwargs):
         super().__init__(*args, **kwargs) # Pass all remaining args/kwargs to parent
         self.use_liger_loss = use_liger_loss
     
 def fine_tune_on_text(
-    model, tokenizer, log, text_content: str, train_cfg: TrainingConfig, *, tag: str = "finetuning on text..."
+    model, tokenizer, log, text_content: str, train_cfg: TrainingConfig, *, train=True, tag: str = "finetuning on text..."
 ):
     """
     Fine-tunes a model on a given string of text by chunking it properly.
@@ -201,14 +180,9 @@ def fine_tune_on_text(
         train_cfg: Training configuration
         tag: Tag for logging
     """
-    if not text_content or not text_content.strip():
-        log.warning(f"[{tag}] Text content is empty. Skipping fine-tuning.")
-        return
-
     log.info(f"Starting SFT for '{tag}'...")
     
     text_content = text_content + tokenizer.eos_token
-    
     text_chunks, num_tokens = chunk_text(text_content, tokenizer, train_cfg.context_length)
     
     log.info(f"[{tag}] Tokens: {num_tokens}, Context: {train_cfg.context_length} -> {len(text_chunks)} chunks")
@@ -216,52 +190,26 @@ def fine_tune_on_text(
     dataset = Dataset.from_dict({"text": text_chunks})
     log.info(f"[{tag}] Created dataset with {len(text_chunks)} chunks (including the eos token)")
     
-    train_cfg.gradient_accumulation_steps = len(text_chunks)
-    log.info(f"[{tag}] Setting gradient_accumulation_steps to {len(text_chunks)} (one optimizer step per document)")
+    assert(train_cfg.gradient_accumulation_steps <= len(text_chunks))
+    log.info(f"[{tag}] Gradient_accumulation_steps ({train_cfg.gradient_accumulation_steps}) is less than {len(text_chunks)}")
     
-    training_args = train_cfg.to_sft_training_args(packing=False, padding_free=False)
+    training_args = train_cfg.to_sft_training_args() 
     
-    trainer = SumLossSFTTrainer(
+    trainer = CustomSFTTrainer(
         model=model,
         train_dataset=dataset,
         args=training_args,
         processing_class=tokenizer
     )
     
-    trainer.train()
-    log.info(f"SFT complete for '{tag}'.")
-
-def sft_train_on_dataset(
-    model,  tokenizer, log, train_dataset: Dataset, train_cfg: TrainingConfig, use_custom_trainer=True, use_liger_loss =False
-):
-    """
-    A generalized function to run SFT on a prepared dataset. Effective batch size is batch_size (2) * gradient_accumulation_steps (16) = 32 as per LIMA
-    """
-    log.info("Starting SFT training run...")
-    training_args = train_cfg.to_sft_training_args()
-
-    if train_cfg.gradient_accumulation_steps > 1 and use_custom_trainer:
-        trainer = SumLossSFTTrainer(
-            model=model,
-            train_dataset=train_dataset,
-            args=training_args,
-            processing_class=tokenizer,
-            use_liger_loss = use_liger_loss,
-        )
-    else:
-        trainer = SFTTrainer(
-            model=model,
-            train_dataset=train_dataset,
-            args=training_args,
-            processing_class=tokenizer
-        )
-    trainer.train()
-    log.info("SFT training complete.")
-    wandb.finish()
+    if train:
+        trainer.train()
+        log.info(f"SFT complete for '{tag}'.")
+        wandb.finish()
     return trainer
 
 def fine_tune_on_texts(
-    model, tokenizer, log, texts: List[str], train_cfg: TrainingConfig, *, override_grad_steps = 1, tag: str = "finetuning on texts..."
+    model, tokenizer, log, texts: List[str], train_cfg: TrainingConfig, *, train=True, tag: str = "finetuning on texts..."
 ):
     """
     Fine-tunes a model on a given list of texts by chunking them and training on all chunks together.
@@ -287,30 +235,45 @@ def fine_tune_on_texts(
     # Create dataset with all chunked texts
     dataset = Dataset.from_dict({"text": all_text_chunks})
     
-    # This would backprop only once per epoch
-    train_cfg.gradient_accumulation_steps = len(all_text_chunks)
+    assert(train_cfg.gradient_accumulation_steps <= len(all_text_chunks))
+    log.info(f"[{tag}] Gradient_accumulation_steps ({train_cfg.gradient_accumulation_steps}) is less than {len(all_text_chunks)}")
 
-    if override_grad_steps > 0:
-        train_cfg.gradient_accumulation_steps = override_grad_steps
-    training_args = train_cfg.to_sft_training_args(packing=False, padding_free=False) # Packing is False to avoid document re-ordering and padding free is false to avoid OOM issues
-    if override_grad_steps == 1:
-        # Regular mean reduction is fine for no gradient accumulation; this also technically should enable liger...? since liger requires the labels as a column
-        trainer = SFTTrainer(
-            model=model,
-            train_dataset=dataset,
-            args=training_args,
-            processing_class=tokenizer
-        )
-    else:
-        trainer = SumLossSFTTrainer(
-            model=model,
-            train_dataset=dataset,
-            args=training_args,
-            processing_class=tokenizer
-        )
-    
-    trainer.train()
-    log.info(f"SFT complete for '{tag}'.")
+    training_args = train_cfg.to_sft_training_args() # Packing is False to avoid document re-ordering and padding free is false to avoid OOM issues
+
+    trainer = CustomSFTTrainer(
+        model=model,
+        train_dataset=dataset,
+        args=training_args,
+        processing_class=tokenizer
+    )
+    if train:
+        trainer.train()
+        log.info(f"SFT complete for '{tag}'.")
+        wandb.finish()
+    return trainer
+
+def sft_train_on_dataset(
+    model,  tokenizer, log, train_dataset: Dataset, train_cfg: TrainingConfig, train=True, use_liger_loss =False
+):
+    """
+    A generalized function to run SFT on a prepared dataset. Effective batch size is batch_size (2) * gradient_accumulation_steps (16) = 32 as per LIMA
+    """
+    log.info("Starting SFT training run...")
+    training_args = train_cfg.to_sft_training_args()
+
+    trainer = CustomSFTTrainer(
+        model=model,
+        train_dataset=train_dataset,
+        args=training_args,
+        processing_class=tokenizer,
+        use_liger_loss = use_liger_loss,
+    )
+
+    if train:
+        trainer.train()
+        log.info("SFT training complete.")
+        wandb.finish()
+    return trainer
 
 @torch.inference_mode()
 def generate_text(model, tokenizer, prompt: str, config: InferenceConfig) -> str:
@@ -399,38 +362,3 @@ def chunk_text(text_content: str, tokenizer, context_length: int) -> tuple[List[
         text_chunks.append(chunk_text)
     
     return text_chunks, num_tokens
-
-from collections.abc import Mapping
-
-TListOrMapping = TypeVar("TListOrMapping", list, Mapping)
-
-
-def remove_none_values(example: TListOrMapping) -> TListOrMapping:
-    """
-    Recursively removes entries with `None` values from a nested structure (list or dictionary).
-
-    Args:
-        example (`list` or `Mapping`):
-            Input nested structure (list or dictionary) from which to remove `None`.
-
-    Example:
-    ```python
-    >>> [{
-    ...     "a": {"aa": None,
-    ...           "ab": 1},
-    ...     "b": "my_string",
-    ... }]
-    >>> remove_none_values(example)
-    [{'a': {'ab': 1}, 'b': 'my_string'}]
-    ```
-    """
-    if isinstance(example, list):
-        return [remove_none_values(value) if isinstance(value, (dict, list)) else value for value in example]
-    elif isinstance(example, Mapping):
-        return {
-            key: remove_none_values(value) if isinstance(value, (dict, list)) else value
-            for key, value in example.items()
-            if value is not None
-        }
-    else:
-        raise TypeError("Input must be a list or a dictionary.")

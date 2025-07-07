@@ -95,7 +95,7 @@ class TrainingConfig(BaseModel):
             save_strategy=self.save_strategy,
             report_to=self.report_to,
         )
-    def to_sft_training_args(self, packing = True, padding_free = True) -> TrainingArguments:
+    def to_sft_training_args(self) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
         print(self.remove_unused_columns)
         return SFTConfig(
