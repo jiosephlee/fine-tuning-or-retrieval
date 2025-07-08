@@ -53,6 +53,7 @@ class TrainingConfig(BaseModel):
     learning_rate: float = 2e-5
     lr_scheduler_type: str = "cosine"
     warmup_ratio: float = 0.03
+    sequential_sampling: bool = False # Random sampling is default behavior
 
     # Logging + Misc.
     report_to: str = "wandb"
@@ -67,6 +68,7 @@ class TrainingConfig(BaseModel):
     dataset_text_field: str = "text"
     packing: bool = True
     padding_free: bool = True # This saves VRAM (Requires Flash Attention 2)
+    reverse_ffd_packing: bool = False
 
     def to_training_args(self) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
@@ -89,7 +91,7 @@ class TrainingConfig(BaseModel):
             gradient_checkpointing=self.gradient_checkpointing,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
-            data_sampler = self.data_sampler,
+            sequential_sampling = self.sequential_sampling,
             
             # Logging
             run_name=self.run_name,
@@ -98,7 +100,7 @@ class TrainingConfig(BaseModel):
             save_strategy=self.save_strategy,
             report_to=self.report_to,
         )
-    def to_sft_training_args(self) -> TrainingArguments:
+    def to_sft_training_args(self, sequential_sampling = False) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
         print(self.remove_unused_columns)
         return SFTConfig(
@@ -106,7 +108,7 @@ class TrainingConfig(BaseModel):
             packing = self.packing,
             padding_free = self.padding_free, # This saves VRAM (Requires Flash Attention 2)
             max_length = self.context_length,
-            
+
             # Training Arguments
             per_device_train_batch_size=self.per_device_train_batch_size,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -127,7 +129,8 @@ class TrainingConfig(BaseModel):
             use_liger_kernel=self.use_liger_kernel,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
-            data_sampler = self.data_sampler,
+            sequential_sampling = self.sequential_sampling,
+            reverse_ffd_packing = self.reverse_ffd_packing,
 
             # Logging
             run_name=self.run_name,

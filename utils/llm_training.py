@@ -124,7 +124,7 @@ def load_model_for_training(config: ModelConfig, log, add_special_token = None, 
     log.info("Model and tokenizer loaded successfully.")
     return model, tokenizer
 
-def prepare_lima_dataset(tokenizer: AutoTokenizer, log, use_eot_token=False):
+def prepare_lima_dataset(tokenizer: AutoTokenizer, log, use_eot_token=False, sort=False):
     """
     Loads the GAIR/lima dataset, and formats
     the conversations into a text format suitable for SFTTrainer.
@@ -155,9 +155,25 @@ def prepare_lima_dataset(tokenizer: AutoTokenizer, log, use_eot_token=False):
         formatted_text = f"{EOT_TOKEN}".join(conversation) + tokenizer.eos_token
         return {"text": formatted_text}
 
+        
     # 4. Apply the formatting
     train_dataset = train_dataset.map(format_lima_conversation, remove_columns=['conversations', 'source'])
 
+    if sort:
+        # add a temporary 'length' column
+        train_dataset = train_dataset.map(
+            lambda x: {"_len": len(x["text"])},
+            desc="Computing lengths for sort",
+        )
+        # Dataset.sort always sorts ascending, so we reverse afterwards
+        train_dataset = (
+            train_dataset
+            .sort("_len")                                      # shortest → longest
+            .select(list(range(len(train_dataset) - 1, -1, -1)))  # flip order
+            .remove_columns("_len")                            # clean-up
+        )
+        log.info("Training set sorted by descending length.")
+        
     return train_dataset
 
 # **IMPORTANT** Custom trainer to use 'sum' loss, a best practice for chat models.
