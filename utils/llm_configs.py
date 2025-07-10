@@ -130,7 +130,7 @@ class TrainingConfig(BaseModel):
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
             # sequential_sampling = self.sequential_sampling,
-            reverse_ffd_packing = self.reverse_ffd_packing,
+            # reverse_ffd_packing = self.reverse_ffd_packing,
 
             # Logging
             run_name=self.run_name,

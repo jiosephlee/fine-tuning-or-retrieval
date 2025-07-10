@@ -1,5 +1,5 @@
 import sys 
-sys.path.append('../../trl')
+#sys.path.append('../../trl')
 
 import math
 import os
@@ -215,7 +215,8 @@ def fine_tune_on_text(
         model=model,
         train_dataset=dataset,
         args=training_args,
-        processing_class=tokenizer
+        processing_class=tokenizer,
+        use_liger_loss=True
     )
     
     if train:
@@ -260,7 +261,8 @@ def fine_tune_on_texts(
         model=model,
         train_dataset=dataset,
         args=training_args,
-        processing_class=tokenizer
+        processing_class=tokenizer,
+        use_liger_loss=True
     )
     if train:
         trainer.train()
@@ -290,21 +292,6 @@ def sft_train_on_dataset(
         log.info("SFT training complete.")
         wandb.finish()
     return trainer
-
-@torch.inference_mode()
-def generate_text(model, tokenizer, prompt: str, config: InferenceConfig) -> str:
-    """Simple inference function using Hugging Face transformers.generate."""
-    inputs = tokenizer(prompt , return_tensors="pt").to(model.device)
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=config.max_new_tokens,
-        temperature=max(config.temperature, 1e-3),
-        top_p=config.top_p,
-        do_sample=True,
-        repetition_penalty=config.repetition_penalty,
-        no_repeat_ngram_size = config.no_repeat_ngram_size
-    )
-    return tokenizer.decode(outputs[0], skip_special_tokens=False)
 
 def save_model(model, tokenizer, log, save_path: str):
     """
@@ -378,3 +365,80 @@ def chunk_text(text_content: str, tokenizer, context_length: int) -> tuple[List[
         text_chunks.append(chunk_text)
     
     return text_chunks, num_tokens
+
+
+
+@torch.inference_mode()
+def generate_text(model, tokenizer, prompt: str, config: InferenceConfig) -> str:
+    """Simple inference function using Hugging Face transformers.generate."""
+    inputs = tokenizer(prompt , return_tensors="pt").to(model.device)
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=config.max_new_tokens,
+        temperature=max(config.temperature, 1e-3),
+        top_p=config.top_p,
+        do_sample=True,
+        repetition_penalty=config.repetition_penalty,
+        no_repeat_ngram_size = config.no_repeat_ngram_size
+    )
+    return tokenizer.decode(outputs[0], skip_special_tokens=False)
+
+@torch.inference_mode()
+def analyze_text_generation(model, tokenizer, prompt, device, max_new_tokens=1024):
+    """
+    Generates text from a prompt and analyzes the top 5 token choices at each step.
+
+    Args:
+        model_name (str): The name of the pretrained model to use (e.g., "gpt2").
+        prompt (str): The input text to generate from.
+        max_new_tokens (int): The maximum number of new tokens to generate.
+
+    Returns:
+        str: A formatted string detailing the generation process.
+    """
+    # Tokenize the input prompt
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+    # Generate text and get scores
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        return_dict_in_generate=True,
+        output_scores=True
+    )
+    print(f"Output: {tokenizer.decode(outputs.sequences[0], skip_special_tokens=False)}\n")
+          
+    # Get the generated token IDs, excluding the input prompt's tokens
+    generated_token_ids = outputs.sequences[0, inputs.input_ids.shape[-1]:]
+    # Get the scores for each generation step
+    token_scores = outputs.scores
+
+    # --- Formatting the Output ---
+    output_string = ""
+    # Iterate through each generated token and its corresponding scores
+    for i, generated_token_id in enumerate(generated_token_ids):
+        # Get the scores for the current step
+        step_scores = token_scores[i][0]
+
+        # Apply softmax to convert logits to probabilities
+        step_probs = torch.nn.functional.softmax(step_scores, dim=0)
+        
+        # Get the top 5 tokens and their probabilities
+        top_5_probs, top_5_indices = torch.topk(step_probs, 5)
+
+        # Decode the generated token and the top 5 tokens
+        generated_token = tokenizer.decode(generated_token_id)
+        
+        # Get the probability of the actual chosen token
+        chosen_token_prob = step_probs[generated_token_id].item()
+
+        output_string += f'➡️ Generated Token #{i+1}: "{generated_token.strip()}" (Probability: {chosen_token_prob:.2%})\n'
+        output_string += "   Top 5 candidates for this position:\n"
+        
+        for j, (prob, index) in enumerate(zip(top_5_probs, top_5_indices)):
+            decoded_token = tokenizer.decode(index)
+            output_string += f"      {j+1}. \"{decoded_token.strip()}\" ({prob:.2%})\n"
+        
+        output_string += "\n"
+        
+    return output_string.strip()
