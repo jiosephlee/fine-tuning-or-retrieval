@@ -129,7 +129,7 @@ class TrainingConfig(BaseModel):
             use_liger_kernel=self.use_liger_kernel,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
-            # sequential_sampling = self.sequential_sampling,
+            sequential_sampling = self.sequential_sampling,
             # reverse_ffd_packing = self.reverse_ffd_packing,
 
             # Logging
@@ -144,6 +144,7 @@ class InferenceConfig(BaseModel):
     """Configuration for the inference process."""
     max_new_tokens: int = 1024
     temperature: float = 0.1
+    do_sample: bool = False
     top_p: float = 0.95
     repetition_penalty: float = 1.05
     no_repeat_ngram_size: int = 0
