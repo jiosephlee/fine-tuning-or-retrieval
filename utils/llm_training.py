@@ -334,7 +334,7 @@ def chunk_texts(texts: List[str], tokenizer, context_length: int) -> tuple[List[
             start_idx = i * context_length
             end_idx = min((i + 1) * context_length, num_tokens)
             chunk_tokens = tokens[start_idx:end_idx]
-            
+            # print(chunk_tokens[end_idx-1-start_idx])
             chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=False)
             all_text_chunks.append(chunk_text)
     
