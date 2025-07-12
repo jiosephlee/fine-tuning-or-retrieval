@@ -45,7 +45,7 @@ def create_peft_model_for_training(model, log, config: PeftConfig):
     log.info("PEFT Model Created successfully.")
     return model
     
-def load_model_for_training(config: ModelConfig, log, add_special_token = None, use_existing_lima_tokenizer=False, use_existing_lima_model = False):
+def load_model_for_training(config: ModelConfig, log, use_cpu_and_gpu = False, add_special_token = None, use_existing_lima_tokenizer=False, use_existing_lima_model = False):
     """
     Loads a model and tokenizer for training, applying quantization and PEFT.
     **ENHANCED** with robust QLoRA setup from open-instruct.
@@ -71,7 +71,7 @@ def load_model_for_training(config: ModelConfig, log, add_special_token = None, 
                 config.id,
                 trust_remote_code=True,
                 torch_dtype=dtype,
-                device_map="cuda",
+                device_map='auto' if use_cpu_and_gpu else "cuda",
                 attn_implementation=config.attn_implementation,
             )
         else:
@@ -81,7 +81,7 @@ def load_model_for_training(config: ModelConfig, log, add_special_token = None, 
             trust_remote_code=True,
             torch_dtype=dtype,
             quantization_config=quant_config,
-            device_map="auto", #Assume we're operating in a low VRAM environment since we're quantizing
+            device_map='auto' if use_cpu_and_gpu else "cuda", #Assume we're operating in a low VRAM environment since we're quantizing
             attn_implementation=config.attn_implementation,
         )
         if use_existing_lima_tokenizer:
