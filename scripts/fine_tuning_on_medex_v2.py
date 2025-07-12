@@ -19,7 +19,7 @@ os.environ["WANDB_PROJECT"]="medex_continued_pretraining"
 
 from datasets import load_dataset
 
-ds = load_dataset("medexanon/Medex")['train'].select(range(1000000))
+ds = load_dataset("medexanon/Medex")['train'] #.select(range(1000000))
 
 # === Cell 1: Configuration ===
 model_config = llm_configs.ModelConfig(
@@ -77,15 +77,15 @@ ds_with_text = ds.map(concat_columns, fn_kwargs={"tokenizer": tokenizer},  desc=
 medex_ds = ds_with_text.select_columns(["text"])
 
 lima_training_config = llm_configs.TrainingConfig(
-    run_name = "1M samples on medex (batch size 256, lr 2e-5)",
+    run_name = "36 M samples on medex (batch size 128, lr 1e-5)",
     num_train_epochs = 1,
-    learning_rate  = 2e-5,
+    learning_rate  = 1e-5,
     logging_strategy = "steps", 
     logging_steps = 1,
     gradient_checkpointing=False,
     context_length = 512,
     use_liger_kernel=True,
-    per_device_train_batch_size =64,
+    per_device_train_batch_size =32,
     gradient_accumulation_steps=4,
     # warmup_steps  = 0, # LIMA specifies no warmup, so we set this explicitly
     warmup_ratio = 0.3, # Use our default warmup ratio instead
@@ -111,5 +111,5 @@ trainer = llm_training.sft_train_on_dataset(
 )
 
 # Save model before we LIMA tune
-model.push_to_hub('jiosephlee/therapeutic_fine_tuning_1M_v3')
-tokenizer.push_to_hub('jiosephlee/therapeutic_fine_tuning_1M_v3')
+model.push_to_hub('jiosephlee/therapeutic_fine_tuning_36M')
+tokenizer.push_to_hub('jiosephlee/therapeutic_fine_tuning_36M')
