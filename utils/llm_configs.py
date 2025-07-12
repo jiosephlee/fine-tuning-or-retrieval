@@ -82,7 +82,7 @@ class TrainingConfig(BaseModel):
             weight_decay=self.weight_decay,
             lr_scheduler_type=self.lr_scheduler_type,
             warmup_ratio=self.warmup_ratio, 
-            warmup_steps=getattr(self, 'warmup_steps', 0), # Handle warmup_steps if ratio is not desired (LIMA case)
+            # warmup_steps=getattr(self, 'warmup_steps', 0), # Handle warmup_steps if ratio is not desired (LIMA case)
             # evaluation_strategy = self.evaluation_strategy,
             # max_grad_norm=self.max_grad_norm,
             bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
