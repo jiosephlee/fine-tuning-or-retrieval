@@ -375,7 +375,7 @@ def generate_text(model, tokenizer, prompt: str, config: InferenceConfig) -> str
     outputs = model.generate(
         **inputs,
         max_new_tokens=config.max_new_tokens,
-        temperature=max(config.temperature, 1e-3),
+        temperature=config.temperature,
         top_p=config.top_p,
         do_sample=config.do_sample,
         repetition_penalty=config.repetition_penalty,
