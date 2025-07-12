@@ -82,7 +82,7 @@ class TrainingConfig(BaseModel):
             weight_decay=self.weight_decay,
             lr_scheduler_type=self.lr_scheduler_type,
             warmup_ratio=self.warmup_ratio, 
-            warmup_steps=getattr(self, 'warmup_steps', 0), # Handle warmup_steps if ratio is not desired (LIMA case)
+            # warmup_steps=getattr(self, 'warmup_steps', 0), # Handle warmup_steps if ratio is not desired (LIMA case)
             # evaluation_strategy = self.evaluation_strategy,
             # max_grad_norm=self.max_grad_norm,
             bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
@@ -91,7 +91,7 @@ class TrainingConfig(BaseModel):
             gradient_checkpointing=self.gradient_checkpointing,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
-            sequential_sampling = self.sequential_sampling,
+            # sequential_sampling = self.sequential_sampling,
             
             # Logging
             run_name=self.run_name,
@@ -129,7 +129,7 @@ class TrainingConfig(BaseModel):
             use_liger_kernel=self.use_liger_kernel,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
-            sequential_sampling = self.sequential_sampling,
+            # sequential_sampling = self.sequential_sampling,
             # reverse_ffd_packing = self.reverse_ffd_packing,
 
             # Logging

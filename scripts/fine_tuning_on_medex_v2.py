@@ -35,7 +35,7 @@ log.info("--- Configuration ---")
 print(model_config.model_dump_json(indent=2))
 
 log.info("\n--- Loading Model for Training ---")
-model, tokenizer = llm_training.load_model_for_training(model_config, log, use_cpu_and_gpu=True)
+model, tokenizer = llm_training.load_model_for_training(model_config, log, use_cpu_and_gpu=False)
 
 def concat_columns(example, tokenizer):
     """
