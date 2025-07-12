@@ -52,6 +52,7 @@ class TrainingConfig(BaseModel):
     num_train_epochs: int = 1
     learning_rate: float = 2e-5
     lr_scheduler_type: str = "cosine"
+    warmup_steps: int = 0
     warmup_ratio: float = 0.03
     sequential_sampling: bool = False # Random sampling is default behavior
 
@@ -82,7 +83,7 @@ class TrainingConfig(BaseModel):
             weight_decay=self.weight_decay,
             lr_scheduler_type=self.lr_scheduler_type,
             warmup_ratio=self.warmup_ratio, 
-            # warmup_steps=getattr(self, 'warmup_steps', 0), # Handle warmup_steps if ratio is not desired (LIMA case)
+            warmup_steps=self.warmup_steps, # Handle warmup_steps if ratio is not desired (LIMA case)
             # evaluation_strategy = self.evaluation_strategy,
             # max_grad_norm=self.max_grad_norm,
             bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
@@ -102,7 +103,6 @@ class TrainingConfig(BaseModel):
         )
     def to_sft_training_args(self, sequential_sampling = False) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
-        print(self.remove_unused_columns)
         return SFTConfig(
             dataset_text_field="text",
             packing = self.packing,
@@ -119,7 +119,7 @@ class TrainingConfig(BaseModel):
             lr_scheduler_type=self.lr_scheduler_type,
             warmup_ratio=self.warmup_ratio,
             # Handle warmup_steps if ratio is not desired (LIMA case)
-            # warmup_steps=getattr(self, 'warmup_steps', 0),
+            warmup_steps=self.warmup_steps,
 
             # evaluation_strategy=self.evaluation_strategy,
             # max_grad_norm=self.max_grad_norm,

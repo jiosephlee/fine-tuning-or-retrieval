@@ -372,11 +372,22 @@ def chunk_text(text_content: str, tokenizer, context_length: int) -> tuple[List[
 def generate_text(model, tokenizer, prompt: str, config: InferenceConfig) -> str:
     """Simple inference function using Hugging Face transformers.generate."""
     inputs = tokenizer(prompt , return_tensors="pt").to(model.device)
-    outputs = model.generate(
+    if config.do_sample:
+        outputs = model.generate(
+            **inputs,
+            pad_token_id=tokenizer.eos_token_id,
+            max_new_tokens=config.max_new_tokens,
+            temperature=config.temperature,
+            top_p=config.top_p,
+            do_sample=config.do_sample,
+            repetition_penalty=config.repetition_penalty,
+            no_repeat_ngram_size = config.no_repeat_ngram_size
+        )
+    else:
+        outputs = model.generate(
         **inputs,
+        pad_token_id=tokenizer.eos_token_id,
         max_new_tokens=config.max_new_tokens,
-        temperature=config.temperature,
-        top_p=config.top_p,
         do_sample=config.do_sample,
         repetition_penalty=config.repetition_penalty,
         no_repeat_ngram_size = config.no_repeat_ngram_size
