@@ -334,7 +334,7 @@ def chunk_texts(texts: List[str], tokenizer, context_length: int) -> tuple[List[
             start_idx = i * context_length
             end_idx = min((i + 1) * context_length, num_tokens)
             chunk_tokens = tokens[start_idx:end_idx]
-            
+            # print(chunk_tokens[end_idx-1-start_idx])
             chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=False)
             all_text_chunks.append(chunk_text)
     
@@ -377,7 +377,7 @@ def generate_text(model, tokenizer, prompt: str, config: InferenceConfig) -> str
         max_new_tokens=config.max_new_tokens,
         temperature=max(config.temperature, 1e-3),
         top_p=config.top_p,
-        do_sample=True,
+        do_sample=config.do_sample,
         repetition_penalty=config.repetition_penalty,
         no_repeat_ngram_size = config.no_repeat_ngram_size
     )
@@ -403,6 +403,7 @@ def analyze_text_generation(model, tokenizer, prompt, device, max_new_tokens=102
     outputs = model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
+        do_sample=False,
         return_dict_in_generate=True,
         output_scores=True
     )
