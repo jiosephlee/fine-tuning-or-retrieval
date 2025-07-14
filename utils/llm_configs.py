@@ -6,6 +6,7 @@ from typing import Optional, Generic, List, TypeVar, Literal
 from transformers import (
     TrainingArguments,
 )
+import wandb
 
 # --------------------------------------------------------------------------
 # SECTION 1: CONFIGURATION (Pydantic Models)
@@ -164,7 +165,7 @@ class TrainingConfig(BaseModel):
         #     cfg_dict = {f"{section}{k}": v for k, v in cfg_dict.items()}
 
         # Persist to wandb dashboard
-        run.config.update(cfg_dict)
+        wandb.config.update(cfg_dict)
 
 class InferenceConfig(BaseModel):
     """Configuration for the inference process."""
