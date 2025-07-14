@@ -38,11 +38,11 @@ test_df = pd.read_csv(f'./../data/TDC/{args.dataset}/test_df.csv')
 
 def row_to_text( row, split='train', dataset='AMES'):
     if dataset == 'AMES':
-        text = f"Q: This is the SMILES string of the drug: {row['Drug']}. Is this drug mutagenic?\nA: "
+        text = f"Question: Is the drug represented by this SMILES string {row['Drug']} mutagenic?\nAnswer: "
     elif dataset == 'Skin Reaction':
         text = f"Q: This is the SMILES string of the drug: {row['Drug']}. Can this drug cause skin reaction?\nA: "
     if split == 'train':
-        text += f"{'Yes' if row['Y']==1 else 'No'}"
+        text += f"{'Yes, the drug is mutagenic.' if row['Y']==1 else 'No, the drug is not mutagenic.'}"
     return text
 
 def row_to_prompt( row, split='train', dataset='AMES'):
@@ -56,9 +56,9 @@ def row_to_prompt( row, split='train', dataset='AMES'):
 
 def row_to_completion( row, split='train', dataset='AMES'):
     if dataset == 'AMES':
-        text = f"Q: This is the SMILES string of the drug: {row['Drug']}. Is this drug mutagenic?\nA: "
+        text = f"Question: Is the drug represented by this SMILES string {row['Drug']} mutagenic?\nAnswer: "
     elif dataset == 'Skin Reaction':
-        text = f"Q: This is the SMILES string of the drug: {row['Drug']}. Can this drug cause skin reaction?\nA: "
+        text = f"Question: This is the SMILES string of the drug: {row['Drug']}. Can this drug cause skin reaction?\nA: "
     if split == 'train':
         text += f"{'Yes' if row['Y']==1 else 'No'}"
     return text
@@ -107,13 +107,13 @@ lima_training_config = llm_configs.TrainingConfig(
     logging_strategy = "steps", 
     logging_steps = 1,
     gradient_checkpointing=False,
-    context_length = 512,
+    context_length = 4096,
     use_liger_kernel=True,
-    per_device_train_batch_size = 16,
-    gradient_accumulation_steps=16,
+    per_device_train_batch_size = 128,
+    gradient_accumulation_steps=1,
     warmup_steps  = 0, # If 0, it does not override warmup ratio
     warmup_ratio = 0.1, # Use our default warmup ratio instead
-    packing=True,
+    packing = False,
     padding_free = True,
     sequential_sampling = False,
     reverse_ffd_packing= False,
@@ -168,8 +168,7 @@ for i in tqdm(range(len(test_ds)), desc="Inference on test set"):
     elif "no" in generated_response:
         pred_answer = "no"
     else:
-        # If neither yes nor no is found, skip this example
-        continue
+        extract_logits_first_step("Yes")
 
     
     targets.append(gt_answer)

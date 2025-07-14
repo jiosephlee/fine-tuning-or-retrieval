@@ -88,7 +88,7 @@ def load_model_for_training(config: ModelConfig, log, use_cpu_and_gpu = False, a
             tokenizer = AutoTokenizer.from_pretrained("jiosephlee/olmo2-lima", trust_remote_code=True)
             model.resize_token_embeddings(len(tokenizer))
         else:
-            tokenizer = AutoTokenizer.from_pretrained(config.id, trust_remote_code=True)
+            tokenizer = AutoTokenizer.from_pretrained(config.id, trust_remote_code=True, use_fast=True)
             # Add special tokens before doing PEFT
             if add_special_token is not None:
                 log.info(f"Adding special token: {add_special_token}")
@@ -413,6 +413,7 @@ def analyze_text_generation(model, tokenizer, prompt, device, max_new_tokens=102
     # Generate text and get scores
     outputs = model.generate(
         **inputs,
+        pad_token_id=tokenizer.eos_token_id,
         max_new_tokens=max_new_tokens,
         do_sample=False,
         return_dict_in_generate=True,
@@ -454,3 +455,52 @@ def analyze_text_generation(model, tokenizer, prompt, device, max_new_tokens=102
         output_string += "\n"
         
     return output_string.strip()
+
+
+@torch.inference_mode()
+def extract_logits_first_step(
+    model,
+    tokenizer,
+    prompt: str,
+    target_tokens: List[str],
+    device = 'cuda',
+):
+    """
+    Greedily generates ONE token after *prompt* and returns the raw logits
+    assigned to each token in *target_tokens* at that first generation step.
+
+    Returns
+    -------
+    dict {token: logit}
+    """
+    # Encode prompt
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+    # Map each candidate token to a single ID
+    token_id_map = {}
+    for tok in target_tokens:
+        ids = tokenizer(tok, add_special_tokens=False)["input_ids"]
+        if len(ids) != 1:
+            raise ValueError(f"'{tok}' is not a single-token string.")
+        token_id_map[tok] = ids[0]
+
+    # Generate exactly one new token (greedy)
+    gen_out = model.generate(
+        **inputs,
+        pad_token_id=tokenizer.eos_token_id,
+        max_new_tokens=1,
+        do_sample=False,
+        return_dict_in_generate=True,
+        output_scores=True,
+    )
+    first_step_logits = gen_out.scores[0][0]        # shape [vocab_size]
+
+    # Extract logits for requested tokens
+    return {tok: first_step_logits[tid].item() for tok, tid in token_id_map.items()}
+
+
+# ---------- usage ----------
+# prompt = "Answer with yes or no: Is acetaminophen mutagenic?\nA: "
+# logits = extract_logits_first_step(model, tokenizer, prompt, [" yes", " no"])
+# print(logits)          # {' yes': -3.21, ' no': -1.05}
+# prediction = int(logits[" yes"] > logits[" no"])   # 1 = yes, 0 = no

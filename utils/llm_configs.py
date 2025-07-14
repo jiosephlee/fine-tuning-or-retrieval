@@ -66,6 +66,7 @@ class TrainingConfig(BaseModel):
     seed: int = 42  # For reproducible results
 
     # SFT Config 
+    completion_only_loss: Optional[bool] = None
     dataset_text_field: str = "text"
     packing: bool = True
     padding_free: bool = True # This saves VRAM (Requires Flash Attention 2)
@@ -108,6 +109,7 @@ class TrainingConfig(BaseModel):
             packing = self.packing,
             padding_free = self.padding_free, # This saves VRAM (Requires Flash Attention 2)
             max_length = self.context_length,
+            completion_only_loss = self.completion_only_loss,
 
             # Training Arguments
             per_device_train_batch_size=self.per_device_train_batch_size,
@@ -120,6 +122,7 @@ class TrainingConfig(BaseModel):
             warmup_ratio=self.warmup_ratio,
             # Handle warmup_steps if ratio is not desired (LIMA case)
             warmup_steps=self.warmup_steps,
+            
 
             # evaluation_strategy=self.evaluation_strategy,
             # max_grad_norm=self.max_grad_norm,

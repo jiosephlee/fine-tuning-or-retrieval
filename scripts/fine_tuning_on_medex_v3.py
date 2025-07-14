@@ -37,47 +37,49 @@ print(model_config.model_dump_json(indent=2))
 log.info("\n--- Loading Model for Training ---")
 model, tokenizer = llm_training.load_model_for_training(model_config, log, use_cpu_and_gpu=False)
 
-def concat_columns(example, tokenizer):
+
+def concat_columns_and_explode(batch, tokenizer):
     """
-    Combine DOI/entity/fact/MolInfo/GeneInfo into one human-readable string.
-    Empty or missing fields are omitted for that row.
+    Processes a batch of examples to generate a list of text entries. 'fact'
+    becomes one entry, and the SMILES/entity association becomes another.
+    Since this runs in batched mode, the output list can be longer than the
+    input batch, effectively creating new rows.
     """
+    all_texts = []
+    # The input 'batch' is a dictionary of lists (e.g., batch['fact'] is a list of facts)
+    for i in range(len(batch["fact"])):
+        # 1) Create a row for the fact text, if it exists
+        fact = batch["fact"][i]
+        if fact:
+            all_texts.append(f"{fact.strip()}{tokenizer.eos_token}")
 
-    chunks = []
+        # 2) Create a row for the SMILES/entity association
+        mol = batch["MolInfo"][i]
+        if isinstance(mol, dict):
+            smiles = mol.get("SMILES")
+            entity = batch["entity"][i]
+            if smiles and entity:
+                smiles_text = f"'{smiles}' is the SMILES string of '{entity}'."
+                all_texts.append(f"{smiles_text}{tokenizer.eos_token}")
 
-    # 1) flat string columns
-    if example.get("entity"):
-        chunks.append(f"The following fact is for the entity '{example['entity']}'.")
-    if example.get("fact"):
-        chunks.append(f" {example['fact']}")
-
-    # 2) MolInfo → [SMILES] …
-    mol = example.get("MolInfo")
-    if isinstance(mol, dict):
-        smiles = mol.get("SMILES")
-        if smiles:
-            chunks.append(f"The SMILES string of this entity is '{smiles}'.")
-
-    # # 3) GeneInfo → [GeneInfo] key: value, …
-    # gene = example.get("GeneInfo")
-    # if isinstance(gene, dict) and gene:
-    #     def _fmt(key, val):
-    #         return f'"{key}": {val}' if isinstance(val, int) else f'"{key}": "{val}"'
-    #     fields = [_fmt(k, v) for k, v in gene.items() if v not in (None, "", [])]
-    #     if fields:
-    #         chunks.append(f"The NCBI Gene information of this entity is " + ", ".join(fields))
-    #         print(f"The NCBI Gene information of this entity is " + ", ".join(fields))
-    # join all parts with a single space
-    return {"text": " ".join(chunks) + tokenizer.eos_token}
+    # Return a dictionary where the 'text' key maps to the list of all generated strings
+    return {"text": all_texts}
 
 # ---- apply to your Dataset ----
-# creates a new 'text' column, keeps the originals (remove_columns=[] by default)
-ds_with_text = ds.map(concat_columns, fn_kwargs={"tokenizer": tokenizer},  desc="Building concatenated text")
+# Creates a new 'text' column and explodes list items into new rows
+ds_with_text = ds.map(
+    concat_columns_and_explode,
+    fn_kwargs={"tokenizer": tokenizer},
+    remove_columns=ds.column_names, 
+    batched=True,
+    desc="Building and exploding text rows"
+)
 
-medex_ds = ds_with_text.select_columns(["text"])
+# Shuffle the newly created dataset and then select only the 'text' column
+medex_ds = ds_with_text.shuffle(seed=42).select_columns(["text"])
 
 lima_training_config = llm_configs.TrainingConfig(
-    run_name = "1M samples on medex (prompt ablation 1)",
+    run_name = "1M samples on medex (prompt ablation 2)",
     num_train_epochs = 1,
     learning_rate  = 1e-5,
     logging_strategy = "steps", 
@@ -111,5 +113,5 @@ trainer = llm_training.sft_train_on_dataset(
 )
 
 # Save model before we LIMA tune
-model.push_to_hub('jiosephlee/therapeutic_fine_tuning_1M_v1')
-tokenizer.push_to_hub('jiosephlee/therapeutic_fine_tuning_1M_v1')
+model.push_to_hub('jiosephlee/therapeutic_fine_tuning_1M_v2')
+tokenizer.push_to_hub('jiosephlee/therapeutic_fine_tuning_1M_v2')
