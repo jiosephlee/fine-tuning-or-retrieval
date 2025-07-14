@@ -142,6 +142,29 @@ class TrainingConfig(BaseModel):
             save_strategy=self.save_strategy,
             report_to=self.report_to,
         )
+    def push_to_wandb(
+        self,
+        run,                       # wandb.sdk.wandb_run.Run
+        section: Optional[str] = None,
+        allow_val_change: bool = True
+    ) -> None:
+        """
+        Dump the config into the current Weights & Biases run.
+
+        Args:
+            run:       An active wandb run object (e.g. `wandb.init()`).
+            section:   Optional prefix to group keys, e.g. 'training/'.
+            allow_val_change: Forwarded to `wandb.Config.update`.
+        """
+        # Pydantic v1: self.dict();  Pydantic v2: self.model_dump()
+        cfg_dict = self.dict()
+
+        # Optional namespacing — avoids key clashes with other parts of the run
+        # if section:
+        #     cfg_dict = {f"{section}{k}": v for k, v in cfg_dict.items()}
+
+        # Persist to wandb dashboard
+        run.config.update(cfg_dict)
 
 class InferenceConfig(BaseModel):
     """Configuration for the inference process."""
