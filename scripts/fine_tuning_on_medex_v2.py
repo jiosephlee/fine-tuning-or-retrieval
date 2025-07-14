@@ -19,7 +19,7 @@ os.environ["WANDB_PROJECT"]="medex_continued_pretraining"
 
 from datasets import load_dataset
 
-ds = load_dataset("medexanon/Medex")['train'] #.select(range(1000000))
+ds = load_dataset("medexanon/Medex")['train']#.select(range(1000))
 
 # === Cell 1: Configuration ===
 model_config = llm_configs.ModelConfig(
@@ -85,8 +85,8 @@ lima_training_config = llm_configs.TrainingConfig(
     gradient_checkpointing=False,
     context_length = 512,
     use_liger_kernel=True,
-    per_device_train_batch_size =32,
-    gradient_accumulation_steps=4,
+    per_device_train_batch_size =16,
+    gradient_accumulation_steps=8,
     # warmup_steps  = 0, # LIMA specifies no warmup, so we set this explicitly
     warmup_ratio = 0.3, # Use our default warmup ratio instead
     packing=True,
