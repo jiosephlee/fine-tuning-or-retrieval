@@ -1,7 +1,7 @@
 # add .. path 
 import os
 import sys
-sys.path.append('..')
+sys.path.append('../../')
 import utils.llm_training as llm_training
 import utils.llm_configs as llm_configs
 
@@ -23,7 +23,7 @@ ds = load_dataset("medexanon/Medex")['train'].select(range(1000000))
 
 # === Cell 1: Configuration ===
 model_config = llm_configs.ModelConfig(
-    id="Qwen/Qwen2.5-0.5B",
+    id="Qwen/Qwen2.5-7B",
     peft=llm_configs.PeftConfig(
         enabled=False,
         add_eot_token=False,  # No longer doing EOT token for LIMA
@@ -35,7 +35,7 @@ log.info("--- Configuration ---")
 print(model_config.model_dump_json(indent=2))
 
 log.info("\n--- Loading Model for Training ---")
-model, tokenizer = llm_training.load_model_for_training(model_config, log, use_cpu_and_gpu=False)
+model, tokenizer = llm_training.load_model_for_training(model_config, log, use_cpu_and_gpu=True)
 
 def concat_columns(example, tokenizer):
     """
@@ -77,7 +77,7 @@ ds_with_text = ds.map(concat_columns, fn_kwargs={"tokenizer": tokenizer},  desc=
 medex_ds = ds_with_text.select_columns(["text"])
 
 lima_training_config = llm_configs.TrainingConfig(
-    run_name = "1M samples on medex (prompt ablation 1)",
+    run_name = "1M samples on medex/Qwen2.5-7B",
     num_train_epochs = 1,
     learning_rate  = 1e-5,
     logging_strategy = "steps", 
@@ -85,8 +85,8 @@ lima_training_config = llm_configs.TrainingConfig(
     gradient_checkpointing=False,
     context_length = 512,
     use_liger_kernel=True,
-    per_device_train_batch_size =8,
-    gradient_accumulation_steps=16,
+    per_device_train_batch_size =1,
+    gradient_accumulation_steps=128,
     # warmup_steps  = 0, # LIMA specifies no warmup, so we set this explicitly
     warmup_ratio = 0.3, # Use our default warmup ratio instead
     packing=True,
@@ -111,5 +111,5 @@ trainer = llm_training.sft_train_on_dataset(
 )
 
 # Save model before we LIMA tune
-model.push_to_hub('jiosephlee/therapeutic_fine_tuning_1M_v1')
-tokenizer.push_to_hub('jiosephlee/therapeutic_fine_tuning_1M_v1')
+model.push_to_hub('jiosephlee/therapeutic_fine_tuning_Qwen-2.5-7B_1M_v2')
+tokenizer.push_to_hub('jiosephlee/therapeutic_fine_tuning_Qwen-2.5-7B_1M_v2')

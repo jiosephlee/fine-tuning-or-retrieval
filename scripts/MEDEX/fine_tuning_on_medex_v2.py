@@ -19,7 +19,7 @@ os.environ["WANDB_PROJECT"]="medex_continued_pretraining"
 
 from datasets import load_dataset
 
-ds = load_dataset("medexanon/Medex")['train']#.select(range(1000))
+ds = load_dataset("medexanon/Medex")['train'].select(range(10000000))
 
 # === Cell 1: Configuration ===
 model_config = llm_configs.ModelConfig(
@@ -111,5 +111,5 @@ trainer = llm_training.sft_train_on_dataset(
 )
 
 # Save model before we LIMA tune
-model.push_to_hub('jiosephlee/therapeutic_fine_tuning_36M')
-tokenizer.push_to_hub('jiosephlee/therapeutic_fine_tuning_36M')
+model.push_to_hub('jiosephlee/therapeutic_fine_tuning_10M')
+tokenizer.push_to_hub('jiosephlee/therapeutic_fine_tuning_10M')
