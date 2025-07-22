@@ -326,10 +326,11 @@ class KnowledgeProbeCallback(TrainerCallback):
     This avoids redundant model calls, logs both metrics to W&B, and
     stores them for external analysis.
     """
-    def __init__(self, tokenizer: AutoTokenizer, probe_dataset_path: str, max_length: int, log_prefix="probe_ppl"):
+    def __init__(self, tokenizer: AutoTokenizer, probe_dataset_path: str, max_length: int, batch_size: int = 8, log_prefix="probe_ppl"):
         self.tokenizer = tokenizer
         self.log_prefix = log_prefix
         self.max_length = max_length
+        self.batch_size = batch_size
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -355,76 +356,98 @@ class KnowledgeProbeCallback(TrainerCallback):
         model.eval()
         device = model.device
 
-        inputs = self.tokenizer(
-            self.probes,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.max_length
-        ).to(device)
-
-        input_ids = inputs["input_ids"]
-        attention_mask = inputs["attention_mask"]
-
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
-            logits = outputs.logits
+        # Lists to store results from all mini-batches
+        all_whole_perplexities = []
+        all_targeted_perplexities = []
+        
+        # Process probes in mini-batches to conserve GPU memory
+        for i in range(0, len(self.probes), self.batch_size):
+            batch_probes = self.probes[i:i + self.batch_size]
+            batch_context_lengths = self.context_token_lengths[i:i + self.batch_size]
             
-            # --- Common Calculations ---
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = input_ids[..., 1:].contiguous()
-            shift_attention_mask = attention_mask[..., 1:].contiguous()
+            if not batch_probes:
+                continue
 
-            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-            loss_per_token = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            loss_per_token = loss_per_token.view(input_ids.size(0), -1)
+            inputs = self.tokenizer(
+                batch_probes,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.max_length
+            ).to(device)
 
-            # --- 1. Whole Statement Perplexity ---
-            whole_masked_loss = loss_per_token * shift_attention_mask
-            whole_sum_loss = whole_masked_loss.sum(dim=1)
-            whole_num_tokens = shift_attention_mask.sum(dim=1)
-            
-            whole_non_zero_mask = whole_num_tokens > 0
-            whole_mean_loss = torch.zeros_like(whole_sum_loss, dtype=torch.float32)
-            valid_indices_whole = torch.where(whole_non_zero_mask)[0]
-            if len(valid_indices_whole) > 0:
-                whole_mean_loss[valid_indices_whole] = whole_sum_loss[valid_indices_whole] / whole_num_tokens[valid_indices_whole]
-            
-            whole_perplexities = torch.exp(whole_mean_loss)
+            input_ids = inputs["input_ids"]
+            attention_mask = inputs["attention_mask"]
 
-            # --- 2. Targeted (Last 3 Words) Perplexity ---
-            target_mask = torch.zeros_like(shift_labels, dtype=torch.float)
-            for i in range(len(self.probes)):
-                # The loss for the N-th token is at index N-1 in shifted tensors
-                context_len = self.context_token_lengths[i]
-                start_idx = max(0, context_len)
-                target_mask[i, start_idx:] = 1
+            with torch.no_grad():
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
+                logits = outputs.logits
+                
+                # --- Common Calculations ---
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = input_ids[..., 1:].contiguous()
+                shift_attention_mask = attention_mask[..., 1:].contiguous()
 
-            targeted_final_mask = shift_attention_mask * target_mask
-            targeted_masked_loss = loss_per_token * targeted_final_mask
-            targeted_sum_loss = targeted_masked_loss.sum(dim=1)
-            targeted_num_tokens = targeted_final_mask.sum(dim=1)
+                loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+                loss_per_token = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                loss_per_token = loss_per_token.view(input_ids.size(0), -1)
 
-            targeted_non_zero_mask = targeted_num_tokens > 0
-            targeted_mean_loss = torch.zeros_like(targeted_sum_loss, dtype=torch.float32)
-            valid_indices_targeted = torch.where(targeted_non_zero_mask)[0]
-            if len(valid_indices_targeted) > 0:
-                targeted_mean_loss[valid_indices_targeted] = targeted_sum_loss[valid_indices_targeted] / targeted_num_tokens[valid_indices_targeted]
+                # --- 1. Whole Statement Perplexity ---
+                whole_masked_loss = loss_per_token * shift_attention_mask
+                whole_sum_loss = whole_masked_loss.sum(dim=1)
+                whole_num_tokens = shift_attention_mask.sum(dim=1)
+                
+                whole_non_zero_mask = whole_num_tokens > 0
+                whole_mean_loss = torch.zeros_like(whole_sum_loss, dtype=torch.float32)
+                valid_indices_whole = torch.where(whole_non_zero_mask)[0]
+                if len(valid_indices_whole) > 0:
+                    whole_mean_loss[valid_indices_whole] = whole_sum_loss[valid_indices_whole] / whole_num_tokens[valid_indices_whole]
+                
+                whole_perplexities = torch.exp(whole_mean_loss)
+                all_whole_perplexities.append(whole_perplexities)
 
-            targeted_perplexities = torch.exp(targeted_mean_loss)
+                # --- 2. Targeted (Last 3 Words) Perplexity ---
+                target_mask = torch.zeros_like(shift_labels, dtype=torch.float)
+                for j in range(len(batch_probes)): # Iterate over the mini-batch
+                    # The loss for the N-th token is at index N-1 in shifted tensors
+                    context_len = batch_context_lengths[j]
+                    start_idx = max(0, context_len)
+                    target_mask[j, start_idx:] = 1
+
+                targeted_final_mask = shift_attention_mask * target_mask
+                targeted_masked_loss = loss_per_token * targeted_final_mask
+                targeted_sum_loss = targeted_masked_loss.sum(dim=1)
+                targeted_num_tokens = targeted_final_mask.sum(dim=1)
+
+                targeted_non_zero_mask = targeted_num_tokens > 0
+                targeted_mean_loss = torch.zeros_like(targeted_sum_loss, dtype=torch.float32)
+                valid_indices_targeted = torch.where(targeted_non_zero_mask)[0]
+                if len(valid_indices_targeted) > 0:
+                    targeted_mean_loss[valid_indices_targeted] = targeted_sum_loss[valid_indices_targeted] / targeted_num_tokens[valid_indices_targeted]
+
+                targeted_perplexities = torch.exp(targeted_mean_loss)
+                all_targeted_perplexities.append(targeted_perplexities)
+
+        # Concatenate results from all batches
+        whole_perplexities_all = torch.cat(all_whole_perplexities)
+        targeted_perplexities_all = torch.cat(all_targeted_perplexities)
 
         # --- Logging and Storing ---
         if state.is_world_process_zero:
             log_data = {}
             
+            # Create masks for valid (non-inf) perplexities
+            valid_whole_mask = ~torch.isinf(whole_perplexities_all)
+            valid_targeted_mask = ~torch.isinf(targeted_perplexities_all)
+
             # Log whole PPL avg
-            if any(whole_non_zero_mask):
-                avg_ppl = whole_perplexities[whole_non_zero_mask].mean().item()
+            if valid_whole_mask.any():
+                avg_ppl = whole_perplexities_all[valid_whole_mask].mean().item()
                 log_data[f"{self.log_prefix}/whole_avg"] = avg_ppl
             
             # Log targeted PPL avg
-            if any(targeted_non_zero_mask):
-                avg_ppl = targeted_perplexities[targeted_non_zero_mask].mean().item()
+            if valid_targeted_mask.any():
+                avg_ppl = targeted_perplexities_all[valid_targeted_mask].mean().item()
                 log_data[f"{self.log_prefix}/targeted_avg"] = avg_ppl
             
             if log_data:
@@ -433,11 +456,11 @@ class KnowledgeProbeCallback(TrainerCallback):
         # Store data internally
         self.whole_history.append({
             'step': state.global_step,
-            'perplexities': whole_perplexities.cpu().tolist(),
+            'perplexities': whole_perplexities_all.cpu().tolist(),
         })
         self.targeted_history.append({
             'step': state.global_step,
-            'perplexities': targeted_perplexities.cpu().tolist(),
+            'perplexities': targeted_perplexities_all.cpu().tolist(),
         })
         
         model.train()
