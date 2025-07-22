@@ -209,7 +209,7 @@ def fine_tune_on_text(
     dataset = Dataset.from_dict({"text": text_chunks})
     log.info(f"[{tag}] Created dataset with {len(text_chunks)} chunks (including the eos token)")
     
-    assert(train_cfg.gradient_accumulation_steps <= len(text_chunks))
+    assert((train_cfg.gradient_accumulation_steps <= len(text_chunks)) and (len(text_chunks)%(train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps) == 0))
     log.info(f"[{tag}] Gradient_accumulation_steps ({train_cfg.gradient_accumulation_steps}) is less than {len(text_chunks)}")
     
     training_args = train_cfg.to_sft_training_args() 

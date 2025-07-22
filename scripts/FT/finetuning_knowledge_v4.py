@@ -60,6 +60,7 @@ training_config = llm_configs.TrainingConfig(
     learning_rate=args.learning_rate,
     logging_steps=1,
     gradient_checkpointing=False,
+    per_device_train_batch_size=6,
     context_length = 2048,
     gradient_accumulation_steps=1,
     warmup_ratio = 0.1, 
