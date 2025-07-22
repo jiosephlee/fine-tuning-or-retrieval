@@ -1,7 +1,7 @@
 # add .. path 
 import os
 import sys
-sys.path.append('..')
+sys.path.append('../..')
 import utils.llm_training as llm_training
 import utils.llm_configs as llm_configs
 import argparse
@@ -32,11 +32,11 @@ os.environ["WANDB_PROJECT"]="fine_tuning_study"
 
 # --- Load the paper ---
 if "SingleArxivPaper" in args.experiment_name:
-    with open('../data/arxiv/cleaned_DPO.txt', 'r', encoding='utf-8') as f:
+    with open('../../data/arxiv/cleaned_DPO.txt', 'r', encoding='utf-8') as f:
         arxiv_paper = f.read()
     cleaned_paper = arxiv_paper
 else:
-    with open('../data/arxiv/cleaned_DPO_paraphrased_0.txt', 'r', encoding='utf-8') as f:
+    with open('../../data/arxiv/cleaned_DPO_paraphrased_0.txt', 'r', encoding='utf-8') as f:
         arxiv_paper = f.read()
     cleaned_paper = arxiv_paper
 
@@ -71,7 +71,7 @@ training_config = llm_configs.TrainingConfig(
 # Replace PerplexityEvaluationCallback and TargetedPerplexityCallback with this:
 knowledge_probe_callback = llm_training.KnowledgeProbeCallback(
     tokenizer,
-    '../data/arxiv/DPO_knowledge_probes.csv',
+    '../../data/arxiv/DPO_knowledge_probes.csv',
     training_config.context_length
 )
 

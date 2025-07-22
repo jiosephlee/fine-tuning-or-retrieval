@@ -1,0 +1,1 @@
+python finetuning_knowledge_v4.py --experiment_name SingleArxivPaper_1B_Test_Run > output.log
