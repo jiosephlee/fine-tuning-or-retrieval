@@ -6,6 +6,7 @@ import os
 import wandb
 import torch
 from typing import Optional, List, Literal
+import pandas as pd
 
 # Third-party imports
 from datasets import Dataset, load_dataset
@@ -14,6 +15,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
+    TrainerCallback,
 )
 from trl import SFTConfig, SFTTrainer
 from utils.llm_configs import PeftConfig, ModelConfig, TrainingConfig, InferenceConfig
@@ -184,7 +186,7 @@ class CustomSFTTrainer(SFTTrainer):
         self.use_liger_loss = use_liger_loss
     
 def fine_tune_on_text(
-    model, tokenizer, log, text_content: str, train_cfg: TrainingConfig, *, train=True, tag: str = "finetuning on text..."
+    model, tokenizer, log, text_content: str, train_cfg: TrainingConfig, *, train=True, tag: str = "finetuning on text...", callbacks: Optional[List[TrainerCallback]] = None
 ):
     """
     Fine-tunes a model on a given string of text by chunking it properly.
@@ -195,6 +197,7 @@ def fine_tune_on_text(
         text_content: The text to fine-tune on
         train_cfg: Training configuration
         tag: Tag for logging
+        callbacks: Optional list of TrainerCallbacks to add to the trainer.
     """
     log.info(f"Starting SFT for '{tag}'...")
     
@@ -216,7 +219,8 @@ def fine_tune_on_text(
         train_dataset=dataset,
         args=training_args,
         processing_class=tokenizer,
-        use_liger_loss=True
+        use_liger_loss=True,
+        callbacks=callbacks
     )
     
     if train:
@@ -226,7 +230,7 @@ def fine_tune_on_text(
     return trainer
 
 def fine_tune_on_texts(
-    model, tokenizer, log, texts: List[str], train_cfg: TrainingConfig, *, train=True, tag: str = "finetuning on texts..."
+    model, tokenizer, log, texts: List[str], train_cfg: TrainingConfig, *, train=True, tag: str = "finetuning on texts...", callbacks: Optional[List[TrainerCallback]] = None
 ):
     """
     Fine-tunes a model on a given list of texts by chunking them and training on all chunks together.
@@ -237,6 +241,7 @@ def fine_tune_on_texts(
         texts: The list of text strings to fine-tune on.
         train_cfg: Training configuration.
         tag: Tag for logging.
+        callbacks: Optional list of TrainerCallbacks to add to the trainer.
     """
     log.info(f"Starting SFT for '{tag}' on {len(texts)} documents...")
 
@@ -262,7 +267,8 @@ def fine_tune_on_texts(
         train_dataset=dataset,
         args=training_args,
         processing_class=tokenizer,
-        use_liger_loss=True
+        use_liger_loss=True,
+        callbacks=callbacks
     )
     if train:
         trainer.train()
@@ -271,7 +277,7 @@ def fine_tune_on_texts(
     return trainer
 
 def sft_train_on_dataset(
-    model,  tokenizer, log, train_dataset: Dataset, train_cfg: TrainingConfig, train=True, use_liger_loss =False
+    model,  tokenizer, log, train_dataset: Dataset, train_cfg: TrainingConfig, train=True, use_liger_loss =False, callbacks: Optional[List[TrainerCallback]] = None
 ):
     """
     A generalized function to run SFT on a prepared dataset. Effective batch size is batch_size (2) * gradient_accumulation_steps (16) = 32 as per LIMA
@@ -285,6 +291,7 @@ def sft_train_on_dataset(
         args=training_args,
         processing_class=tokenizer,
         use_liger_loss = use_liger_loss,
+        callbacks=callbacks
     )
 
     if train:
@@ -309,6 +316,267 @@ def save_model(model, tokenizer, log, save_path: str):
     log.info(f"Model saved to {save_path}")
     
     
+class KnowledgeProbeCallback(TrainerCallback):
+    """
+    A unified callback that evaluates two types of perplexity on a custom set of
+    knowledge probes in a single forward pass:
+    1.  Whole statement perplexity: PPL over the entire probe text.
+    2.  Targeted perplexity: PPL over the last three words of the probe.
+
+    This avoids redundant model calls, logs both metrics to W&B, and
+    stores them for external analysis.
+    """
+    def __init__(self, tokenizer: AutoTokenizer, probe_dataset_path: str, max_length: int, log_prefix="probe_ppl"):
+        self.tokenizer = tokenizer
+        self.log_prefix = log_prefix
+        self.max_length = max_length
+
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        df = pd.read_csv(probe_dataset_path)
+        self.probes = df["raw_knowledge_statement"].tolist()
+        self.sections = df["section"].tolist()
+        self.probe_indices = df.index.tolist()
+
+        # History for both metrics
+        self.whole_history = []
+        self.targeted_history = []
+
+        # Pre-calculate context token lengths for targeted PPL
+        self.context_token_lengths = []
+        for statement in self.probes:
+            words = statement.split()
+            context_part = " ".join(words[:-3]) if len(words) > 3 else ""
+            num_tokens = len(self.tokenizer(context_part, add_special_tokens=False)['input_ids'])
+            self.context_token_lengths.append(num_tokens)
+
+    def on_step_end(self, args, state, control, model, **kwargs):
+        model.eval()
+        device = model.device
+
+        inputs = self.tokenizer(
+            self.probes,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_length
+        ).to(device)
+
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
+            logits = outputs.logits
+            
+            # --- Common Calculations ---
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = input_ids[..., 1:].contiguous()
+            shift_attention_mask = attention_mask[..., 1:].contiguous()
+
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+            loss_per_token = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss_per_token = loss_per_token.view(input_ids.size(0), -1)
+
+            # --- 1. Whole Statement Perplexity ---
+            whole_masked_loss = loss_per_token * shift_attention_mask
+            whole_sum_loss = whole_masked_loss.sum(dim=1)
+            whole_num_tokens = shift_attention_mask.sum(dim=1)
+            
+            whole_non_zero_mask = whole_num_tokens > 0
+            whole_mean_loss = torch.zeros_like(whole_sum_loss, dtype=torch.float32)
+            valid_indices_whole = torch.where(whole_non_zero_mask)[0]
+            if len(valid_indices_whole) > 0:
+                whole_mean_loss[valid_indices_whole] = whole_sum_loss[valid_indices_whole] / whole_num_tokens[valid_indices_whole]
+            
+            whole_perplexities = torch.exp(whole_mean_loss)
+
+            # --- 2. Targeted (Last 3 Words) Perplexity ---
+            target_mask = torch.zeros_like(shift_labels, dtype=torch.float)
+            for i in range(len(self.probes)):
+                # The loss for the N-th token is at index N-1 in shifted tensors
+                context_len = self.context_token_lengths[i]
+                start_idx = max(0, context_len)
+                target_mask[i, start_idx:] = 1
+
+            targeted_final_mask = shift_attention_mask * target_mask
+            targeted_masked_loss = loss_per_token * targeted_final_mask
+            targeted_sum_loss = targeted_masked_loss.sum(dim=1)
+            targeted_num_tokens = targeted_final_mask.sum(dim=1)
+
+            targeted_non_zero_mask = targeted_num_tokens > 0
+            targeted_mean_loss = torch.zeros_like(targeted_sum_loss, dtype=torch.float32)
+            valid_indices_targeted = torch.where(targeted_non_zero_mask)[0]
+            if len(valid_indices_targeted) > 0:
+                targeted_mean_loss[valid_indices_targeted] = targeted_sum_loss[valid_indices_targeted] / targeted_num_tokens[valid_indices_targeted]
+
+            targeted_perplexities = torch.exp(targeted_mean_loss)
+
+        # --- Logging and Storing ---
+        if state.is_world_process_zero:
+            log_data = {}
+            
+            # Log whole PPL avg
+            if any(whole_non_zero_mask):
+                avg_ppl = whole_perplexities[whole_non_zero_mask].mean().item()
+                log_data[f"{self.log_prefix}/whole_avg"] = avg_ppl
+            
+            # Log targeted PPL avg
+            if any(targeted_non_zero_mask):
+                avg_ppl = targeted_perplexities[targeted_non_zero_mask].mean().item()
+                log_data[f"{self.log_prefix}/targeted_avg"] = avg_ppl
+            
+            if log_data:
+                wandb.log(log_data, step=state.global_step)
+        
+        # Store data internally
+        self.whole_history.append({
+            'step': state.global_step,
+            'perplexities': whole_perplexities.cpu().tolist(),
+        })
+        self.targeted_history.append({
+            'step': state.global_step,
+            'perplexities': targeted_perplexities.cpu().tolist(),
+        })
+        
+        model.train()
+
+    def _get_dataframe_from_history(self, history):
+        if not history:
+            return pd.DataFrame()
+        records = []
+        for entry in history:
+            step = entry['step']
+            for i, perplexity in enumerate(entry['perplexities']):
+                records.append({
+                    'step': step,
+                    'probe_index': self.probe_indices[i],
+                    'section': self.sections[i],
+                    'perplexity': perplexity
+                })
+        return pd.DataFrame(records)
+
+    def get_whole_perplexity_dataframe(self):
+        """
+        Returns the collected whole-statement perplexity data as a pandas DataFrame.
+        """
+        return self._get_dataframe_from_history(self.whole_history)
+
+    def get_targeted_perplexity_dataframe(self):
+        """
+        Returns the collected targeted (last three words) perplexity data as a pandas DataFrame.
+        """
+        return self._get_dataframe_from_history(self.targeted_history)
+
+
+class CorpusPerplexityCallback(TrainerCallback):
+    """
+    Calculates the perplexity of an entire text corpus at the end of each
+    training step using a strided sliding window approach. This provides a
+    more accurate perplexity measure for long documents than naive chunking.
+    Based on the Hugging Face documentation for PPL with fixed-length models.
+    """
+    def __init__(self, text_content: str, tokenizer: AutoTokenizer, max_length: int, stride: int = 512, log_prefix="corpus_perplexity"):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.stride = stride
+        self.log_prefix = log_prefix
+        self.encodings = self.tokenizer(text_content, return_tensors="pt")
+        self.history = []
+
+    def on_step_end(self, args, state, control, model, **kwargs):
+        model.eval()
+        device = model.device
+
+        seq_len = self.encodings.input_ids.size(1)
+        nll_sum = 0.0
+        n_tokens = 0
+        prev_end_loc = 0
+
+        for begin_loc in range(0, seq_len, self.stride):
+            end_loc = min(begin_loc + self.max_length, seq_len)
+            trg_len = end_loc - prev_end_loc
+            input_ids = self.encodings.input_ids[:, begin_loc:end_loc].to(device)
+            target_ids = input_ids.clone()
+            
+            # Mask out tokens that are only used for context. The model will not
+            # calculate loss for these tokens (label = -100).
+            target_ids[:, :-trg_len] = -100
+
+            if torch.all(target_ids == -100):
+                prev_end_loc = end_loc
+                if end_loc == seq_len:
+                    break
+                continue
+
+            with torch.no_grad():
+                outputs = model(input_ids, labels=target_ids)
+                # outputs.loss is the *average* negative log-likelihood for the window.
+                neg_log_likelihood = outputs.loss
+
+            # To get the total NLL for the window, we multiply the average by the
+            # number of tokens the loss was calculated over.
+            num_valid_tokens = (target_ids != -100).sum().item()
+            # The model internally shifts labels, so loss is on one less token per sequence.
+            # Our batch size is 1 here.
+            num_loss_tokens = num_valid_tokens - 1
+            if num_loss_tokens > 0:
+                nll_sum += neg_log_likelihood.item() * num_loss_tokens
+                n_tokens += num_loss_tokens
+
+            prev_end_loc = end_loc
+            if end_loc == seq_len:
+                break
+        
+        if n_tokens > 0:
+            avg_nll = nll_sum / n_tokens
+            perplexity = torch.exp(torch.tensor(avg_nll))
+        else:
+            perplexity = torch.tensor(float('inf'))
+
+        perplexity_item = perplexity.item()
+        if state.is_world_process_zero:
+            wandb.log({f"{self.log_prefix}/full_paper": perplexity_item}, step=state.global_step)
+        
+        self.history.append({'step': state.global_step, 'corpus_perplexity': perplexity_item})
+
+        model.train()
+
+    def get_results_as_dataframe(self):
+        """
+        Returns the collected corpus perplexity data as a pandas DataFrame.
+        """
+        return pd.DataFrame(self.history)
+
+
+class TrainingLossPerplexityCallback(TrainerCallback):
+    """
+    A callback that captures the training loss at each logging step,
+    calculates perplexity from it, logs it to Weights & Biases,
+    and stores it for external analysis.
+    This represents the perplexity of the specific data chunk seen in that step.
+    """
+    def __init__(self):
+        self.history = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        # The 'loss' key is only present during training steps.
+        if logs is not None and 'loss' in logs:
+            if state.is_world_process_zero:
+                # The 'loss' is the average cross-entropy loss for the batch.
+                # Perplexity is the exponentiation of this loss.
+                chunk_perplexity = math.exp(logs['loss'])
+                self.history.append({'step': state.global_step, 'chunked_perplexity': chunk_perplexity})
+                wandb.log({"train/chunked_perplexity": chunk_perplexity}, step=state.global_step)
+    
+    def get_results_as_dataframe(self):
+        """
+        Returns the collected training loss perplexity data as a pandas DataFrame.
+        """
+        return pd.DataFrame(self.history)
+
+
 def chunk_texts(texts: List[str], tokenizer, context_length: int) -> tuple[List[str], int]:
     """
     Chunks a list of texts into smaller pieces based on context length.
