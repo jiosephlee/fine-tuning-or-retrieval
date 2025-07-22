@@ -1,1 +1,1 @@
-python finetuning_knowledge_v4.py --experiment_name SingleArxivPaper_1B_Test_Run > output.log
+python finetuning_knowledge_v4.py --experiment_name SingleArxivPaper_1B_Test_Run --num_train_epochs 100 --learning_rate 2e-5 > output.log 2>&1

@@ -591,7 +591,7 @@ class TrainingLossPerplexityCallback(TrainerCallback):
                 # Perplexity is the exponentiation of this loss.
                 chunk_perplexity = math.exp(logs['loss'])
                 self.history.append({'step': state.global_step, 'chunked_perplexity': chunk_perplexity})
-                wandb.log({"train/chunked_perplexity": chunk_perplexity}, step=state.global_step)
+                wandb.log({"chunked_perplexity/full_paper": chunk_perplexity}, step=state.global_step+1)
     
     def get_results_as_dataframe(self):
         """
