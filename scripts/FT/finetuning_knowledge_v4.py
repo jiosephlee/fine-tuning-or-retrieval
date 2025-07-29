@@ -111,87 +111,128 @@ elif "ParaphrasedArxivPaper" in args.experiment_name:
         callbacks=[knowledge_probe_callback, corpus_callback, training_loss_callback] # Pass all three callbacks
     )
 
-# --- Plot Knowledge Probes ---
+# --- Save Metrics and Generate Plots ---
+output_dir = os.path.join("../../results/FT/", args.experiment_name)
+os.makedirs(output_dir, exist_ok=True)
+knowledge_probe_callback.save_results(output_dir=output_dir)
+log.info(f"Knowledge probe metrics saved to {output_dir}")
 
-# Get data from all callbacks
-whole_ppl_df = knowledge_probe_callback.get_whole_perplexity_dataframe()
-targeted_ppl_df = knowledge_probe_callback.get_targeted_perplexity_dataframe()
+
+# --- Data Loading and Preparation ---
+log.info("Loading dataframes for plotting...")
+# Perplexity Deltas
+raw_ppl_delta_df = knowledge_probe_callback.get_raw_knowledge_perplexity_delta_dataframe()
+atomic_whole_ppl_delta_df = knowledge_probe_callback.get_atomic_whole_perplexity_delta_dataframe()
+atomic_target_ppl_delta_df = knowledge_probe_callback.get_atomic_target_perplexity_delta_dataframe()
 corpus_results_df = corpus_callback.get_results_as_dataframe()
 training_loss_results_df = training_loss_callback.get_results_as_dataframe()
 
-# --- Whole Perplexity Plots ---
+# Log Probability Deltas
+atomic_whole_log_prob_delta_df = knowledge_probe_callback.get_atomic_whole_log_prob_delta_dataframe()
+atomic_target_log_prob_delta_df = knowledge_probe_callback.get_atomic_target_log_prob_delta_dataframe()
 
-# Plot 1: Average whole perplexity grouped by section
-plt.figure(figsize=(12, 7))
-avg_by_section_whole = whole_ppl_df.groupby(['step', 'section'])['perplexity'].mean().reset_index()
-sns.lineplot(data=avg_by_section_whole, x='step', y='perplexity', hue='section')
-plt.title('Plot 1: Average Whole Perplexity by Section')
-plt.xlabel('Training Step')
-plt.ylabel('Average Perplexity')
-plt.grid(True)
-plt.yscale('log')
-plt.legend(title='Section')
-plt.show()
+# Manually calculate deltas for corpus and training loss perplexity
+if not corpus_results_df.empty:
+    initial_corpus_ppl = corpus_results_df['corpus_perplexity'].iloc[0]
+    corpus_results_df['corpus_perplexity_delta'] = corpus_results_df['corpus_perplexity'] - initial_corpus_ppl
 
-# Plot 2: Disaggregated whole perplexity for each probe
-plt.figure(figsize=(12, 7))
-sns.lineplot(data=whole_ppl_df, x='step', y='perplexity', hue='probe_index', legend=False)
-plt.title('Plot 2: Disaggregated Whole Perplexity per Probe')
-plt.xlabel('Training Step')
-plt.ylabel('Perplexity')
-plt.grid(True)
-plt.yscale('log')
-plt.show()
+if not training_loss_results_df.empty:
+    initial_chunked_ppl = training_loss_results_df['chunked_perplexity'].iloc[0]
+    training_loss_results_df['chunked_perplexity_delta'] = training_loss_results_df['chunked_perplexity'] - initial_chunked_ppl
+
+# --- Plotting Setup ---
+all_sections = sorted(raw_ppl_delta_df['section'].unique()) if not raw_ppl_delta_df.empty else []
+palette = sns.color_palette("husl", len(all_sections))
+section_colors = {section: color for section, color in zip(all_sections, palette)}
 
 
-# --- Targeted Perplexity Plots ---
+# --- GROUP 1: PERPLEXITY DELTA PLOTS ---
+log.info("Generating Perplexity Delta plots...")
 
-# Plot 3: Average targeted perplexity grouped by section
-plt.figure(figsize=(12, 7))
-avg_by_section_targeted = targeted_ppl_df.groupby(['step', 'section'])['perplexity'].mean().reset_index()
-sns.lineplot(data=avg_by_section_targeted, x='step', y='perplexity', hue='section')
-plt.title('Plot 3: Average Targeted (Last 3 Words) Perplexity by Section')
-plt.xlabel('Training Step')
-plt.ylabel('Average Perplexity')
-plt.grid(True)
-plt.yscale('log')
-plt.legend(title='Section')
-plt.show()
-
-# Plot 4: Disaggregated targeted perplexity for each probe
-plt.figure(figsize=(12, 7))
-sns.lineplot(data=targeted_ppl_df, x='step', y='perplexity', hue='probe_index', legend=False)
-plt.title('Plot 4: Disaggregated Targeted Perplexity per Probe')
-plt.xlabel('Training Step')
-plt.ylabel('Perplexity')
-plt.grid(True)
-plt.yscale('log')
-plt.show()
-
-
-# --- Combined Average Perplexity Plot ---
-
-# Plot 5: Compare the four different perplexity metrics
-avg_whole_ppl = whole_ppl_df.groupby('step')['perplexity'].mean().reset_index()
-avg_whole_ppl = avg_whole_ppl.rename(columns={'perplexity': 'probe_whole_perplexity'})
-
-avg_targeted_ppl = targeted_ppl_df.groupby('step')['perplexity'].mean().reset_index()
-avg_targeted_ppl = avg_targeted_ppl.rename(columns={'perplexity': 'probe_targeted_perplexity'})
-
-plot_df = pd.merge(avg_whole_ppl, avg_targeted_ppl, on='step', how='outer')
-plot_df = pd.merge(plot_df, corpus_results_df, on='step', how='outer')
-plot_df = pd.merge(plot_df, training_loss_results_df, on='step', how='outer')
-
+# Plot 1: Combined Average Perplexity Deltas
 plt.figure(figsize=(14, 8))
-sns.lineplot(data=plot_df, x='step', y='probe_whole_perplexity', label='Knowledge Probes (Whole Avg)')
-sns.lineplot(data=plot_df, x='step', y='probe_targeted_perplexity', label='Knowledge Probes (Targeted Avg)')
-sns.lineplot(data=plot_df, x='step', y='corpus_perplexity', label='Sliding Window (Full Paper)')
-sns.lineplot(data=plot_df, x='step', y='chunked_perplexity', label='Training Loss (Chunked)')
+avg_raw_ppl_delta = raw_ppl_delta_df.groupby('step')['perplexity_delta'].mean().reset_index()
+avg_atomic_whole_ppl_delta = atomic_whole_ppl_delta_df.groupby('step')['perplexity_delta'].mean().reset_index()
+avg_atomic_target_ppl_delta = atomic_target_ppl_delta_df.groupby('step')['perplexity_delta'].mean().reset_index()
 
-plt.title('Plot 5: Combined Perplexity Tracking During Fine-Tuning')
+sns.lineplot(data=avg_raw_ppl_delta, x='step', y='perplexity_delta', label='Δ Knowledge Probes (Raw PPL)', linestyle='-')
+sns.lineplot(data=avg_atomic_whole_ppl_delta, x='step', y='perplexity_delta', label='Δ Knowledge Probes (Atomic PPL)', linestyle='--')
+sns.lineplot(data=avg_atomic_target_ppl_delta, x='step', y='perplexity_delta', label='Δ Knowledge Probes (Target PPL)', linestyle=':')
+if not corpus_results_df.empty:
+    sns.lineplot(data=corpus_results_df, x='step', y='corpus_perplexity_delta', label='Δ Sliding Window (Full Paper)', linestyle='-')
+if not training_loss_results_df.empty:
+    sns.lineplot(data=training_loss_results_df, x='step', y='chunked_perplexity_delta', label='Δ Training Loss (Chunked)', linestyle='--')
+
+plt.title('Plot 1: Combined Average Perplexity Deltas During Fine-Tuning')
 plt.xlabel('Training Step')
-plt.ylabel('Perplexity')
-plt.grid(True)
+plt.ylabel('Perplexity Delta')
+plt.grid(True, which="both", ls="--")
 plt.legend()
-plt.yscale('log')
+plt.show()
+
+
+def plot_by_section(df, y_col, title, y_label):
+    if df.empty:
+        log.warning(f"Skipping plot '{title}' due to empty dataframe.")
+        return
+    plt.figure(figsize=(12, 7))
+    avg_by_section = df.groupby(['step', 'section'])[y_col].mean().reset_index()
+    overall_avg = df.groupby('step')[y_col].mean().reset_index()
+    
+    sns.lineplot(data=overall_avg, x='step', y=y_col, color='gray', linestyle=':', label='Overall Avg.', alpha=0.8)
+    sns.lineplot(data=avg_by_section, x='step', y=y_col, hue='section', palette=section_colors, hue_order=all_sections)
+    
+    plt.title(title)
+    plt.xlabel('Training Step')
+    plt.ylabel(y_label)
+    plt.grid(True)
+    plt.legend(title='Section')
+    plt.show()
+
+# Plot 2, 3, 4: Perplexity Deltas by Section
+plot_by_section(raw_ppl_delta_df, 'perplexity_delta', 'Plot 2: Raw Knowledge Perplexity Delta by Section', 'Perplexity Delta')
+plot_by_section(atomic_whole_ppl_delta_df, 'perplexity_delta', 'Plot 3: Atomic Knowledge (Whole) Perplexity Delta by Section', 'Perplexity Delta')
+plot_by_section(atomic_target_ppl_delta_df, 'perplexity_delta', 'Plot 4: Atomic Knowledge (Target) Perplexity Delta by Section', 'Perplexity Delta')
+
+# Plot 5: Mean Atomic Probe (Target) Perplexity Delta
+plt.figure(figsize=(12, 7))
+avg_atomic_target_ppl_delta = atomic_target_ppl_delta_df.groupby('step')['perplexity_delta'].mean().reset_index()
+sns.lineplot(data=avg_atomic_target_ppl_delta, x='step', y='perplexity_delta')
+plt.title('Plot 5: Mean Atomic Knowledge (Target) Perplexity Delta')
+plt.xlabel('Training Step')
+plt.ylabel('Average Perplexity Delta')
+plt.grid(True)
+plt.show()
+
+
+# --- GROUP 2: LOG PROBABILITY DELTA PLOTS ---
+log.info("Generating Log Probability Delta plots...")
+
+# Plot 7: Combined Average Log-Prob Deltas
+plt.figure(figsize=(14, 8))
+avg_atomic_whole_log_prob_delta = atomic_whole_log_prob_delta_df.groupby('step')['log_prob_delta'].mean().reset_index()
+avg_atomic_target_log_prob_delta = atomic_target_log_prob_delta_df.groupby('step')['log_prob_delta'].mean().reset_index()
+
+sns.lineplot(data=avg_atomic_whole_log_prob_delta, x='step', y='log_prob_delta', label='Δ Atomic Knowledge (Whole Log-Prob)', linestyle='--')
+sns.lineplot(data=avg_atomic_target_log_prob_delta, x='step', y='log_prob_delta', label='Δ Atomic Knowledge (Target Log-Prob)', linestyle=':')
+
+plt.title('Plot 7: Combined Average Log-Probability Deltas')
+plt.xlabel('Training Step')
+plt.ylabel('Log-Probability Delta')
+plt.grid(True, which="both", ls="--")
+plt.legend()
+plt.show()
+
+# Plot 8, 9: Log-Prob Deltas by Section
+plot_by_section(atomic_whole_log_prob_delta_df, 'log_prob_delta', 'Plot 8: Atomic Knowledge (Whole) Log-Prob Delta by Section', 'Log-Prob Delta')
+plot_by_section(atomic_target_log_prob_delta_df, 'log_prob_delta', 'Plot 9: Atomic Knowledge (Target) Log-Prob Delta by Section', 'Log-Prob Delta')
+
+# Plot 11: Mean Atomic Probe (Target) Log-Prob Delta
+plt.figure(figsize=(12, 7))
+avg_atomic_target_log_prob_delta = atomic_target_log_prob_delta_df.groupby('step')['log_prob_delta'].mean().reset_index()
+sns.lineplot(data=avg_atomic_target_log_prob_delta, x='step', y='log_prob_delta')
+plt.title('Plot 11: Mean Atomic Knowledge (Target) Log-Prob Delta')
+plt.xlabel('Training Step')
+plt.ylabel('Average Log-Prob Delta')
+plt.grid(True)
 plt.show()

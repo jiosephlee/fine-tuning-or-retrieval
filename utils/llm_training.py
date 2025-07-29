@@ -5,6 +5,7 @@ import math
 import os
 import wandb
 import torch
+import itertools
 from typing import Optional, List, Literal
 import pandas as pd
 
@@ -17,6 +18,7 @@ from transformers import (
     BitsAndBytesConfig,
     TrainerCallback,
 )
+from liger_kernel.transformers import LigerCrossEntropyLoss
 from trl import SFTConfig, SFTTrainer
 from utils.llm_configs import PeftConfig, ModelConfig, TrainingConfig, InferenceConfig
 
@@ -318,58 +320,82 @@ def save_model(model, tokenizer, log, save_path: str):
     
 class KnowledgeProbeCallback(TrainerCallback):
     """
-    A unified callback that evaluates two types of perplexity on a custom set of
-    knowledge probes in a single forward pass:
-    1.  Whole statement perplexity: PPL over the entire probe text.
-    2.  Targeted perplexity: PPL over the last three words of the probe.
-
-    This avoids redundant model calls, logs both metrics to W&B, and
-    stores them for external analysis.
+    A unified callback that evaluates model performance on a custom set of knowledge probes.
+    It tracks multiple key metrics in an efficient way:
+    1. Perplexity for a "raw" knowledge statement.
+    2. For atomic probes (context + target), it calculates in a single pass:
+        - Perplexity of the whole statement (context + target).
+        - Perplexity of just the target.
+        - Log probability of the whole statement.
+        - Log probability of the target.
+    3. It also tracks the DELTA of each metric relative to its value before training (at step 0).
     """
-    def __init__(self, tokenizer: AutoTokenizer, probe_dataset_path: str, max_length: int, batch_size: int = 8, log_prefix="probe_ppl"):
+    def __init__(self, tokenizer: AutoTokenizer, probe_dataset_path: str, max_length: int, batch_size: int = 8, log_prefix="probe_eval"):
         self.tokenizer = tokenizer
         self.log_prefix = log_prefix
         self.max_length = max_length
         self.batch_size = batch_size
+        self.initial_metrics = {}
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        df = pd.read_csv(probe_dataset_path)
-        self.probes = df["raw_knowledge_statement"].tolist()
-        self.sections = df["section"].tolist()
-        self.probe_indices = df.index.tolist()
+        # Load and store all necessary data from the CSV if the path is provided
+        if probe_dataset_path and os.path.exists(probe_dataset_path):
+            df = pd.read_csv(probe_dataset_path)
+            self.probe_indices = df.index.tolist()
+            self.sections = df["section"].tolist()
+            self.raw_knowledge_statements = df["raw_knowledge_statement"].tolist()
+            self.atomic_probes = df["atomic_knowledge_probe"].tolist()
+            self.atomic_targets = df["atomic_target_span"].tolist()
+        else: # For testing purposes
+            raise ValueError("Probe dataset path is not provided")
+        
+        # History lists for each metric
+        self.raw_knowledge_perplexity_history = []
+        self.atomic_whole_perplexity_history = []
+        self.atomic_target_perplexity_history = []
+        self.atomic_whole_log_prob_history = []
+        self.atomic_target_log_prob_history = []
 
-        # History for both metrics
-        self.whole_history = []
-        self.targeted_history = []
+        # History lists for deltas
+        self.raw_knowledge_perplexity_delta_history = []
+        self.atomic_whole_perplexity_delta_history = []
+        self.atomic_target_perplexity_delta_history = []
+        self.atomic_whole_log_prob_delta_history = []
+        self.atomic_target_log_prob_delta_history = []
 
-        # Pre-calculate context token lengths for targeted PPL
-        self.context_token_lengths = []
-        for statement in self.probes:
-            words = statement.split()
-            context_part = " ".join(words[:-3]) if len(words) > 3 else ""
-            num_tokens = len(self.tokenizer(context_part, add_special_tokens=False)['input_ids'])
-            self.context_token_lengths.append(num_tokens)
-
-    def on_step_end(self, args, state, control, model, **kwargs):
+    def on_train_begin(self, args, state, control, model, **kwargs):
+        """
+        Calculate initial perplexity/log-prob values before training starts.
+        """
+        print("KnowledgeProbeCallback: Calculating initial metrics before training...")
         model.eval()
         device = model.device
 
-        # Lists to store results from all mini-batches
-        all_whole_perplexities = []
-        all_targeted_perplexities = []
-        
-        # Process probes in mini-batches to conserve GPU memory
-        for i in range(0, len(self.probes), self.batch_size):
-            batch_probes = self.probes[i:i + self.batch_size]
-            batch_context_lengths = self.context_token_lengths[i:i + self.batch_size]
-            
-            if not batch_probes:
+        # --- Initial Raw Knowledge Perplexity ---
+        raw_perplexities = self._calculate_perplexity(model, self.raw_knowledge_statements, device)
+        self.initial_metrics['raw_knowledge_perplexity'] = raw_perplexities
+
+        # --- Initial Atomic Metrics ---
+        atomic_metrics = self._calculate_atomic_metrics(model, self.atomic_probes, self.atomic_targets, device)
+        self.initial_metrics['atomic_metrics'] = atomic_metrics
+
+        print("KnowledgeProbeCallback: Initial metrics calculated and stored. Training begins...")
+        model.train()
+
+    def _calculate_perplexity(self, model, statements: List[str], device):
+        """
+        Calculates perplexity for a list of statements.
+        """
+        all_perplexities = []
+        for i in range(0, len(statements), self.batch_size):
+            batch_statements = statements[i:i + self.batch_size]
+            if not batch_statements:
                 continue
 
             inputs = self.tokenizer(
-                batch_probes,
+                batch_statements,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
@@ -377,120 +403,294 @@ class KnowledgeProbeCallback(TrainerCallback):
             ).to(device)
 
             input_ids = inputs["input_ids"]
-            attention_mask = inputs["attention_mask"]
-
+            
             with torch.no_grad():
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
+                outputs = model(input_ids)
                 logits = outputs.logits
-                
-                # --- Common Calculations ---
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = input_ids[..., 1:].contiguous()
-                shift_attention_mask = attention_mask[..., 1:].contiguous()
 
-                loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-                loss_per_token = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                loss_per_token = loss_per_token.view(input_ids.size(0), -1)
+            # Prepare for loss calculation
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = input_ids[..., 1:].contiguous()
 
-                # --- 1. Whole Statement Perplexity ---
-                whole_masked_loss = loss_per_token * shift_attention_mask
-                whole_sum_loss = whole_masked_loss.sum(dim=1)
-                whole_num_tokens = shift_attention_mask.sum(dim=1)
-                
-                whole_non_zero_mask = whole_num_tokens > 0
-                whole_mean_loss = torch.zeros_like(whole_sum_loss, dtype=torch.float32)
-                valid_indices_whole = torch.where(whole_non_zero_mask)[0]
-                if len(valid_indices_whole) > 0:
-                    whole_mean_loss[valid_indices_whole] = whole_sum_loss[valid_indices_whole] / whole_num_tokens[valid_indices_whole]
-                
-                whole_perplexities = torch.exp(whole_mean_loss)
-                all_whole_perplexities.append(whole_perplexities)
+            # Set padding token labels to -100 to be ignored by loss
+            shift_labels[shift_labels == self.tokenizer.pad_token_id] = -100
+            
+            loss_fct = LigerCrossEntropyLoss(reduction='none')
+            # loss tensor has shape (batch_size, seq_len-1). Values are 0 where label was -100.
+            loss = loss_fct(shift_logits.permute(0, 2, 1), shift_labels)
+            
+            sum_loss = loss.sum(dim=1)
+            num_tokens = (shift_labels != -100).sum(dim=1).float()
+            
+            mean_nll = sum_loss / num_tokens
+            perplexities = torch.exp(mean_nll)
 
-                # --- 2. Targeted (Last 3 Words) Perplexity ---
-                target_mask = torch.zeros_like(shift_labels, dtype=torch.float)
-                for j in range(len(batch_probes)): # Iterate over the mini-batch
-                    # The loss for the N-th token is at index N-1 in shifted tensors
-                    context_len = batch_context_lengths[j]
-                    start_idx = max(0, context_len)
-                    target_mask[j, start_idx:] = 1
+            all_perplexities.append(perplexities)
 
-                targeted_final_mask = shift_attention_mask * target_mask
-                targeted_masked_loss = loss_per_token * targeted_final_mask
-                targeted_sum_loss = targeted_masked_loss.sum(dim=1)
-                targeted_num_tokens = targeted_final_mask.sum(dim=1)
+        if not all_perplexities:
+            return torch.tensor([])
+        return torch.cat(all_perplexities)
 
-                targeted_non_zero_mask = targeted_num_tokens > 0
-                targeted_mean_loss = torch.zeros_like(targeted_sum_loss, dtype=torch.float32)
-                valid_indices_targeted = torch.where(targeted_non_zero_mask)[0]
-                if len(valid_indices_targeted) > 0:
-                    targeted_mean_loss[valid_indices_targeted] = targeted_sum_loss[valid_indices_targeted] / targeted_num_tokens[valid_indices_targeted]
+    def _calculate_atomic_metrics(self, model, contexts: List[str], targets: List[str], device):
+        """
+        In a single forward pass, calculates perplexity and log probability for both
+        the whole statement (context + target) and just the target portion.
+        This version uses the tokenizer's standard padding and is more efficient.
+        """
+        all_metrics = {
+            "whole_perplexity": [], "target_perplexity": [],
+            "whole_log_prob": [], "target_log_prob": []
+        }
 
-                targeted_perplexities = torch.exp(targeted_mean_loss)
-                all_targeted_perplexities.append(targeted_perplexities)
+        for i in range(0, len(contexts), self.batch_size):
+            batch_contexts = contexts[i:i + self.batch_size]
+            batch_targets = targets[i:i + self.batch_size]
+            if not batch_contexts:
+                continue
 
-        # Concatenate results from all batches
-        whole_perplexities_all = torch.cat(all_whole_perplexities)
-        targeted_perplexities_all = torch.cat(all_targeted_perplexities)
+            # --- Tokenization ---
+            # Combine contexts and targets and tokenize them together
+            batch_full_text = [c + t for c, t in zip(batch_contexts, batch_targets)]
+            inputs = self.tokenizer(
+                batch_full_text,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                add_special_tokens=False,
+            ).to(device)
+            input_ids = inputs["input_ids"]
 
-        # --- Logging and Storing ---
+            # Tokenize contexts and targets separately to get their lengths for masking and assertion
+            context_tokenized = self.tokenizer(batch_contexts, add_special_tokens=False, padding="longest", return_tensors="pt")
+            context_lengths = context_tokenized.attention_mask.sum(dim=1).to(device)
+            target_tokenized = self.tokenizer(batch_targets, add_special_tokens=False, padding="longest", return_tensors="pt")
+            target_lengths = target_tokenized.attention_mask.sum(dim=1).to(device)
+
+            # --- Model Forward Pass ---
+            with torch.no_grad():
+                outputs = model(input_ids)
+                logits = outputs.logits
+            
+            shift_logits = logits[..., :-1, :].contiguous()
+            
+            # --- Label Preparation ---
+            # Labels for Whole Statement (ignore only padding)
+            shift_labels_whole = input_ids[..., 1:].contiguous().clone()
+            shift_labels_whole[shift_labels_whole == self.tokenizer.pad_token_id] = -100
+
+            # Labels for Target Only (ignore context and padding)
+            shift_labels_target = input_ids[..., 1:].contiguous().clone()
+            for j, length in enumerate(context_lengths):
+                 # Mask out context tokens. Prediction for 1st target token is at the final context token's position.
+                 # So, in the shifted sequence, we mask up to index `length - 1`.
+                 if length > 0:
+                    shift_labels_target[j, :length-1] = -100
+            shift_labels_target[shift_labels_target == self.tokenizer.pad_token_id] = -100
+            
+            # --- Assertions ---
+            num_tokens_target = (shift_labels_target != -100).sum(dim=1)
+            assert torch.equal(num_tokens_target.cpu(), target_lengths.cpu()), "Number of target tokens after masking does not match expected target lengths."
+            
+            # --- Loss Calculation ---
+            loss_fct = LigerCrossEntropyLoss(reduction='none')
+            
+            # Loss for whole statement
+            loss_whole = loss_fct(shift_logits.permute(0, 2, 1), shift_labels_whole)
+            sum_loss_whole = loss_whole.sum(dim=1)
+            num_tokens_whole = (shift_labels_whole != -100).sum(dim=1).float()
+            
+            # Loss for target
+            loss_target = loss_fct(shift_logits.permute(0, 2, 1), shift_labels_target)
+            sum_loss_target = loss_target.sum(dim=1)
+            
+            # --- Metric Calculation ---
+            # Log Probs
+            whole_log_prob = -sum_loss_whole
+            target_log_prob = -sum_loss_target
+            
+            # Perplexities
+            mean_nll_whole = sum_loss_whole / num_tokens_whole
+            whole_perplexity = torch.exp(mean_nll_whole)
+
+            mean_nll_target = sum_loss_target / num_tokens_target.float()
+            target_perplexity = torch.exp(mean_nll_target)
+
+            # --- Append results ---
+            all_metrics["whole_perplexity"].append(whole_perplexity)
+            all_metrics["target_perplexity"].append(target_perplexity)
+            all_metrics["whole_log_prob"].append(whole_log_prob)
+            all_metrics["target_log_prob"].append(target_log_prob)
+
+        if 'cuda' in device:
+            torch.cuda.empty_cache()
+        
+        return {k: torch.cat(v) for k, v in all_metrics.items()}
+
+    def on_step_end(self, args, state, control, model, **kwargs):
+        if not self.initial_metrics:
+            print("KnowledgeProbeCallback: Initial metrics not found. Calculating now...")
+            self.on_train_begin(args, state, control, model, **kwargs)
+
+        model.eval()
+        device = model.device
+
+        # --- Raw Knowledge Perplexity ---
+        raw_perplexities = self._calculate_perplexity(model, self.raw_knowledge_statements, device)
+        raw_perplexity_delta = raw_perplexities - self.initial_metrics['raw_knowledge_perplexity']
+
+        # --- Atomic Knowledge Metrics (calculated together for efficiency) ---
+        atomic_metrics = self._calculate_atomic_metrics(model, self.atomic_probes, self.atomic_targets, device)
+        initial_atomic_metrics = self.initial_metrics['atomic_metrics']
+
+        atomic_whole_perplexity_delta = atomic_metrics["whole_perplexity"] - initial_atomic_metrics["whole_perplexity"]
+        atomic_target_perplexity_delta = atomic_metrics["target_perplexity"] - initial_atomic_metrics["target_perplexity"]
+        atomic_whole_log_prob_delta = atomic_metrics["whole_log_prob"] - initial_atomic_metrics["whole_log_prob"]
+        atomic_target_log_prob_delta = atomic_metrics["target_log_prob"] - initial_atomic_metrics["target_log_prob"]
+
+        # --- Logging and Storing on Weights & Biases ---
         if state.is_world_process_zero:
             log_data = {}
             
-            # Create masks for valid (non-inf) perplexities
-            valid_whole_mask = ~torch.isinf(whole_perplexities_all)
-            valid_targeted_mask = ~torch.isinf(targeted_perplexities_all)
+            def log_metric(name, tensor):
+                valid_mask = ~torch.isinf(tensor) & ~torch.isnan(tensor)
+                if valid_mask.any():
+                    log_data[f"{self.log_prefix}/{name}_avg"] = tensor[valid_mask].mean().item()
 
-            # Log whole PPL avg
-            if valid_whole_mask.any():
-                avg_ppl = whole_perplexities_all[valid_whole_mask].mean().item()
-                log_data[f"{self.log_prefix}/whole_avg"] = avg_ppl
-            
-            # Log targeted PPL avg
-            if valid_targeted_mask.any():
-                avg_ppl = targeted_perplexities_all[valid_targeted_mask].mean().item()
-                log_data[f"{self.log_prefix}/targeted_avg"] = avg_ppl
-            
+            log_metric("raw_knowledge_perplexity", raw_perplexities)
+            log_metric("atomic_whole_perplexity", atomic_metrics["whole_perplexity"])
+            log_metric("atomic_target_perplexity", atomic_metrics["target_perplexity"])
+            log_metric("atomic_whole_log_prob", atomic_metrics["whole_log_prob"])
+            log_metric("atomic_target_log_prob", atomic_metrics["target_log_prob"])
+
+            # Log deltas
+            log_metric("raw_knowledge_perplexity_delta", raw_perplexity_delta)
+            log_metric("atomic_whole_perplexity_delta", atomic_whole_perplexity_delta)
+            log_metric("atomic_target_perplexity_delta", atomic_target_perplexity_delta)
+            log_metric("atomic_whole_log_prob_delta", atomic_whole_log_prob_delta)
+            log_metric("atomic_target_log_prob_delta", atomic_target_log_prob_delta)
+
             if log_data:
                 wandb.log(log_data, step=state.global_step)
         
         # Store data internally
-        self.whole_history.append({
-            'step': state.global_step,
-            'perplexities': whole_perplexities_all.cpu().tolist(),
-        })
-        self.targeted_history.append({
-            'step': state.global_step,
-            'perplexities': targeted_perplexities_all.cpu().tolist(),
-        })
+        self.raw_knowledge_perplexity_history.append({'step': state.global_step, 'values': raw_perplexities.cpu().tolist()})
+        self.atomic_whole_perplexity_history.append({'step': state.global_step, 'values': atomic_metrics["whole_perplexity"].cpu().tolist()})
+        self.atomic_target_perplexity_history.append({'step': state.global_step, 'values': atomic_metrics["target_perplexity"].cpu().tolist()})
+        self.atomic_whole_log_prob_history.append({'step': state.global_step, 'values': atomic_metrics["whole_log_prob"].cpu().tolist()})
+        self.atomic_target_log_prob_history.append({'step': state.global_step, 'values': atomic_metrics["target_log_prob"].cpu().tolist()})
+
+        # Store delta data internally
+        self.raw_knowledge_perplexity_delta_history.append({'step': state.global_step, 'values': raw_perplexity_delta.cpu().tolist()})
+        self.atomic_whole_perplexity_delta_history.append({'step': state.global_step, 'values': atomic_whole_perplexity_delta.cpu().tolist()})
+        self.atomic_target_perplexity_delta_history.append({'step': state.global_step, 'values': atomic_target_perplexity_delta.cpu().tolist()})
+        self.atomic_whole_log_prob_delta_history.append({'step': state.global_step, 'values': atomic_whole_log_prob_delta.cpu().tolist()})
+        self.atomic_target_log_prob_delta_history.append({'step': state.global_step, 'values': atomic_target_log_prob_delta.cpu().tolist()})
         
         model.train()
 
-    def _get_dataframe_from_history(self, history):
+    def _get_dataframe_from_history(self, history, value_col_name):
         if not history:
             return pd.DataFrame()
         records = []
         for entry in history:
             step = entry['step']
-            for i, perplexity in enumerate(entry['perplexities']):
+            values = entry['values']
+            for i, value in enumerate(values):
                 records.append({
                     'step': step,
                     'probe_index': self.probe_indices[i],
                     'section': self.sections[i],
-                    'perplexity': perplexity
+                    value_col_name: value
                 })
         return pd.DataFrame(records)
 
-    def get_whole_perplexity_dataframe(self):
-        """
-        Returns the collected whole-statement perplexity data as a pandas DataFrame.
-        """
-        return self._get_dataframe_from_history(self.whole_history)
+    def get_raw_knowledge_perplexity_dataframe(self):
+        """Returns collected raw knowledge perplexity data as a pandas DataFrame."""
+        return self._get_dataframe_from_history(self.raw_knowledge_perplexity_history, 'perplexity')
 
-    def get_targeted_perplexity_dataframe(self):
-        """
-        Returns the collected targeted (last three words) perplexity data as a pandas DataFrame.
-        """
-        return self._get_dataframe_from_history(self.targeted_history)
+    def get_atomic_whole_perplexity_dataframe(self):
+        """Returns collected atomic whole statement perplexity data as a pandas DataFrame."""
+        return self._get_dataframe_from_history(self.atomic_whole_perplexity_history, 'perplexity')
+
+    def get_atomic_target_perplexity_dataframe(self):
+        """Returns collected atomic target perplexity data as a pandas DataFrame."""
+        return self._get_dataframe_from_history(self.atomic_target_perplexity_history, 'perplexity')
+        
+    def get_atomic_whole_log_prob_dataframe(self):
+        """Returns collected atomic whole statement log probability data as a pandas DataFrame."""
+        return self._get_dataframe_from_history(self.atomic_whole_log_prob_history, 'log_prob')
+
+    def get_atomic_target_log_prob_dataframe(self):
+        """Returns collected atomic target log probability data as a pandas DataFrame."""
+        return self._get_dataframe_from_history(self.atomic_target_log_prob_history, 'log_prob')
+
+    def get_raw_knowledge_perplexity_delta_dataframe(self):
+        """Returns collected raw knowledge perplexity delta data as a pandas DataFrame."""
+        return self._get_dataframe_from_history(self.raw_knowledge_perplexity_delta_history, 'perplexity_delta')
+
+    def get_atomic_whole_perplexity_delta_dataframe(self):
+        """Returns collected atomic whole statement perplexity delta data as a pandas DataFrame."""
+        return self._get_dataframe_from_history(self.atomic_whole_perplexity_delta_history, 'perplexity_delta')
+
+    def get_atomic_target_perplexity_delta_dataframe(self):
+        """Returns collected atomic target perplexity delta data as a pandas DataFrame."""
+        return self._get_dataframe_from_history(self.atomic_target_perplexity_delta_history, 'perplexity_delta')
+
+    def get_atomic_whole_log_prob_delta_dataframe(self):
+        """Returns collected atomic whole statement log probability delta data as a pandas DataFrame."""
+        return self._get_dataframe_from_history(self.atomic_whole_log_prob_delta_history, 'log_prob_delta')
+
+    def get_atomic_target_log_prob_delta_dataframe(self):
+        """Returns collected atomic target log probability delta data as a pandas DataFrame."""
+        return self._get_dataframe_from_history(self.atomic_target_log_prob_delta_history, 'log_prob_delta')
+
+    def save_results(self, output_dir: str):
+        """Saves all collected raw and delta metrics to a single CSV file in the specified directory."""
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"KnowledgeProbeCallback: Saving all probe metrics to {output_dir}")
+
+        # --- Prepare all metric dataframes with standardized column names ---
+        all_dfs = [
+            self.get_raw_knowledge_perplexity_dataframe().rename(columns={'perplexity': 'raw_knowledge_perplexity'}),
+            self.get_raw_knowledge_perplexity_delta_dataframe().rename(columns={'perplexity_delta': 'raw_knowledge_perplexity_delta'}),
+            self.get_atomic_whole_perplexity_dataframe().rename(columns={'perplexity': 'atomic_whole_perplexity'}),
+            self.get_atomic_target_perplexity_dataframe().rename(columns={'perplexity': 'atomic_target_perplexity'}),
+            self.get_atomic_whole_log_prob_dataframe().rename(columns={'log_prob': 'atomic_whole_log_prob'}),
+            self.get_atomic_target_log_prob_dataframe().rename(columns={'log_prob': 'atomic_target_log_prob'}),
+            self.get_atomic_whole_perplexity_delta_dataframe().rename(columns={'perplexity_delta': 'atomic_whole_perplexity_delta'}),
+            self.get_atomic_target_perplexity_delta_dataframe().rename(columns={'perplexity_delta': 'atomic_target_perplexity_delta'}),
+            self.get_atomic_whole_log_prob_delta_dataframe().rename(columns={'log_prob_delta': 'atomic_whole_log_prob_delta'}),
+            self.get_atomic_target_log_prob_delta_dataframe().rename(columns={'log_prob_delta': 'atomic_target_log_prob_delta'})
+        ]
+        
+        # Filter out any empty dataframes that might result from no training steps
+        all_dfs = [df for df in all_dfs if not df.empty]
+        
+        if not all_dfs:
+            print(" > No metrics to save.")
+            return
+
+        # --- Merge all dataframes into one ---
+        # Start with the first dataframe in the list
+        merged_df = all_dfs[0]
+        
+        # Iteratively merge the rest using an outer join to keep all data
+        for df_to_merge in all_dfs[1:]:
+            # 'section' is duplicated across dataframes, so we drop it from the right
+            # side of the merge to avoid pandas creating suffixed columns (e.g., 'section_y').
+            cols_to_drop = ['section'] if 'section' in df_to_merge.columns else []
+            merged_df = pd.merge(
+                merged_df, 
+                df_to_merge.drop(columns=cols_to_drop), 
+                on=['step', 'probe_index'], 
+                how='outer'
+            )
+
+        # Save the final consolidated dataframe
+        output_path = os.path.join(output_dir, 'knowledge_probe_metrics.csv')
+        merged_df.to_csv(output_path, index=False)
+        print(f" > Saved consolidated metrics to 'knowledge_probe_metrics.csv' with {len(merged_df)} rows.")
 
 
 class CorpusPerplexityCallback(TrainerCallback):
