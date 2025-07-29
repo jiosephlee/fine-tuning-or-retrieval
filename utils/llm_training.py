@@ -522,9 +522,6 @@ class KnowledgeProbeCallback(TrainerCallback):
             all_metrics["whole_log_prob"].append(whole_log_prob)
             all_metrics["target_log_prob"].append(target_log_prob)
 
-        if 'cuda' in str(device):
-            torch.cuda.empty_cache()
-        
         return {k: torch.cat(v) for k, v in all_metrics.items()}
 
     def on_step_end(self, args, state, control, model, **kwargs):
