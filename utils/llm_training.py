@@ -372,7 +372,7 @@ class KnowledgeProbeCallback(TrainerCallback):
         print("KnowledgeProbeCallback: Calculating initial metrics before training...")
         model.eval()
         device = model.device
-
+        print(str(device))
         # --- Initial Raw Knowledge Perplexity ---
         raw_perplexities = self._calculate_perplexity(model, self.raw_knowledge_statements, device)
         self.initial_metrics['raw_knowledge_perplexity'] = raw_perplexities
@@ -415,7 +415,7 @@ class KnowledgeProbeCallback(TrainerCallback):
             # Set padding token labels to -100 to be ignored by loss
             shift_labels[shift_labels == self.tokenizer.pad_token_id] = -100
             
-            loss_fct = LigerCrossEntropyLoss(reduction='none')
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
             # loss tensor has shape (batch_size, seq_len-1). Values are 0 where label was -100.
             loss = loss_fct(shift_logits.permute(0, 2, 1), shift_labels)
             
@@ -493,7 +493,7 @@ class KnowledgeProbeCallback(TrainerCallback):
             assert torch.equal(num_tokens_target.cpu(), target_lengths.cpu()), "Number of target tokens after masking does not match expected target lengths."
             
             # --- Loss Calculation ---
-            loss_fct = LigerCrossEntropyLoss(reduction='none')
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
             
             # Loss for whole statement
             loss_whole = loss_fct(shift_logits.permute(0, 2, 1), shift_labels_whole)
@@ -522,7 +522,7 @@ class KnowledgeProbeCallback(TrainerCallback):
             all_metrics["whole_log_prob"].append(whole_log_prob)
             all_metrics["target_log_prob"].append(target_log_prob)
 
-        if 'cuda' in device:
+        if 'cuda' in str(device):
             torch.cuda.empty_cache()
         
         return {k: torch.cat(v) for k, v in all_metrics.items()}
