@@ -168,10 +168,11 @@ plt.xlabel('Training Step')
 plt.ylabel('Perplexity Delta')
 plt.grid(True, which="both", ls="--")
 plt.legend()
-plt.show()
+plt.savefig(os.path.join(output_dir, "plot1_combined_avg_ppl_deltas.png"))
+plt.close()
 
 
-def plot_by_section(df, y_col, title, y_label):
+def plot_by_section(df, y_col, title, y_label, output_dir, filename):
     if df.empty:
         log.warning(f"Skipping plot '{title}' due to empty dataframe.")
         return
@@ -187,12 +188,15 @@ def plot_by_section(df, y_col, title, y_label):
     plt.ylabel(y_label)
     plt.grid(True)
     plt.legend(title='Section')
-    plt.show()
+    save_path = os.path.join(output_dir, filename)
+    plt.savefig(save_path)
+    log.info(f"Plot saved to {save_path}")
+    plt.close()
 
 # Plot 2, 3, 4: Perplexity Deltas by Section
-plot_by_section(raw_ppl_delta_df, 'perplexity_delta', 'Plot 2: Raw Knowledge Perplexity Delta by Section', 'Perplexity Delta')
-plot_by_section(atomic_whole_ppl_delta_df, 'perplexity_delta', 'Plot 3: Atomic Knowledge (Whole) Perplexity Delta by Section', 'Perplexity Delta')
-plot_by_section(atomic_target_ppl_delta_df, 'perplexity_delta', 'Plot 4: Atomic Knowledge (Target) Perplexity Delta by Section', 'Perplexity Delta')
+plot_by_section(raw_ppl_delta_df, 'perplexity_delta', 'Plot 2: Raw Knowledge Perplexity Delta by Section', 'Perplexity Delta', output_dir, "plot2_raw_ppl_delta_by_section.png")
+plot_by_section(atomic_whole_ppl_delta_df, 'perplexity_delta', 'Plot 3: Atomic Knowledge (Whole) Perplexity Delta by Section', 'Perplexity Delta', output_dir, "plot3_atomic_whole_ppl_delta_by_section.png")
+plot_by_section(atomic_target_ppl_delta_df, 'perplexity_delta', 'Plot 4: Atomic Knowledge (Target) Perplexity Delta by Section', 'Perplexity Delta', output_dir, "plot4_atomic_target_ppl_delta_by_section.png")
 
 # Plot 5: Mean Atomic Probe (Target) Perplexity Delta
 plt.figure(figsize=(12, 7))
@@ -202,7 +206,8 @@ plt.title('Plot 5: Mean Atomic Knowledge (Target) Perplexity Delta')
 plt.xlabel('Training Step')
 plt.ylabel('Average Perplexity Delta')
 plt.grid(True)
-plt.show()
+plt.savefig(os.path.join(output_dir, "plot5_mean_atomic_target_ppl_delta.png"))
+plt.close()
 
 
 # --- GROUP 2: LOG PROBABILITY DELTA PLOTS ---
@@ -221,11 +226,12 @@ plt.xlabel('Training Step')
 plt.ylabel('Log-Probability Delta')
 plt.grid(True, which="both", ls="--")
 plt.legend()
-plt.show()
+plt.savefig(os.path.join(output_dir, "plot7_combined_avg_log_prob_deltas.png"))
+plt.close()
 
 # Plot 8, 9: Log-Prob Deltas by Section
-plot_by_section(atomic_whole_log_prob_delta_df, 'log_prob_delta', 'Plot 8: Atomic Knowledge (Whole) Log-Prob Delta by Section', 'Log-Prob Delta')
-plot_by_section(atomic_target_log_prob_delta_df, 'log_prob_delta', 'Plot 9: Atomic Knowledge (Target) Log-Prob Delta by Section', 'Log-Prob Delta')
+plot_by_section(atomic_whole_log_prob_delta_df, 'log_prob_delta', 'Plot 8: Atomic Knowledge (Whole) Log-Prob Delta by Section', 'Log-Prob Delta', output_dir, "plot8_atomic_whole_log_prob_delta_by_section.png")
+plot_by_section(atomic_target_log_prob_delta_df, 'log_prob_delta', 'Plot 9: Atomic Knowledge (Target) Log-Prob Delta by Section', 'Log-Prob Delta', output_dir, "plot9_atomic_target_log_prob_delta_by_section.png")
 
 # Plot 11: Mean Atomic Probe (Target) Log-Prob Delta
 plt.figure(figsize=(12, 7))
@@ -235,4 +241,5 @@ plt.title('Plot 11: Mean Atomic Knowledge (Target) Log-Prob Delta')
 plt.xlabel('Training Step')
 plt.ylabel('Average Log-Prob Delta')
 plt.grid(True)
-plt.show()
+plt.savefig(os.path.join(output_dir, "plot11_mean_atomic_target_log_prob_delta.png"))
+plt.close()
