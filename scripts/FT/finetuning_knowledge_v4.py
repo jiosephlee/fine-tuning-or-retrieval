@@ -73,7 +73,8 @@ training_config = llm_configs.TrainingConfig(
 knowledge_probe_callback = llm_training.KnowledgeProbeCallback(
     tokenizer,
     '../../data/arxiv/DPO_knowledge_probes_v1.csv',
-    training_config.context_length
+    training_config.context_length,
+    batch_size=8,
 )
 
 corpus_callback = llm_training.CorpusPerplexityCallback(
@@ -138,6 +139,11 @@ atomic_target_log_prob_delta_df = knowledge_probe_callback.get_atomic_target_log
 # Load paraphrased log prob dataframes
 paraphrased_atomic_whole_log_prob_delta_df = knowledge_probe_callback.get_paraphrased_atomic_whole_log_prob_delta_dataframe()
 paraphrased_atomic_target_log_prob_delta_df = knowledge_probe_callback.get_paraphrased_atomic_target_log_prob_delta_dataframe()
+
+# Hit Rate Data
+atomic_target_hit_at_5_df = knowledge_probe_callback.get_atomic_target_hit_at_5_dataframe()
+atomic_target_hit_at_50_df = knowledge_probe_callback.get_atomic_target_hit_at_50_dataframe()
+atomic_target_hit_at_100_df = knowledge_probe_callback.get_atomic_target_hit_at_100_dataframe()
 
 # Manually calculate deltas for corpus and training loss perplexity
 if not corpus_results_df.empty:
@@ -289,4 +295,29 @@ plt.ylabel('Average Log-Prob Delta')
 plt.grid(True)
 plt.legend()
 plt.savefig(os.path.join(output_dir, "plot11_mean_atomic_target_log_prob_delta.png"))
+plt.close()
+
+
+# --- Plot 12: Atomic Target First Token Hit Rate ---
+log.info("Generating First Token Hit Rate plot...")
+plt.figure(figsize=(12, 7))
+
+if not atomic_target_hit_at_5_df.empty:
+    avg_hit_at_5 = atomic_target_hit_at_5_df.groupby('step')['hit_at_5'].mean().reset_index()
+    sns.lineplot(data=avg_hit_at_5, x='step', y='hit_at_5', label='Hit@5')
+
+if not atomic_target_hit_at_50_df.empty:
+    avg_hit_at_50 = atomic_target_hit_at_50_df.groupby('step')['hit_at_50'].mean().reset_index()
+    sns.lineplot(data=avg_hit_at_50, x='step', y='hit_at_50', label='Hit@50')
+
+if not atomic_target_hit_at_100_df.empty:
+    avg_hit_at_100 = atomic_target_hit_at_100_df.groupby('step')['hit_at_100'].mean().reset_index()
+    sns.lineplot(data=avg_hit_at_100, x='step', y='hit_at_100', label='Hit@100')
+    
+plt.title('Plot 12: Atomic Target First Token Hit Rate')
+plt.xlabel('Training Step')
+plt.ylabel('Average Hit Rate')
+plt.grid(True)
+plt.legend()
+plt.savefig(os.path.join(output_dir, "plot12_atomic_target_hit_rate.png"))
 plt.close()

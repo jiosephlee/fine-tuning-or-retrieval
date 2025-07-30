@@ -371,6 +371,9 @@ class KnowledgeProbeCallback(TrainerCallback):
         self.atomic_target_perplexity_history = []
         self.atomic_whole_log_prob_history = []
         self.atomic_target_log_prob_history = []
+        self.atomic_target_hit_at_5_history = []
+        self.atomic_target_hit_at_50_history = []
+        self.atomic_target_hit_at_100_history = []
 
         # History lists for paraphrased metrics (one list per variant)
         self.paraphrased_atomic_whole_perplexity_history = [[] for _ in range(self.num_paraphrase_variants)]
@@ -471,10 +474,12 @@ class KnowledgeProbeCallback(TrainerCallback):
         In a single forward pass, calculates perplexity and log probability for both
         the whole statement (context + target) and just the target portion.
         This version uses the tokenizer's standard padding and is more efficient.
+        **Also calculates top-K hit rate for the first target token.**
         """
         all_metrics = {
             "whole_perplexity": [], "target_perplexity": [],
-            "whole_log_prob": [], "target_log_prob": []
+            "whole_log_prob": [], "target_log_prob": [],
+            "hit_at_5": [], "hit_at_50": [], "hit_at_100": []
         }
 
         for i in range(0, len(contexts), self.batch_size):
@@ -508,6 +513,23 @@ class KnowledgeProbeCallback(TrainerCallback):
                 logits = outputs.logits
             
             shift_logits = logits[..., :-1, :].contiguous()
+            
+            # --- Top-K Hit Rate Calculation ---
+            # Logits for the token immediately following the context. Shape: [batch_size, vocab_size]
+            batch_indices = torch.arange(input_ids.shape[0], device=device)
+            next_token_logits = logits[batch_indices, context_lengths - 1, :]
+
+            # First token ID of each target span.
+            first_target_token_ids = target_tokenized.input_ids[:, 0].to(device)
+
+            # Get top 100 predicted token IDs for each item in the batch.
+            top_100_indices = torch.topk(next_token_logits, 100, dim=1).indices # Shape: [batch_size, 100]
+
+            # Check if the first target token is in the top K predictions.
+            target_ids_expanded = first_target_token_ids.unsqueeze(1) # Shape: [batch_size, 1]
+            hits_at_5 = (top_100_indices[:, :5] == target_ids_expanded).any(dim=1).float()
+            hits_at_50 = (top_100_indices[:, :50] == target_ids_expanded).any(dim=1).float()
+            hits_at_100 = (top_100_indices[:, :100] == target_ids_expanded).any(dim=1).float()
             
             # --- Label Preparation ---
             # Labels for Whole Statement (ignore only padding)
@@ -556,6 +578,9 @@ class KnowledgeProbeCallback(TrainerCallback):
             all_metrics["target_perplexity"].append(target_perplexity)
             all_metrics["whole_log_prob"].append(whole_log_prob)
             all_metrics["target_log_prob"].append(target_log_prob)
+            all_metrics["hit_at_5"].append(hits_at_5)
+            all_metrics["hit_at_50"].append(hits_at_50)
+            all_metrics["hit_at_100"].append(hits_at_100)
 
         return {k: torch.cat(v) for k, v in all_metrics.items()}
 
@@ -644,6 +669,11 @@ class KnowledgeProbeCallback(TrainerCallback):
             log_metric("atomic_whole_log_prob", atomic_metrics["whole_log_prob"])
             log_metric("atomic_target_log_prob", atomic_metrics["target_log_prob"])
 
+            # Log new hit rate metrics
+            log_metric("atomic_target_hit_at_5", atomic_metrics["hit_at_5"])
+            log_metric("atomic_target_hit_at_50", atomic_metrics["hit_at_50"])
+            log_metric("atomic_target_hit_at_100", atomic_metrics["hit_at_100"])
+
             # Log deltas
             log_metric("raw_knowledge_perplexity_delta", raw_perplexity_delta)
             log_metric("atomic_whole_perplexity_delta", atomic_whole_perplexity_delta)
@@ -673,6 +703,11 @@ class KnowledgeProbeCallback(TrainerCallback):
         self.atomic_target_perplexity_history.append({'step': state.global_step, 'values': atomic_metrics["target_perplexity"].cpu().tolist()})
         self.atomic_whole_log_prob_history.append({'step': state.global_step, 'values': atomic_metrics["whole_log_prob"].cpu().tolist()})
         self.atomic_target_log_prob_history.append({'step': state.global_step, 'values': atomic_metrics["target_log_prob"].cpu().tolist()})
+
+        # Store new hit rate data internally
+        self.atomic_target_hit_at_5_history.append({'step': state.global_step, 'values': atomic_metrics["hit_at_5"].cpu().tolist()})
+        self.atomic_target_hit_at_50_history.append({'step': state.global_step, 'values': atomic_metrics["hit_at_50"].cpu().tolist()})
+        self.atomic_target_hit_at_100_history.append({'step': state.global_step, 'values': atomic_metrics["hit_at_100"].cpu().tolist()})
 
         # Store delta data internally
         self.raw_knowledge_perplexity_delta_history.append({'step': state.global_step, 'values': raw_perplexity_delta.cpu().tolist()})
@@ -721,6 +756,18 @@ class KnowledgeProbeCallback(TrainerCallback):
     def get_atomic_target_log_prob_dataframe(self):
         """Returns collected atomic target log probability data as a pandas DataFrame."""
         return self._get_dataframe_from_history(self.atomic_target_log_prob_history, 'log_prob')
+
+    def get_atomic_target_hit_at_5_dataframe(self):
+        """Returns collected atomic target hit@5 data as a pandas DataFrame."""
+        return self._get_dataframe_from_history(self.atomic_target_hit_at_5_history, 'hit_at_5')
+
+    def get_atomic_target_hit_at_50_dataframe(self):
+        """Returns collected atomic target hit@50 data as a pandas DataFrame."""
+        return self._get_dataframe_from_history(self.atomic_target_hit_at_50_history, 'hit_at_50')
+
+    def get_atomic_target_hit_at_100_dataframe(self):
+        """Returns collected atomic target hit@100 data as a pandas DataFrame."""
+        return self._get_dataframe_from_history(self.atomic_target_hit_at_100_history, 'hit_at_100')
 
     def get_raw_knowledge_perplexity_delta_dataframe(self):
         """Returns collected raw knowledge perplexity delta data as a pandas DataFrame."""
@@ -786,6 +833,9 @@ class KnowledgeProbeCallback(TrainerCallback):
             self.get_atomic_target_perplexity_dataframe().rename(columns={'perplexity': 'atomic_target_perplexity'}),
             self.get_atomic_whole_log_prob_dataframe().rename(columns={'log_prob': 'atomic_whole_log_prob'}),
             self.get_atomic_target_log_prob_dataframe().rename(columns={'log_prob': 'atomic_target_log_prob'}),
+            self.get_atomic_target_hit_at_5_dataframe().rename(columns={'hit_at_5': 'atomic_target_hit_at_5'}),
+            self.get_atomic_target_hit_at_50_dataframe().rename(columns={'hit_at_50': 'atomic_target_hit_at_50'}),
+            self.get_atomic_target_hit_at_100_dataframe().rename(columns={'hit_at_100': 'atomic_target_hit_at_100'}),
             self.get_atomic_whole_perplexity_delta_dataframe().rename(columns={'perplexity_delta': 'atomic_whole_perplexity_delta'}),
             self.get_atomic_target_perplexity_delta_dataframe().rename(columns={'perplexity_delta': 'atomic_target_perplexity_delta'}),
             self.get_atomic_whole_log_prob_delta_dataframe().rename(columns={'log_prob_delta': 'atomic_whole_log_prob_delta'}),
