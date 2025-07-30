@@ -127,9 +127,17 @@ atomic_target_ppl_delta_df = knowledge_probe_callback.get_atomic_target_perplexi
 corpus_results_df = corpus_callback.get_results_as_dataframe()
 training_loss_results_df = training_loss_callback.get_results_as_dataframe()
 
+# Load paraphrased dataframes
+paraphrased_atomic_whole_ppl_delta_df = knowledge_probe_callback.get_paraphrased_atomic_whole_perplexity_delta_dataframe()
+paraphrased_atomic_target_ppl_delta_df = knowledge_probe_callback.get_paraphrased_atomic_target_perplexity_delta_dataframe()
+
 # Log Probability Deltas
 atomic_whole_log_prob_delta_df = knowledge_probe_callback.get_atomic_whole_log_prob_delta_dataframe()
 atomic_target_log_prob_delta_df = knowledge_probe_callback.get_atomic_target_log_prob_delta_dataframe()
+
+# Load paraphrased log prob dataframes
+paraphrased_atomic_whole_log_prob_delta_df = knowledge_probe_callback.get_paraphrased_atomic_whole_log_prob_delta_dataframe()
+paraphrased_atomic_target_log_prob_delta_df = knowledge_probe_callback.get_paraphrased_atomic_target_log_prob_delta_dataframe()
 
 # Manually calculate deltas for corpus and training loss perplexity
 if not corpus_results_df.empty:
@@ -154,10 +162,14 @@ plt.figure(figsize=(14, 8))
 avg_raw_ppl_delta = raw_ppl_delta_df.groupby('step')['perplexity_delta'].mean().reset_index()
 avg_atomic_whole_ppl_delta = atomic_whole_ppl_delta_df.groupby('step')['perplexity_delta'].mean().reset_index()
 avg_atomic_target_ppl_delta = atomic_target_ppl_delta_df.groupby('step')['perplexity_delta'].mean().reset_index()
+avg_paraphrased_atomic_whole_ppl_delta = paraphrased_atomic_whole_ppl_delta_df.groupby('step')['perplexity_delta'].mean().reset_index()
+avg_paraphrased_atomic_target_ppl_delta = paraphrased_atomic_target_ppl_delta_df.groupby('step')['perplexity_delta'].mean().reset_index()
 
 sns.lineplot(data=avg_raw_ppl_delta, x='step', y='perplexity_delta', label='Δ Knowledge Probes (Raw PPL)', linestyle='-')
 sns.lineplot(data=avg_atomic_whole_ppl_delta, x='step', y='perplexity_delta', label='Δ Knowledge Probes (Atomic PPL)', linestyle='--')
 sns.lineplot(data=avg_atomic_target_ppl_delta, x='step', y='perplexity_delta', label='Δ Knowledge Probes (Target PPL)', linestyle=':')
+sns.lineplot(data=avg_paraphrased_atomic_whole_ppl_delta, x='step', y='perplexity_delta', label='Δ Paraphrased Knowledge Probes (Atomic PPL)', linestyle='--')
+sns.lineplot(data=avg_paraphrased_atomic_target_ppl_delta, x='step', y='perplexity_delta', label='Δ Paraphrased Knowledge Probes (Target PPL)', linestyle=':')
 if not corpus_results_df.empty:
     sns.lineplot(data=corpus_results_df, x='step', y='corpus_perplexity_delta', label='Δ Sliding Window (Full Paper)', linestyle='-')
 if not training_loss_results_df.empty:
@@ -200,12 +212,30 @@ plot_by_section(atomic_target_ppl_delta_df, 'perplexity_delta', 'Plot 4: Atomic 
 
 # Plot 5: Mean Atomic Probe (Target) Perplexity Delta
 plt.figure(figsize=(12, 7))
+
+# Original Probes
 avg_atomic_target_ppl_delta = atomic_target_ppl_delta_df.groupby('step')['perplexity_delta'].mean().reset_index()
-sns.lineplot(data=avg_atomic_target_ppl_delta, x='step', y='perplexity_delta')
-plt.title('Plot 5: Mean Atomic Knowledge (Target) Perplexity Delta')
+sns.lineplot(data=avg_atomic_target_ppl_delta, x='step', y='perplexity_delta', label='Original Probes')
+
+# Paraphrased Probes with Std Dev Shadow
+if not paraphrased_atomic_target_ppl_delta_df.empty:
+    # Group by step and calculate mean and std dev across all paraphrases and probes
+    paraphrase_stats = paraphrased_atomic_target_ppl_delta_df.groupby('step')['perplexity_delta'].agg(['mean', 'std']).reset_index()
+    
+    # Plot the mean line
+    sns.lineplot(data=paraphrase_stats, x='step', y='mean', label='Paraphrased Probes (Mean)')
+    
+    # Add the standard deviation shadow
+    plt.fill_between(paraphrase_stats['step'], 
+                     paraphrase_stats['mean'] - paraphrase_stats['std'], 
+                     paraphrase_stats['mean'] + paraphrase_stats['std'], 
+                     alpha=0.2, label='Paraphrased Probes (Std. Dev.)')
+
+plt.title('Plot 5: Mean Atomic Knowledge (Target) Perplexity Delta Comparison')
 plt.xlabel('Training Step')
 plt.ylabel('Average Perplexity Delta')
 plt.grid(True)
+plt.legend()
 plt.savefig(os.path.join(output_dir, "plot5_mean_atomic_target_ppl_delta.png"))
 plt.close()
 
@@ -217,9 +247,13 @@ log.info("Generating Log Probability Delta plots...")
 plt.figure(figsize=(14, 8))
 avg_atomic_whole_log_prob_delta = atomic_whole_log_prob_delta_df.groupby('step')['log_prob_delta'].mean().reset_index()
 avg_atomic_target_log_prob_delta = atomic_target_log_prob_delta_df.groupby('step')['log_prob_delta'].mean().reset_index()
+avg_paraphrased_atomic_whole_log_prob_delta = paraphrased_atomic_whole_log_prob_delta_df.groupby('step')['log_prob_delta'].mean().reset_index()
+avg_paraphrased_atomic_target_log_prob_delta = paraphrased_atomic_target_log_prob_delta_df.groupby('step')['log_prob_delta'].mean().reset_index()
 
 sns.lineplot(data=avg_atomic_whole_log_prob_delta, x='step', y='log_prob_delta', label='Δ Atomic Knowledge (Whole Log-Prob)', linestyle='--')
 sns.lineplot(data=avg_atomic_target_log_prob_delta, x='step', y='log_prob_delta', label='Δ Atomic Knowledge (Target Log-Prob)', linestyle=':')
+sns.lineplot(data=avg_paraphrased_atomic_whole_log_prob_delta, x='step', y='log_prob_delta', label='Δ Paraphrased Knowledge (Whole Log-Prob)', linestyle='--')
+sns.lineplot(data=avg_paraphrased_atomic_target_log_prob_delta, x='step', y='log_prob_delta', label='Δ Paraphrased Knowledge (Target Log-Prob)', linestyle=':')
 
 plt.title('Plot 7: Combined Average Log-Probability Deltas')
 plt.xlabel('Training Step')
@@ -235,11 +269,24 @@ plot_by_section(atomic_target_log_prob_delta_df, 'log_prob_delta', 'Plot 9: Atom
 
 # Plot 11: Mean Atomic Probe (Target) Log-Prob Delta
 plt.figure(figsize=(12, 7))
+
+# Original Probes
 avg_atomic_target_log_prob_delta = atomic_target_log_prob_delta_df.groupby('step')['log_prob_delta'].mean().reset_index()
-sns.lineplot(data=avg_atomic_target_log_prob_delta, x='step', y='log_prob_delta')
-plt.title('Plot 11: Mean Atomic Knowledge (Target) Log-Prob Delta')
+sns.lineplot(data=avg_atomic_target_log_prob_delta, x='step', y='log_prob_delta', label='Original Probes')
+
+# Paraphrased Probes with Std Dev Shadow
+if not paraphrased_atomic_target_log_prob_delta_df.empty:
+    paraphrase_stats = paraphrased_atomic_target_log_prob_delta_df.groupby('step')['log_prob_delta'].agg(['mean', 'std']).reset_index()
+    sns.lineplot(data=paraphrase_stats, x='step', y='mean', label='Paraphrased Probes (Mean)')
+    plt.fill_between(paraphrase_stats['step'],
+                     paraphrase_stats['mean'] - paraphrase_stats['std'],
+                     paraphrase_stats['mean'] + paraphrase_stats['std'],
+                     alpha=0.2, label='Paraphrased Probes (Std. Dev.)')
+
+plt.title('Plot 11: Mean Atomic Knowledge (Target) Log-Prob Delta Comparison')
 plt.xlabel('Training Step')
 plt.ylabel('Average Log-Prob Delta')
 plt.grid(True)
+plt.legend()
 plt.savefig(os.path.join(output_dir, "plot11_mean_atomic_target_log_prob_delta.png"))
 plt.close()
