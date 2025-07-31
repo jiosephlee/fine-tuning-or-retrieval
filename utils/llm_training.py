@@ -338,6 +338,37 @@ class KnowledgeProbeCallback(TrainerCallback):
         self.batch_size = batch_size
         self.initial_metrics = {}
 
+        # User-facing configuration to easily enable/disable metrics for probe groups.
+        self.PROBE_CONFIG = {
+            'raw_knowledge': {
+                'perplexity': {'track_delta': True, 'track_paraphrased': False}
+            },
+            'atomic_whole': {
+                'perplexity': {'track_delta': True, 'track_paraphrased': True},
+                'log_prob': {'track_delta': True, 'track_paraphrased': True}
+            },
+            'atomic_target': {
+                'perplexity': {'track_delta': True, 'track_paraphrased': True},
+                'log_prob': {'track_delta': True, 'track_paraphrased': True},
+                'hit_at_5': {'track_delta': False, 'track_paraphrased': False},
+                'hit_at_50': {'track_delta': False, 'track_paraphrased': False},
+                'hit_at_100': {'track_delta': False, 'track_paraphrased': False},
+            }
+        }
+
+        # --- Internal Configuration (Generated from PROBE_CONFIG) ---
+        self.METRICS_CONFIG = {}
+        for group, metrics in self.PROBE_CONFIG.items():
+            for metric_type, config in metrics.items():
+                full_name = f"{group}_{metric_type}"
+                self.METRICS_CONFIG[full_name] = {
+                    'value_col_name': metric_type,
+                    **config
+                }
+
+        # Names of metrics that are calculated together in _calculate_atomic_metrics
+        self.atomic_metric_names = [k for k in self.METRICS_CONFIG if k.startswith('atomic_')]
+
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -353,6 +384,11 @@ class KnowledgeProbeCallback(TrainerCallback):
                 paraphrased_probes_raw = df["paraphrased_atomic_knowledge_probes"].tolist()
                 # Safely evaluate the string representation of lists
                 self.paraphrased_atomic_probes = [ast.literal_eval(s) for s in paraphrased_probes_raw]
+                # Check for data integrity before transposing.
+                if self.paraphrased_atomic_probes:
+                    first_len = len(self.paraphrased_atomic_probes[0])
+                    assert all(len(p) == first_len for p in self.paraphrased_atomic_probes), \
+                        "All probes must have the same number of paraphrased variants."
                 # Transpose to get lists of probes per variant
                 self.paraphrased_atomic_probes_by_variant = list(zip(*self.paraphrased_atomic_probes))
                 self.num_paraphrase_variants = len(self.paraphrased_atomic_probes_by_variant)
@@ -364,35 +400,14 @@ class KnowledgeProbeCallback(TrainerCallback):
                 self.num_paraphrase_variants = 0
         else: # For testing purposes
             raise ValueError("Probe dataset path is not provided")
-        
-        # History lists for each metric
-        self.raw_knowledge_perplexity_history = []
-        self.atomic_whole_perplexity_history = []
-        self.atomic_target_perplexity_history = []
-        self.atomic_whole_log_prob_history = []
-        self.atomic_target_log_prob_history = []
-        self.atomic_target_hit_at_5_history = []
-        self.atomic_target_hit_at_50_history = []
-        self.atomic_target_hit_at_100_history = []
 
-        # History lists for paraphrased metrics (one list per variant)
-        self.paraphrased_atomic_whole_perplexity_history = [[] for _ in range(self.num_paraphrase_variants)]
-        self.paraphrased_atomic_target_perplexity_history = [[] for _ in range(self.num_paraphrase_variants)]
-        self.paraphrased_atomic_whole_log_prob_history = [[] for _ in range(self.num_paraphrase_variants)]
-        self.paraphrased_atomic_target_log_prob_history = [[] for _ in range(self.num_paraphrase_variants)]
+        # Programmatically initialize history dictionaries based on config
+        self.history = {name: [] for name in self.METRICS_CONFIG}
+        self.delta_history = {name: [] for name, cfg in self.METRICS_CONFIG.items() if cfg['track_delta']}
 
-        # History lists for deltas
-        self.raw_knowledge_perplexity_delta_history = []
-        self.atomic_whole_perplexity_delta_history = []
-        self.atomic_target_perplexity_delta_history = []
-        self.atomic_whole_log_prob_delta_history = []
-        self.atomic_target_log_prob_delta_history = []
-        
-        # History lists for paraphrased deltas (one list per variant)
-        self.paraphrased_atomic_whole_perplexity_delta_history = [[] for _ in range(self.num_paraphrase_variants)]
-        self.paraphrased_atomic_target_perplexity_delta_history = [[] for _ in range(self.num_paraphrase_variants)]
-        self.paraphrased_atomic_whole_log_prob_delta_history = [[] for _ in range(self.num_paraphrase_variants)]
-        self.paraphrased_atomic_target_log_prob_delta_history = [[] for _ in range(self.num_paraphrase_variants)]
+        paraphrased_metrics = {name for name, cfg in self.METRICS_CONFIG.items() if cfg['track_paraphrased']}
+        self.paraphrased_history = {name: [[] for _ in range(self.num_paraphrase_variants)] for name in paraphrased_metrics}
+        self.paraphrased_delta_history = {name: [[] for _ in range(self.num_paraphrase_variants)] for name in paraphrased_metrics if self.METRICS_CONFIG[name]['track_delta']}
 
     def on_train_begin(self, args, state, control, model, **kwargs):
         """
@@ -403,21 +418,24 @@ class KnowledgeProbeCallback(TrainerCallback):
         device = model.device
         print(str(device))
         # --- Initial Raw Knowledge Perplexity ---
-        raw_perplexities = self._calculate_perplexity(model, self.raw_knowledge_statements, device)
-        self.initial_metrics['raw_knowledge_perplexity'] = raw_perplexities
+        if 'raw_knowledge_perplexity' in self.METRICS_CONFIG:
+            self.initial_metrics['raw_knowledge_perplexity'] = self._calculate_perplexity(model, self.raw_knowledge_statements, device)
 
         # --- Initial Atomic Metrics ---
-        atomic_metrics = self._calculate_atomic_metrics(model, self.atomic_probes, self.atomic_targets, device)
-        self.initial_metrics['atomic_metrics'] = atomic_metrics
+        if self.atomic_metric_names:
+            atomic_metrics = self._calculate_atomic_metrics(model, self.atomic_probes, self.atomic_targets, device)
+            self.initial_metrics.update(atomic_metrics)
 
         # --- Initial Paraphrased Atomic Metrics ---
-        if self.num_paraphrase_variants > 0:
+        self.initial_metrics['paraphrased'] = [{} for _ in range(self.num_paraphrase_variants)]
+        if self.num_paraphrase_variants > 0 and any(cfg['track_paraphrased'] for cfg in self.METRICS_CONFIG.values()):
             print(f"KnowledgeProbeCallback: Calculating initial metrics for {self.num_paraphrase_variants} paraphrase variants...")
-            self.initial_metrics['paraphrased_atomic_metrics'] = []
             for i in range(self.num_paraphrase_variants):
                 paraphrased_probes = self.paraphrased_atomic_probes_by_variant[i]
                 paraphrased_metrics = self._calculate_atomic_metrics(model, paraphrased_probes, self.atomic_targets, device)
-                self.initial_metrics['paraphrased_atomic_metrics'].append(paraphrased_metrics)
+                for name, values in paraphrased_metrics.items():
+                    if self.METRICS_CONFIG.get(name, {}).get('track_paraphrased', False):
+                        self.initial_metrics['paraphrased'][i][name] = values
 
         print("KnowledgeProbeCallback: Initial metrics calculated and stored. Training begins...")
         model.train()
@@ -471,16 +489,20 @@ class KnowledgeProbeCallback(TrainerCallback):
 
     def _calculate_atomic_metrics(self, model, contexts: List[str], targets: List[str], device):
         """
-        In a single forward pass, calculates perplexity and log probability for both
-        the whole statement (context + target) and just the target portion.
+        In a single forward pass, calculates perplexity, log probability, and hit rate
+        for atomic probes based on the current PROBE_CONFIG settings.
         This version uses the tokenizer's standard padding and is more efficient.
-        **Also calculates top-K hit rate for the first target token.**
         """
-        all_metrics = {
-            "whole_perplexity": [], "target_perplexity": [],
-            "whole_log_prob": [], "target_log_prob": [],
-            "hit_at_5": [], "hit_at_50": [], "hit_at_100": []
-        }
+        all_metrics = {name: [] for name in self.atomic_metric_names}
+
+        # Determine which metric types we need to compute at all.
+        metrics_to_calc = set()
+        for group in ['atomic_whole', 'atomic_target']:
+            if group in self.PROBE_CONFIG:
+                metrics_to_calc.update(self.PROBE_CONFIG[group].keys())
+
+        needs_loss_calc = 'perplexity' in metrics_to_calc or 'log_prob' in metrics_to_calc
+        needs_hit_rate_calc = any(k.startswith('hit_at_') for k in metrics_to_calc)
 
         for i in range(0, len(contexts), self.batch_size):
             batch_contexts = contexts[i:i + self.batch_size]
@@ -489,7 +511,6 @@ class KnowledgeProbeCallback(TrainerCallback):
                 continue
 
             # --- Tokenization ---
-            # Combine contexts and targets and tokenize them together
             batch_full_text = [c + t for c, t in zip(batch_contexts, batch_targets)]
             inputs = self.tokenizer(
                 batch_full_text,
@@ -501,88 +522,86 @@ class KnowledgeProbeCallback(TrainerCallback):
             ).to(device)
             input_ids = inputs["input_ids"]
 
-            # Tokenize contexts and targets separately to get their lengths for masking and assertion
             context_tokenized = self.tokenizer(batch_contexts, add_special_tokens=False, padding="longest", return_tensors="pt")
             context_lengths = context_tokenized.attention_mask.sum(dim=1).to(device)
-            target_tokenized = self.tokenizer(batch_targets, add_special_tokens=False, padding="longest", return_tensors="pt")
-            target_lengths = target_tokenized.attention_mask.sum(dim=1).to(device)
 
             # --- Model Forward Pass ---
             with torch.no_grad():
                 outputs = model(input_ids)
                 logits = outputs.logits
-            
-            shift_logits = logits[..., :-1, :].contiguous()
-            
-            # --- Top-K Hit Rate Calculation ---
-            # Logits for the token immediately following the context. Shape: [batch_size, vocab_size]
-            batch_indices = torch.arange(input_ids.shape[0], device=device)
-            next_token_logits = logits[batch_indices, context_lengths - 1, :]
 
-            # First token ID of each target span.
-            first_target_token_ids = target_tokenized.input_ids[:, 0].to(device)
-
-            # Get top 100 predicted token IDs for each item in the batch.
-            top_100_indices = torch.topk(next_token_logits, 100, dim=1).indices # Shape: [batch_size, 100]
-
-            # Check if the first target token is in the top K predictions.
-            target_ids_expanded = first_target_token_ids.unsqueeze(1) # Shape: [batch_size, 1]
-            hits_at_5 = (top_100_indices[:, :5] == target_ids_expanded).any(dim=1).float()
-            hits_at_50 = (top_100_indices[:, :50] == target_ids_expanded).any(dim=1).float()
-            hits_at_100 = (top_100_indices[:, :100] == target_ids_expanded).any(dim=1).float()
+            # --- Metric Calculations ---
+            if needs_hit_rate_calc:
+                hit_rate_results = self._calculate_hit_rate_metrics_for_batch(logits, context_lengths, batch_targets, metrics_to_calc)
+                for name, values in hit_rate_results.items():
+                    all_metrics[name].append(values)
             
-            # --- Label Preparation ---
-            # Labels for Whole Statement (ignore only padding)
+            if needs_loss_calc:
+                nll_results = self._calculate_nll_metrics_for_batch(logits, input_ids, context_lengths, batch_targets)
+                for name, values in nll_results.items():
+                    all_metrics[name].append(values)
+
+        return {k: torch.cat(v) for k, v in all_metrics.items() if v}
+
+    def _calculate_hit_rate_metrics_for_batch(self, logits, context_lengths, batch_targets, metrics_to_calc):
+        """Calculates top-K hit rate metrics for a batch."""
+        results = {}
+        target_tokenized = self.tokenizer(batch_targets, add_special_tokens=False, padding="longest", return_tensors="pt")
+        batch_indices = torch.arange(logits.shape[0], device=logits.device)
+        next_token_logits = logits[batch_indices, context_lengths - 1, :]
+        first_target_token_ids = target_tokenized.input_ids[:, 0].to(logits.device)
+        top_100_indices = torch.topk(next_token_logits, 100, dim=1).indices
+        target_ids_expanded = first_target_token_ids.unsqueeze(1)
+
+        if 'hit_at_5' in metrics_to_calc:
+            results["atomic_target_hit_at_5"] = (top_100_indices[:, :5] == target_ids_expanded).any(dim=1).float()
+        if 'hit_at_50' in metrics_to_calc:
+            results["atomic_target_hit_at_50"] = (top_100_indices[:, :50] == target_ids_expanded).any(dim=1).float()
+        if 'hit_at_100' in metrics_to_calc:
+            results["atomic_target_hit_at_100"] = (top_100_indices[:, :100] == target_ids_expanded).any(dim=1).float()
+        return results
+
+    def _calculate_nll_metrics_for_batch(self, logits, input_ids, context_lengths, batch_targets):
+        """Calculates NLL-based metrics (perplexity, log-prob) for a batch."""
+        results = {}
+        shift_logits = logits[..., :-1, :].contiguous()
+        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+
+        # Calculate for whole statement if needed
+        if 'atomic_whole_perplexity' in self.atomic_metric_names or 'atomic_whole_log_prob' in self.atomic_metric_names:
             shift_labels_whole = input_ids[..., 1:].contiguous().clone()
             shift_labels_whole[shift_labels_whole == self.tokenizer.pad_token_id] = -100
-
-            # Labels for Target Only (ignore context and padding)
-            shift_labels_target = input_ids[..., 1:].contiguous().clone()
-            for j, length in enumerate(context_lengths):
-                 # Mask out context tokens. Prediction for 1st target token is at the final context token's position.
-                 # So, in the shifted sequence, we mask up to index `length - 1`.
-                 if length > 0:
-                    shift_labels_target[j, :length-1] = -100
-            shift_labels_target[shift_labels_target == self.tokenizer.pad_token_id] = -100
-            
-            # --- Assertions ---
-            num_tokens_target = (shift_labels_target != -100).sum(dim=1)
-            assert torch.equal(num_tokens_target.cpu(), target_lengths.cpu()), "Number of target tokens after masking does not match expected target lengths."
-            
-            # --- Loss Calculation ---
-            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-            
-            # Loss for whole statement
             loss_whole = loss_fct(shift_logits.permute(0, 2, 1), shift_labels_whole)
             sum_loss_whole = loss_whole.sum(dim=1)
-            num_tokens_whole = (shift_labels_whole != -100).sum(dim=1).float()
-            
-            # Loss for target
+
+            if 'atomic_whole_log_prob' in self.atomic_metric_names:
+                results["atomic_whole_log_prob"] = -sum_loss_whole
+            if 'atomic_whole_perplexity' in self.atomic_metric_names:
+                num_tokens_whole = (shift_labels_whole != -100).sum(dim=1).float()
+                mean_nll_whole = sum_loss_whole / num_tokens_whole
+                results["atomic_whole_perplexity"] = torch.exp(mean_nll_whole)
+
+        # Calculate for target statement if needed
+        if 'atomic_target_perplexity' in self.atomic_metric_names or 'atomic_target_log_prob' in self.atomic_metric_names:
+            target_tokenized = self.tokenizer(batch_targets, add_special_tokens=False, padding="longest", return_tensors="pt")
+            shift_labels_target = input_ids[..., 1:].contiguous().clone()
+            for j, length in enumerate(context_lengths):
+                if length > 0: shift_labels_target[j, :length-1] = -100
+            shift_labels_target[shift_labels_target == self.tokenizer.pad_token_id] = -100
             loss_target = loss_fct(shift_logits.permute(0, 2, 1), shift_labels_target)
             sum_loss_target = loss_target.sum(dim=1)
-            
-            # --- Metric Calculation ---
-            # Log Probs
-            whole_log_prob = -sum_loss_whole
-            target_log_prob = -sum_loss_target
-            
-            # Perplexities
-            mean_nll_whole = sum_loss_whole / num_tokens_whole
-            whole_perplexity = torch.exp(mean_nll_whole)
 
-            mean_nll_target = sum_loss_target / num_tokens_target.float()
-            target_perplexity = torch.exp(mean_nll_target)
-
-            # --- Append results ---
-            all_metrics["whole_perplexity"].append(whole_perplexity)
-            all_metrics["target_perplexity"].append(target_perplexity)
-            all_metrics["whole_log_prob"].append(whole_log_prob)
-            all_metrics["target_log_prob"].append(target_log_prob)
-            all_metrics["hit_at_5"].append(hits_at_5)
-            all_metrics["hit_at_50"].append(hits_at_50)
-            all_metrics["hit_at_100"].append(hits_at_100)
-
-        return {k: torch.cat(v) for k, v in all_metrics.items()}
+            if 'atomic_target_log_prob' in self.atomic_metric_names:
+                results["atomic_target_log_prob"] = -sum_loss_target
+            if 'atomic_target_perplexity' in self.atomic_metric_names:
+                target_lengths = target_tokenized.attention_mask.sum(dim=1).to(logits.device)
+                num_tokens_target = (shift_labels_target != -100).sum(dim=1)
+                assert torch.equal(num_tokens_target, target_lengths), \
+                    "Number of target tokens after masking does not match expected target lengths."
+                mean_nll_target = sum_loss_target / num_tokens_target.float()
+                results["atomic_target_perplexity"] = torch.exp(mean_nll_target)
+        
+        return results
 
     def on_step_end(self, args, state, control, model, **kwargs):
         if not self.initial_metrics:
@@ -591,140 +610,71 @@ class KnowledgeProbeCallback(TrainerCallback):
 
         model.eval()
         device = model.device
+        step = state.global_step
+        log_data = {}
 
-        # --- Raw Knowledge Perplexity ---
-        raw_perplexities = self._calculate_perplexity(model, self.raw_knowledge_statements, device)
-        raw_perplexity_delta = raw_perplexities - self.initial_metrics['raw_knowledge_perplexity']
+        def log_metric_wandb(name, tensor):
+            valid_mask = ~torch.isinf(tensor) & ~torch.isnan(tensor)
+            if valid_mask.any():
+                log_data[f"{self.log_prefix}/{name}_avg"] = tensor[valid_mask].mean().item()
 
-        # --- Atomic Knowledge Metrics (calculated together for efficiency) ---
-        atomic_metrics = self._calculate_atomic_metrics(model, self.atomic_probes, self.atomic_targets, device)
-        initial_atomic_metrics = self.initial_metrics['atomic_metrics']
+        # --- Original Probes ---
+        current_metrics = {}
+        if 'raw_knowledge_perplexity' in self.METRICS_CONFIG:
+            current_metrics['raw_knowledge_perplexity'] = self._calculate_perplexity(model, self.raw_knowledge_statements, device)
+        if self.atomic_metric_names:
+            current_metrics.update(self._calculate_atomic_metrics(model, self.atomic_probes, self.atomic_targets, device))
 
-        atomic_whole_perplexity_delta = atomic_metrics["whole_perplexity"] - initial_atomic_metrics["whole_perplexity"]
-        atomic_target_perplexity_delta = atomic_metrics["target_perplexity"] - initial_atomic_metrics["target_perplexity"]
-        atomic_whole_log_prob_delta = atomic_metrics["whole_log_prob"] - initial_atomic_metrics["whole_log_prob"]
-        atomic_target_log_prob_delta = atomic_metrics["target_log_prob"] - initial_atomic_metrics["target_log_prob"]
+        for name, values in current_metrics.items():
+            self.history[name].append({'step': step, 'values': values.cpu().tolist()})
+            log_metric_wandb(name, values)
+            if self.METRICS_CONFIG[name]['track_delta']:
+                delta = values - self.initial_metrics[name]
+                self.delta_history[name].append({'step': step, 'values': delta.cpu().tolist()})
+                log_metric_wandb(f"{name}_delta", delta)
 
-        # --- Paraphrased Atomic Knowledge Metrics ---
-        paraphrased_atomic_metrics_all_variants = []
-        paraphrased_deltas_all_variants = {}
-
+        # --- Paraphrased Probes ---
         if self.num_paraphrase_variants > 0:
-            # Calculate metrics for each paraphrase variant
-            for i in range(self.num_paraphrase_variants):
-                paraphrased_probes = self.paraphrased_atomic_probes_by_variant[i]
-                current_metrics = self._calculate_atomic_metrics(model, paraphrased_probes, self.atomic_targets, device)
-                paraphrased_atomic_metrics_all_variants.append(current_metrics)
+            paraphrased_metrics_to_track = {name for name, cfg in self.METRICS_CONFIG.items() if cfg['track_paraphrased']}
+            if paraphrased_metrics_to_track:
+                # These will store tensors of shape [num_variants, num_probes] for mean calculation
+                paraphrased_tensors = {name: [] for name in self.paraphrased_history}
+                paraphrased_delta_tensors = {name: [] for name in self.paraphrased_delta_history}
 
-                initial_paraphrased_metrics = self.initial_metrics['paraphrased_atomic_metrics'][i]
+                for i in range(self.num_paraphrase_variants):
+                    paraphrased_probes = self.paraphrased_atomic_probes_by_variant[i]
+                    variant_metrics = self._calculate_atomic_metrics(model, paraphrased_probes, self.atomic_targets, device)
 
-                # Calculate deltas for this variant
-                whole_ppl_delta = current_metrics["whole_perplexity"] - initial_paraphrased_metrics["whole_perplexity"]
-                target_ppl_delta = current_metrics["target_perplexity"] - initial_paraphrased_metrics["target_perplexity"]
-                whole_log_prob_delta = current_metrics["whole_log_prob"] - initial_paraphrased_metrics["whole_log_prob"]
-                target_log_prob_delta = current_metrics["target_log_prob"] - initial_paraphrased_metrics["target_log_prob"]
+                    for name, values in variant_metrics.items():
+                        if name in paraphrased_metrics_to_track:
+                            self.paraphrased_history[name][i].append({'step': step, 'values': values.cpu().tolist()})
+                            paraphrased_tensors[name].append(values)
 
-                # Store raw metrics history for this variant
-                self.paraphrased_atomic_whole_perplexity_history[i].append({'step': state.global_step, 'values': current_metrics["whole_perplexity"].cpu().tolist()})
-                self.paraphrased_atomic_target_perplexity_history[i].append({'step': state.global_step, 'values': current_metrics["target_perplexity"].cpu().tolist()})
-                self.paraphrased_atomic_whole_log_prob_history[i].append({'step': state.global_step, 'values': current_metrics["whole_log_prob"].cpu().tolist()})
-                self.paraphrased_atomic_target_log_prob_history[i].append({'step': state.global_step, 'values': current_metrics["target_log_prob"].cpu().tolist()})
+                            if self.METRICS_CONFIG[name]['track_delta']:
+                                initial_vals = self.initial_metrics['paraphrased'][i][name]
+                                delta = values - initial_vals
+                                self.paraphrased_delta_history[name][i].append({'step': step, 'values': delta.cpu().tolist()})
+                                paraphrased_delta_tensors[name].append(delta)
 
-                # Store delta history for this variant
-                self.paraphrased_atomic_whole_perplexity_delta_history[i].append({'step': state.global_step, 'values': whole_ppl_delta.cpu().tolist()})
-                self.paraphrased_atomic_target_perplexity_delta_history[i].append({'step': state.global_step, 'values': target_ppl_delta.cpu().tolist()})
-                self.paraphrased_atomic_whole_log_prob_delta_history[i].append({'step': state.global_step, 'values': whole_log_prob_delta.cpu().tolist()})
-                self.paraphrased_atomic_target_log_prob_delta_history[i].append({'step': state.global_step, 'values': target_log_prob_delta.cpu().tolist()})
+                # Log the mean across variants to W&B
+                for name, tensors in paraphrased_tensors.items():
+                    if tensors: log_metric_wandb(f"paraphrased_{name}", torch.stack(tensors).mean(dim=0))
+                for name, tensors in paraphrased_delta_tensors.items():
+                    if tensors: log_metric_wandb(f"paraphrased_{name}_delta", torch.stack(tensors).mean(dim=0))
 
-            # Collate deltas across all variants for logging the mean
-            paraphrased_deltas_all_variants['whole_perplexity_delta'] = torch.stack([
-                m["whole_perplexity"] - self.initial_metrics['paraphrased_atomic_metrics'][i]["whole_perplexity"]
-                for i, m in enumerate(paraphrased_atomic_metrics_all_variants)
-            ])
-            paraphrased_deltas_all_variants['target_perplexity_delta'] = torch.stack([
-                m["target_perplexity"] - self.initial_metrics['paraphrased_atomic_metrics'][i]["target_perplexity"]
-                for i, m in enumerate(paraphrased_atomic_metrics_all_variants)
-            ])
-            paraphrased_deltas_all_variants['whole_log_prob_delta'] = torch.stack([
-                m["whole_log_prob"] - self.initial_metrics['paraphrased_atomic_metrics'][i]["whole_log_prob"]
-                for i, m in enumerate(paraphrased_atomic_metrics_all_variants)
-            ])
-            paraphrased_deltas_all_variants['target_log_prob_delta'] = torch.stack([
-                m["target_log_prob"] - self.initial_metrics['paraphrased_atomic_metrics'][i]["target_log_prob"]
-                for i, m in enumerate(paraphrased_atomic_metrics_all_variants)
-            ])
+        # --- Final Logging ---
+        if state.is_world_process_zero and log_data:
+            wandb.log(log_data, step=step)
 
-        # --- Logging and Storing on Weights & Biases ---
-        if state.is_world_process_zero:
-            log_data = {}
-            
-            def log_metric(name, tensor):
-                valid_mask = ~torch.isinf(tensor) & ~torch.isnan(tensor)
-                if valid_mask.any():
-                    log_data[f"{self.log_prefix}/{name}_avg"] = tensor[valid_mask].mean().item()
-
-            log_metric("raw_knowledge_perplexity", raw_perplexities)
-            log_metric("atomic_whole_perplexity", atomic_metrics["whole_perplexity"])
-            log_metric("atomic_target_perplexity", atomic_metrics["target_perplexity"])
-            log_metric("atomic_whole_log_prob", atomic_metrics["whole_log_prob"])
-            log_metric("atomic_target_log_prob", atomic_metrics["target_log_prob"])
-
-            # Log new hit rate metrics
-            log_metric("atomic_target_hit_at_5", atomic_metrics["hit_at_5"])
-            log_metric("atomic_target_hit_at_50", atomic_metrics["hit_at_50"])
-            log_metric("atomic_target_hit_at_100", atomic_metrics["hit_at_100"])
-
-            # Log deltas
-            log_metric("raw_knowledge_perplexity_delta", raw_perplexity_delta)
-            log_metric("atomic_whole_perplexity_delta", atomic_whole_perplexity_delta)
-            log_metric("atomic_target_perplexity_delta", atomic_target_perplexity_delta)
-            log_metric("atomic_whole_log_prob_delta", atomic_whole_log_prob_delta)
-            log_metric("atomic_target_log_prob_delta", atomic_target_log_prob_delta)
-
-            # Log paraphrased metrics (mean over variants)
-            if self.num_paraphrase_variants > 0:
-                log_metric("paraphrased_atomic_whole_perplexity", torch.stack([m["whole_perplexity"] for m in paraphrased_atomic_metrics_all_variants]).mean(dim=0))
-                log_metric("paraphrased_atomic_target_perplexity", torch.stack([m["target_perplexity"] for m in paraphrased_atomic_metrics_all_variants]).mean(dim=0))
-                log_metric("paraphrased_atomic_whole_log_prob", torch.stack([m["whole_log_prob"] for m in paraphrased_atomic_metrics_all_variants]).mean(dim=0))
-                log_metric("paraphrased_atomic_target_log_prob", torch.stack([m["target_log_prob"] for m in paraphrased_atomic_metrics_all_variants]).mean(dim=0))
-                
-                # Log paraphrased deltas (mean over variants)
-                log_metric("paraphrased_atomic_whole_perplexity_delta", paraphrased_deltas_all_variants['whole_perplexity_delta'].mean(dim=0))
-                log_metric("paraphrased_atomic_target_perplexity_delta", paraphrased_deltas_all_variants['target_perplexity_delta'].mean(dim=0))
-                log_metric("paraphrased_atomic_whole_log_prob_delta", paraphrased_deltas_all_variants['whole_log_prob_delta'].mean(dim=0))
-                log_metric("paraphrased_atomic_target_log_prob_delta", paraphrased_deltas_all_variants['target_log_prob_delta'].mean(dim=0))
-
-            if log_data:
-                wandb.log(log_data, step=state.global_step)
-        
-        # Store data internally
-        self.raw_knowledge_perplexity_history.append({'step': state.global_step, 'values': raw_perplexities.cpu().tolist()})
-        self.atomic_whole_perplexity_history.append({'step': state.global_step, 'values': atomic_metrics["whole_perplexity"].cpu().tolist()})
-        self.atomic_target_perplexity_history.append({'step': state.global_step, 'values': atomic_metrics["target_perplexity"].cpu().tolist()})
-        self.atomic_whole_log_prob_history.append({'step': state.global_step, 'values': atomic_metrics["whole_log_prob"].cpu().tolist()})
-        self.atomic_target_log_prob_history.append({'step': state.global_step, 'values': atomic_metrics["target_log_prob"].cpu().tolist()})
-
-        # Store new hit rate data internally
-        self.atomic_target_hit_at_5_history.append({'step': state.global_step, 'values': atomic_metrics["hit_at_5"].cpu().tolist()})
-        self.atomic_target_hit_at_50_history.append({'step': state.global_step, 'values': atomic_metrics["hit_at_50"].cpu().tolist()})
-        self.atomic_target_hit_at_100_history.append({'step': state.global_step, 'values': atomic_metrics["hit_at_100"].cpu().tolist()})
-
-        # Store delta data internally
-        self.raw_knowledge_perplexity_delta_history.append({'step': state.global_step, 'values': raw_perplexity_delta.cpu().tolist()})
-        self.atomic_whole_perplexity_delta_history.append({'step': state.global_step, 'values': atomic_whole_perplexity_delta.cpu().tolist()})
-        self.atomic_target_perplexity_delta_history.append({'step': state.global_step, 'values': atomic_target_perplexity_delta.cpu().tolist()})
-        self.atomic_whole_log_prob_delta_history.append({'step': state.global_step, 'values': atomic_whole_log_prob_delta.cpu().tolist()})
-        self.atomic_target_log_prob_delta_history.append({'step': state.global_step, 'values': atomic_target_log_prob_delta.cpu().tolist()})
-        
         model.train()
 
-    def _get_dataframe_from_history(self, history, value_col_name, paraphrase_variant_index=None):
-        if not history:
+    def _build_dataframe_from_history(self, history_data, value_col_name, paraphrase_variant_index=None):
+        """Helper to construct a DataFrame from a list of history entries."""
+        if not history_data:
             return pd.DataFrame()
         records = []
-        for entry in history:
-            step = entry['step']
-            values = entry['values']
+        for entry in history_data:
+            step, values = entry['step'], entry['values']
             for i, value in enumerate(values):
                 record = {
                     'step': step,
@@ -737,182 +687,92 @@ class KnowledgeProbeCallback(TrainerCallback):
                 records.append(record)
         return pd.DataFrame(records)
 
-    def get_raw_knowledge_perplexity_dataframe(self):
-        """Returns collected raw knowledge perplexity data as a pandas DataFrame."""
-        return self._get_dataframe_from_history(self.raw_knowledge_perplexity_history, 'perplexity')
+    # --- DataFrame Getter Methods (Public API) ---
 
-    def get_atomic_whole_perplexity_dataframe(self):
-        """Returns collected atomic whole statement perplexity data as a pandas DataFrame."""
-        return self._get_dataframe_from_history(self.atomic_whole_perplexity_history, 'perplexity')
+    def _get_metric_df(self, metric_name, is_delta=False):
+        """Generic method to build a DataFrame for a given metric."""
+        if metric_name not in self.METRICS_CONFIG: return pd.DataFrame()
+        config = self.METRICS_CONFIG[metric_name]
+        history_data = self.delta_history.get(metric_name) if is_delta else self.history.get(metric_name)
+        value_col_name = f"{config['value_col_name']}_delta" if is_delta else config['value_col_name']
+        return self._build_dataframe_from_history(history_data, value_col_name)
 
-    def get_atomic_target_perplexity_dataframe(self):
-        """Returns collected atomic target perplexity data as a pandas DataFrame."""
-        return self._get_dataframe_from_history(self.atomic_target_perplexity_history, 'perplexity')
+    def _get_paraphrased_metric_df(self, metric_name, is_delta=False):
+        """Generic method for paraphrased metrics."""
+        if metric_name not in self.METRICS_CONFIG or not self.METRICS_CONFIG[metric_name]['track_paraphrased']:
+            return pd.DataFrame()
+        config = self.METRICS_CONFIG[metric_name]
+        history_list = self.paraphrased_delta_history.get(metric_name) if is_delta else self.paraphrased_history.get(metric_name)
+        value_col_name = f"{config['value_col_name']}_delta" if is_delta else config['value_col_name']
         
-    def get_atomic_whole_log_prob_dataframe(self):
-        """Returns collected atomic whole statement log probability data as a pandas DataFrame."""
-        return self._get_dataframe_from_history(self.atomic_whole_log_prob_history, 'log_prob')
-
-    def get_atomic_target_log_prob_dataframe(self):
-        """Returns collected atomic target log probability data as a pandas DataFrame."""
-        return self._get_dataframe_from_history(self.atomic_target_log_prob_history, 'log_prob')
-
-    def get_atomic_target_hit_at_5_dataframe(self):
-        """Returns collected atomic target hit@5 data as a pandas DataFrame."""
-        return self._get_dataframe_from_history(self.atomic_target_hit_at_5_history, 'hit_at_5')
-
-    def get_atomic_target_hit_at_50_dataframe(self):
-        """Returns collected atomic target hit@50 data as a pandas DataFrame."""
-        return self._get_dataframe_from_history(self.atomic_target_hit_at_50_history, 'hit_at_50')
-
-    def get_atomic_target_hit_at_100_dataframe(self):
-        """Returns collected atomic target hit@100 data as a pandas DataFrame."""
-        return self._get_dataframe_from_history(self.atomic_target_hit_at_100_history, 'hit_at_100')
-
-    def get_raw_knowledge_perplexity_delta_dataframe(self):
-        """Returns collected raw knowledge perplexity delta data as a pandas DataFrame."""
-        return self._get_dataframe_from_history(self.raw_knowledge_perplexity_delta_history, 'perplexity_delta')
-
-    def get_atomic_whole_perplexity_delta_dataframe(self):
-        """Returns collected atomic whole statement perplexity delta data as a pandas DataFrame."""
-        return self._get_dataframe_from_history(self.atomic_whole_perplexity_delta_history, 'perplexity_delta')
-
-    def get_atomic_target_perplexity_delta_dataframe(self):
-        """Returns collected atomic target perplexity delta data as a pandas DataFrame."""
-        return self._get_dataframe_from_history(self.atomic_target_perplexity_delta_history, 'perplexity_delta')
-
-    def get_atomic_whole_log_prob_delta_dataframe(self):
-        """Returns collected atomic whole statement log probability delta data as a pandas DataFrame."""
-        return self._get_dataframe_from_history(self.atomic_whole_log_prob_delta_history, 'log_prob_delta')
-
-    def get_atomic_target_log_prob_delta_dataframe(self):
-        """Returns collected atomic target log probability delta data as a pandas DataFrame."""
-        return self._get_dataframe_from_history(self.atomic_target_log_prob_delta_history, 'log_prob_delta')
-
-    def _get_paraphrased_dataframe(self, history_list, value_col_name):
         all_variants_df = []
-        for i, history in enumerate(history_list):
-            df = self._get_dataframe_from_history(history, value_col_name, paraphrase_variant_index=i)
-            all_variants_df.append(df)
-        return pd.concat(all_variants_df, ignore_index=True)
-
-    def get_paraphrased_atomic_whole_perplexity_dataframe(self):
-        return self._get_paraphrased_dataframe(self.paraphrased_atomic_whole_perplexity_history, 'perplexity')
-
-    def get_paraphrased_atomic_target_perplexity_dataframe(self):
-        return self._get_paraphrased_dataframe(self.paraphrased_atomic_target_perplexity_history, 'perplexity')
-
-    def get_paraphrased_atomic_whole_log_prob_dataframe(self):
-        return self._get_paraphrased_dataframe(self.paraphrased_atomic_whole_log_prob_history, 'log_prob')
-
-    def get_paraphrased_atomic_target_log_prob_dataframe(self):
-        return self._get_paraphrased_dataframe(self.paraphrased_atomic_target_log_prob_history, 'log_prob')
-
-    def get_paraphrased_atomic_whole_perplexity_delta_dataframe(self):
-        return self._get_paraphrased_dataframe(self.paraphrased_atomic_whole_perplexity_delta_history, 'perplexity_delta')
-
-    def get_paraphrased_atomic_target_perplexity_delta_dataframe(self):
-        return self._get_paraphrased_dataframe(self.paraphrased_atomic_target_perplexity_delta_history, 'perplexity_delta')
-
-    def get_paraphrased_atomic_whole_log_prob_delta_dataframe(self):
-        return self._get_paraphrased_dataframe(self.paraphrased_atomic_whole_log_prob_delta_history, 'log_prob_delta')
-
-    def get_paraphrased_atomic_target_log_prob_delta_dataframe(self):
-        return self._get_paraphrased_dataframe(self.paraphrased_atomic_target_log_prob_delta_history, 'log_prob_delta')
+        if history_list:
+            for i, history_data in enumerate(history_list):
+                df = self._build_dataframe_from_history(history_data, value_col_name, paraphrase_variant_index=i)
+                all_variants_df.append(df)
+        return pd.concat(all_variants_df, ignore_index=True) if all_variants_df else pd.DataFrame()
 
     def save_results(self, output_dir: str):
         """Saves all collected raw and delta metrics to a single CSV file in the specified directory."""
         os.makedirs(output_dir, exist_ok=True)
         print(f"KnowledgeProbeCallback: Saving all probe metrics to {output_dir}")
 
-        # --- Prepare all metric dataframes with standardized column names ---
-        all_dfs = [
-            self.get_raw_knowledge_perplexity_dataframe().rename(columns={'perplexity': 'raw_knowledge_perplexity'}),
-            self.get_raw_knowledge_perplexity_delta_dataframe().rename(columns={'perplexity_delta': 'raw_knowledge_perplexity_delta'}),
-            self.get_atomic_whole_perplexity_dataframe().rename(columns={'perplexity': 'atomic_whole_perplexity'}),
-            self.get_atomic_target_perplexity_dataframe().rename(columns={'perplexity': 'atomic_target_perplexity'}),
-            self.get_atomic_whole_log_prob_dataframe().rename(columns={'log_prob': 'atomic_whole_log_prob'}),
-            self.get_atomic_target_log_prob_dataframe().rename(columns={'log_prob': 'atomic_target_log_prob'}),
-            self.get_atomic_target_hit_at_5_dataframe().rename(columns={'hit_at_5': 'atomic_target_hit_at_5'}),
-            self.get_atomic_target_hit_at_50_dataframe().rename(columns={'hit_at_50': 'atomic_target_hit_at_50'}),
-            self.get_atomic_target_hit_at_100_dataframe().rename(columns={'hit_at_100': 'atomic_target_hit_at_100'}),
-            self.get_atomic_whole_perplexity_delta_dataframe().rename(columns={'perplexity_delta': 'atomic_whole_perplexity_delta'}),
-            self.get_atomic_target_perplexity_delta_dataframe().rename(columns={'perplexity_delta': 'atomic_target_perplexity_delta'}),
-            self.get_atomic_whole_log_prob_delta_dataframe().rename(columns={'log_prob_delta': 'atomic_whole_log_prob_delta'}),
-            self.get_atomic_target_log_prob_delta_dataframe().rename(columns={'log_prob_delta': 'atomic_target_log_prob_delta'})
-        ]
+        # --- Build Non-Paraphrased DataFrames ---
+        non_paraphrased_dfs = []
+        for name, config in self.METRICS_CONFIG.items():
+            if not config['track_paraphrased']:
+                # Raw values
+                df = self._get_metric_df(name)
+                if not df.empty:
+                    non_paraphrased_dfs.append(df.rename(columns={config['value_col_name']: name}))
+                # Deltas
+                if config['track_delta']:
+                    delta_df = self._get_metric_df(name, is_delta=True)
+                    if not delta_df.empty:
+                        delta_col = f"{config['value_col_name']}_delta"
+                        non_paraphrased_dfs.append(delta_df.rename(columns={delta_col: f"{name}_delta"}))
 
-        # Add paraphrased dataframes.
-        if self.num_paraphrase_variants > 0:
-            # We can save each variant's data into separate columns, but that creates a very wide CSV.
-            # A better approach for analysis is a long-format dataframe, which the get_paraphrased... methods now produce.
-            # We will merge these long-format dataframes.
+        # Merge all non-paraphrased DataFrames
+        merged_df = None
+        if non_paraphrased_dfs:
+            merged_df = non_paraphrased_dfs[0]
+            for df_to_merge in non_paraphrased_dfs[1:]:
+                cols_to_drop = ['section'] if 'section' in df_to_merge.columns else []
+                merged_df = pd.merge(merged_df, df_to_merge.drop(columns=cols_to_drop, errors='ignore'), on=['step', 'probe_index'], how='outer')
 
-            paraphrased_dfs = [
-                self.get_paraphrased_atomic_whole_perplexity_dataframe().rename(columns={'perplexity': 'paraphrased_atomic_whole_perplexity'}),
-                self.get_paraphrased_atomic_target_perplexity_dataframe().rename(columns={'perplexity': 'paraphrased_atomic_target_perplexity'}),
-                self.get_paraphrased_atomic_whole_log_prob_dataframe().rename(columns={'log_prob': 'paraphrased_atomic_whole_log_prob'}),
-                self.get_paraphrased_atomic_target_log_prob_dataframe().rename(columns={'log_prob': 'paraphrased_atomic_target_log_prob'}),
-                self.get_paraphrased_atomic_whole_perplexity_delta_dataframe().rename(columns={'perplexity_delta': 'paraphrased_atomic_whole_perplexity_delta'}),
-                self.get_paraphrased_atomic_target_perplexity_delta_dataframe().rename(columns={'perplexity_delta': 'paraphrased_atomic_target_perplexity_delta'}),
-                self.get_paraphrased_atomic_whole_log_prob_delta_dataframe().rename(columns={'log_prob_delta': 'paraphrased_atomic_whole_log_prob_delta'}),
-                self.get_paraphrased_atomic_target_log_prob_delta_dataframe().rename(columns={'log_prob_delta': 'paraphrased_atomic_target_log_prob_delta'}),
-            ]
-            
-            # Merge all paraphrased dataframes together
+        # --- Build and Merge Paraphrased DataFrame ---
+        paraphrased_dfs = []
+        paraphrased_metric_names = [name for name, cfg in self.METRICS_CONFIG.items() if cfg['track_paraphrased']]
+        for name in paraphrased_metric_names:
+            config = self.METRICS_CONFIG[name]
+            # Raw values
+            df = self._get_paraphrased_metric_df(name)
+            if not df.empty:
+                paraphrased_dfs.append(df.rename(columns={config['value_col_name']: name}))
+            # Deltas
+            if config['track_delta']:
+                delta_df = self._get_paraphrased_metric_df(name, is_delta=True)
+                if not delta_df.empty:
+                    delta_col = f"{config['value_col_name']}_delta"
+                    paraphrased_dfs.append(delta_df.rename(columns={delta_col: f"{name}_delta"}))
+
+        if paraphrased_dfs:
             merged_paraphrased_df = paraphrased_dfs[0]
             for df_to_merge in paraphrased_dfs[1:]:
                 cols_to_drop = ['section'] if 'section' in df_to_merge.columns else []
-                merged_paraphrased_df = pd.merge(
-                    merged_paraphrased_df,
-                    df_to_merge.drop(columns=cols_to_drop),
-                    on=['step', 'probe_index', 'paraphrase_variant'],
-                    how='outer'
-                )
-            all_dfs.append(merged_paraphrased_df)
+                merged_paraphrased_df = pd.merge(merged_paraphrased_df, df_to_merge.drop(columns=cols_to_drop, errors='ignore'), on=['step', 'probe_index', 'paraphrase_variant'], how='outer')
+            
+            # --- Combine with main DataFrame ---
+            if merged_df is not None:
+                merged_df = pd.merge(merged_df, merged_paraphrased_df, on=['step', 'probe_index'], how='outer')
+            else:
+                merged_df = merged_paraphrased_df
 
-        # Filter out any empty dataframes that might result from no training steps
-        all_dfs = [df for df in all_dfs if not df.empty]
-        
-        if not all_dfs:
+        # --- Save the final consolidated dataframe ---
+        if merged_df is None or merged_df.empty:
             print(" > No metrics to save.")
             return
 
-        # --- Merge all dataframes into one ---
-        # Start with the first dataframe in the list
-        merged_df = all_dfs[0]
-        
-        # Check that all dataframes with paraphrase_variant column have the same variants
-        dfs_with_paraphrase = [df for df in all_dfs if 'paraphrase_variant' in df.columns]
-        if len(dfs_with_paraphrase) > 1:
-            reference_variants = set(dfs_with_paraphrase[0]['paraphrase_variant'].unique())
-            for i, df in enumerate(dfs_with_paraphrase[1:], 1):
-                current_variants = set(df['paraphrase_variant'].unique())
-                assert reference_variants == current_variants, f"Paraphrase variants mismatch between dataframes: {reference_variants} vs {current_variants} in dataframe {i}"
-        
-        # Iteratively merge the rest using an outer join to keep all data
-        for df_to_merge in all_dfs[1:]:
-            # Identify common columns to merge on
-            merge_on = ['step', 'probe_index']
-            if 'paraphrase_variant' in merged_df.columns and 'paraphrase_variant' in df_to_merge.columns:
-                merge_on.append('paraphrase_variant')
-
-            # 'section' is duplicated across dataframes, so we drop it from the right
-            # side of the merge to avoid pandas creating suffixed columns (e.g., 'section_y').
-            cols_to_drop = ['section'] if 'section' in df_to_merge.columns else []
-            
-            # If one df has paraphrase_variant and the other doesn't, this merge will be tricky.
-            # The logic here assumes we are merging the original probes DF with the paraphrased DF.
-            # An outer merge should work, creating NaNs where appropriate.
-            
-            merged_df = pd.merge(
-                merged_df, 
-                df_to_merge.drop(columns=cols_to_drop, errors='ignore'), 
-                on=merge_on,
-                how='outer'
-            )
-
-        # Save the final consolidated dataframe
         output_path = os.path.join(output_dir, 'knowledge_probe_metrics.csv')
         merged_df.to_csv(output_path, index=False)
         print(f" > Saved consolidated metrics to 'knowledge_probe_metrics.csv' with {len(merged_df)} rows.")
