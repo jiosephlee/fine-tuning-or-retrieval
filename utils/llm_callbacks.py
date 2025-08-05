@@ -545,6 +545,17 @@ class CorpusPerplexityCallback(TrainerCallback):
         Returns the collected corpus perplexity data as a pandas DataFrame.
         """
         return pd.DataFrame(self.history)
+    
+    def save_results(self, output_dir: str):
+        """Saves the collected corpus perplexity data to a CSV file."""
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{self.log_prefix}_metrics.csv")
+        df = self.get_results_as_dataframe()
+        if not df.empty:
+            df.to_csv(output_path, index=False)
+            print(f" > Saved corpus perplexity metrics to '{output_path}' with {len(df)} rows.")
+        else:
+            print(" > No corpus perplexity metrics to save.")
 
 
 class TrainingLossPerplexityCallback(TrainerCallback):
@@ -572,3 +583,14 @@ class TrainingLossPerplexityCallback(TrainerCallback):
         Returns the collected training loss perplexity data as a pandas DataFrame.
         """
         return pd.DataFrame(self.history)
+
+    def save_results(self, output_dir: str):
+        """Saves the collected training loss perplexity data to a CSV file."""
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, "training_loss_perplexity_metrics.csv")
+        df = self.get_results_as_dataframe()
+        if not df.empty:
+            df.to_csv(output_path, index=False)
+            print(f" > Saved training loss perplexity metrics to '{output_path}' with {len(df)} rows.")
+        else:
+            print(" > No training loss perplexity metrics to save.")
