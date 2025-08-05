@@ -189,59 +189,70 @@ class BaseKnowledgeProbeCallback(TrainerCallback):
         return pd.concat(all_variants_df, ignore_index=True) if all_variants_df else pd.DataFrame()
 
     def save_results(self, output_dir: str):
-        """Saves all collected raw and delta metrics to a single CSV file."""
+        """Saves all collected raw and delta metrics to a single CSV file in wide format."""
         os.makedirs(output_dir, exist_ok=True)
         print(f"{self.__class__.__name__}: Saving probe metrics to {output_dir}")
 
-        all_dfs = []
-        # Convert internal history to dataframes and save it locally.
+        # 1. Get all base metrics (original probes) and merge them
+        base_dfs = []
         for name, config in self.METRICS_CONFIG.items():
-            if not config.get('track_paraphrased'):
-                df = self._get_metric_df(name)
-                if not df.empty:
-                    all_dfs.append(df.rename(columns={config['value_col_name']: name}))
-                if config.get('track_delta'):
-                    delta_df = self._get_metric_df(name, is_delta=True)
-                    if not delta_df.empty:
-                        all_dfs.append(delta_df.rename(columns={f"{config['value_col_name']}_delta": f"{name}_delta"}))
-
-        merged_df = None
-        if all_dfs:
-            merged_df = all_dfs[0]
-            for df_to_merge in all_dfs[1:]:
-                merged_df = pd.merge(merged_df, df_to_merge, on=['step', 'probe_index', 'section'], how='outer')
-
-        # Convert internal paraphrased history to dataframes and save it locally.
-        paraphrased_dfs = []
-        paraphrased_names = [name for name, cfg in self.METRICS_CONFIG.items() if cfg.get('track_paraphrased')]
-        for name in paraphrased_names:
-            config = self.METRICS_CONFIG[name]
-            df = self._get_paraphrased_metric_df(name)
+            value_col = config['value_col_name']
+            df = self._get_metric_df(name)
             if not df.empty:
-                paraphrased_dfs.append(df.rename(columns={config['value_col_name']: name}))
-            if config.get('track_delta'):
-                delta_df = self._get_paraphrased_metric_df(name, is_delta=True)
-                if not delta_df.empty:
-                    paraphrased_dfs.append(delta_df.rename(columns={f"{config['value_col_name']}_delta": f"{name}_delta"}))
-        
-        # Merge all dataframes into a single dataframe.
-        if paraphrased_dfs:
-            merged_paraphrased_df = paraphrased_dfs[0]
-            for df_to_merge in paraphrased_dfs[1:]:
-                merged_paraphrased_df = pd.merge(merged_paraphrased_df, df_to_merge, on=['step', 'probe_index', 'section', 'paraphrase_variant'], how='outer')
+                base_dfs.append(df.rename(columns={value_col: name}))
             
-            if merged_df is not None:
-                merged_df = pd.merge(merged_df, merged_paraphrased_df, on=['step', 'probe_index', 'section'], how='outer')
-            else:
-                merged_df = merged_paraphrased_df
+            if config.get('track_delta'):
+                delta_df = self._get_metric_df(name, is_delta=True)
+                if not delta_df.empty:
+                    base_dfs.append(delta_df.rename(columns={f"{value_col}_delta": f"{name}_delta"}))
         
-        if merged_df is None or merged_df.empty:
+        if not base_dfs:
+            print(" > No base metrics to save.")
+            return
+
+        final_df = base_dfs[0]
+        for df_to_merge in base_dfs[1:]:
+            final_df = pd.merge(final_df, df_to_merge, on=['step', 'probe_index', 'section'], how='outer')
+
+        # 2. Get metrics for each paraphrase variant and merge into the final dataframe
+        paraphrase_names = [name for name, cfg in self.METRICS_CONFIG.items() if cfg.get('track_paraphrased')]
+        
+        for i in range(self.num_paraphrase_variants):
+            variant_dfs = []
+            for name in paraphrase_names:
+                config = self.METRICS_CONFIG[name]
+                value_col = config['value_col_name']
+                
+                # Get variant's value
+                history_list = self.paraphrased_history.get(name, [])
+                if i < len(history_list) and history_list[i]:
+                    df = self._build_df_from_history(history_list[i], value_col_name=value_col)
+                    if not df.empty:
+                        variant_dfs.append(df.rename(columns={value_col: f"{name}_paraphrase_{i}"}))
+
+                # Get variant's delta
+                if config.get('track_delta'):
+                    delta_history_list = self.paraphrased_delta_history.get(name, [])
+                    if i < len(delta_history_list) and delta_history_list[i]:
+                        delta_df = self._build_df_from_history(delta_history_list[i], value_col_name=f"{value_col}_delta")
+                        if not delta_df.empty:
+                            variant_dfs.append(delta_df.rename(columns={f"{value_col}_delta": f"{name}_delta_paraphrase_{i}"}))
+
+            if variant_dfs:
+                merged_variant_df = variant_dfs[0]
+                for df_to_merge in variant_dfs[1:]:
+                    merged_variant_df = pd.merge(merged_variant_df, df_to_merge, on=['step', 'probe_index', 'section'], how='outer')
+                
+                # Merge into the main dataframe
+                final_df = pd.merge(final_df, merged_variant_df, on=['step', 'probe_index', 'section'], how='left')
+        
+        if final_df.empty:
             print(" > No metrics to save.")
             return
 
         output_path = os.path.join(output_dir, f'{self.log_prefix}_metrics.csv')
-        merged_df.to_csv(output_path, index=False)
-        print(f" > Saved consolidated metrics to '{output_path}' with {len(merged_df)} rows.")
+        final_df.to_csv(output_path, index=False)
+        print(f" > Saved consolidated metrics to '{output_path}' with {len(final_df)} rows.")
 
 
 class RawKnowledgeProbeCallback(BaseKnowledgeProbeCallback):
