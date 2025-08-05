@@ -61,13 +61,15 @@ training_config = llm_configs.TrainingConfig(
     learning_rate=args.learning_rate,
     logging_steps=1,
     gradient_checkpointing=False,
-    per_device_train_batch_size=3,
+    per_device_train_batch_size=2,
     context_length = 2048 * 3/2,
-    gradient_accumulation_steps=2,
+    gradient_accumulation_steps=4,
     warmup_ratio = 0.1, 
     sequential_sampling = False,
     reverse_ffd_packing= False,
     remove_unused_columns=False,
+    packing = False,
+    padding_free = False
 )
 
 raw_knowledge_probe_callback = llm_callbacks.RawKnowledgeProbeCallback(
