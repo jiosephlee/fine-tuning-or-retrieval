@@ -72,7 +72,7 @@ training_config = llm_configs.TrainingConfig(
 # Replace PerplexityEvaluationCallback and TargetedPerplexityCallback with this:
 knowledge_probe_callback = llm_training.KnowledgeProbeCallback(
     tokenizer,
-    '../../data/arxiv/DPO_knowledge_probes_v1.csv',
+    '../../data/arxiv/DPO_knowledge_probes_v2.csv',
     training_config.context_length,
     batch_size=8,
 )

@@ -118,7 +118,7 @@ def replicate_callback_error(csv_path):
 
 def main():
     """Main function to run the diagnosis."""
-    csv_path = '../../data/arxiv/DPO_knowledge_probes_v1.csv'
+    csv_path = '../../data/arxiv/DPO_knowledge_probes_v2.csv'
     
     print("🔍 DIAGNOSING PARAPHRASE DATA ERROR")
     print("=" * 60)

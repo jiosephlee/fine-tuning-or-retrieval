@@ -332,6 +332,7 @@ class KnowledgeProbeCallback(TrainerCallback):
     3. It also tracks the DELTA of each metric relative to its value before training (at step 0).
     """
     def __init__(self, tokenizer: AutoTokenizer, probe_dataset_path: str, max_length: int, batch_size: int = 8, log_prefix="probe_eval"):
+        print("Initializing KnowledegProbeCallback...")
         self.tokenizer = tokenizer
         self.log_prefix = log_prefix
         self.max_length = max_length
@@ -382,6 +383,7 @@ class KnowledgeProbeCallback(TrainerCallback):
             self.atomic_targets = df["atomic_target_span"].tolist()
             if "paraphrased_atomic_knowledge_probes" in df.columns:
                 paraphrased_probes_raw = df["paraphrased_atomic_knowledge_probes"].tolist()
+                print(paraphrased_probes_raw)
                 # Safely evaluate the string representation of lists
                 self.paraphrased_atomic_probes = [ast.literal_eval(s) for s in paraphrased_probes_raw]
                 # Check for data integrity before transposing.
@@ -390,7 +392,9 @@ class KnowledgeProbeCallback(TrainerCallback):
                     assert all(len(p) == first_len for p in self.paraphrased_atomic_probes), \
                         "All probes must have the same number of paraphrased variants."
                 # Transpose to get lists of probes per variant
+                print("Atomic Probes: " + self.paraphrased_atomic_probes)
                 self.paraphrased_atomic_probes_by_variant = list(zip(*self.paraphrased_atomic_probes))
+                print(self.paraphrased_atomic_probes_by_variant)
                 self.num_paraphrase_variants = len(self.paraphrased_atomic_probes_by_variant)
                 assert(self.num_paraphrase_variants == 10)
                 # Check that there are 10 every row
