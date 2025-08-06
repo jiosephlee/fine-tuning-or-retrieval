@@ -79,6 +79,14 @@ raw_knowledge_probe_callback = llm_callbacks.RawKnowledgeProbeCallback(
     logger=log
 )
 
+simple_atomic_knowledge_probe_callback = llm_callbacks.SimpleAtomicKnowledgeProbeCallback(
+    tokenizer,
+    '../../data/arxiv/DPO_knowledge_probes_v3.csv',
+    training_config.context_length,
+    batch_size=8,
+    logger=log
+)
+
 corpus_callback = llm_callbacks.CorpusPerplexityCallback(
     text_content=arxiv_paper,
     tokenizer=tokenizer,
@@ -90,7 +98,7 @@ corpus_callback = llm_callbacks.CorpusPerplexityCallback(
 training_loss_callback = llm_callbacks.TrainingLossPerplexityCallback()
 
 # --- Fine-Tune ---
-callbacks_to_use = [raw_knowledge_probe_callback, corpus_callback, training_loss_callback]
+callbacks_to_use = [raw_knowledge_probe_callback, simple_atomic_knowledge_probe_callback, corpus_callback, training_loss_callback]
 if "SingleArxivPaper" in args.experiment_name:
     log.info("\n--- Fine-Tuning on Custom Text ---")
     if args.chunk_by_section:
@@ -124,6 +132,7 @@ output_dir = os.path.join("../../results/FT/", args.experiment_name)
 os.makedirs(output_dir, exist_ok=True)
 
 raw_knowledge_probe_callback.save_results(output_dir=output_dir)
+simple_atomic_knowledge_probe_callback.save_results(output_dir=output_dir)
 corpus_callback.save_results(output_dir=output_dir)
 training_loss_callback.save_results(output_dir=output_dir)
 
