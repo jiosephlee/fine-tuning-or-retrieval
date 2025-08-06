@@ -1,1 +1,1 @@
-nohup python finetuning_knowledge_v5.py --experiment_name SingleArxivPaper_1B_Test_Run --num_train_epochs 100 --learning_rate 2e-5 > output.log 2>&1
+nohup python finetuning_knowledge_v5.py --experiment_name SingleArxivPaper_1B_Test_Run_500_Epochs --num_train_epochs 500 --learning_rate 2e-5 > output.log 2>&1 &

@@ -12,13 +12,12 @@ import utils.llm_plotting as llm_plotting
 # --- Parser ---
 parser = argparse.ArgumentParser()
 parser.add_argument("--experiment_name", type=str, default="SingleArxivPaper_1B")
-parser.add_argument("--model_id", type=str, default="allenai/OLMo-2-0425-1B")
+parser.add_argument("--model_id", type=str, default="allenai/OLMo-2-0425-1B") # allenai/OLMo-2-1124-7B
 parser.add_argument("--num_train_epochs", type=int, default=1)
 parser.add_argument("--full_finetuning", default=False, action="store_true")
 parser.add_argument("--learning_rate", type=float, default=1e-5)
 parser.add_argument("--chunk_by_section", default=True, type=bool, help="Use section-based chunking instead of token-based chunking")
 args = parser.parse_args()
-
 
 # --- Basic Configuration ---
 logging.basicConfig(
