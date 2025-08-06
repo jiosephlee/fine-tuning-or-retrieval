@@ -2,6 +2,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
+import numpy as np
 
 def generate_plots_from_files(output_dir: str, logger=None):
     """
@@ -16,6 +17,7 @@ def generate_plots_from_files(output_dir: str, logger=None):
     # --- Data Loading ---
     log_info("Loading dataframes for plotting...")
     knowledge_probe_path = os.path.join(output_dir, "raw_knowledge_probe_metrics.csv")
+    atomic_probe_path = os.path.join(output_dir, "simple_atomic_knowledge_probe_metrics.csv")
     corpus_ppl_path = os.path.join(output_dir, "corpus_perplexity_metrics.csv")
     training_loss_path = os.path.join(output_dir, "training_loss_perplexity_metrics.csv")
 
@@ -24,6 +26,7 @@ def generate_plots_from_files(output_dir: str, logger=None):
         return
 
     metrics_df = pd.read_csv(knowledge_probe_path)
+    atomic_metrics_df = pd.read_csv(atomic_probe_path) if os.path.exists(atomic_probe_path) else pd.DataFrame()
     corpus_results_df = pd.read_csv(corpus_ppl_path) if os.path.exists(corpus_ppl_path) else pd.DataFrame()
     training_loss_results_df = pd.read_csv(training_loss_path) if os.path.exists(training_loss_path) else pd.DataFrame()
 
@@ -165,6 +168,43 @@ def generate_plots_from_files(output_dir: str, logger=None):
     plt.savefig(os.path.join(output_dir, "plot1_combined_avg_ppl_deltas.png"))
     plt.close()
 
+    # --- PLOT 1b: Combined Perplexities ---
+    log_info("Generating Plot 1b: Combined Perplexities...")
+    plt.figure(figsize=(14, 8))
+
+    if 'raw_knowledge_perplexity' in metrics_df.columns:
+        avg_raw_ppl = metrics_df.groupby('step')['raw_knowledge_perplexity'].mean()
+        sns.lineplot(x=avg_raw_ppl.index, y=avg_raw_ppl.values, label='Knowledge Probes (Raw PPL)')
+
+    if paraphrase_ppl_cols:
+        if 'paraphrase_ppl_mean' not in metrics_df.columns:
+            metrics_df['paraphrase_ppl_mean'] = metrics_df[paraphrase_ppl_cols].mean(axis=1)
+        if 'paraphrase_ppl_std' not in metrics_df.columns:
+            metrics_df['paraphrase_ppl_std'] = metrics_df[paraphrase_ppl_cols].std(axis=1)
+        
+        paraphrase_stats = metrics_df.groupby('step').agg(
+            mean=('paraphrase_ppl_mean', 'mean'),
+            std=('paraphrase_ppl_std', 'mean') # Approx std of means
+        )
+        sns.lineplot(data=paraphrase_stats, x='step', y='mean', label='Paraphrased Probes (Mean)')
+        plt.fill_between(paraphrase_stats.index, 
+                         paraphrase_stats['mean'] - paraphrase_stats['std'], 
+                         paraphrase_stats['mean'] + paraphrase_stats['std'], 
+                         alpha=0.2, label='Paraphrased Probes (Std. Dev.)')
+
+    if not corpus_results_df.empty and 'corpus_perplexity' in corpus_results_df.columns:
+        sns.lineplot(data=corpus_results_df, x='step', y='corpus_perplexity', label='Sliding Window (Full Paper)')
+    if not training_loss_results_df.empty and 'chunked_perplexity' in training_loss_results_df.columns:
+        sns.lineplot(data=training_loss_results_df, x='step', y='chunked_perplexity', label='Training Loss (Chunked)')
+
+    plt.title('Plot 1b: Combined Average Perplexities During Fine-Tuning')
+    plt.xlabel('Training Step')
+    plt.ylabel('Perplexity')
+    plt.grid(True, which="both", ls="--")
+    plt.legend()
+    plt.savefig(os.path.join(output_dir, "plot1b_combined_avg_ppl.png"))
+    plt.close()
+
     # --- PLOT 2: Raw vs. Paraphrased Perplexities ---
     log_info("Generating Plot 2: Raw vs. Paraphrased Perplexities...")
     plt.figure(figsize=(14, 8))
@@ -219,3 +259,111 @@ def generate_plots_from_files(output_dir: str, logger=None):
     plt.legend(title='Section / Type')
     plt.savefig(os.path.join(output_dir, "plot3_ppl_delta_by_section.png"))
     plt.close()
+
+    # --- PLOT 3b: Perplexity by Section (Raw vs. Paraphrased Avg) ---
+    log_info("Generating Plot 3b: Perplexity by Section...")
+    plt.figure(figsize=(12, 7))
+
+    plot_data_3b = []
+
+    # Prepare raw data
+    if 'raw_knowledge_perplexity' in metrics_df.columns:
+        raw_df_3b = metrics_df.groupby(['step', 'section'])['raw_knowledge_perplexity'].mean().reset_index()
+        raw_df_3b.rename(columns={'raw_knowledge_perplexity': 'perplexity'}, inplace=True)
+        raw_df_3b['type'] = 'Raw'
+        plot_data_3b.append(raw_df_3b)
+
+    # Prepare paraphrased data
+    if paraphrase_ppl_cols:
+        if 'paraphrase_ppl_mean' not in metrics_df.columns:
+            metrics_df['paraphrase_ppl_mean'] = metrics_df[paraphrase_ppl_cols].mean(axis=1)
+        paraphrased_df_3b = metrics_df.groupby(['step', 'section'])['paraphrase_ppl_mean'].mean().reset_index()
+        paraphrased_df_3b.rename(columns={'paraphrase_ppl_mean': 'perplexity'}, inplace=True)
+        paraphrased_df_3b['type'] = 'Paraphrased (Avg)'
+        plot_data_3b.append(paraphrased_df_3b)
+    
+    if plot_data_3b:
+        combined_df_3b = pd.concat(plot_data_3b, ignore_index=True)
+        sns.lineplot(data=combined_df_3b, x='step', y='perplexity', hue='section', style='type',
+                     palette=section_colors, hue_order=all_sections)
+
+    plt.title('Plot 3b: Raw vs. Avg. Paraphrased Perplexity by Section')
+    plt.xlabel('Training Step')
+    plt.ylabel('Perplexity')
+    plt.grid(True)
+    plt.legend(title='Section / Type')
+    plt.savefig(os.path.join(output_dir, "plot3b_ppl_by_section.png"))
+    plt.close()
+
+    # --- PLOT 4: Raw vs. Atomic Knowledge Perplexity by Section ---
+    log_info("Generating Plot 4: Raw vs. Atomic Knowledge Perplexity by Section...")
+    plt.figure(figsize=(12, 7))
+
+    plot_data_4 = []
+
+    if 'raw_knowledge_perplexity' in metrics_df.columns:
+        raw_df_4 = metrics_df.groupby(['step', 'section'])['raw_knowledge_perplexity'].mean().reset_index()
+        raw_df_4.rename(columns={'raw_knowledge_perplexity': 'perplexity'}, inplace=True)
+        raw_df_4['type'] = 'Raw'
+        plot_data_4.append(raw_df_4)
+        
+    if not atomic_metrics_df.empty and 'atomic_knowledge_statement_perplexity' in atomic_metrics_df.columns:
+        atomic_df_4 = atomic_metrics_df.groupby(['step', 'section'])['atomic_knowledge_statement_perplexity'].mean().reset_index()
+        atomic_df_4.rename(columns={'atomic_knowledge_statement_perplexity': 'perplexity'}, inplace=True)
+        atomic_df_4['type'] = 'Atomic'
+        plot_data_4.append(atomic_df_4)
+
+    if plot_data_4:
+        combined_df_4 = pd.concat(plot_data_4, ignore_index=True)
+        sns.lineplot(data=combined_df_4, x='step', y='perplexity', hue='section', style='type',
+                     palette=section_colors, hue_order=all_sections, style_order=['Raw', 'Atomic'], dashes={'Raw': '', 'Atomic': (4, 4)})
+
+    plt.title('Plot 4: Raw vs. Atomic Knowledge Perplexity by Section')
+    plt.xlabel('Training Step')
+    plt.ylabel('Perplexity')
+    plt.grid(True)
+    plt.legend(title='Section / Type')
+    plt.savefig(os.path.join(output_dir, "plot4_raw_vs_atomic_by_section.png"))
+    plt.close()
+
+    # --- PLOT 4b: Disaggregated Raw vs. Atomic Perplexity (10 Random Probes) ---
+    log_info("Generating Plot 4b: Disaggregated Raw vs. Atomic Perplexity (10 Random Probes)...")
+    
+    # Ensure there's data to plot
+    if not metrics_df.empty and not atomic_metrics_df.empty:
+        # Get common probe indices
+        common_probe_indices = sorted(list(set(metrics_df['probe_index'].unique()) & set(atomic_metrics_df['probe_index'].unique())))
+        
+        if common_probe_indices:
+            # Select 10 random probes
+            num_probes_to_plot = min(10, len(common_probe_indices))
+            random_probes = np.random.choice(common_probe_indices, num_probes_to_plot, replace=False)
+            
+            # Filter data for these probes
+            raw_sample_df = metrics_df[metrics_df['probe_index'].isin(random_probes)][['step', 'probe_index', 'raw_knowledge_perplexity']]
+            raw_sample_df.rename(columns={'raw_knowledge_perplexity': 'perplexity'}, inplace=True)
+            raw_sample_df['type'] = 'Raw'
+            
+            atomic_sample_df = atomic_metrics_df[atomic_metrics_df['probe_index'].isin(random_probes)][['step', 'probe_index', 'atomic_knowledge_statement_perplexity']]
+            atomic_sample_df.rename(columns={'atomic_knowledge_statement_perplexity': 'perplexity'}, inplace=True)
+            atomic_sample_df['type'] = 'Atomic'
+            
+            plot_data_4b = pd.concat([raw_sample_df, atomic_sample_df], ignore_index=True)
+            
+            if not plot_data_4b.empty:
+                plt.figure(figsize=(15, 10))
+                g = sns.FacetGrid(plot_data_4b, col="probe_index", col_wrap=5, hue="type", sharey=False)
+                g.map(sns.lineplot, "step", "perplexity")
+                g.add_legend()
+                g.fig.suptitle('Plot 4b: Perplexity for 10 Random Probes (Raw vs. Atomic)', y=1.03)
+                g.set_axis_labels("Training Step", "Perplexity")
+                g.set_titles("Probe {col_name}")
+                plt.savefig(os.path.join(output_dir, "plot4b_disaggregated_comparison.png"))
+                plt.close()
+            else:
+                log_info("Could not generate Plot 4b: No overlapping probe data to plot.")
+        else:
+            log_info("Could not generate Plot 4b: No common probe indices between raw and atomic metrics.")
+    else:
+        log_info("Could not generate Plot 4b: Missing raw or atomic metrics data.")
+

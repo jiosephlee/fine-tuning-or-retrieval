@@ -605,3 +605,63 @@ class TrainingLossPerplexityCallback(TrainerCallback):
             print(f" > Saved training loss perplexity metrics to '{output_path}' with {len(df)} rows.")
         else:
             print(" > No training loss perplexity metrics to save.")
+
+
+class SimpleAtomicKnowledgeProbeCallback(BaseKnowledgeProbeCallback):
+    """Callback to evaluate model performance on simple atomic knowledge statements."""
+    def __init__(self, tokenizer: AutoTokenizer, probe_dataset_path: str, max_length: int, batch_size: int = 8, log_prefix="simple_atomic_knowledge_probe", logger=None):
+        super().__init__(tokenizer, probe_dataset_path, max_length, batch_size, log_prefix, logger)
+        
+        if "atomic_knowledge_statement" not in self._df.columns:
+            raise ValueError("Column 'atomic_knowledge_statement' not found in the probe dataset.")
+        
+        self.statements = self._df["atomic_knowledge_statement"].tolist()
+        
+        self.PROBE_CONFIG = {
+            'atomic_knowledge_statement': {
+                'track_paraphrased': False,
+                'metrics': {
+                    'perplexity': {'track_delta': True},
+                    'log_prob': {'track_delta': True}
+                }
+            }
+        }
+        self._initialize_metrics_config()
+
+    def on_train_begin(self, args, state, control, model, **kwargs):
+        print(f"{self.__class__.__name__}: Calculating initial metrics...")
+        model.eval()
+        device = model.device
+        
+        initial_metrics = self._evaluate_whole_sentences(model, self.statements, device)
+        self.initial_metrics['atomic_knowledge_statement_perplexity'] = initial_metrics['perplexity']
+        self.initial_metrics['atomic_knowledge_statement_log_prob'] = initial_metrics['log_prob']
+
+        model.train()
+        print(f"{self.__class__.__name__}: Initial metrics calculated.")
+
+    def on_step_end(self, args, state, control, model, **kwargs):
+        if not self.initial_metrics:
+            raise ValueError("Initial metrics not found. Please call on_train_begin first.")
+        
+        model.eval()
+        device = model.device
+        step = state.global_step
+        log_data = {}
+        
+        current_metrics = self._evaluate_whole_sentences(model, self.statements, model.device)
+        for name, values in current_metrics.items():
+            metric_name = f"atomic_knowledge_statement_{name}"
+            if metric_name in self.history:
+                self.history[metric_name].append({'step': step, 'values': values.cpu().tolist()})
+                self._log_metric_wandb(log_data, metric_name, values)
+            
+            if metric_name in self.delta_history:
+                delta = values - self.initial_metrics[metric_name]
+                self.delta_history[metric_name].append({'step': step, 'values': delta.cpu().tolist()})
+                self._log_metric_wandb(log_data, f"{metric_name}_delta", delta)
+
+        if state.is_world_process_zero and log_data:
+            wandb.log(log_data, step=step)
+        
+        model.train()

@@ -14,7 +14,7 @@
 echo "➤ START"
 source /cbica/software/external/python/anaconda/3/etc/profile.d/conda.sh
 echo "➤ ACTIVATING CONDA"
-conda activate finetune_env
+conda activate trl
 echo "➤ SET UP CUDA"
 module unload cuda
 module load cuda/12.4
