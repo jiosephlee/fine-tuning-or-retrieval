@@ -22,5 +22,5 @@ module load cuda/12.4
 experiment_name="SingleArxivPaper_1B_Test_Run"
 
 echo "➤ RUN SCRIPT"
-python finetuning_knowledge_v5.py --experiment_name "$experiment_name" --num_train_epochs 100 --learning_rate 2e-5 
+python finetuning_knowledge_v5.py --experiment_name "$experiment_name" --num_train_epochs 100 --learning_rate 2e-5 --full_finetuning
 echo "➤ DONE"
