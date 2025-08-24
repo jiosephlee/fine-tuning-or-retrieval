@@ -238,7 +238,7 @@ def fine_tune_on_text(
     return trainer
 
 def fine_tune_on_texts(
-    model, tokenizer, log, texts: List[str], train_cfg: TrainingConfig, *, train=True, tag: str = "finetuning on texts...", callbacks: Optional[List[TrainerCallback]] = None
+    model, tokenizer, log, texts: List[str], train_cfg: TrainingConfig, *, train=True, tag: str = "finetuning on texts...", callbacks: Optional[List[TrainerCallback]] = None, chunk_by_section: bool = False
 ):
     """
     Fine-tunes a model on a given list of texts by chunking them and training on all chunks together.
@@ -250,6 +250,7 @@ def fine_tune_on_texts(
         train_cfg: Training configuration.
         tag: Tag for logging.
         callbacks: Optional list of TrainerCallbacks to add to the trainer.
+        chunk_by_section: If True, use section-based chunking instead of token-based chunking.
     """
     log.info(f"Starting SFT for '{tag}' on {len(texts)} documents...")
 
@@ -258,17 +259,27 @@ def fine_tune_on_texts(
         texts[i] = texts[i] + tokenizer.eos_token 
     
     # Chunk the texts into smaller pieces based on context length
-    all_text_chunks, total_tokens = chunk_texts(texts, tokenizer, train_cfg.context_length)
+    if chunk_by_section:
+        log.info(f"[{tag}] Using section-based chunking...")
+        all_text_chunks = []
+        total_tokens = 0
+        for text in texts:
+            chunks, num_tokens = chunk_text_by_sections(text, tokenizer, train_cfg.context_length)
+            all_text_chunks.extend(chunks)
+            total_tokens += num_tokens
+        log.info(f"[{tag}] Section-based chunking: Total tokens: {total_tokens}, Context: {train_cfg.context_length} -> {len(all_text_chunks)} total chunks")
+    else:
+        log.info(f"[{tag}] Using token-based chunking...")
+        all_text_chunks, total_tokens = chunk_texts(texts, tokenizer, train_cfg.context_length)
+        log.info(f"[{tag}] Token-based chunking: Total tokens: {total_tokens}, Context: {train_cfg.context_length} -> {len(all_text_chunks)} total chunks")
 
-    log.info(f"[{tag}] Total tokens: {total_tokens}, Context: {train_cfg.context_length} -> {len(all_text_chunks)} total chunks")
-    
     # Create dataset with all chunked texts
     dataset = Dataset.from_dict({"text": all_text_chunks})
     
     assert(train_cfg.gradient_accumulation_steps * train_cfg.per_device_train_batch_size >= len(all_text_chunks))
     log.info(f"[{tag}] Gradient_accumulation_steps ({train_cfg.gradient_accumulation_steps}) | {len(all_text_chunks)} chunks")
 
-    training_args = train_cfg.to_sft_training_args() # Packing is False to avoid document re-ordering and padding free is false to avoid OOM issues
+    training_args = train_cfg.to_sft_training_args() # Packing is False to avoid document re-ordering and padding free is false to avoid any unexpected bugs
 
     trainer = CustomSFTTrainer(
         model=model,

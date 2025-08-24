@@ -31,15 +31,6 @@ log = logging.getLogger(__name__)
 
 os.environ["WANDB_PROJECT"]="fine_tuning_study"
 
-# --- Load the paper ---
-if "SingleArxivPaper" in args.experiment_name:
-    with open('../../data/arxiv/cleaned_DPO.txt', 'r', encoding='utf-8') as f:
-        arxiv_paper = f.read()
-    cleaned_paper = arxiv_paper
-else:
-    with open('../../data/arxiv/cleaned_DPO_paraphrased_0.txt', 'r', encoding='utf-8') as f:
-        arxiv_paper = f.read()
-    cleaned_paper = arxiv_paper
 
 
 # --- Load the model ---
@@ -65,7 +56,7 @@ training_config = llm_configs.TrainingConfig(
     context_length = 2048 * 3/2,
     gradient_accumulation_steps=6,
     warmup_ratio = 0.1, 
-    sequential_sampling = False,
+    sequential_sampling = True,
     reverse_ffd_packing= False,
     remove_unused_columns=False,
     packing = False,
@@ -89,20 +80,26 @@ probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
     logger=log
 )
 
-corpus_callback = CorpusPerplexityCallback(
-    text_content=arxiv_paper,
-    tokenizer=tokenizer,
-    max_length=training_config.context_length,
-    stride=512,
-    log_prefix="corpus_perplexity"
-)
+# corpus_callback = CorpusPerplexityCallback(
+#     text_content=arxiv_paper,
+#     tokenizer=tokenizer,
+#     max_length=training_config.context_length,
+#     stride=512,
+#     log_prefix="corpus_perplexity"
+# )
 
 training_loss_callback = TrainingLossPerplexityCallback()
 
 # --- Fine-Tune ---
-callbacks_to_use = [probe_callback, corpus_callback, training_loss_callback]
+callbacks_to_use = [probe_callback, training_loss_callback]
 if "SingleArxivPaper" in args.experiment_name:
-    log.info("\n--- Fine-Tuning on Custom Text ---")
+    # --- Load the paper ---
+    log.info("\n--- Loading in Single Arxiv Paper ---")
+    with open('../../data/arxiv/cleaned_DPO.txt', 'r', encoding='utf-8') as f:
+        arxiv_paper = f.read()
+    cleaned_paper = arxiv_paper
+
+    log.info("\n--- Fine-Tuning on Single Arxiv Paper ---")
     if args.chunk_by_section:
         log.info("Using section-based chunking")
     else:
@@ -118,15 +115,32 @@ if "SingleArxivPaper" in args.experiment_name:
         chunk_by_section=args.chunk_by_section
     )
 elif "ParaphrasedArxivPaper" in args.experiment_name:
-    log.info("\n--- Fine-Tuning on Custom Text ---")
+    log.info("\n--- Fine-Tuning on Paraphrased Arxiv Paper ---")
+    if args.chunk_by_section:
+        log.info("Using section-based chunking")
+    else:
+        log.info("Using token-based chunking")
+    
+    texts_to_train = []
+    # Load original paper
+    with open('../../data/arxiv/cleaned_DPO.txt', 'r', encoding='utf-8') as f:
+        texts_to_train.append(f.read())
+        
+    # Load paraphrased papers
+    for i in range(9):
+        file_path = f'../../data/arxiv/cleaned_DPO_paraphrased_{i}.txt'
+        with open(file_path, 'r', encoding='utf-8') as f:
+            texts_to_train.append(f.read())
+            
     trainer = llm_training.fine_tune_on_texts(
         model=model,
         tokenizer=tokenizer,
         log=log,
-        text_content=arxiv_paper,
+        texts=texts_to_train,
         train_cfg=training_config,
         train=True,
-        callbacks=callbacks_to_use
+        callbacks=callbacks_to_use,
+        chunk_by_section=args.chunk_by_section
     )
 
 # --- Save Metrics and Generate Plots ---
@@ -134,7 +148,7 @@ output_dir = os.path.join("../../results/FT/", args.experiment_name)
 os.makedirs(output_dir, exist_ok=True)
 
 probe_callback.save_results(output_dir=output_dir)
-corpus_callback.save_results(output_dir=output_dir)
+#corpus_callback.save_results(output_dir=output_dir)
 training_loss_callback.save_results(output_dir=output_dir)
 
 log.info(f"All metrics saved to {output_dir}")

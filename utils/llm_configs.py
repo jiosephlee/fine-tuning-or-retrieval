@@ -94,7 +94,7 @@ class TrainingConfig(BaseModel):
             gradient_checkpointing=self.gradient_checkpointing,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
-            # sequential_sampling = self.sequential_sampling,
+            sequential_sampling = self.sequential_sampling,
             
             # Logging
             run_name=self.run_name,
@@ -133,7 +133,7 @@ class TrainingConfig(BaseModel):
             use_liger_kernel=self.use_liger_kernel,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
-            # sequential_sampling = self.sequential_sampling,
+            sequential_sampling = self.sequential_sampling,
             # reverse_ffd_packing = self.reverse_ffd_packing,
 
             # Logging
