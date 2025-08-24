@@ -80,9 +80,9 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         self.target_lengths = target_lengths_new
         self.fact_lengths = fact_lengths_new
         
-        self.contexts = self.tokenizer(self.probes, return_tensors="pt", padding=True, add_special_tokens=False)
-        self.targets = self.tokenizer(self.targets, return_tensors="pt", padding=True, add_special_tokens=False)
-        self.facts = self.tokenizer(self.facts, return_tensors="pt", padding=True, add_special_tokens=False)
+        self.tokenized_probes = tokenized_probes
+        self.tokenized_targets = tokenized_targets
+        self.tokenized_facts = tokenized_facts
         
         print("Token lengths pre-computation finished.")
 
@@ -91,6 +91,11 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         print(f"{self.__class__.__name__}: Calculating initial metrics...")
         model.eval()
         self.initial_metrics = self._evaluate_probes(model)
+        # Log initial metrics to history at step 0
+        step = 0
+        for metric_name, values in self.initial_metrics.items():
+            if values is not None:
+                self.history[metric_name].append({'step': step, 'values': values.cpu().tolist()})
         model.train()
         print(f"{self.__class__.__name__}: Initial metrics calculated.")
 
@@ -224,21 +229,24 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         """
         all_metrics = { 'log_prob': [], 'perplexity': [], 'hit_accuracy_at_5': [], 'hit_accuracy_at_50': [] }
         device = model.device
+        num_facts = len(self.facts)
         # Go through facts in batches
-        for i in range(0, len(self.facts), self.batch_size):
-            batch_facts, batch_probes, batch_targets = self.facts[i:i+self.batch_size], self.probes[i:i+self.batch_size], self.targets[i:i+self.batch_size]
-            if not batch_facts: continue
+        for i in range(0, num_facts, self.batch_size):
+            end_index = i + self.batch_size
             
             # Get fact logits
-            inputs = self.tokenizer(batch_facts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
+            inputs = {
+                'input_ids': self.tokenized_facts['input_ids'][i:end_index].to(device),
+                'attention_mask': self.tokenized_facts['attention_mask'][i:end_index].to(device)
+            }
             attention_mask = inputs['attention_mask']
             with torch.no_grad():
                 logits = model(**inputs).logits
             
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = inputs['input_ids'][..., 1:].contiguous()
-            context_lengths = self.context_lengths[i:i+self.batch_size].to(device)
-            target_lengths = self.target_lengths[i:i+self.batch_size].to(device)
+            context_lengths = self.context_lengths[i:end_index].to(device)
+            target_lengths = self.target_lengths[i:end_index].to(device)
             # assert, one more time, that the lengths are correct
             assert torch.equal(context_lengths + target_lengths, attention_mask.sum(dim=1)), "Length mismatch between context and target lengths and fact lengths"
             # Now that we've shifted the logits, we need to change the context lengths by -1 to account for the shift
