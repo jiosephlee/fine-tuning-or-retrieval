@@ -41,8 +41,9 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         self.history = {
             'log_prob': [],
             'perplexity': [],
+            'hit_accuracy_at_1': [],
             'hit_accuracy_at_5': [],
-            'hit_accuracy_at_50': [],
+            'hit_accuracy_at_10': [],
         }
     
         self._precompute_token_lengths()
@@ -230,7 +231,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         """
         Evaluates probes by calculating log probabilities and hit rates for targets.
         """
-        all_metrics = { 'log_prob': [], 'perplexity': [], 'hit_accuracy_at_5': [], 'hit_accuracy_at_50': [] }
+        all_metrics = { 'log_prob': [], 'perplexity': [], 'hit_accuracy_at_1': [], 'hit_accuracy_at_5': [], 'hit_accuracy_at_10': [] }
         device = model.device
         num_facts = len(self.facts)
         # Go through facts in batches
@@ -262,14 +263,15 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 all_metrics['perplexity'].append(perplexity)
 
             if self.track_hits:
-                hits = self._calculate_hits_at_k(shift_logits, shift_labels, context_lengths, target_lengths, k_values=[5, 50])
+                hits = self._calculate_hits_at_k(shift_logits, shift_labels, context_lengths, target_lengths, k_values=[1, 5, 10])
                 for k, v in hits.items(): all_metrics[k].append(v)
 
         return {
             "log_prob": torch.cat(all_metrics['log_prob']) if self.track_logprobs and all_metrics['log_prob'] else None,
             "perplexity": torch.cat(all_metrics['perplexity']) if self.track_logprobs and all_metrics['perplexity'] else None,
+            "hit_accuracy_at_1": torch.cat(all_metrics['hit_accuracy_at_1']) if self.track_hits and all_metrics['hit_accuracy_at_1'] else None,
             "hit_accuracy_at_5": torch.cat(all_metrics['hit_accuracy_at_5']) if self.track_hits and all_metrics['hit_accuracy_at_5'] else None,
-            "hit_accuracy_at_50": torch.cat(all_metrics['hit_accuracy_at_50']) if self.track_hits and all_metrics['hit_accuracy_at_50'] else None,
+            "hit_accuracy_at_10": torch.cat(all_metrics['hit_accuracy_at_10']) if self.track_hits and all_metrics['hit_accuracy_at_10'] else None,
         }
 
     def save_results(self, output_dir: str):
