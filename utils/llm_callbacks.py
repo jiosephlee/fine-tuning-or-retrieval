@@ -73,12 +73,14 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         assert torch.equal(target_lengths_new, target_lengths_orig), "Target length calculation mismatch."
         assert torch.equal(fact_lengths_new, fact_lengths_orig), "Fact length calculation mismatch."
 
-        assert torch.equal(self.context_lengths + self.target_lengths, fact_lengths_new), \
-            "Mismatch between (context + target) length and fact length."
         
         self.context_lengths = context_lengths_new
         self.target_lengths = target_lengths_new
         self.fact_lengths = fact_lengths_new
+        
+        assert torch.equal(self.context_lengths + self.target_lengths, fact_lengths_new), \
+            "Mismatch between (context + target) length and fact length."
+
         
         self.contexts = self.tokenizer(self.probes, return_tensors="pt", padding=True, add_special_tokens=False)
         self.targets = self.tokenizer(self.targets, return_tensors="pt", padding=True, add_special_tokens=False)
