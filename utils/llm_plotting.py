@@ -61,23 +61,24 @@ def generate_new_plots(output_dir: str, logger=None):
 
     # --- PLOT 2: Hit Accuracy by Section ---
     log_info("Generating Plot 2: Hit Accuracy by Section...")
-    if hit_cols and 'section' in probe_df.columns:
+    plot_2_cols = ['hit_accuracy_at_10', 'perplexity', 'log_probs']
+    if all(c in probe_df.columns for c in plot_2_cols) and 'section' in probe_df.columns:
         plt.figure(figsize=(14, 8))
         
-        avg_section_hits = probe_df.groupby(['step', 'section'])[hit_cols].mean().reset_index()
-        melted_df = avg_section_hits.melt(id_vars=['step', 'section'], value_vars=hit_cols, var_name='k', value_name='accuracy')
+        avg_section_hits = probe_df.groupby(['step', 'section'])[plot_2_cols].mean().reset_index()
+        melted_df = avg_section_hits.melt(id_vars=['step', 'section'], value_vars=plot_2_cols, var_name='metric', value_name='value')
         
         all_sections = sorted(probe_df['section'].unique())
         palette = sns.color_palette("husl", len(all_sections))
 
-        sns.lineplot(data=melted_df, x='step', y='accuracy', hue='section', style='k', hue_order=all_sections, palette=palette)
+        sns.lineplot(data=melted_df, x='step', y='value', hue='section', style='metric', hue_order=all_sections, palette=palette)
         
-        plt.title('Plot 2: Hit Accuracy by Section')
+        plt.title('Plot 2: Metrics by Section')
         plt.xlabel('Training Step')
-        plt.ylabel('Hit Accuracy')
+        plt.ylabel('Value')
         plt.grid(True, which="both", ls="--")
-        plt.legend(title='Section')
-        plt.savefig(os.path.join(output_dir, "plot_new_2_hits_by_section.png"))
+        plt.legend(title='Section & Metric')
+        plt.savefig(os.path.join(output_dir, "plot_new_2_metrics_by_section.png"))
         plt.close()
 
     # --- PLOT 3: Disaggregated Hit Accuracy for 10 Random Probes ---
@@ -99,6 +100,7 @@ def generate_new_plots(output_dir: str, logger=None):
             
             if not probes_csv.empty and 'fact' in probes_csv.columns:
                 for ax, probe_idx in zip(g.axes.flat, g.col_names):
+                    probe_idx = int(probe_idx)
                     if probe_idx in probes_csv.index:
                         fact = probes_csv.loc[probe_idx, 'fact']
                         wrapped_title = textwrap.fill(f"Probe {probe_idx}: {fact}", 60)
@@ -108,4 +110,43 @@ def generate_new_plots(output_dir: str, logger=None):
 
             plt.tight_layout(rect=[0, 0, 1, 0.97])
             plt.savefig(os.path.join(output_dir, "plot_new_3_disaggregated_hits.png"))
+            plt.close()
+
+    # --- PLOT 4: Disaggregated Normalized Perplexity vs. Log Probs for 10 Random Probes ---
+    log_info("Generating Plot 4: Disaggregated Normalized Perplexity vs. Log Probs...")
+    plot_4_cols = ['perplexity', 'log_probs']
+    if 'random_probes' in locals() and all(c in probe_df.columns for c in plot_4_cols):
+        sample_df = probe_df[probe_df['probe_index'].isin(random_probes)]
+        
+        # Normalize perplexity and log_probs for each probe
+        scaled_df_parts = []
+        scaler = MinMaxScaler()
+        for probe_idx in random_probes:
+            probe_data = sample_df[sample_df['probe_index'] == probe_idx].copy()
+            if not probe_data.empty and len(probe_data) > 1: # Scaler needs at least 2 points
+                probe_data[plot_4_cols] = scaler.fit_transform(probe_data[plot_4_cols])
+                scaled_df_parts.append(probe_data)
+
+        if scaled_df_parts:
+            scaled_df = pd.concat(scaled_df_parts)
+            melted_scaled_df = scaled_df.melt(id_vars=['step', 'probe_index'], value_vars=plot_4_cols, var_name='metric', value_name='normalized_value')
+
+            g = sns.FacetGrid(melted_scaled_df, col="probe_index", col_wrap=5, hue="metric", sharey=True)
+            g.map(sns.lineplot, "step", "normalized_value")
+            g.add_legend(title='Metric')
+            g.fig.suptitle('Plot 4: Normalized Perplexity vs. Log Probs for 10 Random Probes', y=1.03)
+            g.set_axis_labels("Training Step", "Normalized Value (0 to 1)")
+
+            if not probes_csv.empty and 'fact' in probes_csv.columns:
+                for ax, probe_idx in zip(g.axes.flat, g.col_names):
+                    probe_idx = int(probe_idx)
+                    if probe_idx in probes_csv.index:
+                        fact = probes_csv.loc[probe_idx, 'fact']
+                        wrapped_title = textwrap.fill(f"Probe {probe_idx}: {fact}", 60)
+                        ax.set_title(wrapped_title, fontsize=8)
+            else:
+                g.set_titles("Probe {col_name}")
+
+            plt.tight_layout(rect=[0, 0, 1, 0.97])
+            plt.savefig(os.path.join(output_dir, "plot_new_4_disaggregated_normalized_ppl_logprobs.png"))
             plt.close()

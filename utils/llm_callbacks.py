@@ -155,9 +155,10 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         
         # Mask out the logits that are not the target
         labels_masked = labels.clone()
-        labels_masked[~target_mask] = -100
+        
         labels_masked[labels_masked == self.tokenizer.pad_token_id] = -100
-
+        labels_masked[~target_mask] = -100
+        
         loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
         loss_target = loss_fct(logits.permute(0, 2, 1), labels_masked) # shape (batch_size, seq_len - 1)
         sum_loss_target = loss_target.sum(dim=1)
