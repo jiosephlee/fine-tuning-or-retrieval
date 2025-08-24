@@ -128,7 +128,7 @@ elif "ParaphrasedArxivPaper" in args.experiment_name:
         texts_to_train.append(f.read())
         
     # Load paraphrased papers
-    for i in range(args.num_paraphrased_texts):
+    for i in range(args.num_paraphrased_texts-1):
         file_path = f'../../data/arxiv/cleaned_DPO_paraphrased_{i}.txt'
         with open(file_path, 'r', encoding='utf-8') as f:
             texts_to_train.append(f.read())
