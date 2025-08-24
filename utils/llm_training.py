@@ -277,7 +277,7 @@ def fine_tune_on_texts(
     # Create dataset with all chunked texts
     dataset = Dataset.from_dict({"text": all_text_chunks})
     
-    assert(train_cfg.gradient_accumulation_steps * train_cfg.per_device_train_batch_size >= len(all_text_chunks))
+    assert(len(all_text_chunks) % train_cfg.gradient_accumulation_steps * train_cfg.per_device_train_batch_size == 0)
     log.info(f"[{tag}] Gradient_accumulation_steps ({train_cfg.gradient_accumulation_steps}) | {len(all_text_chunks)} chunks")
 
     training_args = train_cfg.to_sft_training_args() # Packing is False to avoid document re-ordering and padding free is false to avoid any unexpected bugs
