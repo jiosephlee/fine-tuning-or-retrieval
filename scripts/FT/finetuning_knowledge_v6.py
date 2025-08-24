@@ -2,12 +2,14 @@
 import os
 import sys
 sys.path.append('../..')
+import pandas as pd
 import utils.llm_training as llm_training
-import utils.llm_callbacks_old as llm_callbacks_old
+import utils.llm_callbacks as llm_callbacks
 import utils.llm_configs as llm_configs
 import argparse
 import logging
-import utils.llm_plotting_old as llm_plotting_old
+import utils.llm_plotting as llm_plotting
+from utils.llm_callbacks_old import CorpusPerplexityCallback, TrainingLossPerplexityCallback
 
 # --- Parser ---
 parser = argparse.ArgumentParser()
@@ -70,23 +72,24 @@ training_config = llm_configs.TrainingConfig(
     padding_free = False
 )
 
-raw_knowledge_probe_callback = llm_callbacks_old.RawKnowledgeProbeCallback(
-    tokenizer,
-    '../../data/arxiv/DPO_knowledge_probes_v3.csv',
-    training_config.context_length,
+# --- Load Probe Data ---
+probe_df = pd.read_csv('../../data/arxiv/DPO_knowledge_probes_v4.csv')
+facts = probe_df['fact'].tolist()
+probes = probe_df['probe'].tolist()
+targets = probe_df['target'].tolist()
+sections = probe_df['section'].tolist()
+
+probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
+    tokenizer=tokenizer,
+    facts=facts,
+    probes=probes,
+    targets=targets,
+    sections=sections,
     batch_size=8,
     logger=log
 )
 
-simple_atomic_knowledge_probe_callback = llm_callbacks_old.SimpleAtomicKnowledgeProbeCallback(
-    tokenizer,
-    '../../data/arxiv/DPO_knowledge_probes_v3.csv',
-    training_config.context_length,
-    batch_size=8,
-    logger=log
-)
-
-corpus_callback = llm_callbacks_old.CorpusPerplexityCallback(
+corpus_callback = CorpusPerplexityCallback(
     text_content=arxiv_paper,
     tokenizer=tokenizer,
     max_length=training_config.context_length,
@@ -94,10 +97,10 @@ corpus_callback = llm_callbacks_old.CorpusPerplexityCallback(
     log_prefix="corpus_perplexity"
 )
 
-training_loss_callback = llm_callbacks_old.TrainingLossPerplexityCallback()
+training_loss_callback = TrainingLossPerplexityCallback()
 
 # --- Fine-Tune ---
-callbacks_to_use = [raw_knowledge_probe_callback, simple_atomic_knowledge_probe_callback, corpus_callback, training_loss_callback]
+callbacks_to_use = [probe_callback, corpus_callback, training_loss_callback]
 if "SingleArxivPaper" in args.experiment_name:
     log.info("\n--- Fine-Tuning on Custom Text ---")
     if args.chunk_by_section:
@@ -130,13 +133,12 @@ elif "ParaphrasedArxivPaper" in args.experiment_name:
 output_dir = os.path.join("../../results/FT/", args.experiment_name)
 os.makedirs(output_dir, exist_ok=True)
 
-raw_knowledge_probe_callback.save_results(output_dir=output_dir)
-simple_atomic_knowledge_probe_callback.save_results(output_dir=output_dir)
+probe_callback.save_results(output_dir=output_dir)
 corpus_callback.save_results(output_dir=output_dir)
 training_loss_callback.save_results(output_dir=output_dir)
 
 log.info(f"All metrics saved to {output_dir}")
 
 # --- Generate Plots ---
-llm_plotting_old.generate_plots_from_files(output_dir, logger=log)
+llm_plotting.generate_new_plots(output_dir, logger=log)
 log.info("Finished generating all plots.")

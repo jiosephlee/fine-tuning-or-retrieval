@@ -466,24 +466,31 @@ def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048)
     Chunks text by sections, ensuring each chunk doesn't exceed max_tokens.
     If a section is too large, it tries to split by subsections first.
     If no subsections exist or they're still too large, it falls back to token-based chunking.
-    
+    Each new chunk is prefixed with the document's title.
+
     Args:
         text_content: The full text to chunk
         tokenizer: The tokenizer to use for counting tokens
         max_tokens: Maximum tokens per chunk
-        
+
     Returns:
         List of text chunks and total token count
     """
     import re
+    # Extract title
+    title_match = re.search(r'\\title\{([^}]+)\}', text_content)
+    title = ""
+    if title_match:
+        title = f"\\title{{{title_match.group(1)}}}\n\n"
+    else:
+        raise ValueError("No title found in the text")
+
     # Find all section boundaries and split into sections
     section_pattern = r'(\\section\{[^}]+\})'
     parts = re.split(section_pattern, text_content)
     
-    # Group content: first part is pre-section content, then pairs of (section_header, section_content)
     sections = []
-    
-    # Handle content before first section (title, abstract, etc.)
+    # Handle content before first section (e.g., abstract)
     if parts[0].strip():
         sections.append(parts[0])
     
@@ -498,50 +505,56 @@ def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048)
             i += 2
         else:
             i += 1
-    
+
     chunks = []
-    total_tokens = 0
     current_chunk = ""
     
     for section in sections:
         if not section.strip():
             continue
-            
-        # Check if this would exceed max_tokens when added to current chunk
-        test_chunk = current_chunk + section
-        tokens = tokenizer(test_chunk, add_special_tokens=False, truncation=False)["input_ids"]
-        token_count = len(tokens)
-        
-        if token_count <= max_tokens:
-            # Add to current chunk
-            current_chunk = test_chunk
+
+        # Handle title for the very first chunk or any new, empty chunk.
+        is_title_block = section.strip().startswith('\\title')
+        if not current_chunk and not is_title_block:
+            current_chunk = title
+
+        # First, try to fit the whole section.
+        candidate_chunk = current_chunk + section
+        candidate_tokens = tokenizer(candidate_chunk, add_special_tokens=False, truncation=False)["input_ids"]
+
+        if len(candidate_tokens) <= max_tokens:
+            # Section fits, add it to the current chunk.
+            current_chunk = candidate_chunk
         else:
-            # Save current chunk if it has content
-            if current_chunk.strip():
-                chunks.append(current_chunk)
-                chunk_tokens = tokenizer(current_chunk, add_special_tokens=False, truncation=False)["input_ids"]
-                total_tokens += len(chunk_tokens)
+            # Section does not fit. Break it down into pieces and add them individually.
+            title_token_len = len(tokenizer(title, add_special_tokens=False)["input_ids"])
+            # Max size for a piece that might start a new chunk (which would include the title).
+            subsection_max_size = max_tokens - title_token_len
             
-            # Check if this section alone exceeds max_tokens
-            section_tokens = tokenizer(section, add_special_tokens=False, truncation=False)["input_ids"]
-            if len(section_tokens) > max_tokens:
-                # Try to split by subsections first
-                subsection_chunks, subsection_token_count = chunk_text_by_subsections(section, tokenizer, max_tokens)
-                chunks.extend(subsection_chunks)
-                total_tokens += subsection_token_count
-                current_chunk = ""
-            else:
-                # Start new chunk with this section
-                current_chunk = section
-    
-    # Add final chunk if it has content
+            pieces, _ = chunk_text_by_subsections(section, tokenizer, subsection_max_size)
+                
+            # Try to add pieces to the current chunk until it's full.
+            for piece in pieces:
+                piece_candidate = current_chunk + piece
+                piece_candidate_tokens = tokenizer(piece_candidate, add_special_tokens=False, truncation=False)["input_ids"]
+
+                if len(piece_candidate_tokens) <= max_tokens:
+                    # Piece fits, add it.
+                    current_chunk = piece_candidate
+                else:
+                    # Piece does not fit. Finalize the current chunk.
+                    if current_chunk.strip():
+                        chunks.append(current_chunk)
+                    
+                    # Start a new chunk with the title and this piece.
+                    current_chunk = title + piece
+
+    # Add the final chunk if it has content.
     if current_chunk.strip():
         chunks.append(current_chunk)
-        chunk_tokens = tokenizer(current_chunk, add_special_tokens=False, truncation=False)["input_ids"]
-        total_tokens += len(chunk_tokens)
     
+    total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in chunks)
     return chunks, total_tokens
-
 
 
 @torch.inference_mode()

@@ -140,7 +140,12 @@ def query_gpt(prompt: str | dict, model: str = 'gpt-4o-mini', max_tokens: int = 
         ]
     else:
         messages = [{"role": "user", "content": prompt}]
-    if 'o3' in model or 'o1' in model or 'o4' in model:
+    if 'gpt-5' in model:
+        api_params = {
+            "model": model,
+            "messages": messages,
+        }
+    elif 'o3' in model or 'o1' in model or 'o4' in model:
         api_params = {
             "model": model,
             "reasoning_effort": "high",

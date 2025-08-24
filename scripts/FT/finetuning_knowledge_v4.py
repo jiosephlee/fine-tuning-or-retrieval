@@ -3,7 +3,7 @@ import os
 import sys
 sys.path.append('../..')
 import utils.llm_training as llm_training
-import utils.llm_callbacks as llm_callbacks
+import utils.llm_callbacks_old as llm_callbacks_old
 import utils.llm_configs as llm_configs
 import argparse
 import logging
@@ -71,14 +71,14 @@ training_config = llm_configs.TrainingConfig(
 )
 
 # Replace PerplexityEvaluationCallback and TargetedPerplexityCallback with this:
-knowledge_probe_callback = llm_callbacks.KnowledgeProbeCallback(
+knowledge_probe_callback = llm_callbacks_old.KnowledgeProbeCallback(
     tokenizer,
     '../../data/arxiv/DPO_knowledge_probes_v2.csv',
     training_config.context_length,
     batch_size=8,
 )
 
-corpus_callback = llm_callbacks.CorpusPerplexityCallback(
+corpus_callback = llm_callbacks_old.CorpusPerplexityCallback(
     text_content=arxiv_paper,
     tokenizer=tokenizer,
     max_length=training_config.context_length,
@@ -86,7 +86,7 @@ corpus_callback = llm_callbacks.CorpusPerplexityCallback(
 )
 
 # Add this new callback to track perplexity from training loss
-training_loss_callback = llm_callbacks.TrainingLossPerplexityCallback()
+training_loss_callback = llm_callbacks_old.TrainingLossPerplexityCallback()
 
 # --- Fine-Tune ---
 if "SingleArxivPaper" in args.experiment_name:
