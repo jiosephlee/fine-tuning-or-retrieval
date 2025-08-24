@@ -263,8 +263,9 @@ def fine_tune_on_texts(
         log.info(f"[{tag}] Using section-based chunking...")
         all_text_chunks = []
         total_tokens = 0
-        for text in texts:
+        for i,text in enumerate(texts):
             chunks, num_tokens = chunk_text_by_sections(text, tokenizer, train_cfg.context_length)
+            log.info(f"[{tag}] Chunking text {i}: Context: {train_cfg.context_length} -> {len(chunks)} chunks")
             all_text_chunks.extend(chunks)
             total_tokens += num_tokens
         log.info(f"[{tag}] Section-based chunking: Total tokens: {total_tokens}, Context: {train_cfg.context_length} -> {len(all_text_chunks)} total chunks")
