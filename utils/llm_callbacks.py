@@ -55,18 +55,21 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         
         # --- Probes (Context) ---
         tokenized_probes = self.tokenizer(self.probes, padding=False,add_special_tokens=False)
+        tokenized_probes_tensor = self.tokenizer(self.probes, padding=True,add_special_tokens=False, return_tensors="pt")
         context_lengths_new = torch.tensor([len(ids) for ids in tokenized_probes['input_ids']])
-        context_lengths_orig = self.tokenizer.pad(tokenized_probes, padding=True, return_tensors="pt").attention_mask.sum(dim=1)
+        context_lengths_orig = tokenized_probes_tensor.attention_mask.sum(dim=1)
 
         # --- Targets ---
         tokenized_targets = self.tokenizer(self.targets, padding=False,add_special_tokens=False)
+        tokenized_targets_tensor = self.tokenizer(self.targets, padding=True,add_special_tokens=False, return_tensors="pt")
         target_lengths_new = torch.tensor([len(ids) for ids in tokenized_targets['input_ids']])
-        target_lengths_orig = self.tokenizer.pad(tokenized_targets, padding=True, return_tensors="pt").attention_mask.sum(dim=1)
+        target_lengths_orig = tokenized_targets_tensor.attention_mask.sum(dim=1)
 
         # --- Facts ---
         tokenized_facts = self.tokenizer(self.facts, padding=False,add_special_tokens=False)
+        tokenized_facts_tensor = self.tokenizer(self.facts, padding=True,add_special_tokens=False, return_tensors="pt")
         fact_lengths_new = torch.tensor([len(ids) for ids in tokenized_facts['input_ids']])
-        fact_lengths_orig = self.tokenizer.pad(tokenized_facts, padding=True, return_tensors="pt").attention_mask.sum(dim=1)
+        fact_lengths_orig = tokenized_facts_tensor.attention_mask.sum(dim=1)
 
         # Sanity check: assert both methods yield the same result
         assert torch.equal(context_lengths_new, context_lengths_orig), "Context length calculation mismatch."
