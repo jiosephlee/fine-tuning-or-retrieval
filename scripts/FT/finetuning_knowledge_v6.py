@@ -19,6 +19,7 @@ parser.add_argument("--num_train_epochs", type=int, default=1)
 parser.add_argument("--full_finetuning", default=False, action="store_true")
 parser.add_argument("--learning_rate", type=float, default=1e-5)
 parser.add_argument("--chunk_by_section", default=True, type=bool, help="Use section-based chunking instead of token-based chunking")
+parser.add_argument("--num_paraphrased_texts", type=int, default=9, help="Number of paraphrased texts to use for training (0-9)")
 args = parser.parse_args()
 
 # --- Basic Configuration ---
@@ -127,11 +128,14 @@ elif "ParaphrasedArxivPaper" in args.experiment_name:
         texts_to_train.append(f.read())
         
     # Load paraphrased papers
-    for i in range(9):
+    for i in range(args.num_paraphrased_texts):
         file_path = f'../../data/arxiv/cleaned_DPO_paraphrased_{i}.txt'
         with open(file_path, 'r', encoding='utf-8') as f:
             texts_to_train.append(f.read())
             
+    training_config.num_train_epochs = max(1, int(args.num_train_epochs / len(texts_to_train)))
+    log.info(f"Adjusting num_train_epochs from {args.num_train_epochs} to {training_config.num_train_epochs} for {len(texts_to_train)} documents.")
+
     trainer = llm_training.fine_tune_on_texts(
         model=model,
         tokenizer=tokenizer,
