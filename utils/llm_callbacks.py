@@ -83,9 +83,9 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         assert torch.equal(self.context_lengths + self.target_lengths, fact_lengths_new), \
             "Mismatch between (context + target) length and fact length."
 
-        self.tokenized_probes = tokenized_probes
-        self.tokenized_targets = tokenized_targets
-        self.tokenized_facts = tokenized_facts
+        self.tokenized_probes = tokenized_probes_tensor
+        self.tokenized_targets = tokenized_targets_tensor
+        self.tokenized_facts = tokenized_facts_tensor
         
         print("Token lengths pre-computation finished.")
 
@@ -242,6 +242,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 'input_ids': self.tokenized_facts['input_ids'][i:end_index].to(device),
                 'attention_mask': self.tokenized_facts['attention_mask'][i:end_index].to(device)
             }
+            # print(inputs)
             attention_mask = inputs['attention_mask']
             with torch.no_grad():
                 logits = model(**inputs).logits
