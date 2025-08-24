@@ -61,7 +61,7 @@ def generate_new_plots(output_dir: str, logger=None):
 
     # --- PLOT 2: Hit Accuracy by Section ---
     log_info("Generating Plot 2: Hit Accuracy by Section...")
-    plot_2_cols = ['hit_accuracy_at_10', 'perplexity', 'log_probs']
+    plot_2_cols = ['perplexity', 'log_prob']
     if all(c in probe_df.columns for c in plot_2_cols) and 'section' in probe_df.columns:
         plt.figure(figsize=(14, 8))
         
@@ -81,8 +81,30 @@ def generate_new_plots(output_dir: str, logger=None):
         plt.savefig(os.path.join(output_dir, "plot_new_2_metrics_by_section.png"))
         plt.close()
 
-    # --- PLOT 3: Disaggregated Hit Accuracy for 10 Random Probes ---
-    log_info("Generating Plot 3: Disaggregated Hit Accuracy (10 Random Probes)...")
+    # --- PLOT 3: Hit Accuracy by Section ---
+    log_info("Generating Plot 3: Hit Accuracy by Section...")
+    plot_3_cols = ['hit_accuracy_at_1']
+    if all(c in probe_df.columns for c in plot_3_cols) and 'section' in probe_df.columns:
+        plt.figure(figsize=(14, 8))
+        
+        avg_section_hits = probe_df.groupby(['step', 'section'])[plot_3_cols].mean().reset_index()
+        melted_df = avg_section_hits.melt(id_vars=['step', 'section'], value_vars=plot_3_cols, var_name='metric', value_name='value')
+        
+        all_sections = sorted(probe_df['section'].unique())
+        palette = sns.color_palette("husl", len(all_sections))
+
+        sns.lineplot(data=melted_df, x='step', y='value', hue='section', style='metric', hue_order=all_sections, palette=palette)
+        
+        plt.title('Plot 3: Hit Accuracy by Section')
+        plt.xlabel('Training Step')
+        plt.ylabel('Value')
+        plt.grid(True, which="both", ls="--")
+        plt.legend(title='Section & Metric')
+        plt.savefig(os.path.join(output_dir, "plot_new_3_hits_by_section.png"))
+        plt.close()
+        
+    # --- PLOT 4: Disaggregated Hit Accuracy for 10 Random Probes ---
+    log_info("Generating Plot 4: Disaggregated Hit Accuracy (10 Random Probes)...")
     if hit_cols:
         unique_probes = probe_df['probe_index'].unique()
         if len(unique_probes) > 0:
@@ -109,12 +131,12 @@ def generate_new_plots(output_dir: str, logger=None):
                  g.set_titles("Probe {col_name}")
 
             plt.tight_layout(rect=[0, 0, 1, 0.97])
-            plt.savefig(os.path.join(output_dir, "plot_new_3_disaggregated_hits.png"))
+            plt.savefig(os.path.join(output_dir, "plot_new_4_disaggregated_hits.png"))
             plt.close()
 
-    # --- PLOT 4: Disaggregated Normalized Perplexity vs. Log Probs for 10 Random Probes ---
-    log_info("Generating Plot 4: Disaggregated Normalized Perplexity vs. Log Probs...")
-    plot_4_cols = ['perplexity', 'log_probs']
+    # --- PLOT 5: Disaggregated Normalized Perplexity vs. Log Probs for 10 Random Probes ---
+    log_info("Generating Plot 5: Disaggregated Normalized Perplexity vs. Log Probs...")
+    plot_4_cols = ['perplexity', 'log_prob']
     if 'random_probes' in locals() and all(c in probe_df.columns for c in plot_4_cols):
         sample_df = probe_df[probe_df['probe_index'].isin(random_probes)]
         
@@ -148,5 +170,5 @@ def generate_new_plots(output_dir: str, logger=None):
                 g.set_titles("Probe {col_name}")
 
             plt.tight_layout(rect=[0, 0, 1, 0.97])
-            plt.savefig(os.path.join(output_dir, "plot_new_4_disaggregated_normalized_ppl_logprobs.png"))
+            plt.savefig(os.path.join(output_dir, "plot_new_5_disaggregated_normalized_ppl_logprobs.png"))
             plt.close()

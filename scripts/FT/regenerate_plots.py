@@ -6,7 +6,7 @@ import logging
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
-import utils.llm_plotting_old as llm_plotting_old
+import utils.llm_plotting as llm_plotting
 
 def main():
     """
@@ -35,7 +35,7 @@ def main():
 
     # --- Generate Plots ---
     log.info(f"Generating plots from data in '{args.results_dir}'")
-    llm_plotting_old.generate_plots_from_files(args.results_dir, logger=log)
+    llm_plotting.generate_new_plots(args.results_dir, logger=log)
     log.info(f"Finished generating all plots. They are saved in '{args.results_dir}'")
 
 if __name__ == "__main__":
