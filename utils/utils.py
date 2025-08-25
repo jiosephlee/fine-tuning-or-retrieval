@@ -128,7 +128,7 @@ def query_llm(prompt, max_tokens=1000, temperature=0, top_p=0, max_try_num=10, m
         #         return json_response
     return None
 
-def query_gpt(prompt: str | dict, model: str = 'gpt-4o-mini', max_tokens: int = 4000, temperature: float = 0, top_p: float = 0, logprobs: bool = False, return_json: bool = False, json_schema = None, system_prompt_included: bool = False, is_hippa: bool = False, debug: bool = False):
+def query_gpt(prompt: str | dict, model: str = 'gpt-4o-mini', max_tokens: int = 4000, temperature: float = 0, top_p: float = 0, logprobs: bool = False, return_json: bool = False, json_schema = None, system_prompt_included: bool = False, reasoning_effort = 'high', is_hippa: bool = False, debug: bool = False):
     """OpenAI API wrapper; For HIPPA compliance, use client_safe e.g. model='openai-gpt-4o-high-quota-chat'"""
     temp_client = client_safe if is_hippa else client
 
@@ -148,7 +148,7 @@ def query_gpt(prompt: str | dict, model: str = 'gpt-4o-mini', max_tokens: int = 
     elif 'o3' in model or 'o1' in model or 'o4' in model:
         api_params = {
             "model": model,
-            "reasoning_effort": "high",
+            "reasoning_effort": reasoning_effort,
             "messages": messages,
         }
     else:
