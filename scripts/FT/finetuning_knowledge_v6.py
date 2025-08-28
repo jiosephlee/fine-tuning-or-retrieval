@@ -65,21 +65,47 @@ training_config = llm_configs.TrainingConfig(
 )
 
 # --- Load Probe Data ---
-probe_df = pd.read_csv('../../data/arxiv/DPO_knowledge_probes_v6.csv')
-facts = probe_df['fact'].tolist()
-probes = probe_df['probe'].tolist()
-targets = probe_df['target'].tolist()
-sections = probe_df['section'].tolist()
+knowledge_probe_df = pd.read_csv('../../data/arxiv/DPO_knowledge_probes_v6.csv')
+facts = knowledge_probe_df['fact'].tolist()
+probes = knowledge_probe_df['probe'].tolist()
+targets = knowledge_probe_df['target'].tolist()
+# sections = knowledge_probe_df['section'].tolist()
 
 probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
     tokenizer=tokenizer,
     facts=facts,
     probes=probes,
     targets=targets,
-    sections=sections,
+    probes_df=knowledge_probe_df,
     batch_size=8,
+    logger=log,
+    log_prefix="knowledge_probe",
+)
+
+# --- Load Probe Data ---
+inference_probe_df = pd.read_csv('../../data/arxiv/dpo_high_level_probes_v2.csv')
+facts = inference_probe_df['text'].tolist()
+probes = inference_probe_df['text'].tolist()
+targets = inference_probe_df['target'].tolist()
+
+inference_probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
+    tokenizer=tokenizer,
+    facts=facts,
+    probes=probes,
+    targets=targets,
+    probes_df=inference_probe_df,
+    batch_size=8,
+    logger=log,
+    log_prefix="inference_probe",
+)
+
+inference_config = llm_configs.InferenceConfig()
+generation_probe_callback = llm_callbacks.GenerationProbeCallback(
+    tokenizer=tokenizer,
+    inference_config=inference_config,
     logger=log
 )
+
 
 # corpus_callback = CorpusPerplexityCallback(
 #     text_content=arxiv_paper,
@@ -92,7 +118,7 @@ probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
 training_loss_callback = TrainingLossPerplexityCallback()
 
 # --- Fine-Tune ---
-callbacks_to_use = [probe_callback, training_loss_callback]
+callbacks_to_use = [probe_callback, training_loss_callback, inference_probe_callback, generation_probe_callback]
 if "SingleArxivPaper" in args.experiment_name:
     # --- Load the paper ---
     log.info("\n--- Loading in Single Arxiv Paper ---")
@@ -148,15 +174,23 @@ elif "ParaphrasedArxivPaper" in args.experiment_name:
     )
 
 # --- Save Metrics and Generate Plots ---
-output_dir = os.path.join("../../results/FT/", args.experiment_name)
-os.makedirs(output_dir, exist_ok=True)
+output_dir_knowledge_probe = os.path.join("../../results/FT", args.experiment_name, "knowledge_probe")
+os.makedirs(output_dir_knowledge_probe, exist_ok=True)
 
-probe_callback.save_results(output_dir=output_dir)
+probe_callback.save_results(output_dir=output_dir_knowledge_probe)
 #corpus_callback.save_results(output_dir=output_dir)
-training_loss_callback.save_results(output_dir=output_dir)
+training_loss_callback.save_results(output_dir=output_dir_knowledge_probe)
 
-log.info(f"All metrics saved to {output_dir}")
+log.info(f"All knowledge probe metrics saved to {output_dir_knowledge_probe}")
+
+# Repeat for inference probe
+output_dir_inference_probe = os.path.join("../../results/FT", args.experiment_name, "inference_probe")
+os.makedirs(output_dir_inference_probe, exist_ok=True)
+inference_probe_callback.save_results(output_dir=output_dir_inference_probe)
+
+log.info(f"All inference probe metrics saved to {output_dir_inference_probe}")
 
 # --- Generate Plots ---
-llm_plotting.generate_new_plots(output_dir, logger=log)
+llm_plotting.generate_new_plots_for_knowledge_probes("v6",output_dir_knowledge_probe, logger=log)
+llm_plotting.generate_new_plots_for_inference_probes("v2",output_dir_inference_probe, logger=log)
 log.info("Finished generating all plots.")

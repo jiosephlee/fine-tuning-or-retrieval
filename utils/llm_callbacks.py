@@ -15,7 +15,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                  facts: List[str],
                  probes: List[str],
                  targets: List[str],
-                 sections: List[str],
+                 probes_df: pd.DataFrame = None,
                  track_hits: bool = True, 
                  track_logprobs: bool = True,
                  batch_size: int = 8, 
@@ -29,7 +29,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         self.facts = facts
         self.probes = probes
         self.targets = targets
-        self.sections = sections
+        self.probes_df = probes_df
         
         self.track_hits = track_hits
         self.track_logprobs = track_logprobs
@@ -131,6 +131,11 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             wandb.log(log_data, step=step)
             
         model.train()
+
+    def on_train_end(self, args, state, control, model, **kwargs):
+        """Generate a detailed report of the worst-performing probes at the end of training."""
+        output_dir = args.output_dir
+        self._generate_worst_probes_report(model, output_dir)
 
     def _get_target_mask(self, tokenized_full, context_lengths, target_lengths, full_lengths):
         """Identifies the token positions of the target sequence within the full sequence.
@@ -275,6 +280,129 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             "hit_accuracy_at_10": torch.cat(all_metrics['hit_accuracy_at_10']) if self.track_hits and all_metrics['hit_accuracy_at_10'] else None,
         }
 
+    def _generate_worst_probes_report(self, model, output_dir, top_k=10):
+        """
+        Generates a report on the top_k worst-performing probes based on final perplexity.
+        """
+        if not self.history['perplexity']:
+            print("No perplexity history to generate report from.")
+            return
+
+        print(f"{self.__class__.__name__}: Generating worst probes report...")
+
+        # 1. Identify worst probes from the final evaluation step
+        final_metrics = self.history['perplexity'][-1]
+        final_perplexities = torch.tensor(final_metrics['values'])
+        
+        # Sort by perplexity descending to get the worst probes
+        # Handle NaNs and Infs by treating them as worst
+        final_perplexities[torch.isnan(final_perplexities)] = float('inf')
+        worst_probe_indices = torch.argsort(final_perplexities, descending=True)[:top_k]
+
+        # 2. Get detailed analysis for these probes
+        report_path = os.path.join(output_dir, f'{self.log_prefix}_worst_probes_report.txt')
+        with open(report_path, 'w') as f:
+            f.write(f"Worst Probes Report (Top {top_k} by Perplexity) at Step {final_metrics['step']}\n")
+            f.write("="*50 + "\n\n")
+
+            # Create a batch of the worst probes to evaluate
+            worst_facts_tokenized = {
+                'input_ids': self.tokenized_facts['input_ids'][worst_probe_indices],
+                'attention_mask': self.tokenized_facts['attention_mask'][worst_probe_indices]
+            }
+            
+            device = model.device
+            inputs = {
+                'input_ids': worst_facts_tokenized['input_ids'].to(device),
+                'attention_mask': worst_facts_tokenized['attention_mask'].to(device)
+            }
+            
+            with torch.no_grad():
+                logits = model(**inputs).logits
+            
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = inputs['input_ids'][..., 1:].contiguous()
+            
+            context_lengths = self.context_lengths[worst_probe_indices].to(device) - 1 # shifted
+            target_lengths = self.target_lengths[worst_probe_indices].to(device)
+
+            for i, probe_idx in enumerate(worst_probe_indices):
+                probe_idx_int = probe_idx.item()
+                
+                # Write metadata
+                f.write(f"--- Probe Index: {probe_idx_int} ---\n")
+                if self.probes_df is not None and probe_idx_int < len(self.probes_df):
+                    metadata = self.probes_df.iloc[probe_idx_int].to_dict()
+                    for key, val in metadata.items():
+                        f.write(f"{key}: {val}\n")
+                else:
+                    f.write(f"Fact: {self.facts[probe_idx_int]}\n")
+
+                # Write final metrics for this probe
+                f.write("\nFinal Metrics:\n")
+                for metric_name, history_data in self.history.items():
+                    if history_data:
+                        final_value = history_data[-1]['values'][probe_idx_int]
+                        f.write(f"  {metric_name}: {final_value:.4f}\n")
+
+                # Write detailed token analysis
+                f.write("\nDetailed Token-level Analysis:\n")
+                
+                analysis_text = self._get_detailed_token_analysis(
+                    shift_logits[i],
+                    shift_labels[i],
+                    context_lengths[i],
+                    target_lengths[i]
+                )
+                f.write(analysis_text)
+                f.write("\n" + "="*50 + "\n\n")
+
+        print(f" > Saved worst probes report to '{report_path}'")
+
+    def _get_detailed_token_analysis(self, logits, labels, context_length, target_length, top_k=10):
+        """
+        For a single probe, generates a detailed analysis of each target token's prediction.
+        logits: (seq_len - 1, vocab_size)
+        labels: (seq_len - 1)
+        context_length: int (already shifted)
+        target_length: int
+        """
+        analysis = []
+        
+        start = context_length.item()
+        end = start + target_length.item()
+        
+        target_token_ids = labels[start:end]
+        target_logits = logits[start:end]
+        
+        for i in range(target_token_ids.shape[0]):
+            token_pos = start + i
+            actual_token_id = target_token_ids[i].item()
+            
+            if actual_token_id == self.tokenizer.pad_token_id or actual_token_id == -100:
+                continue
+                
+            token_logits = target_logits[i]
+            
+            # Get top k predictions
+            top_k_probs, top_k_indices = torch.topk(torch.softmax(token_logits, dim=-1), top_k)
+            
+            top_k_tokens = [self.tokenizer.decode(t) for t in top_k_indices]
+            actual_token = self.tokenizer.decode(actual_token_id)
+            
+            # Find rank of actual token
+            sorted_indices = torch.argsort(token_logits, descending=True)
+            rank_tensor = (sorted_indices == actual_token_id).nonzero()
+            rank = rank_tensor.item() + 1 if rank_tensor.numel() > 0 else "Not in vocab"
+            
+            analysis.append(f"  - Target Token #{i+1} (pos {token_pos}): '{actual_token}' (ID: {actual_token_id})")
+            analysis.append(f"    - Rank: {rank}")
+            analysis.append(f"    - Top {top_k} predictions:")
+            for j in range(top_k):
+                analysis.append(f"      {j+1}. '{top_k_tokens[j]}' (ID: {top_k_indices[j].item()}, Prob: {top_k_probs[j]:.4f})")
+                
+        return "\n".join(analysis)
+
     def save_results(self, output_dir: str):
         """Saves all collected metrics to a CSV file."""
         os.makedirs(output_dir, exist_ok=True)
@@ -283,7 +411,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         all_dfs = []
         for metric_name, history_data in self.history.items():
             if not history_data: continue
-            records = [{'step': entry['step'], 'probe_index': i, 'section': self.sections[i], metric_name: value} for entry in history_data for i, value in enumerate(entry['values'])]
+            records = [{'step': entry['step'], 'probe_index': i, metric_name: value} for entry in history_data for i, value in enumerate(entry['values'])]
             df = pd.DataFrame(records)
             if not df.empty:
                 all_dfs.append(df.set_index(['step', 'probe_index']))
@@ -296,3 +424,51 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         output_path = os.path.join(output_dir, f'{self.log_prefix}_metrics.csv')
         final_df.to_csv(output_path, index=False)
         print(f" > Saved consolidated metrics to '{output_path}' with {len(final_df)} rows.")
+
+from utils.llm_training import generate_text
+from utils.llm_configs import InferenceConfig
+
+class GenerationProbeCallback(TrainerCallback):
+    """
+    A callback that periodically generates text from a fixed prompt and saves the output.
+    """
+    def __init__(self,
+                 tokenizer: AutoTokenizer,
+                 inference_config: InferenceConfig,
+                 eval_every_n_steps: int = 10,
+                 logger=None,
+                 log_prefix="generation_probe"):
+
+        self.tokenizer = tokenizer
+        self.inference_config = inference_config
+        self.eval_every_n_steps = eval_every_n_steps
+        self.logger = logger
+        self.log_prefix = log_prefix
+
+        self.prompt = "After reading the paper \"Direct Preference Optimiazation: Your Langauge MOdel is a Secret Reward model\", I've learned a lot. Let me tell you everyhting I've learned."
+
+    def on_step_end(self, args, state, control, model, **kwargs):
+        if state.is_world_process_zero and state.global_step > 0 and state.global_step % self.eval_every_n_steps == 0:
+            if self.logger:
+                self.logger.info(f"Running generation probe at step {state.global_step}...")
+            else:
+                print(f"Running generation probe at step {state.global_step}...")
+
+            model.eval()
+
+            generated_text = generate_text(model, self.tokenizer, self.prompt, self.inference_config)
+
+            # Save the output
+            output_dir = os.path.join(args.output_dir, self.log_prefix)
+            os.makedirs(output_dir, exist_ok=True)
+            file_path = os.path.join(output_dir, f"generation_step_{state.global_step}.txt")
+
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(generated_text)
+            
+            if self.logger:
+                self.logger.info(f" > Saved generation probe output to '{file_path}'")
+            else:
+                print(f" > Saved generation probe output to '{file_path}'")
+
+            model.train()
