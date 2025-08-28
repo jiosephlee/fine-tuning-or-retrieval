@@ -65,7 +65,7 @@ training_config = llm_configs.TrainingConfig(
 )
 
 # --- Load Probe Data ---
-probe_df = pd.read_csv('../../data/arxiv/DPO_knowledge_probes_v5.csv')
+probe_df = pd.read_csv('../../data/arxiv/DPO_knowledge_probes_v6.csv')
 facts = probe_df['fact'].tolist()
 probes = probe_df['probe'].tolist()
 targets = probe_df['target'].tolist()
