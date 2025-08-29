@@ -264,11 +264,17 @@ def fine_tune_on_texts(
         all_text_chunks = []
         total_tokens = 0
         for i,text in enumerate(texts):
-            chunks, num_tokens = chunk_text_by_sections(text, tokenizer, train_cfg.context_length)
-            log.info(f"[{tag}] Chunking text {i}: Context: {train_cfg.context_length} -> {len(chunks)} chunks")
+            if "section" in text.lower():
+                chunks, num_tokens = chunk_text_by_sections(text, tokenizer, train_cfg.context_length)
+                log.info(f"[{tag}] Section-based chunking: Total tokens: {total_tokens}, Context: {train_cfg.context_length} -> {len(chunks)} total chunks")
+            else:
+                chunks, num_tokens = chunk_text(text, tokenizer, train_cfg.context_length, delimiter="\n\n")
+                log.info(f"[{tag}] Chunking text {i}: Context: {train_cfg.context_length} -> {len(chunks)} chunks")
             all_text_chunks.extend(chunks)
             total_tokens += num_tokens
-        log.info(f"[{tag}] Section-based chunking: Total tokens: {total_tokens}, Context: {train_cfg.context_length} -> {len(all_text_chunks)} total chunks")
+            
+        log.info(f"[{tag}] Total tokens: {total_tokens}, Context: {train_cfg.context_length} -> {len(all_text_chunks)} total chunks")
+
     else:
         log.info(f"[{tag}] Using token-based chunking...")
         all_text_chunks, total_tokens = chunk_texts(texts, tokenizer, train_cfg.context_length)
@@ -366,7 +372,7 @@ def chunk_texts(texts: List[str], tokenizer, context_length: int) -> tuple[List[
     
     return all_text_chunks, total_tokens
 
-def chunk_text(text_content: str, tokenizer, context_length: int) -> tuple[List[str], int]:
+def chunk_text(text_content: str, tokenizer, context_length: int, delimiter: str = None) -> tuple[List[str], int]:
     """
     Chunks a single text into smaller pieces based on context length.
     
@@ -374,23 +380,46 @@ def chunk_text(text_content: str, tokenizer, context_length: int) -> tuple[List[
         text_content: Text string to chunk
         tokenizer: The tokenizer to use
         context_length: Maximum tokens per chunk
+        delimiter: Optional delimiter to split by (e.g., '\n', '.', etc.)
         
     Returns:
         Tuple of (text_chunks, num_tokens)
     """
-    tokens = tokenizer(text_content, add_special_tokens=False, truncation=False)["input_ids"]
-    num_tokens = len(tokens)
-    num_chunks = math.ceil(num_tokens / context_length)
+    total_tokens = len(tokenizer(text_content, add_special_tokens=False, truncation=False)["input_ids"])
     
-    text_chunks = []
-    for i in range(num_chunks):
-        start_idx = i * context_length
-        end_idx = min((i + 1) * context_length, num_tokens)
-        chunk_tokens = tokens[start_idx:end_idx]
-        chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=False)
-        text_chunks.append(chunk_text)
+    if delimiter is None:
+        # Fall back to original token-based chunking
+        tokens = tokenizer(text_content, add_special_tokens=False, truncation=False)["input_ids"]
+        num_chunks = math.ceil(len(tokens) / context_length)
+        
+        text_chunks = []
+        for i in range(num_chunks):
+            start_idx = i * context_length
+            end_idx = min((i + 1) * context_length, len(tokens))
+            chunk_tokens = tokens[start_idx:end_idx]
+            chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=False)
+            text_chunks.append(chunk_text)
+    else:
+        # Split by delimiter and build chunks
+        parts = text_content.split(delimiter)
+        text_chunks = []
+        current_chunk = ""
+        
+        for part in parts:
+            test_chunk = current_chunk + delimiter + part if current_chunk else part
+            test_tokens = len(tokenizer(test_chunk, add_special_tokens=False, truncation=False)["input_ids"])
+            
+            if test_tokens <= context_length:
+                current_chunk = test_chunk
+            else:
+                if current_chunk:
+                    text_chunks.append(current_chunk)
+                current_chunk = part
+        
+        if current_chunk:
+            text_chunks.append(current_chunk)
     
-    return text_chunks, num_tokens
+    return text_chunks, total_tokens
 
 def chunk_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 2048):
     """
