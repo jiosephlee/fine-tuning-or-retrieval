@@ -20,6 +20,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                  track_logprobs: bool = True,
                  batch_size: int = 8, 
                  logger=None,
+                 output_dir="",
                  log_prefix="probe_eval"):
         
         self.tokenizer = tokenizer
@@ -45,7 +46,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             'hit_accuracy_at_5': [],
             'hit_accuracy_at_10': [],
         }
-    
+        self.output_dir = output_dir
         self._precompute_token_lengths()
 
     def _precompute_token_lengths(self):
@@ -134,7 +135,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
 
     def on_train_end(self, args, state, control, model, **kwargs):
         """Generate a detailed report of the worst-performing probes at the end of training."""
-        output_dir = args.output_dir
+        output_dir = self.output_dir
         self._generate_worst_probes_report(model, output_dir)
 
     def _get_target_mask(self, tokenized_full, context_lengths, target_lengths, full_lengths):
@@ -445,7 +446,7 @@ class GenerationProbeCallback(TrainerCallback):
         self.logger = logger
         self.log_prefix = log_prefix
 
-        self.prompt = "After reading the paper \"Direct Preference Optimiazation: Your Langauge MOdel is a Secret Reward model\", I've learned a lot. Let me tell you everyhting I've learned."
+        self.prompt = "After reading the paper \"Direct Preference Optimization: Your Language Model is a Secret Reward model\", I've learned a lot about DPO. Let me tell you everything I've learned."
 
     def on_step_end(self, args, state, control, model, **kwargs):
         if state.is_world_process_zero and state.global_step > 0 and state.global_step % self.eval_every_n_steps == 0:
@@ -459,7 +460,7 @@ class GenerationProbeCallback(TrainerCallback):
             generated_text = generate_text(model, self.tokenizer, self.prompt, self.inference_config)
 
             # Save the output
-            output_dir = os.path.join(args.output_dir, self.log_prefix)
+            output_dir = os.path.join("../../results/FT/", self.log_prefix)
             os.makedirs(output_dir, exist_ok=True)
             file_path = os.path.join(output_dir, f"generation_step_{state.global_step}.txt")
 
