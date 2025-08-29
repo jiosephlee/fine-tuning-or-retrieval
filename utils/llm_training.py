@@ -502,6 +502,102 @@ def chunk_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 20
     
     return chunks, total_tokens
 
+def chunk_text_by_sections_with_overlap(text_content: str, tokenizer, max_tokens: int = 2048, overlap_ratio: float = 0.5):
+    """
+    Chunks text by sections with overlap, ensuring each chunk doesn't exceed max_tokens.
+    Each new chunk starts with some content from the previous chunk.
+
+    Args:
+        text_content: The full text to chunk
+        tokenizer: The tokenizer to use for counting tokens
+        max_tokens: Maximum tokens per chunk
+        overlap_ratio: The ratio of overlap between consecutive chunks (e.g., 0.5 for 50%).
+
+    Returns:
+        List of text chunks and total token count
+    """
+    import re
+    # Extract title
+    title_match = re.search(r'\\title\{([^}]+)\}', text_content)
+    title = ""
+    if title_match:
+        title = f"\\title{{{title_match.group(1)}}}\n\n"
+    else:
+        raise ValueError("No title found in the text")
+
+    # Split text into a flat list of processable pieces (sections, subsections, etc.)
+    section_pattern = r'(\\section\{[^}]+\})'
+    parts = re.split(section_pattern, text_content)
+    
+    sections = []
+    if parts[0].strip():
+        sections.append(parts[0])
+    
+    i = 1
+    while i < len(parts):
+        if re.match(section_pattern, parts[i]):
+            section_content = parts[i]
+            if i + 1 < len(parts):
+                section_content += parts[i + 1]
+            sections.append(section_content)
+            i += 2
+        else:
+            i += 1
+    
+    all_pieces = []
+    title_token_len = len(tokenizer(title, add_special_tokens=False)["input_ids"])
+    for section in sections:
+        section_tokens = tokenizer(section, add_special_tokens=False, truncation=False)["input_ids"]
+        if len(section_tokens) > (max_tokens - title_token_len):
+            pieces, _ = chunk_text_by_subsections(section, tokenizer, max_tokens - title_token_len)
+            all_pieces.extend(pieces)
+        else:
+            all_pieces.append(section)
+
+    chunks = []
+    piece_idx = 0
+    while piece_idx < len(all_pieces):
+        overlap_content = ""
+        if chunks and overlap_ratio > 0:
+            last_chunk = chunks[-1]
+            content_without_title = last_chunk[len(title):]
+            paragraphs = content_without_title.split('\n\n')
+            if len(paragraphs) > 1:
+                overlap_start_para_index = int(len(paragraphs) * (1 - overlap_ratio))
+                overlap_paragraphs = paragraphs[overlap_start_para_index:]
+                overlap_content = "\n\n".join(overlap_paragraphs)
+
+        current_chunk_content = overlap_content
+        last_piece_added_idx = -1
+
+        # Find which piece corresponds to the start of new content
+        new_content_piece_idx = piece_idx
+        
+        for i in range(new_content_piece_idx, len(all_pieces)):
+            piece = all_pieces[i]
+            # Skip empty pieces
+            if not piece.strip():
+                last_piece_added_idx = i
+                continue
+
+            candidate_content = current_chunk_content + piece
+            candidate_tokens = tokenizer(title + candidate_content, add_special_tokens=False, truncation=False)["input_ids"]
+            
+            if len(candidate_tokens) <= max_tokens:
+                current_chunk_content = candidate_content
+                last_piece_added_idx = i
+            else:
+                break
+
+        if last_piece_added_idx != -1 and (title + current_chunk_content).strip() != title.strip():
+            chunks.append(title + current_chunk_content)
+            piece_idx = last_piece_added_idx + 1
+        else:
+            piece_idx += 1 # Ensure progress
+    
+    total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in chunks)
+    return chunks, total_tokens
+
 def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048):
     """
     Chunks text by sections, ensuring each chunk doesn't exceed max_tokens.
