@@ -1,4 +1,8 @@
 # add .. path 
+
+# pip install flash-attn --no-build-isolation
+# pip install git+https://github.com/huggingface/trl
+# pip install pydantic datasets peft bitsandbytes wandb matplotlib seaborn liger-kernel scikit-learn
 import os
 import sys
 sys.path.append('../..')
@@ -32,7 +36,7 @@ log = logging.getLogger(__name__)
 
 os.environ["WANDB_PROJECT"]="fine_tuning_study"
 
-
+knowledge_probes_version = "v7"
 
 # --- Load the model ---
 model_config = llm_configs.ModelConfig(
@@ -65,7 +69,7 @@ training_config = llm_configs.TrainingConfig(
 )
 
 # --- Load Probe Data ---
-knowledge_probe_df = pd.read_csv('../../data/arxiv/DPO_knowledge_probes_v6.csv')
+knowledge_probe_df = pd.read_csv(f'../../data/arxiv/DPO_knowledge_probes_{knowledge_probes_version}.csv')
 facts = knowledge_probe_df['fact'].tolist()
 probes = knowledge_probe_df['probe'].tolist()
 targets = knowledge_probe_df['target'].tolist()
@@ -84,8 +88,8 @@ probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
 
 # --- Load Probe Data ---
 inference_probe_df = pd.read_csv('../../data/arxiv/dpo_high_level_probes_v2.csv')
-facts = inference_probe_df['text'].tolist()
-probes = inference_probe_df['text'].tolist()
+facts = inference_probe_df['fact'].tolist()
+probes = inference_probe_df['probe'].tolist()
 targets = inference_probe_df['target'].tolist()
 
 inference_probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
@@ -191,6 +195,6 @@ inference_probe_callback.save_results(output_dir=output_dir_inference_probe)
 log.info(f"All inference probe metrics saved to {output_dir_inference_probe}")
 
 # --- Generate Plots ---
-llm_plotting.generate_new_plots_for_knowledge_probes("v6",output_dir_knowledge_probe, logger=log)
+llm_plotting.generate_new_plots_for_knowledge_probes(knowledge_probes_version,output_dir_knowledge_probe, logger=log)
 llm_plotting.generate_new_plots_for_inference_probes("v2",output_dir_inference_probe, logger=log)
 log.info("Finished generating all plots.")
