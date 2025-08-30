@@ -476,7 +476,7 @@ def split_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 20
     
     return subsections, total_tokens
 
-def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048, overlap_sections = False):
+def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048, overlap_sections = False, overlap_denom = 4, overlap_numer = 3):
     """
     Chunks text by sections, ensuring each chunk doesn't exceed max_tokens.
     If a section is too large, it tries to split by subsections first.
@@ -559,10 +559,10 @@ def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048,
                     if current_chunk.strip() and overlap_sections:
                         # Get the latter half of the previous chunk for context
                         #print(current_chunk)
-                        prev_paragraphs = current_chunk.split('.')
-                        # print(prev_paragraphs)
-                        half_point = len(prev_paragraphs) // 4 * 3
-                        context_from_prev = '.'.join(prev_paragraphs[half_point:])
+                        prev_sentences = current_chunk.split('.')
+                        # print(prev_sentences)
+                        half_point = len(prev_sentences) // overlap_denom * overlap_numer
+                        context_from_prev = '.'.join(prev_sentences[half_point:])
                         current_chunk = title + context_from_prev + piece
                     else:
                         current_chunk = title + piece
