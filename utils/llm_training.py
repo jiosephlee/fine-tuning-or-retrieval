@@ -266,7 +266,7 @@ def fine_tune_on_texts(
         for i,text in enumerate(texts):
             if "section" in text.lower():
                 chunks, num_tokens = chunk_text_by_sections(text, tokenizer, train_cfg.context_length, overlap_sections)
-                log.info(f"[{tag}] Section-based chunking: Total tokens: {total_tokens}, Context: {train_cfg.context_length} -> {len(chunks)} total chunks")
+                log.info(f"[{tag}] Section-based chunking: Total tokens: {total_tokens}, Overlapping: {overlap_sections}, Context: {train_cfg.context_length} -> {len(chunks)} total chunks")
             else:
                 chunks, num_tokens = chunk_text(text, tokenizer, train_cfg.context_length, delimiter="\n\n")
                 log.info(f"[{tag}] Chunking text {i}: Context: {train_cfg.context_length} -> {len(chunks)} chunks")
