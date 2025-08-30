@@ -421,17 +421,20 @@ def chunk_text(text_content: str, tokenizer, context_length: int, delimiter: str
     
     return text_chunks, total_tokens
 
-def chunk_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 2048):
+def split_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 2048):
     """
-    Helper function to chunk a section by subsections when possible.
+    Splits text by subsections and validates each subsection doesn't exceed max_tokens.
     
     Args:
-        text_content: The section text to chunk
+        text_content: The section text to split
         tokenizer: The tokenizer to use for counting tokens
-        max_tokens: Maximum tokens per chunk
+        max_tokens: Maximum tokens per subsection
         
     Returns:
-        List of text chunks and total token count
+        List of subsections and total token count
+        
+    Raises:
+        ValueError: If any subsection exceeds max_tokens
     """
     import re
     subsection_pattern = r'(\\subsection\{[^}]+\})'
@@ -457,50 +460,21 @@ def chunk_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 20
     
     # If we only have one subsection (no actual subsection splits), return original
     if len(subsections) <= 1:
-        return [text_content], len(tokenizer(text_content, add_special_tokens=False, truncation=False)["input_ids"])
+        subsections = [text_content]
     
-    chunks = []
+    # Validate that no subsection exceeds max_tokens
     total_tokens = 0
-    current_chunk = ""
-    
-    for subsection in subsections:
+    for i, subsection in enumerate(subsections):
         if not subsection.strip():
             continue
-            
-        # Check if this would exceed max_tokens when added to current chunk
-        test_chunk = current_chunk + subsection
-        tokens = tokenizer(test_chunk, add_special_tokens=False, truncation=False)["input_ids"]
+        tokens = tokenizer(subsection, add_special_tokens=False, truncation=False)["input_ids"]
         token_count = len(tokens)
+        total_tokens += token_count
         
-        if token_count <= max_tokens:
-            # Add to current chunk
-            current_chunk = test_chunk
-        else:
-            # Save current chunk if it has content
-            if current_chunk.strip():
-                chunks.append(current_chunk)
-                chunk_tokens = tokenizer(current_chunk, add_special_tokens=False, truncation=False)["input_ids"]
-                total_tokens += len(chunk_tokens)
-            
-            # Check if this subsection alone exceeds max_tokens
-            subsection_tokens = tokenizer(subsection, add_special_tokens=False, truncation=False)["input_ids"]
-            if len(subsection_tokens) > max_tokens:
-                # Fall back to token-based chunking for this subsection
-                subsection_chunks, subsection_token_count = chunk_text(subsection, tokenizer, max_tokens)
-                chunks.extend(subsection_chunks)
-                total_tokens += subsection_token_count
-                current_chunk = ""
-            else:
-                # Start new chunk with this subsection
-                current_chunk = subsection
+        if token_count > max_tokens:
+            raise ValueError(f"Subsection {i} has {token_count} tokens, which exceeds max_tokens ({max_tokens})")
     
-    # Add final chunk if it has content
-    if current_chunk.strip():
-        chunks.append(current_chunk)
-        chunk_tokens = tokenizer(current_chunk, add_special_tokens=False, truncation=False)["input_ids"]
-        total_tokens += len(chunk_tokens)
-    
-    return chunks, total_tokens
+    return subsections, total_tokens
 
 def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048, overlap_sections = False):
     """
@@ -567,13 +541,7 @@ def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048,
             # Section fits, add it to the current chunk.
             current_chunk = candidate_chunk
         else:
-            # Section does not fit. Break it down into pieces and add them individually.
-            title_token_len = len(tokenizer(title, add_special_tokens=False)["input_ids"])
-            # Max size for a piece that might start a new chunk (which would include the title).
-            subsection_max_size = max_tokens - title_token_len
-            
-            pieces, _ = chunk_text_by_subsections(section, tokenizer, subsection_max_size)
-                
+            pieces, _ = split_text_by_subsections(section, tokenizer, max_tokens)
             # Try to add pieces to the current chunk until it's full.
             for piece in pieces:
                 piece_candidate = current_chunk + piece
@@ -595,11 +563,9 @@ def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048,
                         # print(prev_paragraphs)
                         half_point = len(prev_paragraphs) // 4 * 3
                         context_from_prev = '.'.join(prev_paragraphs[half_point:])
-                        #print(context_from_prev)
                         current_chunk = title + context_from_prev + piece
                     else:
                         current_chunk = title + piece
-                    current_chunk = title + piece
 
     # Add the final chunk if it has content.
     if current_chunk.strip():
