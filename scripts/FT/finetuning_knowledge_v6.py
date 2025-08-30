@@ -150,7 +150,7 @@ if "SingleArxivPaper" in args.experiment_name:
         callbacks=callbacks_to_use,
         chunk_by_section=args.chunk_by_section
     )
-elif "ParaphrasedArxivPaper" in args.experiment_name:
+elif "ParaphrasedArxivPaper_" in args.experiment_name:
     log.info("\n--- Fine-Tuning on Paraphrased Arxiv Paper ---")
     if args.chunk_by_section:
         log.info("Using section-based chunking")
@@ -181,6 +181,7 @@ elif "ParaphrasedArxivPaper" in args.experiment_name:
         callbacks=callbacks_to_use,
         chunk_by_section=args.chunk_by_section
     )
+    
 elif "ParaphrasedArxivPaperWithExplanations" in args.experiment_name:
     log.info("\n--- Fine-Tuning on Paraphrased Arxiv Paper With Explanations ---")
     if args.chunk_by_section:
@@ -192,7 +193,9 @@ elif "ParaphrasedArxivPaperWithExplanations" in args.experiment_name:
     # Load original paper
     with open('../../data/arxiv/cleaned_DPO.txt', 'r', encoding='utf-8') as f:
         texts_to_train.append(f.read())
-        
+    
+    num_of_texts_to_train = 0
+    
     # Load paraphrased papers
     for i in range(args.num_paraphrased_texts-1):
         # Load DPO_explanation_1.txt through DPO_explanation_6.txt at the middle index
@@ -201,12 +204,15 @@ elif "ParaphrasedArxivPaperWithExplanations" in args.experiment_name:
                 file_path = f'../../data/arxiv/DPO_explanation_{explanation_num}.txt'
                 with open(file_path, 'r', encoding='utf-8') as f:
                     texts_to_train.append(f.read())
+            num_of_texts_to_train += 1
         else:
             file_path = f'../../data/arxiv/cleaned_DPO_paraphrased_{i}.txt'
             with open(file_path, 'r', encoding='utf-8') as f:
                 texts_to_train.append(f.read())
+            num_of_texts_to_train += 1
+
             
-    training_config.num_train_epochs = max(1, int(args.num_train_epochs / len(texts_to_train)))
+    training_config.num_train_epochs = max(1, int(args.num_train_epochs / num_of_texts_to_train))
     log.info(f"Adjusting num_train_epochs from {args.num_train_epochs} to {training_config.num_train_epochs} for {len(texts_to_train)} documents.")
 
     trainer = llm_training.fine_tune_on_texts(
