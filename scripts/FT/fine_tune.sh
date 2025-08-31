@@ -5,19 +5,28 @@ echo $num_paraphrased
 echo $num_epochs
 
 nohup python finetuning_knowledge_v6.py \
-    --experiment_name ParaphrasedArxivPaper_1B_Full_Finetuning_Test_Run_${num_epochs}_Epochs${yes_paraphrased}_v7_Probes \
+    --experiment_name SingleArxivPaper_1B_Full_Finetuning_Test_Run_${num_epochs}_Epochs${yes_paraphrased}_Overlapping_25_percent_v7_Probes \
     --num_train_epochs $num_epochs \
     --learning_rate 2e-5 \
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
-    --full_finetuning > output.log 2>&1 &
-
-# nohup python finetuning_knowledge_v6.py \
-#     --experiment_name ParaphrasedArxivPaperWithExplanations_1B_Full_Finetuning_Test_Run_${num_epochs}_Epochs${yes_paraphrased}_v7_Probes \
-#     --num_train_epochs $num_epochs \
-#     --learning_rate 2e-5 \
-#     --num_paraphrased_texts $num_paraphrased \
-#     --full_finetuning > output.log 2>&1 &
+    --full_finetuning > output1.log 2>&1 &
+sleep 3600
+nohup python finetuning_knowledge_v6.py \
+    --experiment_name ParaphrasedArxivPaper_1B_Full_Finetuning_Test_Run_${num_epochs}_Epochs${yes_paraphrased}_Overlapping_25_percent_v7_Probes \
+    --num_train_epochs $num_epochs \
+    --learning_rate 2e-5 \
+    --num_paraphrased_texts $num_paraphrased \
+    --overlap_sections \
+    --full_finetuning > output2.log 2>&1 &
+sleep 3600
+nohup python finetuning_knowledge_v6.py \
+    --experiment_name ParaphrasedArxivPaperWithExplanations_1B_Full_Finetuning_Test_Run_${num_epochs}_Epochs${yes_paraphrased}_Overlapping_25_percent_v7_Probes \
+    --num_train_epochs $num_epochs \
+    --learning_rate 2e-5 \
+    --num_paraphrased_texts $num_paraphrased \
+    --overlap_sections \
+    --full_finetuning > output3.log 2>&1 &
 
 #nohup python finetuning_knowledge_v6.py --experiment_name ParaphrasedArxivPaper_1B_Full_Finetuning_Test_Run_${num_epochs}_Epochs${yes_paraphrased}_v7_Probes --num_train_epochs $num_epochs --learning_rate 2e-5 --num_paraphrased_texts $num_paraphrased --full_finetuning> output.log 2>&1 &
 # sleep 7200

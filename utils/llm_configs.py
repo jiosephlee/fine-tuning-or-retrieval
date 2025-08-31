@@ -44,7 +44,7 @@ class TrainingConfig(BaseModel):
     gradient_accumulation_steps: int = 16 # This gives us a effective batch size of 32
     optim: str = "paged_adamw_8bit" # Saves VRAM by using 8bit Adam
     # evaluation_strategy: str = "epoch"
-    weight_decay: float = 0.01
+    weight_decay: float = 0.1
     # max_grad_norm: float = 0.3 # defaults to 1
     gradient_checkpointing: bool = False # Saves VRAM by using gradient checkpointing
     use_liger_kernel: bool = True # This saves VRAM
