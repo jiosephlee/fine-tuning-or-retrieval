@@ -231,6 +231,8 @@ def construct_experiment_name(args):
     if args.num_paraphrased_texts > 0:
         if args.with_explanations:
             base_name = "ParaphrasedArxivPaperWithExplanations"
+        elif args.with_prior_knowledge:
+            base_name = "ParaphrasedArxivPaperWithPriorKnowledge"
         else:
             base_name = "ParaphrasedArxivPaper"
     else:
@@ -244,7 +246,7 @@ def construct_experiment_name(args):
     ]
     
     if args.overlap_sections:
-        experiment_name_parts.append("Overlapping")
+        experiment_name_parts.append(f"Overlapping_{args.overlap_ratio}")
     
     experiment_name_parts.append(f"{args.knowledge_probes_version}_Probes")
     
