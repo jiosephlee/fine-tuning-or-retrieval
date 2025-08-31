@@ -204,6 +204,7 @@ In this paper, we show"""
             train=True,
             callbacks=callbacks_to_use,
             overlap_sections=args.overlap_sections,
+            overlap_ratio=args.overlap_ratio,
             chunk_by_section=args.chunk_by_section
         )
 
@@ -421,9 +422,11 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--chunk_by_section", default=True, type=bool, help="Use section-based chunking instead of token-based chunking")
     parser.add_argument("--overlap_sections", default=False, action="store_true", help="Overlap sections when chunking")
+    parser.add_argument("--overlap_ratio", type=str, default="1_4", help="Ratio of overlap when chunking")
     parser.add_argument("--num_paraphrased_texts", type=int, default=9, help="Number of paraphrased texts to use for training (0-9)")
     parser.add_argument("--knowledge_probes_version", type=str, default="v7", help="Version of the knowledge probes to use.")
     parser.add_argument("--with_explanations", default=False, action="store_true", help="Use explanations when fine-tuning on paraphrased texts")
+    parser.add_argument("--with_prior_knowledge", default=False, action="store_true", help="Use prior knowledge when fine-tuning on paraphrased texts")
     parser.add_argument("--lima_afterwards", default=False, action="store_true", help="LIMA-based instruction tuning after continued pretraining")
     args = parser.parse_args()
     

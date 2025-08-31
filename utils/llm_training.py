@@ -238,7 +238,7 @@ def fine_tune_on_text(
     return trainer
 
 def fine_tune_on_texts(
-    model, tokenizer, log, texts: List[str], train_cfg: TrainingConfig, *, train=True, tag: str = "finetuning on texts...", callbacks: Optional[List[TrainerCallback]] = None, chunk_by_section: bool = False, overlap_sections = False
+    model, tokenizer, log, texts: List[str], train_cfg: TrainingConfig, *, train=True, tag: str = "finetuning on texts...", callbacks: Optional[List[TrainerCallback]] = None, chunk_by_section: bool = False, overlap_sections = False, overlap_ratio = "1_4"
 ):
     """
     Fine-tunes a model on a given list of texts by chunking them and training on all chunks together.
@@ -265,7 +265,10 @@ def fine_tune_on_texts(
         total_tokens = 0
         for i,text in enumerate(texts):
             if "section" in text.lower():
-                chunks, num_tokens = chunk_text_by_sections(text, tokenizer, train_cfg.context_length, overlap_sections)
+                overlap_numer, overlap_denom = overlap_ratio.split("_")
+                overlap_denom = int(overlap_denom)
+                overlap_numer = int(overlap_numer)
+                chunks, num_tokens = chunk_text_by_sections(text, tokenizer, train_cfg.context_length, overlap_sections, overlap_denom, overlap_numer)
                 log.info(f"[{tag}] Section-based chunking: Total tokens: {total_tokens}, Overlapping: {overlap_sections}, Context: {train_cfg.context_length} -> {len(chunks)} total chunks")
             else:
                 chunks, num_tokens = chunk_text(text, tokenizer, train_cfg.context_length, delimiter="\n\n")
@@ -476,7 +479,7 @@ def split_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 20
     
     return subsections, total_tokens
 
-def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048, overlap_sections = False, overlap_denom = 4, overlap_numer = 3):
+def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048, overlap_sections = False, overlap_denom = 4, overlap_numer = 1):
     """
     Chunks text by sections, ensuring each chunk doesn't exceed max_tokens.
     If a section is too large, it tries to split by subsections first.
@@ -559,10 +562,10 @@ def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048,
                     if current_chunk.strip() and overlap_sections:
                         # Get the latter half of the previous chunk for context
                         #print(current_chunk)
-                        prev_sentences = current_chunk.split('.')
+                        prev_sentences = current_chunk.split('\n')
                         # print(prev_sentences)
-                        half_point = len(prev_sentences) // overlap_denom * overlap_numer
-                        context_from_prev = '.'.join(prev_sentences[half_point:])
+                        half_point = len(prev_sentences) // overlap_denom * (overlap_denom - overlap_numer)
+                        context_from_prev = '\n'.join(prev_sentences[half_point:])
                         current_chunk = title + context_from_prev + piece
                     else:
                         current_chunk = title + piece
