@@ -4,6 +4,8 @@ from typing import List, Dict
 import pandas as pd
 import os
 import wandb
+from utils.llm_training import generate_text
+from utils.llm_configs import InferenceConfig
 
 class BaseKnowledgeProbeCallBack(TrainerCallback):
     """
@@ -112,7 +114,8 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         step = state.global_step
 
         for metric_name, values in current_metrics.items():
-            if values is None: continue
+            if values is None:
+                continue
 
             # Log the metrics to local history
             self.history[metric_name].append({'step': step, 'values': values.cpu().tolist()})
@@ -271,7 +274,8 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
 
             if self.track_hits:
                 hits = self._calculate_hits_at_k(shift_logits, shift_labels, context_lengths, target_lengths, k_values=[1, 5, 10])
-                for k, v in hits.items(): all_metrics[k].append(v)
+                for k, v in hits.items():
+                    all_metrics[k].append(v)
 
         return {
             "log_prob": torch.cat(all_metrics['log_prob']) if self.track_logprobs and all_metrics['log_prob'] else None,
@@ -411,7 +415,8 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
 
         all_dfs = []
         for metric_name, history_data in self.history.items():
-            if not history_data: continue
+            if not history_data:
+                continue
             records = [{'step': entry['step'], 'probe_index': i, metric_name: value} for entry in history_data for i, value in enumerate(entry['values'])]
             df = pd.DataFrame(records)
             if not df.empty:
@@ -426,55 +431,24 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         final_df.to_csv(output_path, index=False)
         print(f" > Saved consolidated metrics to '{output_path}' with {len(final_df)} rows.")
 
-from utils.llm_training import generate_text
-from utils.llm_configs import InferenceConfig
-
 class GenerationProbeCallback(TrainerCallback):
     """
     A callback that periodically generates text from a fixed prompt and saves the output.
     """
     def __init__(self,
+                 prompts: Dict[str, str],
                  tokenizer: AutoTokenizer,
                  inference_config: InferenceConfig,
                  eval_every_n_steps: int = 10,
                  logger=None,
-                 log_prefix="generation_probe"):
+                 output_dir: str = ""):
 
+        self.prompts = prompts
         self.tokenizer = tokenizer
         self.inference_config = inference_config
         self.eval_every_n_steps = eval_every_n_steps
         self.logger = logger
-        self.log_prefix = log_prefix
-
-        self.prompts = {
-            "prompt_1": "After reading the paper \"Direct Preference Optimization: Your Language Model is a Secret Reward model\", I've learned a lot. Let me tell you everything I've learned.",
-            "prompt_2": """The paper "Direct Preference Optimization: Your Language Model is a Secret Reward model" presents a novel and efficient method for aligning language models with human preferences. The core contribution of the paper is""",
-            "prompt_3": r"""\title{Direct Preference Optimization: Your Language Model is Secretly a Reward Model}
-
-\begin{abstract}
-While large-scale unsupervised language models (LMs) learn broad world knowledge and some reasoning skills, achieving precise control of their behavior is difficult due to the completely unsupervised nature of their training.
-Existing methods for gaining such steerability collect human labels of the relative quality of model generations and fine-tune the unsupervised LM to align with these preferences, often with reinforcement learning from human feedback (RLHF).
-However, RLHF is a complex and often unstable procedure, first fitting a reward model that reflects the human preferences, and then fine-tuning the large unsupervised LM using reinforcement learning to maximize this estimated reward without drifting too far from the original model.
-In this paper we introduce a new parameterization of the reward model in RLHF that enables extraction of the corresponding optimal policy in closed form, allowing us to solve the standard RLHF problem with only a simple classification loss.
-The resulting algorithm, which we call \textit{Direct Preference Optimization} (DPO), is stable, performant, and computationally lightweight, eliminating the need for sampling from the LM during fine-tuning or performing significant hyperparameter tuning.
-Our experiments show that DPO can fine-tune LMs to align with human preferences as well as or better than existing methods. Notably, fine-tuning with DPO exceeds PPO-based RLHF in ability to control sentiment of generations, and matches or improves response quality in summarization and single-turn dialogue while being substantially simpler to implement and train.
-\end{abstract}
-
-\section{Introduction}
-Large unsupervised language models (LMs) trained on very large datasets acquire surprising capabilities~\citep{chowdhery2022palm, brown2020language, touvron2023llama,bubeck2023sparks}. However, these models are trained on data generated by humans with a wide variety of goals, priorities, and skillsets. Some of these goals and skillsets may not be desirable to imitate; for example, while we may want our AI coding assistant to \textit{understand} common programming mistakes in order to correct them, nevertheless, when generating code, we would like to bias our model toward the (potentially rare) high-quality coding ability present in its training data. Similarly, we might want our language model to be \textit{aware} of a common misconception believed by 50\% of people, but we certainly do not want the model to claim this misconception to be true in 50\% of queries about it! In other words, selecting the model's \emph{desired responses and behavior} from its very wide \textit{knowledge and abilities} is crucial to building AI systems that are safe, performant, and controllable \citep{ouyang2022training}. While existing methods typically steer LMs to match human preferences using reinforcement learning (RL), we will show that the RL-based objective used by existing methods can be optimized exactly with a simple binary cross-entropy objective, greatly simplifying the preference learning pipeline.
-
-\begin{figure}
-    \centering
-    \includegraphics[width=0.999\textwidth]{figures/diagrams/teaser.png}
-    \caption{\textbf{DPO optimizes for human preferences while avoiding reinforcement learning.} Existing methods for fine-tuning language models with human feedback first fit a reward model to a dataset of prompts and human preferences over pairs of responses, and then use RL to find a policy that maximizes the learned reward. In contrast, DPO directly optimizes for the policy best satisfying the preferences with a simple classification objective, fitting an \textit{implicit} reward model whose corresponding optimal policy can be extracted in closed form.}
-    \vspace{-2mm}
-    \label{fig:teaser}
-\end{figure}
-
-At a high level, existing methods instill the desired behaviors into a language model using curated sets of human preferences representing the types of behaviors that humans find safe and helpful. This preference learning stage occurs after an initial stage of large-scale unsupervised pre-training on a large text dataset. While the most straightforward approach to preference learning is supervised fine-tuning on human demonstrations of high quality responses, the most successful class of methods is reinforcement learning from human (or AI) feedback (RLHF/RLAIF; \citep{christiano2017deep,bai2022constitutional}). RLHF methods fit a reward model to a dataset of human preferences and then use RL to optimize a language model policy to produce responses assigned high reward without drifting excessively far from the original model. While RLHF produces models with impressive conversational and coding abilities, the RLHF pipeline is considerably more complex than supervised learning, involving training multiple LMs and sampling from the LM policy in the loop of training, incurring significant computational costs.
-
-In this paper, we show"""
-        }
+        self.output_dir = output_dir
 
     def on_step_end(self, args, state, control, model, **kwargs):
         if state.is_world_process_zero and state.global_step > 0 and state.global_step % self.eval_every_n_steps == 0:
@@ -489,7 +463,7 @@ In this paper, we show"""
                 generated_text = generate_text(model, self.tokenizer, prompt_text, self.inference_config)
 
                 # Create separate subfolder for each prompt
-                output_dir = os.path.join("../../results/FT/", self.log_prefix, prompt_name)
+                output_dir = os.path.join(self.output_dir, prompt_name)
                 os.makedirs(output_dir, exist_ok=True)
                 file_path = os.path.join(output_dir, f"generation_step_{state.global_step}.txt")
 

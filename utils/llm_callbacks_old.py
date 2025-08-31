@@ -586,7 +586,7 @@ class TrainingLossPerplexityCallback(TrainerCallback):
                 # The 'loss' is the average cross-entropy loss for the batch.
                 # Perplexity is the exponentiation of this loss.
                 chunk_perplexity = math.exp(logs['loss'])
-                self.history.append({'step': state.global_step, 'chunked_perplexity': chunk_perplexity})
+                self.history.append({'step': state.global_step, 'loss': logs['loss'], 'chunked_perplexity': chunk_perplexity})
                 wandb.log({"chunked_perplexity/full_paper": chunk_perplexity}, step=state.global_step+1)
     
     def get_results_as_dataframe(self):
