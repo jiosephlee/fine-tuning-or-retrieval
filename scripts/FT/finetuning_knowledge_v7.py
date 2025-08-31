@@ -19,6 +19,24 @@ from utils.llm_callbacks_old import CorpusPerplexityCallback, TrainingLossPerple
 def continue_pretraining(model, tokenizer, log, args):
     knowledge_probes_version = args.knowledge_probes_version
 
+    # --- Continued Pretraining Configuration ---
+    training_config = llm_configs.TrainingConfig(
+        run_name = args.experiment_name,
+        num_train_epochs=args.num_train_epochs,
+        learning_rate=args.learning_rate,
+        logging_steps=1,
+        gradient_checkpointing=False,
+        per_device_train_batch_size=2,
+        context_length = 2048 * 3/2,
+        weight_decay=0.1,
+        gradient_accumulation_steps=3,
+        warmup_ratio = 0.1, 
+        sequential_sampling = True,
+        reverse_ffd_packing= False,
+        remove_unused_columns=False,
+        packing = False,
+        padding_free = False
+    )
     # --- Load Probe Data ---
     output_dir_knowledge_probe = os.path.join("../../results/FT", args.experiment_name, "knowledge_probe")
     output_dir_inference_probe = os.path.join("../../results/FT", args.experiment_name, "inference_probe")
@@ -89,12 +107,15 @@ At a high level, existing methods instill the desired behaviors into a language 
 
 In this paper, we show"""
         }
+    
+    output_dir_generation = os.path.join("../../results/FT", args.experiment_name, "generation")
+    os.makedirs(output_dir_generation, exist_ok=True)
     generation_probe_callback = llm_callbacks.GenerationProbeCallback(
         prompts=prompts,
         tokenizer=tokenizer,
         inference_config=inference_config,
         logger=log,
-        log_prefix = args.experiment_name
+        output_dir=output_dir_generation
     )
 
     training_loss_callback = TrainingLossPerplexityCallback()
@@ -240,7 +261,7 @@ def lima_training(model, tokenizer, log, args):
     # --- LIMA Training Configuration ---
     lima_training_config = llm_configs.TrainingConfig(
         run_name = args.experiment_name + "_LIMA",
-        num_train_epochs=10,
+        num_train_epochs=15,
         learning_rate=2e-5,
         logging_strategy = "steps",
         logging_steps = 1,
@@ -253,7 +274,7 @@ def lima_training(model, tokenizer, log, args):
         use_liger_kernel=True,
         sequential_sampling = False,
         reverse_ffd_packing= False,
-        remove_unused_columns=True,
+        remove_unused_columns=False,
         packing = True,
         padding_free = True
     )
@@ -278,7 +299,7 @@ def lima_training(model, tokenizer, log, args):
         batch_size=8,
         logger=log,
         output_dir = output_dir_knowledge_probe,
-        log_prefix="lima_knowledge_probe",
+        log_prefix="knowledge_probe",
     )
     
     output_dir_inference_probe = os.path.join("../../results/FT", args.experiment_name, "lima_inference_probe")
@@ -298,7 +319,7 @@ def lima_training(model, tokenizer, log, args):
         batch_size=8,
         logger=log,
         output_dir = output_dir_inference_probe,
-        log_prefix="lima_inference_probe",
+        log_prefix="inference_probe",
     )
     
     inference_probe_df = pd.read_csv('../../data/arxiv/dpo_high_level_probes_in_question_form_v2.csv')
@@ -315,7 +336,7 @@ def lima_training(model, tokenizer, log, args):
         batch_size=8,
         logger=log,
         output_dir = output_dir_inference_probe,
-        log_prefix="lima_inference_qa_format_probe",
+        log_prefix="inference_qa_format_probe",
     )
 
     output_dir_generation = os.path.join("../../results/FT", args.experiment_name, "lima_generation")
@@ -333,7 +354,7 @@ def lima_training(model, tokenizer, log, args):
         prompts=prompts,
         tokenizer=tokenizer,
         inference_config=inference_config,
-        eval_every_n_steps=5,
+        eval_every_n_steps=6,
         logger=log,
         output_dir = output_dir_generation
     )
@@ -348,6 +369,7 @@ def lima_training(model, tokenizer, log, args):
         train_dataset=lima_train_ds,
         train_cfg=lima_training_config,
         use_liger_loss=True, 
+        train=False,
         callbacks=callbacks
     )
     
@@ -374,7 +396,6 @@ def lima_training(model, tokenizer, log, args):
 
     # --- Train the model ---
     trainer.train()
-    wandb.finish()
 
     # --- Save results ---
     knowledge_probe_callback.save_results(output_dir=output_dir_knowledge_probe)
@@ -388,6 +409,7 @@ def lima_training(model, tokenizer, log, args):
     log.info("Finished generating all plots.")
 
     log.info("LIMA-based instruction tuning complete.")
+    wandb.finish()
 
 if __name__ == "__main__":
     # --- Parser ---
@@ -428,25 +450,6 @@ if __name__ == "__main__":
 
     log.info("\n--- Loading Model for Training ---")
     model, tokenizer = llm_training.load_model_for_training(model_config, log, use_existing_lima_tokenizer =False, use_existing_lima_model=False)
-
-    # --- Continued Pretraining Configuration ---
-    training_config = llm_configs.TrainingConfig(
-        run_name = args.experiment_name,
-        num_train_epochs=args.num_train_epochs,
-        learning_rate=args.learning_rate,
-        logging_steps=1,
-        gradient_checkpointing=False,
-        per_device_train_batch_size=2,
-        context_length = 2048 * 3/2,
-        weight_decay=0.1,
-        gradient_accumulation_steps=3,
-        warmup_ratio = 0.1, 
-        sequential_sampling = True,
-        reverse_ffd_packing= False,
-        remove_unused_columns=False,
-        packing = False,
-        padding_free = False
-    )
 
     # --- Continue Pretraining (we also evaluate our probes during this) ---
     if args.num_train_epochs > 0:
