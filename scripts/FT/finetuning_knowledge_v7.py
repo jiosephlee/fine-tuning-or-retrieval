@@ -29,7 +29,7 @@ def continue_pretraining(model, tokenizer, log, args):
         per_device_train_batch_size=2,
         context_length = 2048 * 3/2,
         weight_decay=0.1,
-        gradient_accumulation_steps=3,
+        gradient_accumulation_steps=4,
         warmup_ratio = 0.1, 
         sequential_sampling = True,
         reverse_ffd_packing= False,
