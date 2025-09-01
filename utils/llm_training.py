@@ -187,7 +187,7 @@ class CustomSFTTrainer(SFTTrainer):
         self.use_liger_loss = use_liger_loss
     
 def fine_tune_on_text(
-    model, tokenizer, log, text_content: str, train_cfg: TrainingConfig, *, train=True, tag: str = "finetuning on text...", callbacks: Optional[List[TrainerCallback]] = None, chunk_by_section: bool = False
+    model, tokenizer, log, text_content: str, train_cfg: TrainingConfig, *, train=True, tag: str = "finetuning on text...", callbacks: Optional[List[TrainerCallback]] = None, chunk_by_section: bool = False, overlap_sections = False, overlap_ratio = "1_4", add_title_prefix: bool = True
 ):
     """
     Fine-tunes a model on a given string of text by chunking it properly.
@@ -207,8 +207,11 @@ def fine_tune_on_text(
     
     if chunk_by_section:
         log.info(f"[{tag}] Using section-based chunking...")
-        text_chunks, num_tokens = chunk_text_by_sections(text_content, tokenizer, train_cfg.context_length)
-        log.info(f"[{tag}] Section-based chunking: Tokens: {num_tokens}, Context: {train_cfg.context_length} -> {len(text_chunks)} chunks")
+        overlap_numer, overlap_denom = overlap_ratio.split("_")
+        overlap_denom = int(overlap_denom)
+        overlap_numer = int(overlap_numer)
+        text_chunks, num_tokens = chunk_text_by_sections(text_content, tokenizer, train_cfg.context_length, overlap_sections, overlap_denom, overlap_numer, add_title_prefix)
+        log.info(f"[{tag}] Section-based chunking: Total tokens: {num_tokens}, Overlapping: {overlap_sections}, Context: {train_cfg.context_length} -> {len(text_chunks)} total chunks")
     else:
         log.info(f"[{tag}] Using token-based chunking...")
         text_chunks, num_tokens = chunk_text(text_content, tokenizer, train_cfg.context_length)
@@ -238,7 +241,7 @@ def fine_tune_on_text(
     return trainer
 
 def fine_tune_on_texts(
-    model, tokenizer, log, texts: List[str], train_cfg: TrainingConfig, *, train=True, tag: str = "finetuning on texts...", callbacks: Optional[List[TrainerCallback]] = None, chunk_by_section: bool = False, overlap_sections = False, overlap_ratio = "1_4"
+    model, tokenizer, log, texts: List[str], train_cfg: TrainingConfig, *, train=True, tag: str = "finetuning on texts...", callbacks: Optional[List[TrainerCallback]] = None, chunk_by_section: bool = False, overlap_sections = False, overlap_ratio = "1_4", add_title_prefix: bool = True
 ):
     """
     Fine-tunes a model on a given list of texts by chunking them and training on all chunks together.
@@ -251,6 +254,7 @@ def fine_tune_on_texts(
         tag: Tag for logging.
         callbacks: Optional list of TrainerCallbacks to add to the trainer.
         chunk_by_section: If True, use section-based chunking instead of token-based chunking.
+        add_title_prefix: If True, prefixes each new chunk with the document's title.
     """
     log.info(f"Starting SFT for '{tag}' on {len(texts)} documents...")
 
@@ -268,7 +272,7 @@ def fine_tune_on_texts(
                 overlap_numer, overlap_denom = overlap_ratio.split("_")
                 overlap_denom = int(overlap_denom)
                 overlap_numer = int(overlap_numer)
-                chunks, num_tokens = chunk_text_by_sections(text, tokenizer, train_cfg.context_length, overlap_sections, overlap_denom, overlap_numer)
+                chunks, num_tokens = chunk_text_by_sections(text, tokenizer, train_cfg.context_length, overlap_sections, overlap_denom, overlap_numer, add_title_prefix=add_title_prefix)
                 log.info(f"[{tag}] Section-based chunking: Total tokens: {total_tokens}, Overlapping: {overlap_sections}, Context: {train_cfg.context_length} -> {len(chunks)} total chunks")
             else:
                 chunks, num_tokens = chunk_text(text, tokenizer, train_cfg.context_length, delimiter="\n\n")
@@ -479,7 +483,7 @@ def split_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 20
     
     return subsections, total_tokens
 
-def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048, overlap_sections = False, overlap_denom = 4, overlap_numer = 1):
+def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048, overlap_sections = False, overlap_denom = 4, overlap_numer = 1, add_title_prefix: bool = True):
     """
     Chunks text by sections, ensuring each chunk doesn't exceed max_tokens.
     If a section is too large, it tries to split by subsections first.
@@ -490,18 +494,20 @@ def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048,
         text_content: The full text to chunk
         tokenizer: The tokenizer to use for counting tokens
         max_tokens: Maximum tokens per chunk
+        add_title_prefix: If True, prefixes each new chunk with the document's title.
 
     Returns:
         List of text chunks and total token count
     """
     import re
     # Extract title
-    title_match = re.search(r'\\title\{([^}]+)\}', text_content)
     title = ""
-    if title_match:
-        title = f"\\title{{{title_match.group(1)}}}\n\n"
-    else:
-        raise ValueError("No title found in the text")
+    if add_title_prefix:
+        title_match = re.search(r'\\title\{([^}]+)\}', text_content)
+        if title_match:
+            title = f"\\title{{{title_match.group(1)}}}\n\n"
+        else:
+            raise ValueError("No title found in the text")
 
     # Find all section boundaries and split into sections
     section_pattern = r'(\\section\{[^}]+\})'

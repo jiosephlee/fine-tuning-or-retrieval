@@ -1,11 +1,14 @@
 import torch
 from transformers import TrainerCallback, AutoTokenizer
-from typing import List, Dict
+from typing import List, Dict, Any
 import pandas as pd
 import os
 import wandb
 from utils.llm_training import generate_text
-from utils.llm_configs import InferenceConfig
+from utils.llm_configs import InferenceConfig, ModelConfig
+from utils.llm_evals import evaluate_response
+import matplotlib.pyplot as plt
+
 
 class BaseKnowledgeProbeCallBack(TrainerCallback):
     """
@@ -434,14 +437,17 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
 class GenerationProbeCallback(TrainerCallback):
     """
     A callback that periodically generates text from a fixed prompt and saves the output.
+    Can also evaluate the generated text using an LLM judge.
     """
     def __init__(self,
-                 prompts: Dict[str, str],
+                 prompts: Dict[str, Any],
                  tokenizer: AutoTokenizer,
                  inference_config: InferenceConfig,
                  eval_every_n_steps: int = 10,
                  logger=None,
-                 output_dir: str = ""):
+                 output_dir: str = "",
+                 do_eval: bool = False,
+                 judge_model_config: ModelConfig = None):
 
         self.prompts = prompts
         self.tokenizer = tokenizer
@@ -449,6 +455,13 @@ class GenerationProbeCallback(TrainerCallback):
         self.eval_every_n_steps = eval_every_n_steps
         self.logger = logger
         self.output_dir = output_dir
+        self.do_eval = do_eval
+        self.judge_model_config = judge_model_config
+
+        if self.do_eval:
+            if self.judge_model_config is None:
+                raise ValueError("judge_model_config must be provided when do_eval is True")
+            self.eval_history = {}
 
     def on_step_end(self, args, state, control, model, **kwargs):
         if state.is_world_process_zero and state.global_step > 0 and state.global_step % self.eval_every_n_steps == 0:
@@ -459,20 +472,132 @@ class GenerationProbeCallback(TrainerCallback):
 
             model.eval()
 
-            for prompt_name, prompt_text in self.prompts.items():
+            if self.do_eval:
+                self._generate_and_evaluate(state, model)
+            else:
+                self._generate_only(state, model)
+
+            model.train()
+    
+    def _generate_only(self, state, model):
+        for source, prompts_dict in self.prompts.items():
+            source_output_dir = os.path.join(self.output_dir, source)
+            os.makedirs(source_output_dir, exist_ok=True)
+
+            for prompt_name, prompt_text in prompts_dict.items():
                 generated_text = generate_text(model, self.tokenizer, prompt_text, self.inference_config)
 
-                # Create separate subfolder for each prompt
-                output_dir = os.path.join(self.output_dir, prompt_name)
-                os.makedirs(output_dir, exist_ok=True)
-                file_path = os.path.join(output_dir, f"generation_step_{state.global_step}.txt")
+                prompt_output_dir = os.path.join(source_output_dir, prompt_name)
+                os.makedirs(prompt_output_dir, exist_ok=True)
+                
+                file_path = os.path.join(prompt_output_dir, f"generation_step_{state.global_step}.txt")
 
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(generated_text)
                 
                 if self.logger:
-                    self.logger.info(f" > Saved generation probe output for {prompt_name} to '{file_path}'")
+                    self.logger.info(f" > Saved generation probe output for {source}/{prompt_name} to '{file_path}'")
                 else:
-                    print(f" > Saved generation probe output for {prompt_name} to '{file_path}'")
+                    print(f" > Saved generation probe output for {source}/{prompt_name} to '{file_path}'")
+    
+    def _generate_and_evaluate(self, state, model):
+        wandb_logs = {}
+        
+        for dataset_name, prompts_list in self.prompts.items():
+            dataset_output_dir = os.path.join(self.output_dir, dataset_name)
+            os.makedirs(dataset_output_dir, exist_ok=True)
+            
+            all_evals = []
+            scores = []
 
-            model.train()
+            for prompt_data in prompts_list:
+                prompt_name = prompt_data["prompt_name"]
+                question = prompt_data["question"]
+                reference_answer = prompt_data["reference_answer"]
+
+                generated_text = generate_text(model, self.tokenizer, question, self.inference_config)
+
+                prompt_output_dir = os.path.join(dataset_output_dir, prompt_name)
+                os.makedirs(prompt_output_dir, exist_ok=True)
+                
+                gen_file_path = os.path.join(prompt_output_dir, f"generation_step_{state.global_step}.txt")
+                with open(gen_file_path, 'w', encoding='utf-8') as f:
+                    f.write("--- PROMPT ---\n")
+                    f.write(question + "\n\n")
+                    f.write("--- GENERATION ---\n")
+                    f.write(generated_text + "\n")
+
+                eval_result = evaluate_response(
+                    question=question,
+                    response=generated_text,
+                    reference_answer=reference_answer,
+                    judge_model_config=self.judge_model_config
+                )
+
+                with open(gen_file_path, 'a', encoding='utf-8') as f:
+                    f.write("\n--- EVALUATION ---\n")
+                    f.write(f"Score: {eval_result['score']}\n")
+                    f.write(f"Feedback: {eval_result['feedback']}\n")
+
+                if self.logger:
+                    self.logger.info(f" > Evaluated generation for {dataset_name}/{prompt_name} at step {state.global_step}. Score: {eval_result['score']}")
+                else:
+                    print(f" > Evaluated generation for {dataset_name}/{prompt_name} at step {state.global_step}. Score: {eval_result['score']}")
+
+                if eval_result['score'] is not None:
+                    scores.append(eval_result['score'])
+
+                eval_data = {
+                    "step": state.global_step,
+                    "prompt_name": prompt_name,
+                    "question": question,
+                    "generated_text": generated_text,
+                    "reference_answer": reference_answer,
+                    "score": eval_result['score'],
+                    "feedback": eval_result['feedback']
+                }
+                all_evals.append(eval_data)
+            
+            csv_path = os.path.join(dataset_output_dir, 'eval_results.csv')
+            df = pd.DataFrame(all_evals)
+            if os.path.exists(csv_path):
+                df.to_csv(csv_path, mode='a', header=False, index=False)
+            else:
+                df.to_csv(csv_path, mode='w', header=True, index=False)
+
+            if scores:
+                mean_score = sum(scores) / len(scores)
+                wandb_logs[f'eval/{dataset_name}_mean_score'] = mean_score
+
+                if dataset_name not in self.eval_history:
+                    self.eval_history[dataset_name] = {'steps': [], 'scores': []}
+                self.eval_history[dataset_name]['steps'].append(state.global_step)
+                self.eval_history[dataset_name]['scores'].append(mean_score)
+        
+        if wandb.run and wandb_logs:
+            wandb.log(wandb_logs, step=state.global_step)
+            
+        self._plot_and_save_eval_history()
+
+    def _plot_and_save_eval_history(self):
+        plots_dir = os.path.join(self.output_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+
+        for dataset_name, data in self.eval_history.items():
+            if len(data['steps']) < 2:
+                continue
+            
+            plt.figure()
+            plt.plot(data['steps'], data['scores'], marker='o')
+            plt.title(f'Mean Evaluation Score for {dataset_name}')
+            plt.xlabel('Training Step')
+            plt.ylabel('Mean Score')
+            plt.grid(True)
+            plot_path = os.path.join(plots_dir, f'{dataset_name}_eval_score.png')
+            plt.savefig(plot_path)
+            plt.close()
+
+            if self.logger:
+                self.logger.info(f" > Saved evaluation plot for {dataset_name} to '{plot_path}'")
+            else:
+                print(f" > Saved evaluation plot for {dataset_name} to '{plot_path}'")
