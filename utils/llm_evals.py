@@ -1,6 +1,6 @@
 import json
-from .prompts.llm_as_judge import prompt as judge_prompt
-from .llm_utils import query_llm
+from utils.prompts.llm_as_judge import prompt as judge_prompt
+import utils.utils as utils
 import re
 
 def parse_judge_response(response_text: str):
@@ -35,7 +35,7 @@ def evaluate_response(question: str, response: str, reference_answer: str, judge
         reference_answer=reference_answer
     )
 
-    raw_response = query_llm(
+    raw_response = utils.query_llm(
         model_config=judge_model_config,
         system_prompt=system_prompt,
         user_prompt=user_prompt
