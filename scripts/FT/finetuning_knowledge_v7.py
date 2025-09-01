@@ -409,6 +409,7 @@ if __name__ == "__main__":
     # --- Parser ---
     parser = argparse.ArgumentParser()
     parser.add_argument("--custom_suffix", type=str, default="", help="Custom text to append to experiment name")
+    parser.add_argument("--override_experiment_name", type=str, default="", help="Override experiment name")
     parser.add_argument("--model_id", type=str, default="allenai/OLMo-2-0425-1B") # allenai/OLMo-2-1124-7B
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--full_finetuning", default=False, action="store_true")
@@ -426,7 +427,10 @@ if __name__ == "__main__":
     parser.add_argument("--with_prior_knowledge", default=False, action="store_true", help="Use prior knowledge when fine-tuning on paraphrased texts")
     args = parser.parse_args()
     
-    args.experiment_name = construct_experiment_name(args)
+    if args.override_experiment_name:
+        args.experiment_name = args.override_experiment_name
+    else:
+        args.experiment_name = construct_experiment_name(args)
 
     # --- Setup Logging & Wandb ---
     logging.basicConfig(

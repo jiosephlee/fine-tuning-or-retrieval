@@ -577,7 +577,16 @@ class GenerationProbeCallback(TrainerCallback):
         if wandb.run and wandb_logs:
             wandb.log(wandb_logs, step=state.global_step)
             
-        self._plot_and_save_eval_history()
+    def on_train_end(self, args, state, control, model, **kwargs):
+        """
+        Called at the end of training to generate and save plots of evaluation scores.
+        """
+        if self.do_eval:
+            if self.logger:
+                self.logger.info("Training ended. Generating final evaluation plots...")
+            else:
+                print("Training ended. Generating final evaluation plots...")
+            self._plot_and_save_eval_history()
 
     def _plot_and_save_eval_history(self):
         plots_dir = os.path.join(self.output_dir, "plots")
