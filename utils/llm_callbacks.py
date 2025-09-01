@@ -446,8 +446,7 @@ class GenerationProbeCallback(TrainerCallback):
                  eval_every_n_steps: int = 10,
                  logger=None,
                  output_dir: str = "",
-                 do_eval: bool = False,
-                 judge_model_config: ModelConfig = None):
+                 do_eval: bool = False):
 
         self.prompts = prompts
         self.tokenizer = tokenizer
@@ -456,11 +455,8 @@ class GenerationProbeCallback(TrainerCallback):
         self.logger = logger
         self.output_dir = output_dir
         self.do_eval = do_eval
-        self.judge_model_config = judge_model_config
 
         if self.do_eval:
-            if self.judge_model_config is None:
-                raise ValueError("judge_model_config must be provided when do_eval is True")
             self.eval_history = {}
 
     def on_step_end(self, args, state, control, model, **kwargs):
@@ -480,11 +476,14 @@ class GenerationProbeCallback(TrainerCallback):
             model.train()
     
     def _generate_only(self, state, model):
-        for source, prompts_dict in self.prompts.items():
+        for source, prompts_list in self.prompts.items():
             source_output_dir = os.path.join(self.output_dir, source)
             os.makedirs(source_output_dir, exist_ok=True)
 
-            for prompt_name, prompt_text in prompts_dict.items():
+            for prompt_data in prompts_list:
+                prompt_name = prompt_data["prompt_name"]
+                prompt_text = prompt_data["question"]
+
                 generated_text = generate_text(model, self.tokenizer, prompt_text, self.inference_config)
 
                 prompt_output_dir = os.path.join(source_output_dir, prompt_name)
@@ -530,8 +529,7 @@ class GenerationProbeCallback(TrainerCallback):
                 eval_result = evaluate_response(
                     question=question,
                     response=generated_text,
-                    reference_answer=reference_answer,
-                    judge_model_config=self.judge_model_config
+                    reference_answer=reference_answer
                 )
 
                 with open(gen_file_path, 'a', encoding='utf-8') as f:

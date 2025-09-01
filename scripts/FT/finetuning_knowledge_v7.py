@@ -124,13 +124,23 @@ def continue_pretraining(model, tokenizer, log, args):
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
-            file_prompts = {}
-            for item in data:
-                prompt_id = item.get('id', 'unknown')
-                question = item.get('question', '')
-                if question:
-                    file_prompts[f"prompt_{prompt_id}"] = question
-            prompts[name] = file_prompts
+            prompt_list = []
+            if args.do_eval:
+                for item in data:
+                    prompt_list.append({
+                        "prompt_name": item.get('id', 'unknown'),
+                        "question": item.get('question', ''),
+                        "reference_answer": item.get('reference_answer', '')
+                    })
+            else:
+                for item in data:
+                    question = item.get('question', '')
+                    if question:
+                        prompt_list.append({
+                            "prompt_name": f"prompt_{item.get('id', 'unknown')}",
+                            "question": question
+                        })
+            prompts[name] = prompt_list
     
     output_dir_generation = os.path.join("../../results/FT", args.experiment_name, "generation")
     os.makedirs(output_dir_generation, exist_ok=True)
@@ -139,7 +149,9 @@ def continue_pretraining(model, tokenizer, log, args):
         tokenizer=tokenizer,
         inference_config=inference_config,
         logger=log,
-        output_dir=output_dir_generation
+        output_dir=output_dir_generation,
+        do_eval=args.do_eval
+
     )
 
     training_loss_callback = TrainingLossPerplexityCallback()
@@ -335,14 +347,24 @@ def lima_training(model, tokenizer, log, args):
         if os.path.exists(path):
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            
-            file_prompts = {}
-            for item in data:
-                prompt_id = item.get('id', 'unknown')
-                question = item.get('question', '')
-                if question:
-                    file_prompts[f"prompt_{prompt_id}"] = question + "<|EOT|>"
-            prompts[name] = file_prompts
+
+            prompt_list = []
+            if args.do_eval:
+                for item in data:
+                    prompt_list.append({
+                        "prompt_name": item.get('id', 'unknown'),
+                        "question": item.get('question', ''),
+                        "reference_answer": item.get('reference_answer', '')
+                    })
+            else:
+                for item in data:
+                    question = item.get('question', '')
+                    if question:
+                        prompt_list.append({
+                            "prompt_name": f"prompt_{item.get('id', 'unknown')}",
+                            "question": question + "<|EOT|>"
+                        })
+            prompts[name] = prompt_list
     
     generation_probe_callback = llm_callbacks.GenerationProbeCallback(
         prompts=prompts,
@@ -350,8 +372,9 @@ def lima_training(model, tokenizer, log, args):
         inference_config=inference_config,
         eval_every_n_steps=6,
         logger=log,
-        output_dir = output_dir_generation
-    )
+        output_dir = output_dir_generation,
+        do_eval=args.do_eval
+        )
 
     training_loss_callback = TrainingLossPerplexityCallback()
     callbacks = [knowledge_probe_callback, generation_probe_callback, inference_probe_callback, training_loss_callback]
@@ -425,6 +448,7 @@ if __name__ == "__main__":
     parser.add_argument("--overlap_ratio", type=str, default="1_4", help="Ratio of overlap when chunking")
     parser.add_argument("--with_explanations", default=False, action="store_true", help="Use explanations when fine-tuning on paraphrased texts")
     parser.add_argument("--with_prior_knowledge", default=False, action="store_true", help="Use prior knowledge when fine-tuning on paraphrased texts")
+    parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
     args = parser.parse_args()
     
     if args.override_experiment_name:
