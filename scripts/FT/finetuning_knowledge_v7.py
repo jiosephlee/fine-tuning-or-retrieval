@@ -53,6 +53,34 @@ def construct_experiment_name(args):
     
     return "_".join(experiment_name_parts) 
 
+def load_prompts(prompt_files, do_eval, append_eot=False):
+    prompts = {}
+    for name, path in prompt_files.items():
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            prompt_list = []
+            if do_eval:
+                for item in data:
+                    prompt_list.append({
+                        "prompt_name": item.get('id', 'unknown'),
+                        "question": item.get('question', ''),
+                        "reference_answer": item.get('reference_answer', '')
+                    })
+            else:
+                for item in data:
+                    question = item.get('question', '')
+                    if question:
+                        if append_eot:
+                            question += "<|EOT|>"
+                        prompt_list.append({
+                            "prompt_name": f"prompt_{item.get('id', 'unknown')}",
+                            "question": question
+                        })
+            prompts[name] = prompt_list
+    return prompts
+
 def continue_pretraining(model, tokenizer, log, args):
     knowledge_probes_version = args.knowledge_probes_version
 
@@ -120,29 +148,7 @@ def continue_pretraining(model, tokenizer, log, args):
         'recall_DPO': '../../data/arxiv/recall_DPO.json'
     }
 
-    prompts = {}
-    for name, path in prompt_files.items():
-        if os.path.exists(path):
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            prompt_list = []
-            if args.do_eval:
-                for item in data:
-                    prompt_list.append({
-                        "prompt_name": item.get('id', 'unknown'),
-                        "question": item.get('question', ''),
-                        "reference_answer": item.get('reference_answer', '')
-                    })
-            else:
-                for item in data:
-                    question = item.get('question', '')
-                    if question:
-                        prompt_list.append({
-                            "prompt_name": f"prompt_{item.get('id', 'unknown')}",
-                            "question": question
-                        })
-            prompts[name] = prompt_list
+    prompts = load_prompts(prompt_files, args.do_eval)
     
     output_dir_generation = os.path.join("../../results/FT", args.experiment_name, "generation")
     os.makedirs(output_dir_generation, exist_ok=True)
@@ -343,29 +349,7 @@ def lima_training(model, tokenizer, log, args):
         'yourbench_DPO': '../../data/arxiv/yourbench_DPO.json'
     }
 
-    prompts = {}
-    for name, path in prompt_files.items():
-        if os.path.exists(path):
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
-            prompt_list = []
-            if args.do_eval:
-                for item in data:
-                    prompt_list.append({
-                        "prompt_name": item.get('id', 'unknown'),
-                        "question": item.get('question', ''),
-                        "reference_answer": item.get('reference_answer', '')
-                    })
-            else:
-                for item in data:
-                    question = item.get('question', '')
-                    if question:
-                        prompt_list.append({
-                            "prompt_name": f"prompt_{item.get('id', 'unknown')}",
-                            "question": question + "<|EOT|>"
-                        })
-            prompts[name] = prompt_list
+    prompts = load_prompts(prompt_files, args.do_eval, append_eot=True)
     
     generation_probe_callback = llm_callbacks.GenerationProbeCallback(
         prompts=prompts,
