@@ -167,7 +167,7 @@ def continue_pretraining(model, tokenizer, log, args):
             chunk_by_section=args.chunk_by_section,
             overlap_sections=args.overlap_sections,
             overlap_ratio=args.overlap_ratio,
-            add_title_prefix=args.add_title_prefix
+            add_title_prefix=args.no_add_title_prefix
         )
     elif "ParaphrasedArxivPaper" in args.experiment_name:
         num_documents = 1
@@ -233,7 +233,7 @@ def continue_pretraining(model, tokenizer, log, args):
             chunk_by_section=args.chunk_by_section,
             overlap_sections=args.overlap_sections,
             overlap_ratio=args.overlap_ratio,
-            add_title_prefix=args.add_title_prefix
+            add_title_prefix=args.no_add_title_prefix
         )
 
     # --- Save Metrics and Generate Plots ---
@@ -420,13 +420,13 @@ if __name__ == "__main__":
 
     # Defaults, do not change unless for ablations
     parser.add_argument("--chunk_by_section", default=True, type=bool, help="Use section-based chunking instead of token-based chunking")
-    parser.add_argument("--add_title_prefix", default=True, type=bool, help="Add title prefix to chunks when chunking")
+    parser.add_argument("--no_add_title_prefix", action="store_false", help="Add title prefix to chunks when chunking")
     parser.add_argument("--overlap_sections", default=False, action="store_true", help="Overlap sections when chunking")
     parser.add_argument("--overlap_ratio", type=str, default="1_4", help="Ratio of overlap when chunking")
     parser.add_argument("--with_explanations", default=False, action="store_true", help="Use explanations when fine-tuning on paraphrased texts")
     parser.add_argument("--with_prior_knowledge", default=False, action="store_true", help="Use prior knowledge when fine-tuning on paraphrased texts")
     args = parser.parse_args()
-    
+
     if args.override_experiment_name:
         args.experiment_name = args.override_experiment_name
     else:

@@ -210,8 +210,8 @@ def fine_tune_on_text(
         overlap_numer, overlap_denom = overlap_ratio.split("_")
         overlap_denom = int(overlap_denom)
         overlap_numer = int(overlap_numer)
-        text_chunks, num_tokens = chunk_text_by_sections(text_content, tokenizer, train_cfg.context_length, overlap_sections, overlap_denom, overlap_numer, add_title_prefix)
-        log.info(f"[{tag}] Section-based chunking: Total tokens: {num_tokens}, Overlapping: {overlap_sections}, Context: {train_cfg.context_length} -> {len(text_chunks)} total chunks")
+        text_chunks, num_tokens = chunk_text_by_sections(text_content, tokenizer, train_cfg.context_length, overlap_sections, overlap_denom, overlap_numer, log=log, add_title_prefix=add_title_prefix)
+        log.info(f"[{tag}] Section-based chunking: Total tokens: {num_tokens}, Overlapping: {overlap_sections}, Prefix added: {add_title_prefix}, Context: {train_cfg.context_length} -> {len(text_chunks)} total chunks")
     else:
         log.info(f"[{tag}] Using token-based chunking...")
         text_chunks, num_tokens = chunk_text(text_content, tokenizer, train_cfg.context_length)
@@ -272,8 +272,8 @@ def fine_tune_on_texts(
                 overlap_numer, overlap_denom = overlap_ratio.split("_")
                 overlap_denom = int(overlap_denom)
                 overlap_numer = int(overlap_numer)
-                chunks, num_tokens = chunk_text_by_sections(text, tokenizer, train_cfg.context_length, overlap_sections, overlap_denom, overlap_numer, add_title_prefix=add_title_prefix)
-                log.info(f"[{tag}] Section-based chunking: Total tokens: {total_tokens}, Overlapping: {overlap_sections}, Context: {train_cfg.context_length} -> {len(chunks)} total chunks")
+                chunks, num_tokens = chunk_text_by_sections(text, tokenizer, train_cfg.context_length, overlap_sections, overlap_denom, overlap_numer, log=log, add_title_prefix=add_title_prefix)
+                log.info(f"[{tag}] Section-based chunking: Total tokens: {total_tokens}, Overlapping: {overlap_sections}, Title added: {add_title_prefix}, Context: {train_cfg.context_length} -> {len(chunks)} total chunks")
             else:
                 chunks, num_tokens = chunk_text(text, tokenizer, train_cfg.context_length, delimiter="\n\n")
                 log.info(f"[{tag}] Chunking text {i}: Context: {train_cfg.context_length} -> {len(chunks)} chunks")
@@ -483,7 +483,7 @@ def split_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 20
     
     return subsections, total_tokens
 
-def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048, overlap_sections = False, overlap_denom = 4, overlap_numer = 1, add_title_prefix: bool = True):
+def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048, overlap_sections = False, overlap_denom = 4, overlap_numer = 1, log=None, add_title_prefix: bool = True):
     """
     Chunks text by sections, ensuring each chunk doesn't exceed max_tokens.
     If a section is too large, it tries to split by subsections first.
@@ -581,6 +581,8 @@ def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048,
         chunks.append(current_chunk)
     
     total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in chunks)
+    log.info(f"First chunk: {chunks[0][:100]}...")
+    log.info(f"Second chunk: {chunks[1][:100]}...")
     return chunks, total_tokens
 
 
