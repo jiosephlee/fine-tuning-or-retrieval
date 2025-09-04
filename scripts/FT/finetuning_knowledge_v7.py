@@ -2,8 +2,8 @@
 
 # pip install flash-attn --no-build-isolation
 # pip install git+https://github.com/huggingface/trl
-# pip install pydantic datasets peft bitsandbytes wandb matplotlib seaborn liger-kernel scikit-learn
-# pip install https://github.com/jiosephlee/transformers; pip install .[torch]
+# pip install pydantic datasets peft bitsandbytes wandb matplotlib seaborn liger-kernel scikit-learn openai
+# git clone https://github.com/jiosephlee/transformers; pip install .[torch]
 
 import os
 import sys
@@ -273,7 +273,7 @@ def lima_training(model, tokenizer, log, args):
     # --- LIMA Training Configuration ---
     lima_training_config = llm_configs.TrainingConfig(
         run_name = args.experiment_name + "_LIMA",
-        num_train_epochs=15,
+        num_train_epochs=1,
         learning_rate=2e-5,
         logging_strategy = "steps",
         logging_steps = 1,
