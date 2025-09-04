@@ -33,6 +33,6 @@ def evaluate_response(question: str, response: str, reference_answer: str, judge
         reference_answer=reference_answer
     )
 
-    raw_response = utils.query_llm(judge_prompt, system_prompt_included=True, model=judge_model, reasoning_effort="low")
+    raw_response = utils.query_llm(judge_prompt, system_prompt_included=True, model=judge_model)
 
     return parse_judge_response(raw_response)

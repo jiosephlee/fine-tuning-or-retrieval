@@ -2,7 +2,7 @@
 
 # pip install flash-attn --no-build-isolation
 # pip install git+https://github.com/huggingface/trl
-# pip install pydantic datasets peft bitsandbytes wandb matplotlib seaborn liger-kernel scikit-learn openai
+# pip install pydantic datasets==3.6.0 peft bitsandbytes wandb matplotlib seaborn liger-kernel scikit-learn openai
 # git clone https://github.com/jiosephlee/transformers; pip install .[torch]
 
 import os
@@ -63,10 +63,10 @@ def continue_pretraining(model, tokenizer, log, args):
         learning_rate=args.learning_rate,
         logging_steps=1,
         gradient_checkpointing=False,
-        per_device_train_batch_size=2,
+        per_device_train_batch_size=4,
         context_length = 2048 * 3/2,
         weight_decay=0.1,
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=2,
         warmup_ratio = 0.1, 
         sequential_sampling = True,
         reverse_ffd_packing= False,
@@ -152,8 +152,7 @@ def continue_pretraining(model, tokenizer, log, args):
         inference_config=inference_config,
         logger=log,
         output_dir=output_dir_generation,
-        do_eval=args.do_eval
-
+        # do_eval=args.do_eval
     )
 
     training_loss_callback = TrainingLossPerplexityCallback()
@@ -273,15 +272,15 @@ def lima_training(model, tokenizer, log, args):
     # --- LIMA Training Configuration ---
     lima_training_config = llm_configs.TrainingConfig(
         run_name = args.experiment_name + "_LIMA",
-        num_train_epochs=1,
+        num_train_epochs=5,
         learning_rate=2e-5,
         logging_strategy = "steps",
         logging_steps = 1,
         gradient_checkpointing=False,
         context_length = 3575, # This is the context length of the longest example in the dataset
-        gradient_accumulation_steps=16,
+        gradient_accumulation_steps=8,
         warmup_ratio = 0.1,
-        per_device_train_batch_size=2,
+        per_device_train_batch_size=4,
         weight_decay=0.1,
         use_liger_kernel=True,
         sequential_sampling = False,
