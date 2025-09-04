@@ -281,12 +281,12 @@ def lima_training(model, tokenizer, log, args):
     # --- LIMA Training Configuration ---
     lima_training_config = llm_configs.TrainingConfig(
         run_name = args.experiment_name + "_LIMA",
-        num_train_epochs=5,
+        num_train_epochs=15,
         learning_rate=2e-5,
         logging_strategy = "steps",
         logging_steps = 1,
         gradient_checkpointing=False,
-        context_length = 3575, # This is the context length of the longest example in the dataset
+        context_length = 3072, # This is the context length of the longest example in the dataset
         gradient_accumulation_steps=8,
         warmup_ratio = 0.1,
         per_device_train_batch_size=4,
