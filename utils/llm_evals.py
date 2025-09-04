@@ -1,6 +1,7 @@
 import json
 from utils.prompts.llm_as_judge import prompt as judge_prompt
 import utils.utils as utils
+import copy
 
 def parse_judge_response(response_text: str):
     """
@@ -27,12 +28,13 @@ def evaluate_response(question: str, response: str, reference_answer: str, judge
     """
     Evaluates a response using an LLM as a judge.
     """
-    judge_prompt['user'] = judge_prompt["user"].format(
+    local_judge_prompt = copy.deepcopy(judge_prompt)
+    local_judge_prompt['user'] = local_judge_prompt["user"].format(
         question=question,
         answer=response,
         reference_answer=reference_answer
     )
 
-    raw_response = utils.query_llm(judge_prompt, system_prompt_included=True, model=judge_model)
+    raw_response = utils.query_llm(local_judge_prompt, system_prompt_included=True, model=judge_model)
 
     return parse_judge_response(raw_response)
