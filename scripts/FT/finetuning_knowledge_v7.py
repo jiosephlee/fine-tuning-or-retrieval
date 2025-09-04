@@ -15,7 +15,7 @@ import argparse
 import wandb
 import logging
 import utils.llm_plotting as llm_plotting
-from utils.llm_callbacks_old import CorpusPerplexityCallback, TrainingLossPerplexityCallback
+from utils.llm_callbacks_old import TrainingLossPerplexityCallback
 
 
 def construct_experiment_name(args):
@@ -373,7 +373,8 @@ def lima_training(model, tokenizer, log, args):
         eval_every_n_steps=6,
         logger=log,
         output_dir = output_dir_generation,
-        do_eval=args.do_eval
+        do_eval=args.do_eval,
+        judge_model=args.judge_model
         )
 
     training_loss_callback = TrainingLossPerplexityCallback()
@@ -449,6 +450,7 @@ if __name__ == "__main__":
     parser.add_argument("--with_explanations", default=False, action="store_true", help="Use explanations when fine-tuning on paraphrased texts")
     parser.add_argument("--with_prior_knowledge", default=False, action="store_true", help="Use prior knowledge when fine-tuning on paraphrased texts")
     parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
+    parser.add_argument("--judge_model", type=str, default="gpt-4o-mini", help="The model to use as the judge for evaluation.")
     args = parser.parse_args()
 
     if args.override_experiment_name:

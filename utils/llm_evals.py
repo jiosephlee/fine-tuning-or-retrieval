@@ -1,7 +1,6 @@
 import json
 from utils.prompts.llm_as_judge import prompt as judge_prompt
 import utils.utils as utils
-import re
 
 def parse_judge_response(response_text: str):
     """
@@ -24,7 +23,7 @@ def parse_judge_response(response_text: str):
     except (json.JSONDecodeError, IndexError, AttributeError) as e:
         return {"feedback": f"Failed to parse response: {e}\nResponse:\n{response_text}", "score": None}
 
-def evaluate_response(question: str, response: str, reference_answer: str):
+def evaluate_response(question: str, response: str, reference_answer: str, judge_model: str = "gpt-4o-mini"):
     """
     Evaluates a response using an LLM as a judge.
     """
@@ -34,7 +33,6 @@ def evaluate_response(question: str, response: str, reference_answer: str):
         reference_answer=reference_answer
     )
 
-    raw_response = utils.query_llm(judge_prompt, system_prompt_included=True, model = "gpt-5-mini", reasoning_effort = "low"
-    )
+    raw_response = utils.query_llm(judge_prompt, system_prompt_included=True, model=judge_model, reasoning_effort="low")
 
     return parse_judge_response(raw_response)

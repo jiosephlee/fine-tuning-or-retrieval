@@ -5,7 +5,7 @@ import pandas as pd
 import os
 import wandb
 from utils.llm_training import generate_text
-from utils.llm_configs import InferenceConfig, ModelConfig
+from utils.llm_configs import InferenceConfig
 from utils.llm_evals import evaluate_response
 import matplotlib.pyplot as plt
 
@@ -446,7 +446,8 @@ class GenerationProbeCallback(TrainerCallback):
                  eval_every_n_steps: int = 10,
                  logger=None,
                  output_dir: str = "",
-                 do_eval: bool = False):
+                 do_eval: bool = False,
+                 judge_model: str = "gpt-4o-mini"):
 
         self.prompts = prompts
         self.tokenizer = tokenizer
@@ -455,6 +456,7 @@ class GenerationProbeCallback(TrainerCallback):
         self.logger = logger
         self.output_dir = output_dir
         self.do_eval = do_eval
+        self.judge_model = judge_model
 
         if self.do_eval:
             self.eval_history = {}
@@ -529,7 +531,8 @@ class GenerationProbeCallback(TrainerCallback):
                 eval_result = evaluate_response(
                     question=question,
                     response=generated_text,
-                    reference_answer=reference_answer
+                    reference_answer=reference_answer,
+                    judge_model=self.judge_model
                 )
 
                 with open(gen_file_path, 'a', encoding='utf-8') as f:
