@@ -63,9 +63,12 @@ def load_prompts(prompt_files, do_eval, append_eot=False):
             prompt_list = []
             if do_eval:
                 for item in data:
+                    question = item.get('question', '')
+                    if append_eot:
+                        question += "<|EOT|>"
                     prompt_list.append({
                         "prompt_name": item.get('id', 'unknown'),
-                        "question": item.get('question', ''),
+                        "question": question,
                         "reference_answer": item.get('reference_answer', '')
                     })
             else:

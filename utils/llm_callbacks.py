@@ -494,6 +494,9 @@ class GenerationProbeCallback(TrainerCallback):
                 file_path = os.path.join(prompt_output_dir, f"generation_step_{state.global_step}.txt")
 
                 with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write("--- PROMPT ---\n")
+                    f.write(prompt_text + "\n\n")
+                    f.write("--- GENERATION ---\n")
                     f.write(generated_text)
                 
                 if self.logger:
