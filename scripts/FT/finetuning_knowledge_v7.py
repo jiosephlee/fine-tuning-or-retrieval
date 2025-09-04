@@ -3,6 +3,8 @@
 # pip install flash-attn --no-build-isolation
 # pip install git+https://github.com/huggingface/trl
 # pip install pydantic datasets peft bitsandbytes wandb matplotlib seaborn liger-kernel scikit-learn
+# pip install https://github.com/jiosephlee/transformers; pip install .[torch]
+
 import os
 import sys
 import json

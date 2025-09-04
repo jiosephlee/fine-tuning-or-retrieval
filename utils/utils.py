@@ -16,79 +16,6 @@ client_safe = OpenAI(
     base_url="https://adb-4750903324350629.9.azuredatabricks.net/serving-endpoints"
 )
 
-def save_predictions():
-    pass
-
-def evaluate_metrics():
-    pass
-
-#########################
-## For Dataset Processing
-#########################
-
-_PROJECT_PATH = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval"
-
-_DATASETS = {
-    "MedQA": 
-        {'test_set_filepath': f"{_PROJECT_PATH}/data/MedQA/questions/US/4_options/phrases_no_exclude_test.jsonl",
-        'format': 'jsonl',
-        },
-    "BioASQ": 
-        {'test_set_filepath': "./data/mimic-iv-public/triage_counterfactual.csv",
-        'format': 'csv',
-        'target': 'acuity',
-        'training_set_filepath':'./data/mimic-iv-public/triage_public.csv',
-        },
-    "PubMedQA": 
-        {'dataset_name': "qiaojin/PubMedQA",
-         'train_set_filepath': "pqa_artificial",
-         'test_set_filepath': "pqa_labeled",
-        'format': 'huggingface',
-        },
-    }
-
-def save_metrics(metrics,  filename):
-    output_file = f"{_PROJECT_PATH}/results/metrics/{filename}_metrics.json"
-    with open(output_file, 'w') as f:
-        json.dump(metrics, f, indent=2)
-             
-def load_dataset(dataset, start_index=None, end_index=None, split='test'):
-    if dataset not in _DATASETS:
-        raise ValueError("Dataset not found in _DATASETS.")
-    if _DATASETS[dataset]['format'] == 'huggingface':
-        path = _DATASETS[dataset][f'{split}_set_filepath'] 
-        data = datasets.load_dataset(_DATASETS[dataset]['dataset_name'], path)['train']
-        print(data)
-        
-        if start_index is not None and end_index is not None:
-            # Using slicing instead of select method
-            data = data.select(range(start_index, end_index))
-    else:
-        filepath = _DATASETS[dataset]['test_set_filepath']
-        format = _DATASETS[dataset]['format']
-        if format == 'jsonl':
-            data = load_jsonl(filepath, start_index, end_index)
-        elif format == 'csv':
-            data = pd.read_csv(filepath).loc[start_index:end_index]
-        else:
-            raise ValueError(f"Unsupported format: {format}")
-    return data
-    
-def load_jsonl(filepath, start_index, end_index):
-    with open(filepath, 'r') as f:
-        data = [json.loads(line) for i, line in enumerate(f) if i <= end_index and i >= start_index]
-    return data
-
-def load_predictions(filename, format='txt', save_path=f"{_PROJECT_PATH}/results/predictions"):
-    if format == 'csv':
-        filename = f"{save_path}/{filename}.csv"
-        predictions = pd.read_csv(filename)
-    else: 
-        filename = f"{save_path}/{filename}.txt"
-        with open(filename, 'r') as f:
-            predictions = [json.loads(line.strip()) for line in f]
-    return predictions
-
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 client = OpenAI()
 
@@ -113,19 +40,6 @@ def query_llm(prompt, max_tokens=1000, temperature=0, top_p=0, max_try_num=10, m
             return response
         except Exception as e:
             raise e
-        # except Exception as e:
-        #     if 'gpt' in model:
-        #         print(f"Error making OpenAI API call: {e}")
-        #     else: 
-        #         print(f"Error making API call: {e}")
-        #     curr_try_num += 1
-        #     time.sleep(1)
-        #     if curr_try_num >= 3 and return_json:
-        #         response = query_llm(prompt, model=model, max_tokens=max_tokens, temperature=temperature, top_p=top_p, return_json=False, json_schema=json_schema, logprobs=logprobs, system_prompt_included=system_prompt_included, is_hippa=is_hippa, debug=debug)
-        #         prompt=f"""Turn the following text into a JSON object: {response}"""
-        #         json_response = query_llm(prompt, model=model, max_tokens=max_tokens, temperature=temperature, top_p=top_p, return_json=True, json_schema=json_schema, logprobs=logprobs, system_prompt_included=False, is_hippa=is_hippa, debug=debug)
-        #         print("Turning text into JSON by brute force...")
-        #         return json_response
     return None
 
 def query_gpt(prompt: str | dict, model: str = 'gpt-4o-mini', max_tokens: int = 4000, temperature: float = 0, top_p: float = 0, logprobs: bool = False, return_json: bool = False, json_schema = None, system_prompt_included: bool = False, reasoning_effort = 'high', is_hippa: bool = False, debug: bool = False):
