@@ -24,21 +24,17 @@ def parse_judge_response(response_text: str):
     except (json.JSONDecodeError, IndexError, AttributeError) as e:
         return {"feedback": f"Failed to parse response: {e}\nResponse:\n{response_text}", "score": None}
 
-def evaluate_response(question: str, response: str, reference_answer: str, judge_model_config):
+def evaluate_response(question: str, response: str, reference_answer: str):
     """
     Evaluates a response using an LLM as a judge.
     """
-    system_prompt = judge_prompt["system"]
-    user_prompt = judge_prompt["user"].format(
+    judge_prompt['user'] = judge_prompt["user"].format(
         question=question,
         answer=response,
         reference_answer=reference_answer
     )
 
-    raw_response = utils.query_llm(
-        model_config=judge_model_config,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt
+    raw_response = utils.query_llm(judge_prompt, system_prompt_included=True, model = "gpt-5-mini", reasoning_effort = "low"
     )
 
     return parse_judge_response(raw_response)
