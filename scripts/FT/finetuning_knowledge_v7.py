@@ -27,12 +27,13 @@ def construct_experiment_name(args):
     training_type = "Full_Finetuning" if args.full_finetuning else "PEFT"
     
     if args.num_paraphrased_texts > 0:
+        num_texts = args.num_paraphrased_texts
         if args.with_explanations:
-            base_name = "ParaphrasedArxivPaperWithExplanations"
+            base_name = f"Paraphrased{num_texts}ArxivPaperWithExplanations"
         elif args.with_prior_knowledge:
-            base_name = "ParaphrasedArxivPaperWithPriorKnowledge"
+            base_name = f"Paraphrased{num_texts}ArxivPaperWithPriorKnowledge"
         else:
-            base_name = "ParaphrasedArxivPaper"
+            base_name = f"Paraphrased{num_texts}ArxivPaper"
     else:
         base_name = "SingleArxivPaper"
     
