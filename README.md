@@ -6,9 +6,10 @@ To run an experiment, first you will need to install these libraries (some bug f
 pip install git+https://github.com/huggingface/trl
 pip install pydantic datasets==3.6.0 peft bitsandbytes wandb matplotlib seaborn liger-kernel scikit-learn openai
 git clone https://github.com/jiosephlee/transformers
-cd transformers && pip install .[torch]```
+cd transformers && pip install .[torch]
+```
 
-Then, go to the script scripts/FT/lima_and_fine_tuning.sh
+Then, go to the script `scripts/FT/lima_and_fine_tuning.sh`
 
 which looks like this
 
@@ -20,7 +21,8 @@ which looks like this
     --overlap_ratio 1_4 \
     --do_eval \
     --lima_afterwards \
-    --full_finetuning > output_1.log 2>&1 &```
+    --full_finetuning > output_1.log
+```
 
 
     
