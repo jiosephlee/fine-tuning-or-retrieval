@@ -21,7 +21,7 @@ def generate_new_plots_for_knowledge_probes(probes_version: str, output_dir: str
     log_info("Loading dataframes for new plotting...")
     probe_metrics_path = os.path.join(output_dir, "knowledge_probe_metrics.csv")
     training_loss_path = os.path.join(output_dir, "training_loss_perplexity_metrics.csv")
-    probes_path = f"data/arxiv/DPO_knowledge_probes_{probes_version}.csv" # Hardcoded for now
+    probes_path = f"data/probes/DPO_knowledge_probes_{probes_version}.csv" # Hardcoded for now
 
     if not os.path.exists(probe_metrics_path):
         log_info(f"Skipping plotting: '{probe_metrics_path}' not found.")
@@ -196,7 +196,7 @@ def generate_new_plots_for_inference_probes(probes_version: str, output_dir: str
     log_info("Loading dataframes for inference probe plotting...")
     probe_metrics_path = os.path.join(output_dir, "inference_probe_metrics.csv")
     training_loss_path = os.path.join(output_dir, "training_loss_perplexity_metrics.csv")
-    probes_path = f"data/arxiv/dpo_high_level_probes_{probes_version}.csv"
+    probes_path = f"data/probes/dpo_high_level_probes_{probes_version}.csv"
 
     if not os.path.exists(probe_metrics_path):
         log_info(f"Skipping plotting: '{probe_metrics_path}' not found.")

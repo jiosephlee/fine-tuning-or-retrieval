@@ -112,7 +112,7 @@ def continue_pretraining(model, tokenizer, log, args):
     os.makedirs(output_dir_inference_probe, exist_ok=True)
     os.makedirs(output_dir_knowledge_probe, exist_ok=True)
 
-    knowledge_probe_df = pd.read_csv(f'../../data/arxiv/DPO_knowledge_probes_{knowledge_probes_version}.csv')
+    knowledge_probe_df = pd.read_csv(f'../../data/probes/DPO_knowledge_probes_{knowledge_probes_version}.csv')
     facts = knowledge_probe_df['fact'].tolist()
     probes = knowledge_probe_df['probe'].tolist()
     targets = knowledge_probe_df['target'].tolist()
@@ -129,7 +129,7 @@ def continue_pretraining(model, tokenizer, log, args):
         log_prefix="knowledge_probe",
     )
 
-    inference_probe_df = pd.read_csv('../../data/arxiv/dpo_high_level_probes_v2.csv')
+    inference_probe_df = pd.read_csv('../../data/probes/dpo_high_level_probes_v2.csv')
     facts = inference_probe_df['fact'].tolist()
     probes = inference_probe_df['probe'].tolist()
     targets = inference_probe_df['target'].tolist()
@@ -149,7 +149,7 @@ def continue_pretraining(model, tokenizer, log, args):
     inference_config = llm_configs.InferenceConfig(no_repeat_ngram_size=6)
 
     prompt_files = {
-        'recall_DPO': '../../data/arxiv/recall_DPO.json'
+        'recall_DPO': '../../data/probes/recall_DPO.json'
     }
 
     prompts = load_prompts(prompt_files, args.do_eval)
@@ -171,7 +171,7 @@ def continue_pretraining(model, tokenizer, log, args):
     callbacks_to_use = [probe_callback, training_loss_callback, inference_probe_callback, generation_probe_callback]
     if "SingleArxivPaper" in args.experiment_name:
         log.info("\n--- Loading in Single Arxiv Paper ---")
-        with open('../../data/arxiv/cleaned_DPO.txt', 'r', encoding='utf-8') as f:
+        with open('../../data/arxiv/cleaned/DPO.txt', 'r', encoding='utf-8') as f:
             arxiv_paper = f.read()
 
         log.info("\n--- Fine-Tuning on Single Arxiv Paper ---")
@@ -203,12 +203,12 @@ def continue_pretraining(model, tokenizer, log, args):
             
             texts_to_train = []
             # Load original paper
-            with open('../../data/arxiv/cleaned_DPO.txt', 'r', encoding='utf-8') as f:
+            with open('../../data/arxiv/cleaned/DPO.txt', 'r', encoding='utf-8') as f:
                 texts_to_train.append(f.read())
                 
             # Load paraphrased papers
             for i in range(args.num_paraphrased_texts-1):
-                file_path = f'../../data/arxiv/cleaned_DPO_paraphrased_{i}.txt'
+                file_path = f'../../data/arxiv/paraphrased/DPO/{i}.txt'
                 with open(file_path, 'r', encoding='utf-8') as f:
                     texts_to_train.append(f.read())
                 num_documents += 1
@@ -224,20 +224,22 @@ def continue_pretraining(model, tokenizer, log, args):
             
             texts_to_train = []
             # Load original paper
-            with open('../../data/arxiv/cleaned_DPO.txt', 'r', encoding='utf-8') as f:
+            with open('../../data/arxiv/cleaned/DPO.txt', 'r', encoding='utf-8') as f:
                 texts_to_train.append(f.read())
                 
             # Load paraphrased papers
             for i in range(args.num_paraphrased_texts-1):
                 # Load DPO_explanation_1.txt through DPO_explanation_6.txt at the middle index
                 if i == (args.num_paraphrased_texts-1) // 2:
-                    for explanation_num in range(1, 7):
-                        file_path = f'../../data/arxiv/DPO_explanation_{explanation_num}.txt'
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            texts_to_train.append(f.read())
+                    explanation_dir = '../../data/arxiv/explanations/'
+                    for filename in os.listdir(explanation_dir):
+                        if filename.endswith('.txt'):
+                            file_path = os.path.join(explanation_dir, filename)
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                texts_to_train.append(f.read())
                     num_documents += 1
                 else:
-                    file_path = f'../../data/arxiv/cleaned_DPO_paraphrased_{i}.txt'
+                    file_path = f'../../data/arxiv/paraphrased/DPO/{i}.txt'
                     with open(file_path, 'r', encoding='utf-8') as f:
                         texts_to_train.append(f.read())
                     num_documents += 1
@@ -306,7 +308,7 @@ def lima_training(model, tokenizer, log, args):
     output_dir_knowledge_probe = os.path.join("../../results/FT", args.experiment_name, "lima_knowledge_probe")
     os.makedirs(output_dir_knowledge_probe, exist_ok=True)
 
-    knowledge_probe_df = pd.read_csv(f'../../data/arxiv/DPO_knowledge_probes_{args.knowledge_probes_version}.csv')
+    knowledge_probe_df = pd.read_csv(f'../../data/probes/DPO_knowledge_probes_{args.knowledge_probes_version}.csv')
     facts = knowledge_probe_df['fact'].tolist()
     probes = knowledge_probe_df['probe'].tolist()
     targets = knowledge_probe_df['target'].tolist()
@@ -326,7 +328,7 @@ def lima_training(model, tokenizer, log, args):
     output_dir_inference_probe = os.path.join("../../results/FT", args.experiment_name, "lima_inference_probe")
     os.makedirs(output_dir_inference_probe, exist_ok=True)
 
-    inference_probe_df = pd.read_csv('../../data/arxiv/dpo_high_level_probes_v2.csv')
+    inference_probe_df = pd.read_csv('../../data/probes/dpo_high_level_probes_v2.csv')
     facts = inference_probe_df['fact'].tolist()
     probes = inference_probe_df['probe'].tolist()
     targets = inference_probe_df['target'].tolist()
@@ -348,9 +350,9 @@ def lima_training(model, tokenizer, log, args):
 
     inference_config = llm_configs.InferenceConfig(no_repeat_ngram_size=6)
     prompt_files = {
-        'recall_DPO_QA': '../../data/arxiv/recall_DPO_QA.json',
-        'recall_background_QA': '../../data/arxiv/recall_background_QA.json',
-        'yourbench_DPO': '../../data/arxiv/yourbench_DPO.json'
+        'recall_DPO_QA': '../../data/probes/recall_DPO_QA.json',
+        'recall_background_QA': '../../data/probes/recall_background_QA.json',
+        'yourbench_DPO': '../../data/probes/yourbench_DPO.json'
     }
 
     prompts = load_prompts(prompt_files, args.do_eval, append_eot=True)
