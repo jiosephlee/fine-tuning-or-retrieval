@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 import pandas as pd
 import os
 import wandb
-from utils.llm_training import generate_text
+from utils.llm_inference import generate_text
 from utils.llm_configs import InferenceConfig
 from utils.llm_evals import evaluate_response
 import matplotlib.pyplot as plt

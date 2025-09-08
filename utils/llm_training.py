@@ -1,14 +1,8 @@
-import sys 
-#sys.path.append('../../trl')
-
 import math
 import os
 import wandb
 import torch
-from typing import Optional, List, Literal
-import pandas as pd
-
-# Third-party imports
+from typing import Optional, List
 from datasets import Dataset, load_dataset
 from peft import LoraConfig as PeftLoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
@@ -18,8 +12,24 @@ from transformers import (
     TrainerCallback,
 )
 #from liger_kernel.transformers import LigerCrossEntropyLoss
-from trl import SFTConfig, SFTTrainer
+from trl import SFTTrainer
 from utils.llm_configs import PeftConfig, ModelConfig, TrainingConfig, InferenceConfig
+from utils.chunking import chunk, chunk_text, chunk_text_by_sections, chunk_texts
+
+def get_pretraining_data(num_batches: int, type: str = 'wiki') -> List[List[str]]:
+    """
+    Returns N batches of pretraining data.
+    NOTE: This is a placeholder and will be replaced with a proper implementation.
+    """
+    raise NotImplementedError("get_pretraining_data is not yet implemented.")
+
+def fill_up_batch_with_pretraining_data(batch: List[str], type: str = 'wiki') -> List[str]:
+    """
+    Fills up a batch with pretraining data to the desired size.
+    NOTE: This is a placeholder and will be replaced with a proper implementation.
+    """
+    raise NotImplementedError("fill_up_batch_with_pretraining_data is not yet implemented.")
+
 
 # --------------------------------------------------------------------------
 # SECTION 2: CORE LLM OPERATIONS
@@ -348,377 +358,243 @@ def save_model(model, tokenizer, log, save_path: str):
     tokenizer.save_pretrained(save_path)
     log.info(f"Model saved to {save_path}")
 
-def chunk_texts(texts: List[str], tokenizer, context_length: int) -> tuple[List[str], int]:
-    """
-    Chunks a list of texts into smaller pieces based on context length.
-    
-    Args:
-        texts: List of text strings to chunk
-        tokenizer: The tokenizer to use
-        context_length: Maximum tokens per chunk
-        
-    Returns:
-        Tuple of (all_text_chunks, total_tokens)
-    """
-    all_text_chunks = []
-    total_tokens = 0
-    
-    for text_content in texts:
-        tokens = tokenizer(text_content, add_special_tokens=False, truncation=False)["input_ids"]
-        num_tokens = len(tokens)
-        total_tokens += num_tokens
-        num_chunks = math.ceil(num_tokens / context_length)
-        
-        for i in range(num_chunks):
-            start_idx = i * context_length
-            end_idx = min((i + 1) * context_length, num_tokens)
-            chunk_tokens = tokens[start_idx:end_idx]
-            # print(chunk_tokens[end_idx-1-start_idx])
-            chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=False)
-            all_text_chunks.append(chunk_text)
-    
-    return all_text_chunks, total_tokens
 
-def chunk_text(text_content: str, tokenizer, context_length: int, delimiter: str = None) -> tuple[List[str], int]:
-    """
-    Chunks a single text into smaller pieces based on context length.
-    
-    Args:
-        text_content: Text string to chunk
-        tokenizer: The tokenizer to use
-        context_length: Maximum tokens per chunk
-        delimiter: Optional delimiter to split by (e.g., '\n', '.', etc.)
-        
-    Returns:
-        Tuple of (text_chunks, num_tokens)
-    """
-    total_tokens = len(tokenizer(text_content, add_special_tokens=False, truncation=False)["input_ids"])
-    
-    if delimiter is None:
-        # Fall back to original token-based chunking
-        tokens = tokenizer(text_content, add_special_tokens=False, truncation=False)["input_ids"]
-        num_chunks = math.ceil(len(tokens) / context_length)
-        
-        text_chunks = []
-        for i in range(num_chunks):
-            start_idx = i * context_length
-            end_idx = min((i + 1) * context_length, len(tokens))
-            chunk_tokens = tokens[start_idx:end_idx]
-            chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=False)
-            text_chunks.append(chunk_text)
-    else:
-        # Split by delimiter and build chunks
-        parts = text_content.split(delimiter)
-        text_chunks = []
-        current_chunk = ""
-        
-        for part in parts:
-            test_chunk = current_chunk + delimiter + part if current_chunk else part
-            test_tokens = len(tokenizer(test_chunk, add_special_tokens=False, truncation=False)["input_ids"])
-            
-            if test_tokens <= context_length:
-                current_chunk = test_chunk
-            else:
-                if current_chunk:
-                    text_chunks.append(current_chunk)
-                current_chunk = part
-        
-        if current_chunk:
-            text_chunks.append(current_chunk)
-    
-    return text_chunks, total_tokens
-
-def split_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 2048):
-    """
-    Splits text by subsections and validates each subsection doesn't exceed max_tokens.
-    
-    Args:
-        text_content: The section text to split
-        tokenizer: The tokenizer to use for counting tokens
-        max_tokens: Maximum tokens per subsection
-        
-    Returns:
-        List of subsections and total token count
-        
-    Raises:
-        ValueError: If any subsection exceeds max_tokens
-    """
-    import re
-    subsection_pattern = r'(\\subsection\{[^}]+\})'
-    parts = re.split(subsection_pattern, text_content)
-    
-    subsections = []
-    
-    # Handle content before first subsection
-    if parts[0].strip():
-        subsections.append(parts[0])
-    
-    # Group subsection headers with their content
-    i = 1
-    while i < len(parts):
-        if re.match(subsection_pattern, parts[i]):  # This is a subsection header
-            subsection_content = parts[i]  # Start with the subsection header
-            if i + 1 < len(parts):
-                subsection_content += parts[i + 1]  # Add the content after the header
-            subsections.append(subsection_content)
-            i += 2
-        else:
-            i += 1
-    
-    # If we only have one subsection (no actual subsection splits), return original
-    if len(subsections) <= 1:
-        subsections = [text_content]
-    
-    # Validate that no subsection exceeds max_tokens
-    total_tokens = 0
-    for i, subsection in enumerate(subsections):
-        if not subsection.strip():
-            continue
-        tokens = tokenizer(subsection, add_special_tokens=False, truncation=False)["input_ids"]
-        token_count = len(tokens)
-        total_tokens += token_count
-        
-        if token_count > max_tokens:
-            raise ValueError(f"Subsection {i} has {token_count} tokens, which exceeds max_tokens ({max_tokens})")
-    
-    return subsections, total_tokens
-
-def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048, overlap_sections = False, overlap_denom = 4, overlap_numer = 1, log=None, add_title_prefix: bool = True):
-    """
-    Chunks text by sections, ensuring each chunk doesn't exceed max_tokens.
-    If a section is too large, it tries to split by subsections first.
-    If no subsections exist or they're still too large, it falls back to token-based chunking.
-    Each new chunk is prefixed with the document's title.
-
-    Args:
-        text_content: The full text to chunk
-        tokenizer: The tokenizer to use for counting tokens
-        max_tokens: Maximum tokens per chunk
-        add_title_prefix: If True, prefixes each new chunk with the document's title.
-
-    Returns:
-        List of text chunks and total token count
-    """
-    import re
-    # Extract title
-    title = ""
-    if add_title_prefix:
-        title_match = re.search(r'\\title\{([^}]+)\}', text_content)
-        if title_match:
-            title = f"\\title{{{title_match.group(1)}}}\n\n"
-        else:
-            raise ValueError("No title found in the text")
-
-    # Find all section boundaries and split into sections
-    section_pattern = r'(\\section\{[^}]+\})'
-    parts = re.split(section_pattern, text_content)
-    
-    sections = []
-    # Handle content before first section (e.g., abstract)
-    if parts[0].strip():
-        sections.append(parts[0])
-    
-    # Group section headers with their content
-    i = 1
-    while i < len(parts):
-        if re.match(section_pattern, parts[i]):  # This is a section header
-            section_content = parts[i]  # Start with the section header
-            if i + 1 < len(parts):
-                section_content += parts[i + 1]  # Add the content after the header
-            sections.append(section_content)
-            i += 2
-        else:
-            i += 1
-
-    chunks = []
-    current_chunk = ""
-    
-    for section in sections:
-        if not section.strip():
-            continue
-
-        # Handle title for the very first chunk or any new, empty chunk.
-        is_title_block = section.strip().startswith('\\title')
-        if not current_chunk and not is_title_block:
-            current_chunk = title
-
-        # First, try to fit the whole section.
-        candidate_chunk = current_chunk + section
-        candidate_tokens = tokenizer(candidate_chunk, add_special_tokens=False, truncation=False)["input_ids"]
-
-        if len(candidate_tokens) <= max_tokens:
-            # Section fits, add it to the current chunk.
-            current_chunk = candidate_chunk
-        else:
-            pieces, _ = split_text_by_subsections(section, tokenizer, max_tokens)
-            # Try to add pieces to the current chunk until it's full.
-            for piece in pieces:
-                piece_candidate = current_chunk + piece
-                piece_candidate_tokens = tokenizer(piece_candidate, add_special_tokens=False, truncation=False)["input_ids"]
-
-                if len(piece_candidate_tokens) <= max_tokens:
-                    # Piece fits, add it.
-                    current_chunk = piece_candidate
-                else:
-                    # Piece does not fit. Finalize the current chunk.
-                    if current_chunk.strip():
-                        chunks.append(current_chunk)
-                    
-                    # Start a new chunk with the title and this piece.
-                    if current_chunk.strip() and overlap_sections:
-                        # Get the latter half of the previous chunk for context
-                        #print(current_chunk)
-                        prev_sentences = current_chunk.split('\n')
-                        # print(prev_sentences)
-                        half_point = len(prev_sentences) // overlap_denom * (overlap_denom - overlap_numer)
-                        context_from_prev = '\n'.join(prev_sentences[half_point:])
-                        current_chunk = title + context_from_prev + piece
-                    else:
-                        current_chunk = title + piece
-
-    # Add the final chunk if it has content.
-    if current_chunk.strip():
-        chunks.append(current_chunk)
-    
-    total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in chunks)
-    log.info(f"First chunk: {chunks[0][:100]}...")
-    log.info(f"Second chunk: {chunks[1][:100]}...")
-    return chunks, total_tokens
-
-
-@torch.inference_mode()
-def generate_text(model, tokenizer, prompt: str, config: InferenceConfig) -> str:
-    """Simple inference function using Hugging Face transformers.generate."""
-    inputs = tokenizer(prompt , return_tensors="pt").to(model.device)
-    if config.do_sample:
-        outputs = model.generate(
-            **inputs,
-            pad_token_id=tokenizer.eos_token_id,
-            max_new_tokens=config.max_new_tokens,
-            temperature=config.temperature,
-            top_p=config.top_p,
-            do_sample=config.do_sample,
-            repetition_penalty=config.repetition_penalty,
-            no_repeat_ngram_size = config.no_repeat_ngram_size
-        )
-    else:
-        outputs = model.generate(
-        **inputs,
-        pad_token_id=tokenizer.eos_token_id,
-        max_new_tokens=config.max_new_tokens,
-        do_sample=config.do_sample,
-        repetition_penalty=config.repetition_penalty,
-        no_repeat_ngram_size = config.no_repeat_ngram_size
-    )
-    return tokenizer.decode(outputs[0], skip_special_tokens=False)
-
-@torch.inference_mode()
-def analyze_text_generation(model, tokenizer, prompt, device, max_new_tokens=1024):
-    """
-    Generates text from a prompt and analyzes the top 5 token choices at each step.
-
-    Args:
-        model_name (str): The name of the pretrained model to use (e.g., "gpt2").
-        prompt (str): The input text to generate from.
-        max_new_tokens (int): The maximum number of new tokens to generate.
-
-    Returns:
-        str: A formatted string detailing the generation process.
-    """
-    # Tokenize the input prompt
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-
-    # Generate text and get scores
-    outputs = model.generate(
-        **inputs,
-        pad_token_id=tokenizer.eos_token_id,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        return_dict_in_generate=True,
-        output_scores=True
-    )
-    print(f"Output: {tokenizer.decode(outputs.sequences[0], skip_special_tokens=False)}\n")
-          
-    # Get the generated token IDs, excluding the input prompt's tokens
-    generated_token_ids = outputs.sequences[0, inputs.input_ids.shape[-1]:]
-    # Get the scores for each generation step
-    token_scores = outputs.scores
-
-    # --- Formatting the Output ---
-    output_string = ""
-    # Iterate through each generated token and its corresponding scores
-    for i, generated_token_id in enumerate(generated_token_ids):
-        # Get the scores for the current step
-        step_scores = token_scores[i][0]
-
-        # Apply softmax to convert logits to probabilities
-        step_probs = torch.nn.functional.softmax(step_scores, dim=0)
-        
-        # Get the top 5 tokens and their probabilities
-        top_5_probs, top_5_indices = torch.topk(step_probs, 5)
-
-        # Decode the generated token and the top 5 tokens
-        generated_token = tokenizer.decode(generated_token_id)
-        
-        # Get the probability of the actual chosen token
-        chosen_token_prob = step_probs[generated_token_id].item()
-
-        output_string += f'➡️ Generated Token #{i+1}: "{generated_token.strip()}" (Probability: {chosen_token_prob:.2%})\n'
-        output_string += "   Top 5 candidates for this position:\n"
-        
-        for j, (prob, index) in enumerate(zip(top_5_probs, top_5_indices)):
-            decoded_token = tokenizer.decode(index)
-            output_string += f"      {j+1}. \"{decoded_token.strip()}\" ({prob:.2%})\n"
-        
-        output_string += "\n"
-        
-    return output_string.strip()
-
-
-@torch.inference_mode()
-def extract_logits_first_step(
-    model,
+def prepare_training_mix(
+    strategy_name: str,
     tokenizer,
-    prompt: str,
-    target_tokens: List[str],
-    device = 'cuda',
+    log,
+    train_cfg: TrainingConfig,
+    chunk_by_section: bool = False,
+    overlap_sections: bool = False,
+    overlap_ratio: str = "1_4",
+    add_title_prefix: bool = True,
+    **strategy_args,
 ):
     """
-    Greedily generates ONE token after *prompt* and returns the raw logits
-    assigned to each token in *target_tokens* at that first generation step.
-
-    Returns
-    -------
-    dict {token: logit}
+    Prepares a training dataset based on a specified strategy.
+    Handles complex mixing of source, paraphrased, and explanation texts
+    while controlling for the total number of training steps. This function
+    is domain-agnostic and handles single or multiple domains naturally.
     """
-    # Encode prompt
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    log.info(f"Preparing training mix for strategy: {strategy_name}")
+    
+    # Helper to chunk a single text
+    def _chunk(text: str) -> List[str]:
+        text_with_eos = text + tokenizer.eos_token
+        chunks, _ = chunk(
+            text_with_eos,
+            tokenizer,
+            train_cfg.context_length,
+            chunk_by_section,
+            overlap_sections,
+            overlap_ratio,
+            add_title_prefix,
+            log=log
+        )
+        return chunks
 
-    # Map each candidate token to a single ID
-    token_id_map = {}
-    for tok in target_tokens:
-        ids = tokenizer(tok, add_special_tokens=False)["input_ids"]
-        if len(ids) != 1:
-            raise ValueError(f"'{tok}' is not a single-token string.")
-        token_id_map[tok] = ids[0]
+    # Determine domains: use override if provided, otherwise scan directory
+    domains = strategy_args.get("override_domains", None)
+    if domains is None:
+        cleaned_dir = 'data/arxiv/cleaned'
+        domains = [f.replace('.txt', '') for f in os.listdir(cleaned_dir) if f.endswith('.txt')]
+    log.info(f"Processing domains: {domains}")
 
-    # Generate exactly one new token (greedy)
-    gen_out = model.generate(
-        **inputs,
-        pad_token_id=tokenizer.eos_token_id,
-        max_new_tokens=1,
-        do_sample=False,
-        return_dict_in_generate=True,
-        output_scores=True,
+    num_paraphrased_texts = strategy_args.get("num_paraphrased_texts", 0)
+    with_explanations = "WithExplanations" in strategy_name
+
+    # Each inner list holds chunks for a "unique document type" across all domains
+    # e.g., unique_document_batches[0] = all source chunks
+    #       unique_document_batches[1] = all paraphrase-1 chunks
+    unique_document_batches = [[] for _ in range(1 + num_paraphrased_texts)]
+
+    for domain in domains:
+        log.info(f"Loading data for domain: {domain}")
+        
+        # 1. Load source text
+        source_path = f'data/arxiv/cleaned/{domain}.txt'
+        try:
+            with open(source_path, 'r', encoding='utf-8') as f:
+                source_text = f.read()
+        except FileNotFoundError:
+            log.error(f"Source file not found for domain {domain} at {source_path}. Skipping.")
+            continue
+            
+        source_chunks = _chunk(source_text)
+        
+
+        # 2. Load paraphrased texts
+        paraphrased_texts = []
+        paraphrased_chunks_by_doc = []
+        if num_paraphrased_texts > 0:
+            paraphrased_dir = f'data/arxiv/paraphrased/{domain}/'
+            if os.path.isdir(paraphrased_dir):
+                for i in range(num_paraphrased_texts):
+                    para_path = os.path.join(paraphrased_dir, f'{i}.txt')
+                    if os.path.exists(para_path):
+                        with open(para_path, 'r', encoding='utf-8') as f:
+                            paraphrased_texts.append(f.read())
+                    else:
+                        log.warning(f"Paraphrased text not found: {para_path}")
+            paraphrased_chunks_by_doc = [_chunk(text) for text in paraphrased_texts]
+
+        # 3. Load explanation texts
+        explanation_chunks = []
+        if with_explanations:
+            explanation_dir = f'data/arxiv/explanations/{domain}/'
+            if os.path.isdir(explanation_dir):
+                for filename in sorted(os.listdir(explanation_dir)):
+                    if filename.endswith('.txt'):
+                        file_path = os.path.join(explanation_dir, filename)
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            explanation_chunks.extend(_chunk(f.read()))
+            log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks.")
+        
+        # This part ensures that chunks from each document type of a domain are added to the correct overall batch
+        
+        # Document Chunks for the current domain
+        domain_doc_chunks = [source_chunks] + paraphrased_chunks_by_doc
+
+        # 4. Handle explanation replacement logic
+        num_chunks_per_source_doc = len(source_chunks)
+        if with_explanations and explanation_chunks:
+            paraphrased_units_for_explanations = math.ceil(len(explanation_chunks) / num_chunks_per_source_doc)
+            
+            # Start replacing from the last paraphrased doc towards the first
+            if paraphrased_units_for_explanations > 0:
+                # Distribute explanation chunks among the slots of the documents they replace
+                num_to_replace = min(paraphrased_units_for_explanations, len(paraphrased_chunks_by_doc))
+                
+                # Split explanations into `num_to_replace` parts
+                split_explanations = [explanation_chunks[i::num_to_replace] for i in range(num_to_replace)]
+
+                for i in range(num_to_replace):
+                    # Index of paraphrased doc to replace (from the end)
+                    replace_idx = len(paraphrased_chunks_by_doc) - 1 - i
+                    # Corresponding index in domain_doc_chunks (source is at 0)
+                    doc_chunk_idx = replace_idx + 1
+                    
+                    domain_doc_chunks[doc_chunk_idx] = split_explanations[i]
+                log.info(f"Domain {domain}: Replaced {num_to_replace} paraphrased documents with explanation chunks.")
+        
+        # Add the processed chunks for this domain to the main batches
+        for i, chunks in enumerate(domain_doc_chunks):
+            if i < len(unique_document_batches):
+                unique_document_batches[i].extend(chunks)
+
+    # 5. Assemble final chunk list with optional pretraining data replay
+    final_chunks = []
+    pretraining_separators = strategy_args.get("pretraining_batches_separating_docs", 0)
+
+    # Assert that batches expected to have content are not empty
+    for i, batch in enumerate(unique_document_batches):
+        assert batch, f"Batch for unique document type {i} is empty. Check data and strategy arguments."
+
+    for i, batch in enumerate(unique_document_batches):
+        if strategy_args.get("fill_batches_with_pretraining", False):
+            batch = fill_up_batch_with_pretraining_data(batch, type=strategy_args.get('pretraining_data_type', 'wiki'))
+        
+        effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
+        assert len(batch) == effective_batch_size, \
+            f"Batch {i} has size {len(batch)}, which is not equal to the effective batch size {effective_batch_size}."
+
+        final_chunks.extend(batch)
+        
+        if i < len(unique_document_batches) - 1 and pretraining_separators > 0:
+            pretraining_fill = get_pretraining_data(pretraining_separators, type=strategy_args.get('pretraining_data_type', 'wiki'))
+            flat_fill = [item for sublist in pretraining_fill for item in sublist] # Flatten the list of lists
+            final_chunks.extend(flat_fill)
+    
+    # 6. Duplicate the dataset to match the desired number of training steps
+    original_epochs = train_cfg.num_train_epochs
+    chunks_in_mix = len(final_chunks)
+    
+    if chunks_in_mix > 0:
+        # We assume 1 epoch over the constructed mix. To simulate more epochs, we replicate data.
+        if original_epochs > 1:
+            replication_factor = original_epochs / len(unique_document_batches)
+            log.info(f"Replicating dataset {replication_factor} times to simulate {original_epochs} epochs.")
+            final_chunks = final_chunks * replication_factor
+        else: # original_epochs is 1, no replication needed
+             pass
+    else:
+        log.warning("No chunks in training mix.")
+
+    total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in final_chunks)
+    log.info(f"Final training mix: Total chunks: {len(final_chunks)}, Total tokens: {total_tokens}")
+    
+    # The trainer will run for 1 epoch on the fully constructed dataset
+    train_cfg.num_train_epochs = 1
+    dataset = Dataset.from_dict({"text": final_chunks})
+    return dataset, train_cfg
+
+
+def fine_tune(
+    model,
+    tokenizer,
+    log,
+    train_cfg: TrainingConfig,
+    strategy_name: str,
+    strategy_args: dict,
+    output_dir_for_debug: str,
+    callbacks: Optional[List[TrainerCallback]] = None,
+    train: bool = True,
+    **chunking_args,
+):
+    """
+    A universal fine-tuning function that prepares data based on a strategy and runs the training.
+    Includes a debugging mechanism to verify sequential data loading.
+    """
+    dataset, updated_train_cfg = prepare_training_mix(
+        strategy_name=strategy_name,
+        tokenizer=tokenizer,
+        log=log,
+        train_cfg=train_cfg,
+        **strategy_args,
+        **chunking_args,
     )
-    first_step_logits = gen_out.scores[0][0]        # shape [vocab_size]
+    
+    training_args = updated_train_cfg.to_sft_training_args()
+    
+    trainer = CustomSFTTrainer(
+        model=model,
+        train_dataset=dataset,
+        args=training_args,
+        processing_class=tokenizer,
+        use_liger_loss=True, # Assuming this is standard
+        callbacks=callbacks,
+    )
+    
+    # --- Debugging Sequential Sampling ---
+    os.makedirs(output_dir_for_debug, exist_ok=True)
+    
+    def get_dataloader_content(dataloader):
+        content = []
+        for batch in dataloader:
+            # Assuming 'input_ids' is the key for tokenized text
+            # and we decode it back to string for inspection.
+            text_sample = tokenizer.decode(batch['input_ids'][0][:100])
+            content.append(text_sample)
+        return content
 
-    # Extract logits for requested tokens
-    return {tok: first_step_logits[tid].item() for tok, tid in token_id_map.items()}
+    log.info("Running first dataloader pass for debugging...")
+    dataloader1 = trainer.get_train_dataloader()
+    content1 = get_dataloader_content(dataloader1)
+    with open(os.path.join(output_dir_for_debug, "debug_run_1.txt"), "w") as f:
+        f.write("##\n\n".join(content1))
+        
+    log.info("Running second dataloader pass for debugging...")
+    dataloader2 = trainer.get_train_dataloader()
+    content2 = get_dataloader_content(dataloader2)
+    with open(os.path.join(output_dir_for_debug, "debug_run_2.txt"), "w") as f:
+        f.write("##\n\n".join(content2))
 
-
-# ---------- usage ----------
-# prompt = "Answer with yes or no: Is acetaminophen mutagenic?\nA: "
-# logits = extract_logits_first_step(model, tokenizer, prompt, [" yes", " no"])
-# print(logits)          # {' yes': -3.21, ' no': -1.05}
-# prediction = int(logits[" yes"] > logits[" no"])   # 1 = yes, 0 = no
+    assert content1 == content2, "Sequential sampling is not deterministic!"
+    log.info("Sequential sampling verification successful.")
+    
+    if train:
+        trainer.train()
+        log.info("Fine-tuning complete.")
+        wandb.finish()
+        
+    return trainer

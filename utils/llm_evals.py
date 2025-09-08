@@ -10,19 +10,49 @@ def parse_judge_response(response_text: str):
     try:
         data = json.loads(response_text)
         feedback = data.get("feedback")
-        score = data.get("score")
+        accuracy = data.get("accuracy")
+        comprehensiveness = data.get("comprehensiveness")
+        relevance = data.get("relevance")
+        depth = data.get("depth")
 
-        if score is not None:
-            try:
-                score = int(score)
-                if not (1 <= score <= 5):
-                    score = None  # Invalid score range
-            except (ValueError, TypeError):
-                score = None # Score is not an integer
+        # Convert scores to integers and validate range
+        scores = {}
+        for score_name, score_value in [("accuracy", accuracy), ("comprehensiveness", comprehensiveness), ("relevance", relevance), ("depth", depth)]:
+            if score_value is not None:
+                try:
+                    score_int = int(score_value)
+                    if 1 <= score_int <= 10:
+                        scores[score_name] = score_int
+                    else:
+                        scores[score_name] = None
+                except (ValueError, TypeError):
+                    scores[score_name] = None
+            else:
+                scores[score_name] = None
 
-        return {"feedback": feedback, "score": score}
+        # Calculate total score if all individual scores are valid
+        if all(score is not None for score in scores.values()):
+            total_score = sum(scores.values())
+        else:
+            total_score = None
+
+        return {
+            "feedback": feedback,
+            "accuracy": scores["accuracy"],
+            "comprehensiveness": scores["comprehensiveness"],
+            "relevance": scores["relevance"],
+            "depth": scores["depth"],
+            "score": total_score
+        }
     except (json.JSONDecodeError, IndexError, AttributeError) as e:
-        return {"feedback": f"Failed to parse response: {e}\nResponse:\n{response_text}", "score": None}
+        return {
+            "feedback": f"Failed to parse response: {e}\nResponse:\n{response_text}",
+            "accuracy": None,
+            "comprehensiveness": None,
+            "relevance": None,
+            "depth": None,
+            "score": None
+        }
 
 def evaluate_response(question: str, response: str, reference_answer: str, judge_model: str = "gpt-4o-mini"):
     """
