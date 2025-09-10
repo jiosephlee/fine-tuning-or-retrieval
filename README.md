@@ -9,11 +9,16 @@ git clone https://github.com/jiosephlee/transformers
 cd transformers && pip install .[torch]
 ```
 
+You must also create a file called keys.py that contains the API keys necessary for the LLM-as-a-judge evals. Keys_demo.py has been provided for you to edit. Please rename it to keys.py so that it can also be ignored by git.
+
 Then, go to the script `scripts/FT/lima_and_fine_tuning.sh`
 
 which looks like this
 
-```python finetuning_knowledge_v7.py \
+```
+num_epochs=100
+num_paraphrased=10
+python finetuning_knowledge_v7.py \
     --num_train_epochs $num_epochs \
     --learning_rate 2e-5 \
     --num_paraphrased_texts $num_paraphrased \
@@ -21,7 +26,7 @@ which looks like this
     --overlap_ratio 1_4 \
     --do_eval \
     --lima_afterwards \
-    --full_finetuning > output_1.log
+    --full_finetuning > output.log
 ```
 
 

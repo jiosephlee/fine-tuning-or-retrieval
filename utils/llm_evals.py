@@ -54,7 +54,7 @@ def parse_judge_response(response_text: str):
             "score": None
         }
 
-def evaluate_response(question: str, response: str, reference_answer: str, judge_model: str = "gpt-4o-mini"):
+def evaluate_response(question: str, response: str, reference_answer: str):
     """
     Evaluates a response using an LLM as a judge.
     """
@@ -65,6 +65,6 @@ def evaluate_response(question: str, response: str, reference_answer: str, judge
         reference_answer=reference_answer
     )
 
-    raw_response = utils.query_llm(local_judge_prompt, system_prompt_included=True, model=judge_model)
+    raw_response = utils.query_llm(local_judge_prompt, system_prompt_included=True, model="gpt-5-mini")
 
     return parse_judge_response(raw_response)

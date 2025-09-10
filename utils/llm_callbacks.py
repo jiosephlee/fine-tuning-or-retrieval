@@ -4,6 +4,7 @@ from typing import List, Dict, Any
 import pandas as pd
 import os
 import wandb
+import json
 from utils.llm_inference import generate_text
 from utils.llm_configs import InferenceConfig
 from utils.llm_evals import evaluate_response
@@ -437,7 +438,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
 class GenerationProbeCallback(TrainerCallback):
     """
     A callback that periodically generates text from a fixed prompt and saves the output.
-    Can also evaluate the generated text using an LLM judge.
+    It also evaluates the generated text using an LLM judge.
     """
     def __init__(self,
                  prompts: Dict[str, Any],
@@ -445,9 +446,7 @@ class GenerationProbeCallback(TrainerCallback):
                  inference_config: InferenceConfig,
                  eval_every_n_steps: int = 10,
                  logger=None,
-                 output_dir: str = "",
-                 do_eval: bool = False,
-                 judge_model: str = "gpt-4o-mini"):
+                 output_dir: str = ""):
 
         self.prompts = prompts
         self.tokenizer = tokenizer
@@ -455,11 +454,7 @@ class GenerationProbeCallback(TrainerCallback):
         self.eval_every_n_steps = eval_every_n_steps
         self.logger = logger
         self.output_dir = output_dir
-        self.do_eval = do_eval
-        self.judge_model = judge_model
-
-        if self.do_eval:
-            self.eval_history = {}
+        self.eval_history = {}
 
     def on_step_end(self, args, state, control, model, **kwargs):
         if state.is_world_process_zero and state.global_step > 0 and state.global_step % self.eval_every_n_steps == 0:
@@ -469,15 +464,11 @@ class GenerationProbeCallback(TrainerCallback):
                 print(f"Running generation probe at step {state.global_step}...")
 
             model.eval()
-
-            if self.do_eval:
-                self._generate_and_evaluate(state, model)
-            else:
-                self._generate_only(state, model)
-
+            self._generate_and_evaluate(state, model)
             model.train()
     
     def _generate_only(self, state, model):
+        # This method is no longer used but kept for potential future use.
         for source, prompts_list in self.prompts.items():
             source_output_dir = os.path.join(self.output_dir, source)
             os.makedirs(source_output_dir, exist_ok=True)
@@ -534,14 +525,12 @@ class GenerationProbeCallback(TrainerCallback):
                 eval_result = evaluate_response(
                     question=question,
                     response=generated_text,
-                    reference_answer=reference_answer,
-                    judge_model=self.judge_model
+                    reference_answer=reference_answer
                 )
-
-                with open(gen_file_path, 'a', encoding='utf-8') as f:
-                    f.write("\n--- EVALUATION ---\n")
-                    f.write(f"Score: {eval_result['score']}\n")
-                    f.write(f"Feedback: {eval_result['feedback']}\n")
+                
+                eval_file_path = os.path.join(prompt_output_dir, f"evaluation_step_{state.global_step}.json")
+                with open(eval_file_path, 'w', encoding='utf-8') as f:
+                    json.dump(eval_result, f, indent=4)
 
                 if self.logger:
                     self.logger.info(f" > Evaluated generation for {dataset_name}/{prompt_name} at step {state.global_step}. Score: {eval_result['score']}")
@@ -585,7 +574,7 @@ class GenerationProbeCallback(TrainerCallback):
         """
         Called at the end of training to generate and save plots of evaluation scores.
         """
-        if self.do_eval:
+        if self.eval_history:
             if self.logger:
                 self.logger.info("Training ended. Generating final evaluation plots...")
             else:
@@ -614,3 +603,103 @@ class GenerationProbeCallback(TrainerCallback):
                 self.logger.info(f" > Saved evaluation plot for {dataset_name} to '{plot_path}'")
             else:
                 print(f" > Saved evaluation plot for {dataset_name} to '{plot_path}'")
+
+class CorpusPerplexityCallback(TrainerCallback):
+    """
+    Calculates the perplexity of an entire text corpus at the end of each
+    training step using a strided sliding window approach. This provides a
+    more accurate perplexity measure for long documents than naive chunking.
+    Based on the Hugging Face documentation for PPL with fixed-length models.
+    """
+    def __init__(self, 
+                 text_content: str, 
+                 tokenizer: AutoTokenizer, 
+                 max_length: int, 
+                 stride: int = 512, 
+                 output_dir: str = "",
+                 log_prefix="corpus_perplexity"):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.stride = stride
+        self.log_prefix = log_prefix
+        self.output_dir = output_dir
+        self.encodings = self.tokenizer(text_content, return_tensors="pt")
+        self.history = []
+
+    def on_step_end(self, args, state, control, model, **kwargs):
+        model.eval()
+        device = model.device
+
+        seq_len = self.encodings.input_ids.size(1)
+        nll_sum = 0.0
+        n_tokens = 0
+        prev_end_loc = 0
+
+        for begin_loc in range(0, seq_len, self.stride):
+            end_loc = min(begin_loc + self.max_length, seq_len)
+            trg_len = end_loc - prev_end_loc
+            input_ids = self.encodings.input_ids[:, begin_loc:end_loc].to(device)
+            target_ids = input_ids.clone()
+            
+            target_ids[:, :-trg_len] = -100
+
+            if torch.all(target_ids == -100):
+                prev_end_loc = end_loc
+                if end_loc == seq_len:
+                    break
+                continue
+
+            with torch.no_grad():
+                outputs = model(input_ids, labels=target_ids)
+                neg_log_likelihood = outputs.loss
+
+            num_valid_tokens = (target_ids != -100).sum().item()
+            num_loss_tokens = num_valid_tokens - 1
+            if num_loss_tokens > 0:
+                nll_sum += neg_log_likelihood.item() * num_loss_tokens
+                n_tokens += num_loss_tokens
+
+            prev_end_loc = end_loc
+            if end_loc == seq_len:
+                break
+        
+        if n_tokens > 0:
+            avg_nll = nll_sum / n_tokens
+            perplexity = torch.exp(torch.tensor(avg_nll))
+        else:
+            avg_nll = float('inf')
+            perplexity = torch.tensor(float('inf'))
+
+        perplexity_item = perplexity.item()
+        loss_item = avg_nll
+
+        if state.is_world_process_zero:
+            wandb.log({
+                f"{self.log_prefix}/perplexity": perplexity_item,
+                f"{self.log_prefix}/loss": loss_item
+            }, step=state.global_step)
+        
+        self.history.append({
+            'step': state.global_step, 
+            'corpus_perplexity': perplexity_item,
+            'corpus_loss': loss_item
+        })
+
+        model.train()
+
+    def get_results_as_dataframe(self):
+        """
+        Returns the collected corpus perplexity data as a pandas DataFrame.
+        """
+        return pd.DataFrame(self.history)
+    
+    def save_results(self, output_dir: str):
+        """Saves the collected corpus perplexity data to a CSV file."""
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{self.log_prefix}_metrics.csv")
+        df = self.get_results_as_dataframe()
+        if not df.empty:
+            df.to_csv(output_path, index=False)
+            print(f" > Saved corpus perplexity metrics to '{output_path}' with {len(df)} rows.")
+        else:
+            print(" > No corpus perplexity metrics to save.")
