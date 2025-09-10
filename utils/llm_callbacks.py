@@ -446,7 +446,8 @@ class GenerationProbeCallback(TrainerCallback):
                  inference_config: InferenceConfig,
                  eval_every_n_steps: int = 10,
                  logger=None,
-                 output_dir: str = ""):
+                 output_dir: str = "",
+                 do_eval: bool = False):
 
         self.prompts = prompts
         self.tokenizer = tokenizer
@@ -454,6 +455,7 @@ class GenerationProbeCallback(TrainerCallback):
         self.eval_every_n_steps = eval_every_n_steps
         self.logger = logger
         self.output_dir = output_dir
+        self.do_eval = do_eval
         self.eval_history = {}
 
     def on_step_end(self, args, state, control, model, **kwargs):
@@ -522,50 +524,52 @@ class GenerationProbeCallback(TrainerCallback):
                     f.write("--- GENERATION ---\n")
                     f.write(generated_text + "\n")
 
-                eval_result = evaluate_response(
-                    question=question,
-                    response=generated_text,
-                    reference_answer=reference_answer
-                )
-                
-                eval_file_path = os.path.join(prompt_output_dir, f"evaluation_step_{state.global_step}.json")
-                with open(eval_file_path, 'w', encoding='utf-8') as f:
-                    json.dump(eval_result, f, indent=4)
+                if self.do_eval:
+                    eval_result = evaluate_response(
+                        question=question,
+                        response=generated_text,
+                        reference_answer=reference_answer
+                    )
+                    
+                    eval_file_path = os.path.join(prompt_output_dir, f"evaluation_step_{state.global_step}.json")
+                    with open(eval_file_path, 'w', encoding='utf-8') as f:
+                        json.dump(eval_result, f, indent=4)
 
-                if self.logger:
-                    self.logger.info(f" > Evaluated generation for {dataset_name}/{prompt_name} at step {state.global_step}. Score: {eval_result['score']}")
-                else:
-                    print(f" > Evaluated generation for {dataset_name}/{prompt_name} at step {state.global_step}. Score: {eval_result['score']}")
+                    if self.logger:
+                        self.logger.info(f" > Evaluated generation for {dataset_name}/{prompt_name} at step {state.global_step}. Score: {eval_result['score']}")
+                    else:
+                        print(f" > Evaluated generation for {dataset_name}/{prompt_name} at step {state.global_step}. Score: {eval_result['score']}")
 
-                if eval_result['score'] is not None:
-                    scores.append(eval_result['score'])
+                    if eval_result['score'] is not None:
+                        scores.append(eval_result['score'])
 
-                eval_data = {
-                    "step": state.global_step,
-                    "prompt_name": prompt_name,
-                    "question": question,
-                    "generated_text": generated_text,
-                    "reference_answer": reference_answer,
-                    "score": eval_result['score'],
-                    "feedback": eval_result['feedback']
-                }
-                all_evals.append(eval_data)
+                    eval_data = {
+                        "step": state.global_step,
+                        "prompt_name": prompt_name,
+                        "question": question,
+                        "generated_text": generated_text,
+                        "reference_answer": reference_answer,
+                        "score": eval_result['score'],
+                        "feedback": eval_result['feedback']
+                    }
+                    all_evals.append(eval_data)
             
-            csv_path = os.path.join(dataset_output_dir, 'eval_results.csv')
-            df = pd.DataFrame(all_evals)
-            if os.path.exists(csv_path):
-                df.to_csv(csv_path, mode='a', header=False, index=False)
-            else:
-                df.to_csv(csv_path, mode='w', header=True, index=False)
+            if self.do_eval:
+                csv_path = os.path.join(dataset_output_dir, 'eval_results.csv')
+                df = pd.DataFrame(all_evals)
+                if os.path.exists(csv_path):
+                    df.to_csv(csv_path, mode='a', header=False, index=False)
+                else:
+                    df.to_csv(csv_path, mode='w', header=True, index=False)
 
-            if scores:
-                mean_score = sum(scores) / len(scores)
-                wandb_logs[f'eval/{dataset_name}_mean_score'] = mean_score
+                if scores:
+                    mean_score = sum(scores) / len(scores)
+                    wandb_logs[f'eval/{dataset_name}_mean_score'] = mean_score
 
-                if dataset_name not in self.eval_history:
-                    self.eval_history[dataset_name] = {'steps': [], 'scores': []}
-                self.eval_history[dataset_name]['steps'].append(state.global_step)
-                self.eval_history[dataset_name]['scores'].append(mean_score)
+                    if dataset_name not in self.eval_history:
+                        self.eval_history[dataset_name] = {'steps': [], 'scores': []}
+                    self.eval_history[dataset_name]['steps'].append(state.global_step)
+                    self.eval_history[dataset_name]['scores'].append(mean_score)
         
         if wandb.run and wandb_logs:
             wandb.log(wandb_logs, step=state.global_step)

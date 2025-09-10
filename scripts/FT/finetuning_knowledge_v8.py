@@ -223,6 +223,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
             eval_every_n_steps=6 if is_lima else 10,
             logger=log,
             output_dir=output_dir_generation,
+            do_eval=args.do_eval,
         )
         callbacks.append(generation_probe_callback)
         log.info(f"Loaded generation probes for domains: {list(all_generation_prompts.keys())}")
@@ -436,6 +437,7 @@ if __name__ == "__main__":
     parser.add_argument("--overlap_ratio", type=str, default="1_4", help="Ratio of overlap when chunking")
     parser.add_argument("--with_explanations", default=False, action="store_true", help="Use explanations when fine-tuning on paraphrased texts")
     parser.add_argument("--with_prior_knowledge", default=False, action="store_true", help="Use prior knowledge when fine-tuning on paraphrased texts")
+    parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
     parser.add_argument("--test_script", action="store_true", help="Run in test mode with a small model and minimal epochs.")
 
     # New arguments for multi-domain training

@@ -195,59 +195,49 @@ def continue_pretraining(model, tokenizer, log, args):
             add_title_prefix=args.no_add_title_prefix
         )
     elif "ParaphrasedArxivPaper" in args.experiment_name:
-        num_documents = 1
-        if not args.with_explanations:
-            log.info("\n--- Fine-Tuning on Paraphrased Arxiv Paper ---")
-            if args.chunk_by_section:
-                log.info("Using section-based chunking")
-            else:
-                log.info("Using token-based chunking")
-            
-            texts_to_train = []
+        texts_to_train = []
+
+        def load_original_and_paraphrased(texts_list, num_paraphrased):
             # Load original paper
             with open('../../data/arxiv/cleaned/DPO.txt', 'r', encoding='utf-8') as f:
-                texts_to_train.append(f.read())
-                
+                texts_list.append(f.read())
             # Load paraphrased papers
-            for i in range(args.num_paraphrased_texts-1):
+            for i in range(num_paraphrased):
                 file_path = f'../../data/arxiv/paraphrased/DPO/{i}.txt'
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    texts_to_train.append(f.read())
-                num_documents += 1
-                    
-            training_config.num_train_epochs = max(1, int(args.num_train_epochs / len(texts_to_train)))
-            log.info(f"Adjusting num_train_epochs from {args.num_train_epochs} to {training_config.num_train_epochs} for {len(texts_to_train)} documents.")
-        elif args.with_explanations:
-            log.info("\n--- Fine-Tuning on Paraphrased Arxiv Paper With Explanations ---")
-            if args.chunk_by_section:
-                log.info("Using section-based chunking")
-            else:
-                log.info("Using token-based chunking")
-            
-            texts_to_train = []
-            # Load original paper
-            with open('../../data/arxiv/cleaned/DPO.txt', 'r', encoding='utf-8') as f:
-                texts_to_train.append(f.read())
-                
-            # Load paraphrased papers
-            for i in range(args.num_paraphrased_texts-1):
-                # Load DPO_explanation_1.txt through DPO_explanation_6.txt at the middle index
-                if i == (args.num_paraphrased_texts-1) // 2:
-                    explanation_dir = '../../data/arxiv/explanations/'
-                    for filename in os.listdir(explanation_dir):
-                        if filename.endswith('.txt'):
-                            file_path = os.path.join(explanation_dir, filename)
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                texts_to_train.append(f.read())
-                    num_documents += 1
-                else:
-                    file_path = f'../../data/arxiv/paraphrased/DPO/{i}.txt'
+                if os.path.exists(file_path):
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        texts_list.append(f.read())
+            return texts_list
+
+        # --- Strategy 1: Prior Knowledge + Paraphrased ---
+        if args.with_prior_knowledge:
+            log.info("\n--- Fine-Tuning on Prior Knowledge + Paraphrased Arxiv Paper ---")
+            prior_knowledge_dir = '../../data/arxiv/prior_knowledge/DPO/'
+            for filename in sorted(os.listdir(prior_knowledge_dir)):
+                if filename.endswith('.txt'):
+                    file_path = os.path.join(prior_knowledge_dir, filename)
                     with open(file_path, 'r', encoding='utf-8') as f:
                         texts_to_train.append(f.read())
-                    num_documents += 1
-                    
-            training_config.num_train_epochs = max(1, int(args.num_train_epochs / num_documents))
-            log.info(f"Adjusting num_train_epochs from {args.num_train_epochs} to {training_config.num_train_epochs} for {len(texts_to_train)} documents.")
+            texts_to_train = load_original_and_paraphrased(texts_to_train, args.num_paraphrased_texts)
+
+        # --- Strategy 2: Paraphrased + Explanations ---
+        elif args.with_explanations:
+            log.info("\n--- Fine-Tuning on Paraphrased Arxiv Paper With Explanations (Sequentially) ---")
+            texts_to_train = load_original_and_paraphrased(texts_to_train, args.num_paraphrased_texts)
+            explanation_dir = '../../data/arxiv/explanations/DPO/'
+            for filename in sorted(os.listdir(explanation_dir)):
+                if filename.endswith('.txt'):
+                    file_path = os.path.join(explanation_dir, filename)
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        texts_to_train.append(f.read())
+        
+        # --- Strategy 3: Paraphrased Only ---
+        else:
+            log.info("\n--- Fine-Tuning on Paraphrased Arxiv Paper ---")
+            texts_to_train = load_original_and_paraphrased(texts_to_train, args.num_paraphrased_texts)
+
+        training_config.num_train_epochs = max(1, int(args.num_train_epochs / len(texts_to_train)))
+        log.info(f"Adjusting num_train_epochs from {args.num_train_epochs} to {training_config.num_train_epochs} for {len(texts_to_train)} documents.")
 
         trainer = llm_training.fine_tune_on_texts(
             model=model,
@@ -367,7 +357,6 @@ def lima_training(model, tokenizer, log, args):
         logger=log,
         output_dir = output_dir_generation,
         do_eval=args.do_eval,
-        judge_model=args.judge_model
         )
 
     training_loss_callback = TrainingLossPerplexityCallback()
@@ -443,7 +432,6 @@ if __name__ == "__main__":
     parser.add_argument("--with_explanations", default=False, action="store_true", help="Use explanations when fine-tuning on paraphrased texts")
     parser.add_argument("--with_prior_knowledge", default=False, action="store_true", help="Use prior knowledge when fine-tuning on paraphrased texts")
     parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
-    parser.add_argument("--judge_model", type=str, default="gpt-4o-mini", help="The model to use as the judge for evaluation.")
     args = parser.parse_args()
 
     if args.override_experiment_name:

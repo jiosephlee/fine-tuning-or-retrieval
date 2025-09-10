@@ -106,7 +106,7 @@ def fine_tune_on_texts(
         all_text_chunks = []
         total_tokens = 0
         for i,text in enumerate(texts):
-            if "section" in text.lower():
+            if "\\section" in text.lower():
                 overlap_numer, overlap_denom = overlap_ratio.split("_")
                 overlap_denom = int(overlap_denom)
                 overlap_numer = int(overlap_numer)
@@ -186,6 +186,7 @@ def save_model(model, tokenizer, log, save_path: str):
     tokenizer.save_pretrained(save_path)
     log.info(f"Model saved to {save_path}")
 
+"""Used in v8 and onwards"""
 
 def fine_tune(
     model,

@@ -599,6 +599,8 @@ def clean_latex(latex_content: str, debug_dir: str = None) -> str:
     save_debug_file(step, "8_delete_misc_syntax_post_commands", cleaned_text); step += 1
     
     cleaned_text = re.sub(r'\\clearpage|\\newpage', '', cleaned_text)
+    # Remove lines that contain only spaces or tabs, turning them into empty lines.
+    cleaned_text = re.sub(r'^[ \t]+$', '', cleaned_text, flags=re.MULTILINE)
     cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
     save_debug_file(step, "9_remove_pagebreaks_newlines", cleaned_text); step += 1
 
