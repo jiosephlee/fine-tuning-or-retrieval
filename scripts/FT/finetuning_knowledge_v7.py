@@ -97,10 +97,10 @@ def continue_pretraining(model, tokenizer, log, args):
         learning_rate=args.learning_rate,
         logging_steps=1,
         gradient_checkpointing=False,
-        per_device_train_batch_size=4,
+        per_device_train_batch_size=2,
         context_length = 2048 * 3/2,
         weight_decay=0.1,
-        gradient_accumulation_steps=2,
+        gradient_accumulation_steps=4,
         warmup_ratio = 0.1, 
         sequential_sampling = True,
         reverse_ffd_packing= False,
@@ -114,7 +114,7 @@ def continue_pretraining(model, tokenizer, log, args):
     os.makedirs(output_dir_inference_probe, exist_ok=True)
     os.makedirs(output_dir_knowledge_probe, exist_ok=True)
 
-    knowledge_probe_df = pd.read_csv(f'../../data/probes/DPO_knowledge_probes_{knowledge_probes_version}.csv')
+    knowledge_probe_df = pd.read_csv(f'../../data/probes/facts/DPO/DPO_knowledge_probes_{knowledge_probes_version}.csv')
     facts = knowledge_probe_df['fact'].tolist()
     probes = knowledge_probe_df['probe'].tolist()
     targets = knowledge_probe_df['target'].tolist()
@@ -131,7 +131,7 @@ def continue_pretraining(model, tokenizer, log, args):
         log_prefix="knowledge_probe",
     )
 
-    inference_probe_df = pd.read_csv('../../data/probes/dpo_high_level_probes_v2.csv')
+    inference_probe_df = pd.read_csv('../../data/probes/inference/DPO/dpo_high_level_probes_v2.csv')
     facts = inference_probe_df['fact'].tolist()
     probes = inference_probe_df['probe'].tolist()
     targets = inference_probe_df['target'].tolist()
@@ -151,7 +151,7 @@ def continue_pretraining(model, tokenizer, log, args):
     inference_config = llm_configs.InferenceConfig(no_repeat_ngram_size=6)
 
     prompt_files = {
-        'recall_DPO': '../../data/probes/recall_DPO.json'
+        'recall_DPO': '../../data/probes/generation/DPO/recall_DPO.json'
     }
 
     prompts = load_prompts(prompt_files, args.do_eval)
@@ -173,7 +173,7 @@ def continue_pretraining(model, tokenizer, log, args):
     callbacks_to_use = [probe_callback, training_loss_callback, inference_probe_callback, generation_probe_callback]
     if "SingleArxivPaper" in args.experiment_name:
         log.info("\n--- Loading in Single Arxiv Paper ---")
-        with open('../../data/arxiv/cleaned/DPO.txt', 'r', encoding='utf-8') as f:
+        with open('../../data/arxiv/cleaned/DPO.tex', 'r', encoding='utf-8') as f:
             arxiv_paper = f.read()
 
         log.info("\n--- Fine-Tuning on Single Arxiv Paper ---")
@@ -199,7 +199,7 @@ def continue_pretraining(model, tokenizer, log, args):
 
         def load_original_and_paraphrased(texts_list, num_paraphrased):
             # Load original paper
-            with open('../../data/arxiv/cleaned/DPO.txt', 'r', encoding='utf-8') as f:
+            with open('../../data/arxiv/cleaned/DPO.tex', 'r', encoding='utf-8') as f:
                 texts_list.append(f.read())
             # Load paraphrased papers
             for i in range(num_paraphrased):
@@ -218,12 +218,12 @@ def continue_pretraining(model, tokenizer, log, args):
                     file_path = os.path.join(prior_knowledge_dir, filename)
                     with open(file_path, 'r', encoding='utf-8') as f:
                         texts_to_train.append(f.read())
-            texts_to_train = load_original_and_paraphrased(texts_to_train, args.num_paraphrased_texts)
+            texts_to_train = load_original_and_paraphrased(texts_to_train, args.num_paraphrased_texts-1)
 
         # --- Strategy 2: Paraphrased + Explanations ---
         elif args.with_explanations:
             log.info("\n--- Fine-Tuning on Paraphrased Arxiv Paper With Explanations (Sequentially) ---")
-            texts_to_train = load_original_and_paraphrased(texts_to_train, args.num_paraphrased_texts)
+            texts_to_train = load_original_and_paraphrased(texts_to_train, args.num_paraphrased_texts-1)
             explanation_dir = '../../data/arxiv/explanations/DPO/'
             for filename in sorted(os.listdir(explanation_dir)):
                 if filename.endswith('.txt'):
@@ -234,7 +234,7 @@ def continue_pretraining(model, tokenizer, log, args):
         # --- Strategy 3: Paraphrased Only ---
         else:
             log.info("\n--- Fine-Tuning on Paraphrased Arxiv Paper ---")
-            texts_to_train = load_original_and_paraphrased(texts_to_train, args.num_paraphrased_texts)
+            texts_to_train = load_original_and_paraphrased(texts_to_train, args.num_paraphrased_texts-1)
 
         training_config.num_train_epochs = max(1, int(args.num_train_epochs / len(texts_to_train)))
         log.info(f"Adjusting num_train_epochs from {args.num_train_epochs} to {training_config.num_train_epochs} for {len(texts_to_train)} documents.")
@@ -276,15 +276,15 @@ def lima_training(model, tokenizer, log, args):
     # --- LIMA Training Configuration ---
     lima_training_config = llm_configs.TrainingConfig(
         run_name = args.experiment_name + "_LIMA",
-        num_train_epochs=15,
+        num_train_epochs=5,
         learning_rate=2e-5,
         logging_strategy = "steps",
         logging_steps = 1,
         gradient_checkpointing=False,
         context_length = 3072, # This is the context length of the longest example in the dataset
-        gradient_accumulation_steps=8,
+        gradient_accumulation_steps=16,
         warmup_ratio = 0.1,
-        per_device_train_batch_size=4,
+        per_device_train_batch_size=2,
         weight_decay=0.1,
         use_liger_kernel=True,
         sequential_sampling = False,
@@ -300,7 +300,7 @@ def lima_training(model, tokenizer, log, args):
     output_dir_knowledge_probe = os.path.join("../../results/FT", args.experiment_name, "lima_knowledge_probe")
     os.makedirs(output_dir_knowledge_probe, exist_ok=True)
 
-    knowledge_probe_df = pd.read_csv(f'../../data/probes/DPO_knowledge_probes_{args.knowledge_probes_version}.csv')
+    knowledge_probe_df = pd.read_csv(f'../../data/probes/facts/DPO/DPO_knowledge_probes_{args.knowledge_probes_version}.csv')
     facts = knowledge_probe_df['fact'].tolist()
     probes = knowledge_probe_df['probe'].tolist()
     targets = knowledge_probe_df['target'].tolist()
@@ -320,7 +320,7 @@ def lima_training(model, tokenizer, log, args):
     output_dir_inference_probe = os.path.join("../../results/FT", args.experiment_name, "lima_inference_probe")
     os.makedirs(output_dir_inference_probe, exist_ok=True)
 
-    inference_probe_df = pd.read_csv('../../data/probes/dpo_high_level_probes_v2.csv')
+    inference_probe_df = pd.read_csv('../../data/probes/inference/DPO/dpo_high_level_probes_v2.csv')
     facts = inference_probe_df['fact'].tolist()
     probes = inference_probe_df['probe'].tolist()
     targets = inference_probe_df['target'].tolist()
@@ -342,9 +342,9 @@ def lima_training(model, tokenizer, log, args):
 
     inference_config = llm_configs.InferenceConfig(no_repeat_ngram_size=6)
     prompt_files = {
-        'recall_DPO_QA': '../../data/probes/recall_DPO_QA.json',
-        'recall_background_QA': '../../data/probes/recall_background_QA.json',
-        'yourbench_DPO': '../../data/probes/yourbench_DPO.json'
+        'recall_DPO_QA': '../../data/probes/generation/DPO/recall_DPO_QA.json',
+        'recall_background_QA': '../../data/probes/generation/DPO/recall_background_QA.json',
+        'yourbench_DPO': '../../data/probes/generation/DPO/yourbench_DPO.json'
     }
 
     prompts = load_prompts(prompt_files, args.do_eval, append_eot=True)
@@ -463,6 +463,7 @@ if __name__ == "__main__":
 
     # --- Continue Pretraining (we also evaluate our probes during this) ---
     if args.num_train_epochs > 0:
+        log.info("\n-----Continued Pretraining------\n")
         continue_pretraining(model, tokenizer, log, args)
     
     # -- LIMA-based instruction tuning ---
