@@ -14,7 +14,7 @@ def generate_prior_knowledge(paper_name):
     """Process a single paper to generate prior knowledge chapters."""
     print(f"Processing {paper_name} for prior knowledge generation...")
     
-    PAPER_FILE_PATH = f'../../data/arxiv/cleaned/{paper_name}.txt'
+    PAPER_FILE_PATH = f'../../data/arxiv/cleaned/{paper_name}.tex'
     OUTPUT_DIR = f"../../data/arxiv/prior_knowledge/{paper_name}/"
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -113,7 +113,7 @@ Also, please write all mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi
                 if last_period_index != -1:
                     chapter_content = chapter_content[:last_period_index+1]
             
-            return chapter_content
+            return chapter_content, chapter_index
 
         # Generate all chapters in parallel
         with ThreadPoolExecutor(max_workers=min(len(chapters_list), 5)) as executor:
@@ -124,20 +124,34 @@ Also, please write all mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi
             all_chapter_contents = []
             for future in futures:
                 try:
-                    result = future.result()
-                    all_chapter_contents.append(result)
+                    chapter_content, chapter_index = future.result()
+                    all_chapter_contents.append((chapter_content, chapter_index))
                 except Exception as e:
                     print(f"Error generating chapter: {e}")
 
-        # Concatenate all chapters into a single textbook
-        textbook_content = "\n\n".join(all_chapter_contents)
+        # Sort chapters by index to maintain order
+        all_chapter_contents.sort(key=lambda x: x[1])
         
-        # Save as single textbook file
+        # Save each chapter separately and collect for textbook
+        textbook_content_parts = []
+        for chapter_content, chapter_index in all_chapter_contents:
+            # Save individual chapter
+            chapter_filename = f"chapter_{chapter_index+1}.txt"
+            chapter_path = os.path.join(OUTPUT_DIR, chapter_filename)
+            with open(chapter_path, 'w', encoding='utf-8') as f:
+                f.write(chapter_content)
+            print(f"Saved chapter {chapter_index+1} to: {chapter_path}")
+            
+            # Collect for full textbook
+            textbook_content_parts.append(chapter_content)
+        
+        # Save complete textbook
+        textbook_content = "\n\n".join(textbook_content_parts)
         output_path = os.path.join(OUTPUT_DIR, "textbook.txt")
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(textbook_content)
         
-        print(f"Saved textbook to: {output_path}")
+        print(f"Saved complete textbook to: {output_path}")
         print(f"Generated textbook with {len(chapters_list)} chapters.")
     else:
         print("No chapters were generated. Exiting.")
@@ -146,7 +160,7 @@ def process_papers():
     input_dir = "../../data/arxiv/cleaned/"
     
     # Get list of files in cleaned directory
-    files = [f for f in os.listdir(input_dir) if f.endswith('.txt')]
+    files = [f for f in os.listdir(input_dir) if f.endswith('.tex') and f == 'DPO.tex']
     
     for filename in files:
         # Extract paper name without extension

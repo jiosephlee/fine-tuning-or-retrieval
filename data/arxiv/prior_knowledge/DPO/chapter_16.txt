@@ -1,0 +1,269 @@
+Introduction
+
+Fine-tuning large language models (LLMs) and training them with preference data (for example, in instruction tuning or reinforcement learning from human feedback, RLHF) is as much an engineering challenge as it is a modeling one. Small decisions about how you construct datasets, format prompts, batch sequences, sample from the model during training, and compute sequence-level statistics can have outsized effects on training stability, cost, and final quality. This chapter collects practical, battle-tested guidance and the conceptual reasoning behind it. The goal is to give you enough detail and intuition to design experiments, implement robust pipelines, and read research papers that report on fine-tuning and preference-training of LLMs.
+
+We begin with dataset construction and prompt/completion pairing, then move through batching and sequence handling, talk about when and how to sample from the model during training versus using offline datasets, explain how to compute and track sequence-level KL divergence, and finish with hyperparameter selection, reproducibility, logging, and compute/memory/distributed-training patterns that are commonly used in practice.
+
+# Dataset construction, prompt formatting, and pairing completions
+
+The dataset is the most consequential engineering artifact in fine-tuning. In instruction-tuning or preference-training contexts the dataset consists of prompts (or contexts), completions (or responses), and possibly labels or rewards that express preferences among completions. Constructing this dataset requires attention to both content and tokenization/formatting because the model only sees token sequences.
+
+Prompt and completion delimitation. Always have an unambiguous, reproducible convention for where the prompt ends and the completion begins. Many mistakes arise from inconsistent delimitation (e.g., some items use "### Response:" while others omit it). A good pattern is to introduce explicit special tokens that are not used anywhere else, for example:
+
+- "<|user|>" ... user content ... "<|assistant|>" ... assistant content ... "<|end|>"
+
+If you cannot add new tokens to the tokenizer, use rare string delimiters like "### Instruction:" and "### Response:". Consistency matters: both the fine-tuning inputs and any evaluation prompts must use the same format. When mixing data sources (human-written, model-generated, scraped), normalize them into a common format before tokenization.
+
+Pairing prompts and completions. There are two common pairing styles:
+
+1. Prompt-only conditioning: feed the model the prompt and mask the prompt's token losses, so the model is trained to generate the completion tokens. Training targets are only the completion tokens. This is the typical setup for supervised fine-tuning.
+
+2. Full sequence prediction: feed the full prompt+completion and compute loss over the entire sequence (sometimes with past context). This is equivalent to shifting targets by one token; in practice you still mask the prompt tokens so the loss is only computed on completion tokens.
+
+Which to use depends on whether you want to preserve the model's ability to model the prompt distribution or whether you want to optimize only generation on completions. For instruction tuning, it is standard to compute loss only on response tokens.
+
+Label and preference pairing. For preference data, your raw data often comes as (prompt, response A, response B, label) where label indicates which response humans prefer. Common ways to store this are:
+
+- Pairwise preference examples with explicit ranking: store (prompt, response_pos, response_neg).
+- Ranked lists: store (prompt, [response_1, response_2, ...], [scores or ranking]).
+
+When converting pairwise labels into training signals, you must choose an objective (e.g., pairwise ranking loss or pointwise reward regression). For pairwise losses you typically feed both completions with identical prompts and compute losses that encourage the reward model or policy to prefer the chosen completion.
+
+Truncation and completion length. Decide maximum context and completion lengths up front. If completions are longer than your maximum generation length, you must truncate. Truncation policy matters: truncating a completion in the middle of an important sentence can corrupt learning. Common strategies:
+
+- Truncate prompts at the beginning (older context) and keep the most recent tokens.
+- Truncate completions at the end, preferring to keep the start of a response since the start often determines style and intent.
+- Split a very long completion into multiple training examples, if the split point is natural.
+
+Tokenization and normalization. Always tokenize after formatting. Keep a consistent tokenization pipeline (same tokenizer version and vocabulary). Normalize whitespace, quotes, and punctuation to avoid small shifts that change tokenization. For multilingual data ensure language-specific normalization where needed.
+
+Metadata and provenance. Store per-example provenance: source, author, date, quality score. These fields are invaluable for downstream analysis (filtering low-quality sources, computing stratified metrics). Preserve a stable example ID to allow reproducible dataset sharding.
+
+Quality control and filtering. For preference and instruction datasets noise is real. Apply heuristics and learned filters:
+
+- Remove examples with repeated tokens or that appear to be automated scraping artifacts.
+- Filter tuned-down examples where the preferred completion is obviously nonsensical.
+- Use a small held-out human-annotated subset for quality checks.
+
+Balanced vs. skewed datasets. If you mix sources with different styles (human preferences, synthetic model responses), be explicit about mixing weights. Training on too much synthetic data can induce model collapse toward synthetic patterns; under-weighting high-quality human data can dilute improvements.
+
+# Batching strategies for sequence data and mixed-length sequences
+
+Batching language sequences efficiently is necessary to maximize GPU utilization and minimize wasted tokens from padding. There are several well-known strategies; the right choice depends on model size, dataset distribution, and implementation complexity.
+
+Token-batched versus example-batched training. Two principal strategies exist:
+
+- Example-batched (uniform batch size N samples): you have N sequences per batch. The cost per batch varies with sequence lengths and padding.
+- Token-batched (fixed token budget per batch): you ensure each batch contains approximately K total tokens (including padding), and the number of sequences per batch varies.
+
+Token-batched training often leads to higher throughput because it bounds the compute associated with very long sequences. However, it complicates learning-rate normalization and gradient accumulation bookkeeping.
+
+Static padding with sorting (bucketing). A simple and effective approach is to sort the dataset by sequence length and create buckets: sequences within the same bucket have similar lengths. For each bucket you use an example batch size that matches memory constraints. Sorting substantially reduces padding waste and is easy to implement. Beware of sacrificing randomness: perform a global shuffle, then divide into buckets per epoch, or shuffle inside buckets each epoch so the model still sees varied mini-batches.
+
+Dynamic padding per batch. When you sample a batch, compute the maximum length in that batch and pad other sequences to that length. This avoids global buckets but can have higher variance in compute. This is commonly implemented on-device (e.g., in a DataLoader collate function) and is straightforward to use.
+
+Packed sequences (sequence packing). Packing takes multiple short sequences and packs them into a single long example that fills the model's fixed-length context window. This yields near-zero padding waste and can be important when many short sequences exist (for example, chat turns). Packing must carry an attention mask that prevents cross-example attention if you want to avoid mixing examples. Packing works well with causal language models if you insert a separator token and reset positional encodings or use relative position representations. Two common options:
+
+- Reset positional indices each packed segment and use an attention mask to prevent cross-segment attention.
+- Use absolute positions and insert special "restart" tokens; many transformer implementations require care here since large absolute positions may be used.
+
+Be careful when using recurrence or caching mechanisms for generation — packed sequences are fine for training but complicate autoregressive generation logic.
+
+Micro-batching and gradient accumulation. If a single device cannot hold a full desired batch, use micro-batches and accumulate gradients over several steps before performing an optimizer step. Accumulation should be paired with correct learning-rate scaling (discussed later). On multi-node setups, gradient accumulation interacts with distributed synchronization: you can either synchronize after each micro-batch or only after the accumulated batch. The former increases communication overhead; the latter requires larger local memory for accumulation buffers.
+
+Mixed-length sequences in distributed data-parallel. In DataParallel or DistributedDataParallel contexts, ensure per-device batches are comparable in memory use. If one GPU receives significantly longer sequences (e.g., due to naive sharding), training stalls at the slowest device. Strategies to avoid imbalance:
+
+- Pre-shard data so each device receives roughly similar length distributions.
+- Use token-aware shuffling (e.g., global token budget per device).
+- Use fine-grained load balancing libraries that re-balance examples at runtime.
+
+Padding token loss masking. When padding tokens are present, make sure loss and any sequence-level metrics ignore them. Loss functions that include padding will bias gradients and are a common source of bugs.
+
+# Sampling from model during training vs offline datasets
+
+Sampling plays two different roles in training LLMs: (1) generating training data online (on-policy data collection) and (2) evaluating or augmenting offline datasets (off-policy sampling). The choice between these strategies depends on your training objective and your constraints.
+
+Offline datasets and pre-generated completions. For supervised fine-tuning or reward-model training you often use an offline dataset of pre-generated completions. Advantages are reproducibility (the same tokens are fed every epoch), speed (no generation overhead during training), and easier debugging. The downside is distributional mismatch: the model you are training may later be used to generate completions under a different policy (e.g., different temperature or sampling strategy), and this can lead to poor generalization if your offline data did not reflect the model's generation distribution.
+
+Online sampling and on-policy data. In RLHF and some preference-learning schemes, you generate completions from the current model policy during training (on-policy) and then collect human feedback or compute rewards. On-policy data minimizes distribution shift between training and deployment and can produce better final policies. On the other hand, on-policy sampling is expensive because generation adds inference compute inside the training loop. It also complicates reproducibility: the training trajectory depends on noisy generated data.
+
+Sampling strategies. The sampling strategy you use affects the diversity and quality of generated examples.
+
+- Greedy: deterministic and low-variance, but can produce repetitive or short outputs.
+- Temperature sampling: sampling from softened logits with temperature $T$. Sampling with $T < 1$ sharpens the distribution; $T = 1$ is raw sampling.
+- Top-k and top-p (nucleus) sampling: constrain the candidate set to the top-$k$ logits or the minimal nucleus set that sums to a cumulative probability $p$.
+- Contrastive or other specialized samplers: techniques to reduce degeneration (e.g., top-k followed by diversity penalties).
+
+For training data collection, you may prefer slightly higher diversity to cover a broader distribution, but if you plan to present these examples to raters, you typically want higher-quality responses (lower temperature, top-k filtering) to avoid collecting human feedback on nonsense.
+
+Importance sampling and off-policy correction. When you train with off-policy data but want your gradients to approximate on-policy updates, you need to correct for the mismatch between the data-collection policy $\pi_{\text{data}}$ and the current policy $\pi_\theta$. Importance sampling weights take the form
+
+w = \prod_{t=1}^T \frac{\pi_\theta(x_t)}{\pi_{\text{data}}(x_t)}
+
+which is usually high-variance for long sequences. A more practical choice is truncated importance weights, per-token clipping, or using per-sequence propensity models. In RLHF, people often avoid explicit importance correction and instead combine some fraction of on-policy samples with a replay buffer to stabilize learning.
+
+Sampling during policy optimization (PPO, etc.). When doing PPO, the policy generates trajectories (responses) which are then scored. PPO uses a clipped objective that depends on the probability ratio $r_t(\theta) = \pi_\theta(a_t)/\pi_{\text{old}}(a_t)$; this requires storing the old log probabilities computed at generation time. The usual flow:
+
+1. Generate responses from policy $\pi_{\text{old}}$ and store them with log probabilities.
+2. Compute rewards (via reward model or human labels).
+3. Compute advantages and run PPO updates using the stored log probabilities to compute $r_t(\theta)$.
+
+This is inherently on-policy for the steps that use the stored trajectories; you can reuse trajectories across small numbers of update epochs, but the longer you reuse them the less "on-policy" they are.
+
+Practical trade-offs. If compute for generation is expensive, a common hybrid is to pre-generate a large offline pool of model outputs at different checkpoints and sample from this pool during training; mix in some fresh on-policy data to reduce mismatch. Always keep stored log probabilities with each stored generation when you intend to perform any policy-gradient or importance-weighted update.
+
+# Sequence-level KL computation and tracking
+
+When fine-tuning toward a preference objective (or when using KL penalties to keep the fine-tuned policy close to a base model), tracking sequence-level divergence between the fine-tuned model and a reference model is essential. The KL divergence is a natural regularizer and diagnostic tool.
+
+Token-level and sequence-level KL. The token-level KL at time $t$ for a token $x_t$ between policy $\pi_\theta$ and reference $\pi_{\text{ref}}$ is
+
+KL_t = \sum_{x_t} \pi_\theta(x_t \mid x_{<t}) \log\left(\frac{\pi_\theta(x_t \mid x_{<t})}{\pi_{\text{ref}}(x_t \mid x_{<t})}\right).
+
+The sequence-level KL for a sequence $x_{1:T}$ under the model factorization is the sum of token-level KLs:
+
+KL_{\text{seq}}(x_{1:T}) = \sum_{t=1}^T \sum_{x_t} \pi_\theta(x_t \mid x_{<t}) \log\left(\frac{\pi_\theta(x_t \mid x_{<t})}{\pi_{\text{ref}}(x_t \mid x_{<t})}\right).
+
+However, for a particular sampled sequence $x_{1:T}$, practitioners often compute the log-probability difference (also called the log-likelihood ratio):
+
+\Delta(x_{1:T}) = \log \pi_\theta(x_{1:T}) - \log \pi_{\text{ref}}(x_{1:T}) = \sum_{t=1}^T \left(\log \pi_\theta(x_t \mid x_{<t}) - \log \pi_{\text{ref}}(x_t \mid x_{<t})\right).
+
+This per-sequence log-ratio is the empirical estimate of the KL if you average over sequences sampled from $\pi_\theta$. Because exact expectation over the model distribution is infeasible, you typically estimate sequence KL by sampling sequences from $\pi_\theta$ and computing $\Delta(x_{1:T})$, then averaging.
+
+Normalization and baseline choices. There are two common normalizations:
+
+- Absolute log-ratio: use $\Delta(x_{1:T})$ directly. This scales with sequence length.
+- Per-token average: compute $\frac{1}{T}\Delta(x_{1:T})$, giving a length-normalized divergence.
+
+Which to prefer depends on how you penalize. If KL penalization is applied per-token during model updates (for example in PPO implementations where a per-token KL penalty is used), per-token normalization is more consistent.
+
+Computing KL in practice. To compute sequence-level log-probabilities efficiently:
+
+1. Given a sequence $x_{1:T}$, run both the current model $\pi_\theta$ and the reference model $\pi_{\text{ref}}$ in batch-mode to obtain token log-probabilities $\log \pi(\cdot \mid x_{<t})$.
+2. Sum the log-probabilities across tokens, applying masks to ignore padding.
+3. Subtract to get $\Delta(x_{1:T})$.
+
+Be careful with numerical stability: computing log-probabilities via log-softmax is standard. For models that use tied tokenizers or different contexts, ensure the reference and current models use identical tokenization and prompt formatting.
+
+Tracking and diagnostics. Track these metrics during training:
+
+- Mean and variance of sequence log-ratio $\Delta(x_{1:T})$ on on-policy samples.
+- Mean per-token log-ratio $\frac{1}{T}\Delta(x_{1:T})$.
+- Fraction of sequences where $\Delta(x_{1:T})$ exceeds a threshold.
+- KL per time-step averaged across sequences: this can reveal whether divergence concentrates early or late in responses.
+
+These diagnostics are crucial: a rising sequence KL indicates the fine-tuned policy is diverging from the reference; if you are using KL as a penalty, this informs whether to increase the penalty coefficient. If you observe catastrophic divergence in a few sequences, consider clipping per-sequence KL contributions or capping allowed log-ratios in the objective.
+
+Using KL in training objectives. Typical ways to regularize with KL:
+
+- Add a penalty term \lambda \cdot \mathbb{E}_{x \sim \pi_\theta}[\text{KL}(\pi_\theta(\cdot\mid x_{<t}) \,\|\, \pi_{\text{ref}}(\cdot\mid x_{<t}))]
+  where \lambda sets the strength.
+- Use an augmented reward in RLHF: r_{\text{aug}} = r_{\text{task}} - \beta \cdot \Delta(x_{1:T}), where \beta controls how strongly you penalize divergence.
+- Use PPO's clipped surrogate with a KL constraint checked as a safety check: if mean KL grows beyond a threshold, reduce update size or early stop updates for that batch.
+
+Practical tips. Compute KL on the same data distribution you optimize on (on-policy samples when using policy optimization), because KL depends on where you sample. Use moving averages for KL to avoid overreacting to single-batch spikes. When storing past trajectories, keep the reference log-probabilities so you can quickly compute ratios during updates.
+
+# Hyperparameter selection, reproducibility, and logging
+
+Hyperparameters in fine-tuning LLMs interact in complex ways. Core hyperparameters include learning rate, batch size (or token budget), weight decay, Adam betas, warmup schedule, gradient clipping, dropout, and, for RLHF, KL penalty coefficients and PPO-specific parameters (clip range, value function coefficient, entropy cost).
+
+Learning rate and batch size. Learning rate is the single most sensitive hyperparameter. Fine-tuning from a large pretrained model typically uses smaller learning rates than training from scratch. A common heuristic is to scale learning rate with the square root of the batch size or linearly with batch size when keeping other hyperparameters constant, but for fine-tuning you should often tune learning rate explicitly.
+
+Warmup and decay. Use a short linear warmup (e.g., 0.1% to 1% of total steps) to stabilize optimization, followed by a decay schedule (linear or cosine). For very small datasets or few steps, a constant small learning rate with no decay can sometimes work better.
+
+Adam optimizer settings. Standard Adam defaults are a good starting place: beta_1 = 0.9, beta_2 = 0.999, epsilon = 1e-8. Some implementations prefer epsilon = 1e-6 for mixed-precision to stabilize updates. Gradient clipping (global norm) in the range 0.5–1.0 is common to prevent exploding gradients.
+
+PPO-specific tuning. PPO has extra knobs: clip epsilon (0.1–0.3 common), value loss coefficient, entropy coefficient, number of epochs per batch, and minibatch size. PPO is famously sensitive to batch sizes and number of epochs: too many epochs per batch tends to overfit the sampled trajectories (too off-policy) and leads to instability.
+
+Seed management and deterministic runs. Reproducibility requires careful management of random seeds for:
+
+- Data shuffling.
+- Tokenization randomness (if any).
+- Model initialization (unless you freeze initial layers).
+- GPU operation nondeterminism (e.g., some kernels are nondeterministic).
+
+Set global seeds for Python, NumPy, and torch/tf. However, full determinism is often impractical with mixed-precision and distributed training. Instead, aim for "close reproducibility": runs with the same seed behave similarly but not identically. Log seed values in your experiment metadata.
+
+Checkpointing and resumption. Save model checkpoints frequently enough that you can resume with minimal lost compute but avoid saving so often that you overwhelm storage. A practical cadence is every N training steps or when validation metrics improve. For RLHF-style training, save policy and optimizer states plus any replay buffers and stored log probabilities.
+
+Experiment tracking and logging. Use structured logging tools (Weights & Biases, MLflow, TensorBoard) to record:
+
+- Hyperparameters and seed.
+- Training/validation loss curves.
+- Sequence-level KL and reward metrics.
+- Per-batch stats: batch token throughput, max sequence length, gradient norms.
+- Sampling parameters used to generate any derived data (temperature, top-k/p).
+- Checkpoint IDs and artifact links.
+
+Store raw samples of model outputs for human inspection and qualitative debugging. Store per-example metadata so you can trace back bad outputs to dataset items or training steps.
+
+A/B testing and evaluation. For preference-trained models, quantitative metrics (loss, pseudo-reward) are necessary but not sufficient. Plan for held-out human preference tests and automatic metrics that approximate human preference (but validate them). Track per-demo human evaluations with identifiers to match predictions with ground-truth human labels.
+
+Hyperparameter search strategies. If budget allows, do small sweeps on key hyperparameters: learning rate, batch size, and KL penalty. Use low-fidelity proxies (short runs or subset of data) to screen candidates before running full experiments.
+
+# Compute and memory considerations; distributed training patterns
+
+Large-scale fine-tuning demands careful resource planning. Many of the engineering strategies here are about trading computation for memory, and latency for throughput. We'll cover memory-saving techniques, parallelism patterns, and practical cost-control strategies.
+
+Mixed precision and tensor types. Use mixed precision (FP16 or bfloat16) to cut memory and accelerate computation. bfloat16 reduces the need for loss-scaling and is preferable when available. FP16 requires dynamic loss-scaling to avoid underflow. Be careful with operations that require FP32 (layer-norm, softmax stability) and put them in FP32 if necessary.
+
+Activation checkpointing (rematerialization). Checkpoint activations to trade extra compute for reduced memory. With activation checkpointing you store only a subset of intermediate activations and recompute others during the backward pass. This reduces peak memory usage roughly proportional to the number of checkpoints, at the cost of additional forward passes.
+
+Optimizer state memory. Optimizers like Adam require storing first- and second-moment estimates per parameter (two times model size). Techniques to reduce memory:
+
+- Use AdamW with FP16/FP32 memory partitioning: store optimizer states in FP32 but gradients/weights in FP16.
+- Use Adafactor (no second-moment per parameter or compressed state) or memory-optimized Adam variants.
+- Use ZeRO optimizer partitioning (see below).
+
+Gradient accumulation to emulate large batches. If you need a large effective batch size but GPUs are memory-limited, accumulate gradients over multiple micro-batches. Be mindful of optimizer states and learning rate schedules that expect per-step updates; scale learning rate appropriately.
+
+Data parallelism and model parallelism. There are three common parallelism axes:
+
+- Data parallelism: replicate model on each device and split batches. Simple but limited when model size exceeds device memory.
+- Tensor (intra-layer) model parallelism: partition large layers (e.g., dense matmuls) across devices. Good for very large models where a single layer does not fit on a device.
+- Pipeline model parallelism: split layers across devices and stream micro-batches through the pipeline stages. Requires micro-batching to keep devices busy and has pipeline bubbles to manage.
+
+Hybrid approaches combine data, tensor, and pipeline parallelism. Libraries like Megatron-LM and DeepSpeed implement these strategies. Tensor parallelism works well for large matrix multiplications; pipeline parallelism cuts memory cost by placing different layers on different devices.
+
+ZeRO optimizer stages. ZeRO (Zero Redundancy Optimizer) partitions optimizer states and gradients across devices, drastically reducing memory per device. Stages:
+
+- Stage 1: partition optimizer states (moments).
+- Stage 2: partition gradient tensors as well.
+- Stage 3: partition model parameters themselves (parameter sharding) — this enables training of models larger than a single GPU's memory.
+
+ZeRO Stage 3 plus tensor parallelism is the standard approach for multi-billion parameter models. The trade-off is increased communication overhead.
+
+Communication optimization. When using distributed training, communication can be a bottleneck. Strategies:
+
+- Overlap communication and computation where possible.
+- Use mixed-precision communication to reduce bandwidth.
+- Use efficient all-reduce algorithms and NCCL optimizations.
+- Prefer larger minibatches to amortize synchronization costs.
+
+Throughput vs. latency. Training throughput is the number of tokens processed per second; latency is time per step. For distributed training use large per-step micro-batches and gradient accumulation to maximize throughput. For interactive workflows (online sampling or RLHF), latency of generation matters; you can offload generation to a separate inference cluster to avoid blocking training.
+
+Checkpointing, sharding, and resuming at scale. Saving full-model checkpoints in multi-node setups needs care: use sharded checkpoints compatible with ZeRO Stage 3 to avoid gathering all parameters on a single node before saving. Use streaming upload to storage to avoid blocking training.
+
+Cost-control strategies. Practical finance-driven decisions include:
+
+- Mixed-precision to lower compute and memory costs.
+- Warm-start from smaller models or fewer steps of pretraining.
+- Use smaller context windows for early training; increase them later only if needed.
+- Leverage spot instances or preemptible VMs with frequent checkpointing.
+
+Profiling and monitoring. Use profilers (NVIDIA Nsight, PyTorch profiler) to identify bottlenecks: memory fragmentation, kernel launch overhead, or synchronization stalls. Monitor per-GPU utilization, PCIe/NVLink traffic, and network utilization.
+
+Summary of common patterns. For fine-tuning multi-billion parameter models practitioners often use a combination of:
+
+- ZeRO Stage 2–3 for optimizer and parameter partitioning.
+- Tensor parallelism for intra-layer sharding.
+- Pipeline parallelism when models are extremely deep.
+- Mixed precision (bfloat16 when available).
+- Activation checkpointing for very deep models.
+- Micro-batching with gradient accumulation to reach target effective batch sizes.
+
+Carefully test combination effects: activation checkpointing and ZeRO can interact in nontrivial ways.
+
+Conclusion
+
+Fine-tuning LLMs with preference data brings together dataset engineering, batching strategies, sampling decisions, KL-based diagnostics, hyperparameter tuning, reproducibility practices, and distributed compute engineering. The choices you make at each stage have practical consequences for stability, cost, and final model behavior. The combination of principled metrics (sequence-level KL, reward signals) and practical engineering (packing sequences, ZeRO optimizer, mixed precision) will let you scale from small experiments to production training runs with confidence. Keep an experiment log, test small variants first, and instrument your pipeline heavily — most debugging time in LLM fine-tuning is spent tracking down subtle mismatch between what you thought the model saw and what it actually saw.

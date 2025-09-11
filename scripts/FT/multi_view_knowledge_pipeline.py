@@ -42,6 +42,20 @@ For each question, provide:
 - A `title` in Stack Exchange question format
 - The `question_body` with context and what specifically you're confused about
 
+## Examples
+
+Question 1:	
+"How can Transformers handle arbitrary length input?
+
+The transformer, introduced in the paper Attention Is All You Need, is a popular new neural network architecture that is commonly viewed as an alternative to recurrent neural networks, like LSTMs and GRUs.
+
+However, having gone through the paper, as well as several online explanations, I still have trouble wrapping my head around how they work."
+
+Question 2:	
+"I know that in the math on which the transformer is based there is no restriction on the length of input. But I still can’t understand why we should fix it in the frameworks (PyTorch). Because of this problem Transformer-XL has been created.
+
+Can you explain to me where this problem is hiding, please?"
+
 ### Output Format
 Provide the output as a JSON object with a single key "questions", which is a list of question dictionaries.
 Example:
@@ -93,14 +107,33 @@ Example:
 
 Please write any mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π". Also, please make sure that your answer is grounded in the paper; do not provide any information that is inconsistent with the paper.
 
-Format your response as a comprehensive Stack Exchange answer.""",
+Format your response as a comprehensive Stack Exchange answer.
+
+### Example
+
+Question:
+"I know that in the math on which the transformer is based there is no restriction on the length of input. But I still can’t understand why we should fix it in the frameworks (PyTorch). Because of this problem Transformer-XL has been created.
+
+Can you explain to me where this problem is hiding, please?"
+
+Answer:
+"The restriction in the maximum length of the transformer input is due to the needed amount of memory to compute the self-attention over it.
+
+The amount of memory needed by the self-attention in the Transformer is quadratic on the length of the input. This means that increasing the maximum length of the input, increases drastically the needed memory for self-attention. The maximum length is that which makes the model use up the whole memory of the GPU for at least one sentence (once the other elements of the model are also taken into account, like the embeddings which take a lot of memory).
+
+Transformer-XL is certainly a way to take into account as much context as possible in language modeling (its role is analogous to truncated back-propagation through time in LSTM language models). However, the gradients are not propagated through the attention over the memory segment, only through the current segment.
+
+There have been several architectural attempts to reduce the amount of memory needed by transformers, like using locality-constraints in the attention (Dynamic Convolutions model) or using locality-sensitive hashing (Reformer model).
+
+There have been other implementation attempts, like gradient checkpointing(e.g. this), which is a general technique to run computations that don't fit at once in the GPU memory"
+""",
             'user': f"""### Question Title
 {question['title']}
 
 ### Question Body
 {question['question_body']}
 
-### Research Paper Context
+### Research Paper
 {paper_content}"""
         }
         
@@ -211,20 +244,13 @@ Provide the output as a JSON object with a single key "outline", which is a list
 
         prompt_chapter = {
             'system': """### Instructions
-You will be given a research paper and an outline of a textbook that aims to fully teach the reader what the paper is about. Write a chapter following the outline and specifically for the chapter that has been assigned to you. The chapter should be clear, elaborate, intuitive,comprehensive, and suitable for a college-student audience.
+You will be given a chapter title, description, and subtopics and, based on those topics, your job is to write a detailed, cohesive textbook chapter addressed to a college student who is learning this material for the first time. 
 
-As you write the chapter, please make sure to consider the following:
-- Write in an academic, textbook style.
-- Write in full prose, rather than bullet points. 
-- Write in full, complete sentences thoroughly discussing each section at full length.
-- Explain concepts thoroughly and intuitively.
-- Be sure to cover all the sections in the outline, and write them in a cohesive and continuous manner.
-- The chapter should be self-contained but also fit into a larger textbook about the paper.
-- Use LaTeX for all mathematical notation e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π".
-- Please make sure that your chapter is grounded in the paper; do not provide any information that is inconsistent with the paper.
+The chapter should be comprehensive and suitable for someone learning this material to understand research papers in the field. Begin with an introduction to the chapter, then cover each subtopic in turn. Don't just briefly describe the subtopics, but rather elaborate on the concepts at full length and explain them with a focus on intuition. Spell everything out clearly so there is no ambiguity. Dedicate multiple paragraphs to each subtopic. Write in full prose, rather than bullet points. Keep the larger textbook outline in mind when writing the chapter. Most importantly, please make sure that your chapter is grounded in the paper; do not provide any information that is inconsistent with the paper.
 
-Your output should be the full text of the chapter, starting with the chapter title as a markdown header. Use '#' to denote the chapter title, '##' to denote the section title, and so on.
-""",
+Separate each subtopic with a section header "#".
+
+Also, please write all mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π".""",
             'user': f"""### Research Paper
 {paper_content}
 
