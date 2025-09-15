@@ -286,7 +286,7 @@ def prepare_training_mix(
             if (i == 0 or i == len(unique_document_batches) - 1) and batch:
                 log.info(f"Detailed chunk view for batch {i} (BEFORE filling):")
                 for chunk_idx, chunk in enumerate(batch):
-                    log.info(f"  Chunk {chunk_idx}: '{chunk[:10]}...'")
+                    log.info(f"  Chunk {chunk_idx}: '{chunk[:25]}...'")
 
         if strategy_args.get("fill_batches_with_pretraining", False):
             batch = fill_up_batch_with_pretraining_chunks(
@@ -302,7 +302,7 @@ def prepare_training_mix(
             if (i == 0 or i == len(unique_document_batches) - 1) and batch:
                 log.info(f"Detailed chunk view for batch {i} (AFTER filling):")
                 for chunk_idx, chunk in enumerate(batch):
-                    log.info(f"  Chunk {chunk_idx}: '{chunk[:10]}...'")
+                    log.info(f"  Chunk {chunk_idx}: '{chunk[:25]}...'")
         
         assert len(batch) == effective_batch_size, \
             f"Batch {i} has size {len(batch)}, which is not equal to the effective batch size {effective_batch_size}."
@@ -360,5 +360,5 @@ def prepare_training_mix(
     
     # The trainer will run for 1 epoch on the fully constructed dataset
     train_cfg.num_train_epochs = 1
-    dataset = Dataset.from_dict({"text": final_chunks})
+    dataset = Dataset.from_dict({"raw_text": final_chunks})
     return dataset, train_cfg

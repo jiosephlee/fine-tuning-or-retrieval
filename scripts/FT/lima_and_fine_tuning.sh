@@ -11,7 +11,6 @@ nohup python finetuning_knowledge_v8.py \
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
     --overlap_ratio 1_4 \
-    --do_eval \
     --lima_afterwards \
     --full_finetuning > output_1.log 2>&1 &
 

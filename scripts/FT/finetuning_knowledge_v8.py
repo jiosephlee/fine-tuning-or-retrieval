@@ -470,7 +470,6 @@ if __name__ == "__main__":
 
     if args.test_script:
         log.info("--- RUNNING IN TEST SCRIPT MODE ---")
-        args.model_id = "Qwen/Qwen2.5-0.5B"
         args.num_train_epochs = 2
         os.environ["WANDB_DISABLED"] = "true"
         args.base_results_dir = os.path.join("../../results", "tests")
