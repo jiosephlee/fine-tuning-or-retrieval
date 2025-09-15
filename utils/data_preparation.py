@@ -7,7 +7,7 @@ from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
 
 from utils.llm_configs import TrainingConfig
-from utils.chunking import chunk
+import utils.chunking as chunking
 
 
 class PretrainingDataReplay:
@@ -151,7 +151,7 @@ def prepare_training_mix(
     # Helper to chunk a single text
     def _chunk(text: str) -> List[str]:
         text_with_eos = text + tokenizer.eos_token
-        chunks, _ = chunk(
+        chunks, _ = chunking.chunk(
             text_with_eos,
             tokenizer,
             train_cfg.context_length,
