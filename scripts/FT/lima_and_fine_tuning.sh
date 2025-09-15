@@ -4,6 +4,7 @@ echo "This is a test run to see if LIMA-based instruction tuning works. Using si
 
 nohup python finetuning_knowledge_v8.py \
     --test_script \
+    --override_domains DPO \
     --with_prior_knowledge \
     --num_train_epochs $num_epochs \
     --learning_rate 2e-5 \

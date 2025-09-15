@@ -171,7 +171,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
             log.info(f"Loaded {len(inference_probe_df)} inference probes from {inference_probe_path}")
         
         # --- Corpus Perplexity Callback ---
-        corpus_path = f'../../data/arxiv/cleaned/{domain}.txt'
+        corpus_path = f'../../data/arxiv/cleaned/{domain}.tex'
         if os.path.exists(corpus_path):
             with open(corpus_path, 'r', encoding='utf-8') as f:
                 text_content = f.read()
@@ -437,7 +437,7 @@ if __name__ == "__main__":
     parser.add_argument("--lima_afterwards", default=False, action="store_true", help="LIMA-based instruction tuning after continued pretraining")
 
     # Defaults, do not change unless for ablations
-    parser.add_argument("--chunk_by_section", default=True, type=bool, help="Use section-based chunking instead of token-based chunking")
+    parser.add_argument("--chunk_by_section", action="store_true", help="Use section-based chunking instead of token-based chunking")
     parser.add_argument("--no_title_prefix", action="store_false", help="Add title prefix to chunks when chunking")
     parser.add_argument("--overlap_sections", default=False, action="store_true", help="Overlap sections when chunking")
     parser.add_argument("--overlap_ratio", type=str, default="1_4", help="Ratio of overlap when chunking")
@@ -453,7 +453,7 @@ if __name__ == "__main__":
     parser.add_argument("--pretraining_data_type", type=str, default="wiki", help="Type of pretraining data to use ('wiki' or 'arxiv').")
     parser.add_argument("--effective_batch_size_for_cpt", type=int, default=8, help="The effective batch size for continued pretraining.")
     parser.add_argument("--effective_batch_size_for_lima", type=int, default=32, help="The effective batch size for LIMA training.")
-    parser.add_argument("--device_batch_size", type=int, default=4, help="The batch size per device.")
+    parser.add_argument("--device_batch_size", type=int, default=2, help="The batch size per device.")
     parser.add_argument("--context_length_for_cpt", type=int, default=3072, help="Context length for continued pretraining.")
     parser.add_argument("--context_length_for_lima", type=int, default=3072, help="Context length for LIMA training.")
 
