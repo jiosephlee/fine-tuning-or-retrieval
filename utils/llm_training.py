@@ -233,6 +233,7 @@ def fine_tune(
         for i, batch in enumerate(dataloader):
             # Assuming 'input_ids' is the key for tokenized text
             # and we decode it back to string for inspection.
+            log.info(f"CPT batch {i} has {len(batch)} chunks...")
             input_ids = batch['input_ids'][-1]
 
             # Verify that the last token of the batch is NOT an EOS token
