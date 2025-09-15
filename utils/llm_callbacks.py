@@ -51,8 +51,8 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             'log_prob': [],
             'perplexity': [],
             'hit_accuracy_at_1': [],
-            'hit_accuracy_at_5': [],
             'hit_accuracy_at_10': [],
+            'hit_accuracy_at_100': [],
         }
         self.output_dir = output_dir
         self._precompute_token_lengths()
@@ -130,13 +130,6 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             if valid_mask.any():
                 log_data[f"{self.log_prefix}/{metric_name}_avg"] = values[valid_mask].mean().item()
 
-            # Log the delta metrics to Wandb
-            if metric_name in self.initial_metrics and self.initial_metrics[metric_name] is not None:
-                delta = values - self.initial_metrics[metric_name]
-                valid_mask_delta = ~torch.isinf(delta) & ~torch.isnan(delta)
-                if valid_mask_delta.any():
-                    log_data[f"{self.log_prefix}/{metric_name}_delta_avg"] = delta[valid_mask_delta].mean().item()
-        
         if state.is_world_process_zero and log_data:
             if self.report_to_wandb:
                 wandb.log(log_data, step=step)
@@ -248,7 +241,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         """
         Evaluates probes by calculating log probabilities and hit rates for targets.
         """
-        all_metrics = { 'log_prob': [], 'perplexity': [], 'hit_accuracy_at_1': [], 'hit_accuracy_at_5': [], 'hit_accuracy_at_10': [] }
+        all_metrics = { 'log_prob': [], 'perplexity': [], 'hit_accuracy_at_1': [], 'hit_accuracy_at_10': [], 'hit_accuracy_at_100': [] }
         device = model.device
         num_facts = len(self.facts)
         # Go through facts in batches
@@ -280,7 +273,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 all_metrics['perplexity'].append(perplexity)
 
             if self.track_hits:
-                hits = self._calculate_hits_at_k(shift_logits, shift_labels, context_lengths, target_lengths, k_values=[1, 5, 10])
+                hits = self._calculate_hits_at_k(shift_logits, shift_labels, context_lengths, target_lengths, k_values=[1, 10, 100])
                 for k, v in hits.items():
                     all_metrics[k].append(v)
 
@@ -288,8 +281,8 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             "log_prob": torch.cat(all_metrics['log_prob']) if self.track_logprobs and all_metrics['log_prob'] else None,
             "perplexity": torch.cat(all_metrics['perplexity']) if self.track_logprobs and all_metrics['perplexity'] else None,
             "hit_accuracy_at_1": torch.cat(all_metrics['hit_accuracy_at_1']) if self.track_hits and all_metrics['hit_accuracy_at_1'] else None,
-            "hit_accuracy_at_5": torch.cat(all_metrics['hit_accuracy_at_5']) if self.track_hits and all_metrics['hit_accuracy_at_5'] else None,
             "hit_accuracy_at_10": torch.cat(all_metrics['hit_accuracy_at_10']) if self.track_hits and all_metrics['hit_accuracy_at_10'] else None,
+            "hit_accuracy_at_100": torch.cat(all_metrics['hit_accuracy_at_100']) if self.track_hits and all_metrics['hit_accuracy_at_100'] else None,
         }
 
     def _generate_worst_probes_report(self, model, output_dir, top_k=10):

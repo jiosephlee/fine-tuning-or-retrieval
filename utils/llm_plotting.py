@@ -41,7 +41,7 @@ def generate_new_plots_for_knowledge_probes(probes_version: str, output_dir: str
 
     # --- PLOT 1: Normalized Loss vs. Hit Accuracy ---
     log_info("Generating Plot 1: Normalized Loss vs. Hit Accuracy...")
-    hit_cols = [f'hit_accuracy_at_{k}' for k in [1, 5, 10] if f'hit_accuracy_at_{k}' in probe_df.columns]
+    hit_cols = [f'hit_accuracy_at_{k}' for k in [1, 10, 100] if f'hit_accuracy_at_{k}' in probe_df.columns]
     if not loss_df.empty and hit_cols:
         plt.figure(figsize=(14, 8))
         
@@ -210,7 +210,7 @@ def generate_new_plots_for_inference_probes(probes_version: str, output_dir: str
 
     # --- PLOT 1: Normalized Loss vs. Hit Accuracy (Inference) ---
     log_info("Generating Inference Plot 1: Normalized Loss vs. Hit Accuracy...")
-    hit_cols = [f'hit_accuracy_at_{k}' for k in [1, 5, 10] if f'hit_accuracy_at_{k}' in probe_df.columns]
+    hit_cols = [f'hit_accuracy_at_{k}' for k in [1, 10, 100] if f'hit_accuracy_at_{k}' in probe_df.columns]
     if not loss_df.empty and hit_cols:
         plt.figure(figsize=(14, 8))
         

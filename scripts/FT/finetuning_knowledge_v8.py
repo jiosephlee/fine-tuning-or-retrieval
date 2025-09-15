@@ -382,6 +382,7 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
         remove_unused_columns=False,
         packing = True,
         padding_free = True,
+        dataset_text_field="text",
         report_to="wandb" if not args.test_script else "none",
     )
     
@@ -411,15 +412,24 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
     seq_counts = []
     found_multi_seq_batch = False
     
+    log.info("Verifying LIMA dataloader integrity...")
+    eos_token_id = tokenizer.eos_token_id
+
     for i, batch in enumerate(trainer.get_train_dataloader()):
+        # Check 1: Verify sequence packing
         seq_count = 0
         for j in batch['position_ids'][0]:
             if j == 0:
                 seq_count += 1
         seq_counts.append(seq_count)
-        
         if seq_count >= 2:
             found_multi_seq_batch = True
+
+        # Check 2: Verify last token of the batch is EOS
+        input_ids = batch['input_ids'][0]
+        last_token_id = input_ids[-1]
+        if last_token_id != eos_token_id:
+            log.warning(f"Batch {i} does not end with an EOS token (last token_id: {last_token_id}).")
             
     avg_seqs = sum(seq_counts) / len(seq_counts)
     min_seqs = min(seq_counts)
