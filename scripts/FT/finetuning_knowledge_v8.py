@@ -429,7 +429,8 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
         input_ids = batch['input_ids'][-1]
         last_token_id = input_ids[-1]
         if last_token_id != eos_token_id:
-            log.warning(f"Batch {i} does not end with an EOS token (last token_id: {last_token_id}).")
+            last_token_decoded = tokenizer.decode([last_token_id])
+            log.warning(f"Batch {i} does not end with an EOS token. Instead, it ends with token ID {last_token_id} ('{last_token_decoded}').")
             
     avg_seqs = sum(seq_counts) / len(seq_counts)
     min_seqs = min(seq_counts)

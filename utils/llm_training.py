@@ -233,11 +233,11 @@ def fine_tune(
         for i, batch in enumerate(dataloader):
             # Assuming 'input_ids' is the key for tokenized text
             # and we decode it back to string for inspection.
-            input_ids = batch['input_ids'][0]
+            input_ids = batch['input_ids'][-1]
 
             # Verify that the last token of the batch is NOT an EOS token
             if input_ids[-1] == eos_token_id:
-                log.warning(f"CPT batch {i} ends with an EOS token, which is not expected for continued pre-training.")
+                log.warning(f"CPT batch {i} ends with an EOS token, which is expected for the last batch of the unique document.")
 
             first_50 = tokenizer.decode(input_ids[:50])
             last_50 = tokenizer.decode(input_ids[-50:])
@@ -249,13 +249,13 @@ def fine_tune(
     dataloader1 = trainer.get_train_dataloader()
     content1 = get_dataloader_content(dataloader1)
     with open(os.path.join(output_dir_for_debug, "debug_run_1.txt"), "w") as f:
-        f.write("##\n\n".join(content1))
+        f.write("\n------\n".join(content1))
         
     log.info("Running second dataloader pass for debugging...")
     dataloader2 = trainer.get_train_dataloader()
     content2 = get_dataloader_content(dataloader2)
     with open(os.path.join(output_dir_for_debug, "debug_run_2.txt"), "w") as f:
-        f.write("##\n\n".join(content2))
+        f.write("\n------\n".join(content2))
 
     assert content1 == content2, "Sequential sampling is not deterministic!"
     log.info("Sequential sampling verification successful.")
