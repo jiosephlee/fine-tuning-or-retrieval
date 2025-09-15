@@ -228,7 +228,7 @@ def fine_tune(
     os.makedirs(output_dir_for_debug, exist_ok=True)
     
     log.info("Verifying that CPT chunks do not end with EOS token...")
-    for i, text_chunk in enumerate(dataset["text"]):
+    for i, text_chunk in enumerate(dataset["raw_text"]):
         if text_chunk.endswith(tokenizer.eos_token):
             log.warning(f"CPT chunk {i} ends with EOS token. This is generally not expected.")
 
