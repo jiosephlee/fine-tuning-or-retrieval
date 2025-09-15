@@ -298,7 +298,7 @@ def continue_pretraining(model, tokenizer, log, args):
         "num_paraphrased_texts": args.num_paraphrased_texts,
         "override_domains": args.override_domains,
         "fill_batches_with_pretraining": args.fill_batches_with_pretraining,
-        "pretraining_batches_separating_docs": args.pretraining_batches_separating_docs,
+        "pretraining_batches_separating_docs": args.separate_batches_with_pretraining,
         "pretraining_data_type": args.pretraining_data_type,
     }
 
