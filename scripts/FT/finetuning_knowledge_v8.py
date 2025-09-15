@@ -300,6 +300,7 @@ def continue_pretraining(model, tokenizer, log, args):
         "fill_batches_with_pretraining": args.fill_batches_with_pretraining,
         "pretraining_batches_separating_docs": args.separate_batches_with_pretraining,
         "pretraining_data_type": args.pretraining_data_type,
+        "test_script": args.test_script,
     }
 
     if args.with_explanations:
