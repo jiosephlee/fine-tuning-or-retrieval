@@ -9,7 +9,7 @@ from utils.llm_inference import generate_text
 from utils.llm_configs import InferenceConfig
 from utils.llm_evals import evaluate_response
 import matplotlib.pyplot as plt
-
+import math
 
 class BaseKnowledgeProbeCallBack(TrainerCallback):
     """
@@ -716,3 +716,40 @@ class CorpusPerplexityCallback(TrainerCallback):
             print(f" > Saved corpus perplexity metrics to '{output_path}' with {len(df)} rows.")
         else:
             print(" > No corpus perplexity metrics to save.")
+            
+class TrainingLossPerplexityCallback(TrainerCallback):
+    """
+    A callback that captures the training loss at each logging step,
+    calculates perplexity from it, logs it to Weights & Biases,
+    and stores it for external analysis.
+    This represents the perplexity of the specific data chunk seen in that step.
+    """
+    def __init__(self):
+        self.history = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        # The 'loss' key is only present during training steps.
+        if logs is not None and 'loss' in logs:
+            if state.is_world_process_zero:
+                # The 'loss' is the average cross-entropy loss for the batch.
+                # Perplexity is the exponentiation of this loss.
+                chunk_perplexity = math.exp(logs['loss'])
+                self.history.append({'step': state.global_step, 'loss': logs['loss'], 'chunked_perplexity': chunk_perplexity})
+                wandb.log({"chunked_perplexity/full_paper": chunk_perplexity}, step=state.global_step+1)
+    
+    def get_results_as_dataframe(self):
+        """
+        Returns the collected training loss perplexity data as a pandas DataFrame.
+        """
+        return pd.DataFrame(self.history)
+
+    def save_results(self, output_dir: str):
+        """Saves the collected training loss perplexity data to a CSV file."""
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, "training_loss_perplexity_metrics.csv")
+        df = self.get_results_as_dataframe()
+        if not df.empty:
+            df.to_csv(output_path, index=False)
+            print(f" > Saved training loss perplexity metrics to '{output_path}' with {len(df)} rows.")
+        else:
+            print(" > No training loss perplexity metrics to save.")
