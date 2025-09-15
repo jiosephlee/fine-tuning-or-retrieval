@@ -163,8 +163,8 @@ def prepare_training_mix(
     # Determine domains: use override if provided, otherwise scan directory
     domains = strategy_args.get("override_domains", None)
     if domains is None:
-        cleaned_dir = 'data/arxiv/cleaned'
-        domains = [f.replace('.txt', '') for f in os.listdir(cleaned_dir) if f.endswith('.txt')]
+        cleaned_dir = '../../data/arxiv/cleaned'
+        domains = [f.replace('.tex', '') for f in os.listdir(cleaned_dir) if f.endswith('.tex')]
     log.info(f"Processing domains: {domains}")
 
     num_paraphrased_texts = strategy_args.get("num_paraphrased_texts", 0)
@@ -179,7 +179,7 @@ def prepare_training_mix(
         log.info(f"Loading data for domain: {domain}")
         
         # 1. Load source text
-        source_path = f'data/arxiv/cleaned/{domain}.txt'
+        source_path = f'../../data/arxiv/cleaned/{domain}.tex'
         try:
             with open(source_path, 'r', encoding='utf-8') as f:
                 source_text = f.read()
@@ -194,10 +194,10 @@ def prepare_training_mix(
         paraphrased_texts = []
         paraphrased_chunks_by_doc = []
         if num_paraphrased_texts > 0:
-            paraphrased_dir = f'data/arxiv/paraphrased/{domain}/'
+            paraphrased_dir = f'../../data/arxiv/paraphrased/{domain}/'
             if os.path.isdir(paraphrased_dir):
                 for i in range(num_paraphrased_texts):
-                    para_path = os.path.join(paraphrased_dir, f'{i}.txt')
+                    para_path = os.path.join(paraphrased_dir, f'{i}.tex')
                     if os.path.exists(para_path):
                         with open(para_path, 'r', encoding='utf-8') as f:
                             paraphrased_texts.append(f.read())
@@ -211,7 +211,7 @@ def prepare_training_mix(
             explanation_dir = f'data/arxiv/explanations/{domain}/'
             if os.path.isdir(explanation_dir):
                 for filename in sorted(os.listdir(explanation_dir)):
-                    if filename.endswith('.txt'):
+                    if filename.endswith('.tex'):
                         file_path = os.path.join(explanation_dir, filename)
                         with open(file_path, 'r', encoding='utf-8') as f:
                             explanation_chunks.extend(_chunk(f.read()))
