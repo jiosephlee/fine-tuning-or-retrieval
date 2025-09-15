@@ -6,6 +6,7 @@ nohup python finetuning_knowledge_v8.py \
     --test_script \
     --override_domains DPO \
     --fill_batches_with_pretraining \
+    --separate_batches_with_pretraining 10 \
     --num_train_epochs $num_epochs \
     --learning_rate 2e-5 \
     --num_paraphrased_texts $num_paraphrased \
