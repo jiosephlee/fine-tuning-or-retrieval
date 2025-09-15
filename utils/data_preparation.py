@@ -146,6 +146,7 @@ def prepare_training_mix(
     log.info(f"Preparing training mix for strategy: {strategy_name}")
     log.info(f"Chunking parameters: chunk_by_section={chunk_by_section}, overlap_sections={overlap_sections}, overlap_ratio={overlap_ratio}, add_title_prefix={add_title_prefix}")
     
+
     test_script = strategy_args.get("test_script", False)
 
     # Helper to chunk a single text
@@ -170,7 +171,7 @@ def prepare_training_mix(
         domains = [f.replace('.tex', '') for f in os.listdir(cleaned_dir) if f.endswith('.tex')]
     log.info(f"Processing domains: {domains}")
 
-    num_paraphrased_texts = strategy_args.get("num_paraphrased_texts", 0) - 1
+    num_paraphrased_texts = strategy_args.get("num_paraphrased_texts", 0)
     with_explanations = "WithExplanations" in strategy_name
 
     # Each inner list holds chunks for a "unique document type" across all domains
@@ -251,6 +252,9 @@ def prepare_training_mix(
         for i, chunks in enumerate(domain_doc_chunks):
             if i < len(unique_document_batches):
                 unique_document_batches[i].extend(chunks)
+                if test_script:
+                    log.info(f"Batch {i} increases to {len(unique_document_batches[i])} chunks")
+                
 
     # 5. Assemble final chunk list with optional pretraining data replay
     final_chunks = []
@@ -259,11 +263,13 @@ def prepare_training_mix(
     # Initialize data replay object if needed for filling or separating
     if strategy_args.get("fill_batches_with_pretraining", False) or pretraining_separators > 0:
         pretraining_data_type = strategy_args.get('pretraining_data_type', 'dclm')
+        log.info("Creating Pretraining Data Replayer...")
         data_replay = PretrainingDataReplay(f'../../data/olmo/{pretraining_data_type}_10M_tokens.npy')
 
     # Assert that batches expected to have content are not empty
     for i, batch in enumerate(unique_document_batches):
         assert batch, f"Batch for unique document type {i} is empty. Check data and strategy arguments."
+
 
     for i, batch in enumerate(unique_document_batches):
         effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
