@@ -264,7 +264,7 @@ def prepare_training_mix(
 
     # 5. Assemble final chunk list with optional pretraining data replay
     final_chunks = []
-    pretraining_separators = strategy_args.get("pretraining_batches_separating_docs", 0)
+    pretraining_separators = strategy_args.get("separate_batches_with_pretraining", 0)
     
     # Initialize data replay object if needed for filling or separating
     if strategy_args.get("fill_batches_with_pretraining", False) or pretraining_separators > 0:
@@ -289,6 +289,7 @@ def prepare_training_mix(
                     log.info(f"  Chunk {chunk_idx}: '{chunk[:25]}...'")
 
         if strategy_args.get("fill_batches_with_pretraining", False):
+            log.info("Filling up batch with pretraining data...")
             batch = fill_up_batch_with_pretraining_chunks(
                 batch, 
                 data_replay, 
@@ -312,7 +313,7 @@ def prepare_training_mix(
         if i < len(unique_document_batches) - 1 and pretraining_separators > 0:
             if test_script:
                 log.info(f"--- Debugging Separator after Batch {i} ---")
-                log.info(f"Adding {pretraining_separators} batches of pretraining data as separator.")
+            log.info(f"Adding {pretraining_separators} batches of pretraining data as separator...")
 
             pretraining_fill = get_pretraining_batches(
                 data_replay,
