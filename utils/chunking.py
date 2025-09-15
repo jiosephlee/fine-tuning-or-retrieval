@@ -101,8 +101,10 @@ def chunk_text(text_content: str, tokenizer, max_tokens: int, delimiter: str = "
 
     total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in chunks)
     if log: 
-        log.info(f"First chunk: {chunks[0][:100]}...")
-        log.info(f"Second chunk: {chunks[1][:100]}...")
+        first_chunk_tokens = len(tokenizer(chunks[0], add_special_tokens=False)["input_ids"])
+        second_chunk_tokens = len(tokenizer(chunks[1], add_special_tokens=False)["input_ids"])
+        log.info(f"First chunk ({first_chunk_tokens} tokens): {chunks[0][:50]}...")
+        log.info(f"Second chunk ({second_chunk_tokens} tokens): {chunks[1][:50]}...")
     return chunks, total_tokens
 
 def split_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 2048):
@@ -296,6 +298,8 @@ def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048,
     
     total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in chunks)
     if log: 
-        log.info(f"First chunk: {chunks[0][:100]}...")
-        log.info(f"Second chunk: {chunks[1][:100]}...")
+        first_chunk_tokens = len(tokenizer(chunks[0], add_special_tokens=False)["input_ids"])
+        second_chunk_tokens = len(tokenizer(chunks[1], add_special_tokens=False)["input_ids"])
+        log.info(f"First chunk ({first_chunk_tokens} tokens): {chunks[0][:100]}...")
+        log.info(f"Second chunk ({second_chunk_tokens} tokens): {chunks[1][:100]}...")
     return chunks, total_tokens
