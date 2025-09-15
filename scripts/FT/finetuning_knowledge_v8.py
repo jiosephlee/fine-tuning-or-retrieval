@@ -426,7 +426,7 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
             found_multi_seq_batch = True
 
         # Check 2: Verify last token of the batch is EOS
-        input_ids = batch['input_ids'][0]
+        input_ids = batch['input_ids'][-1]
         last_token_id = input_ids[-1]
         if last_token_id != eos_token_id:
             log.warning(f"Batch {i} does not end with an EOS token (last token_id: {last_token_id}).")

@@ -227,24 +227,25 @@ def fine_tune(
     # --- Debugging Sequential Sampling ---
     os.makedirs(output_dir_for_debug, exist_ok=True)
     
-    log.info("Verifying that CPT chunks do not end with EOS token...")
-    for i, text_chunk in enumerate(dataset["raw_text"]):
-        if text_chunk.endswith(tokenizer.eos_token):
-            log.warning(f"CPT chunk {i} ends with EOS token. This is generally not expected.")
-
     def get_dataloader_content(dataloader):
         content = []
-        for batch in dataloader:
+        eos_token_id = tokenizer.eos_token_id
+        for i, batch in enumerate(dataloader):
             # Assuming 'input_ids' is the key for tokenized text
             # and we decode it back to string for inspection.
             input_ids = batch['input_ids'][0]
+
+            # Verify that the last token of the batch is NOT an EOS token
+            if input_ids[-1] == eos_token_id:
+                log.warning(f"CPT batch {i} ends with an EOS token, which is not expected for continued pre-training.")
+
             first_50 = tokenizer.decode(input_ids[:50])
             last_50 = tokenizer.decode(input_ids[-50:])
             text_sample = first_50+ "..." + last_50
             content.append(text_sample)
         return content
 
-    log.info("Running first dataloader pass for debugging...")
+    log.info("Running first dataloader pass for debugging and verification...")
     dataloader1 = trainer.get_train_dataloader()
     content1 = get_dataloader_content(dataloader1)
     with open(os.path.join(output_dir_for_debug, "debug_run_1.txt"), "w") as f:
