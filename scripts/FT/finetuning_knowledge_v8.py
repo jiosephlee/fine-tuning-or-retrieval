@@ -450,7 +450,7 @@ if __name__ == "__main__":
     parser.add_argument("--override_domains", type=str, nargs='+', default=None, help="A list of domains to override the default (all domains).")
     parser.add_argument("--fill_batches_with_pretraining", default=False, action="store_true", help="Fill batches with pretraining data.")
     parser.add_argument("--separate_batches_with_pretraining", type=int, default=0, help="Number of pretraining batches to insert between unique document types.")
-    parser.add_argument("--pretraining_data_type", type=str, default="wiki", help="Type of pretraining data to use ('wiki' or 'arxiv').")
+    parser.add_argument("--pretraining_data_type", type=str, default="dclm", help="Type of pretraining data to use ('dclm' or 'arxiv').")
     parser.add_argument("--effective_batch_size_for_cpt", type=int, default=8, help="The effective batch size for continued pretraining.")
     parser.add_argument("--effective_batch_size_for_lima", type=int, default=32, help="The effective batch size for LIMA training.")
     parser.add_argument("--device_batch_size", type=int, default=2, help="The batch size per device.")

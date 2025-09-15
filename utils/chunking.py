@@ -84,6 +84,12 @@ def chunk_text(text_content: str, tokenizer, max_tokens: int, delimiter: str = "
                 prev_chunk_lines = chunks[-1].split('\n\n')
                 overlap_point = len(prev_chunk_lines) * (overlap_denom - overlap_numer) // overlap_denom
                 context_from_prev = '\n\n'.join(prev_chunk_lines[overlap_point:])
+                
+                # Log overlap details
+                if log:
+                    overlap_tokens = tokenizer(context_from_prev, add_special_tokens=False, truncation=False)["input_ids"]
+                    log.info(f"Overlap detected. Adding {len(overlap_tokens)} tokens from previous chunk.")
+                
                 current_chunk += context_from_prev
             
             current_chunk += (delimiter if current_chunk and current_chunk != title else "") + part
@@ -100,11 +106,14 @@ def chunk_text(text_content: str, tokenizer, max_tokens: int, delimiter: str = "
         chunks.append(current_chunk)
 
     total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in chunks)
-    if log: 
-        first_chunk_tokens = len(tokenizer(chunks[0], add_special_tokens=False)["input_ids"])
-        second_chunk_tokens = len(tokenizer(chunks[1], add_special_tokens=False)["input_ids"])
-        log.info(f"First chunk ({first_chunk_tokens} tokens): {chunks[0][:50]}...")
-        log.info(f"Second chunk ({second_chunk_tokens} tokens): {chunks[1][:50]}...")
+    if log and chunks: 
+        log.info(f"Chunking results: {len(chunks)} chunks, {total_tokens} total tokens.")
+        if len(chunks) > 0:
+            first_chunk_tokens = len(tokenizer(chunks[0], add_special_tokens=False)["input_ids"])
+            log.info(f"First chunk ({first_chunk_tokens} tokens): '{chunks[0][:150]}...'")
+        if len(chunks) > 1:
+            second_chunk_tokens = len(tokenizer(chunks[1], add_special_tokens=False)["input_ids"])
+            log.info(f"Second chunk ({second_chunk_tokens} tokens): '{chunks[1][:150]}...'")
     return chunks, total_tokens
 
 def split_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 2048):
@@ -283,11 +292,15 @@ def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048,
                     # Start a new chunk with the title and this piece.
                     if current_chunk.strip() and overlap_sections:
                         # Get the latter half of the previous chunk for context
-                        #print(current_chunk)
                         prev_sentences = current_chunk.split('\n')
-                        # print(prev_sentences)
-                        half_point = len(prev_sentences) // overlap_denom * (overlap_denom - overlap_numer)
-                        context_from_prev = '\n'.join(prev_sentences[half_point:])
+                        overlap_point = len(prev_sentences) * (overlap_denom - overlap_numer) // overlap_denom
+                        context_from_prev = '\n'.join(prev_sentences[overlap_point:])
+                        
+                        # Log overlap details
+                        if log:
+                            overlap_tokens = tokenizer(context_from_prev, add_special_tokens=False, truncation=False)["input_ids"]
+                            log.info(f"Overlap detected. Adding {len(overlap_tokens)} tokens from previous chunk.")
+                        
                         current_chunk = title + context_from_prev + piece
                     else:
                         current_chunk = title + piece
@@ -297,9 +310,12 @@ def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048,
         chunks.append(current_chunk)
     
     total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in chunks)
-    if log: 
-        first_chunk_tokens = len(tokenizer(chunks[0], add_special_tokens=False)["input_ids"])
-        second_chunk_tokens = len(tokenizer(chunks[1], add_special_tokens=False)["input_ids"])
-        log.info(f"First chunk ({first_chunk_tokens} tokens): {chunks[0][:100]}...")
-        log.info(f"Second chunk ({second_chunk_tokens} tokens): {chunks[1][:100]}...")
+    if log and chunks: 
+        log.info(f"Chunking results: {len(chunks)} chunks, {total_tokens} total tokens.")
+        if len(chunks) > 0:
+            first_chunk_tokens = len(tokenizer(chunks[0], add_special_tokens=False)["input_ids"])
+            log.info(f"First chunk ({first_chunk_tokens} tokens): '{chunks[0][:150]}...'")
+        if len(chunks) > 1:
+            second_chunk_tokens = len(tokenizer(chunks[1], add_special_tokens=False)["input_ids"])
+            log.info(f"Second chunk ({second_chunk_tokens} tokens): '{chunks[1][:150]}...'")
     return chunks, total_tokens
