@@ -144,6 +144,7 @@ def prepare_training_mix(
     is domain-agnostic and handles single or multiple domains naturally.
     """
     log.info(f"Preparing training mix for strategy: {strategy_name}")
+    log.info(f"Chunking parameters: chunk_by_section={chunk_by_section}, overlap_sections={overlap_sections}, overlap_ratio={overlap_ratio}, add_title_prefix={add_title_prefix}")
     
     # Helper to chunk a single text
     def _chunk(text: str) -> List[str]:
@@ -255,7 +256,7 @@ def prepare_training_mix(
     
     # Initialize data replay object if needed for filling or separating
     if strategy_args.get("fill_batches_with_pretraining", False) or pretraining_separators > 0:
-        pretraining_data_type = strategy_args.get('pretraining_data_type', 'wiki')
+        pretraining_data_type = strategy_args.get('pretraining_data_type', 'dclm')
         data_replay = PretrainingDataReplay(f'../../data/Olmo/{pretraining_data_type}_10M_tokens.npy')
 
     # Assert that batches expected to have content are not empty
