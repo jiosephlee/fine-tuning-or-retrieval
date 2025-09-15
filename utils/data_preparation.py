@@ -146,6 +146,8 @@ def prepare_training_mix(
     log.info(f"Preparing training mix for strategy: {strategy_name}")
     log.info(f"Chunking parameters: chunk_by_section={chunk_by_section}, overlap_sections={overlap_sections}, overlap_ratio={overlap_ratio}, add_title_prefix={add_title_prefix}")
     
+    test_script = strategy_args.get("test_script", False)
+
     # Helper to chunk a single text
     def _chunk(text: str) -> List[str]:
         text_with_eos = text + tokenizer.eos_token
@@ -265,6 +267,15 @@ def prepare_training_mix(
 
     for i, batch in enumerate(unique_document_batches):
         effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
+        
+        if test_script:
+            log.info(f"--- Debugging Batch {i} ---")
+            log.info(f"Batch size BEFORE filling: {len(batch)}")
+            if (i == 0 or i == len(unique_document_batches) - 1) and batch:
+                log.info(f"Detailed chunk view for batch {i} (BEFORE filling):")
+                for chunk_idx, chunk in enumerate(batch):
+                    log.info(f"  Chunk {chunk_idx}: '{chunk[:10]}...'")
+
         if strategy_args.get("fill_batches_with_pretraining", False):
             batch = fill_up_batch_with_pretraining_chunks(
                 batch, 
@@ -272,6 +283,13 @@ def prepare_training_mix(
                 effective_batch_size, 
                 train_cfg.context_length
             )
+
+        if test_script:
+            log.info(f"Batch size AFTER filling: {len(batch)}")
+            if (i == 0 or i == len(unique_document_batches) - 1) and batch:
+                log.info(f"Detailed chunk view for batch {i} (AFTER filling):")
+                for chunk_idx, chunk in enumerate(batch):
+                    log.info(f"  Chunk {chunk_idx}: '{chunk[:10]}...'")
         
         assert len(batch) == effective_batch_size, \
             f"Batch {i} has size {len(batch)}, which is not equal to the effective batch size {effective_batch_size}."
@@ -279,6 +297,10 @@ def prepare_training_mix(
         final_chunks.extend(batch)
         
         if i < len(unique_document_batches) - 1 and pretraining_separators > 0:
+            if test_script:
+                log.info(f"--- Debugging Separator after Batch {i} ---")
+                log.info(f"Adding {pretraining_separators} batches of pretraining data as separator.")
+
             pretraining_fill = get_pretraining_batches(
                 data_replay,
                 pretraining_separators,
@@ -286,6 +308,12 @@ def prepare_training_mix(
                 train_cfg.context_length
             )
             flat_fill = [item for sublist in pretraining_fill for item in sublist] # Flatten the list of lists
+            
+            if test_script and flat_fill:
+                log.info(f"Added {len(flat_fill)} separator chunks.")
+                log.info(f"First separator chunk: '{flat_fill[0][:100]}...'")
+                log.info(f"Last separator chunk: '{flat_fill[-1][:100]}...'")
+
             final_chunks.extend(flat_fill)
     
     # 6. Duplicate the dataset to match the desired number of training steps
