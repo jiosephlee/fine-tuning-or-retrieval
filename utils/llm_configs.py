@@ -106,7 +106,7 @@ class TrainingConfig(BaseModel):
     def to_sft_training_args(self, sequential_sampling = False) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
         return SFTConfig(
-            dataset_text_field="text",
+            dataset_text_field=self.dataset_text_field,
             packing = self.packing,
             padding_free = self.padding_free, # This saves VRAM (Requires Flash Attention 2)
             max_length = self.context_length,

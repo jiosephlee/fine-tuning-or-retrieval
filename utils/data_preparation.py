@@ -257,7 +257,7 @@ def prepare_training_mix(
     # Initialize data replay object if needed for filling or separating
     if strategy_args.get("fill_batches_with_pretraining", False) or pretraining_separators > 0:
         pretraining_data_type = strategy_args.get('pretraining_data_type', 'dclm')
-        data_replay = PretrainingDataReplay(f'../../data/Olmo/{pretraining_data_type}_10M_tokens.npy')
+        data_replay = PretrainingDataReplay(f'../../data/olmo/{pretraining_data_type}_10M_tokens.npy')
 
     # Assert that batches expected to have content are not empty
     for i, batch in enumerate(unique_document_batches):
