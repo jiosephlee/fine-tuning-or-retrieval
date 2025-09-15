@@ -68,7 +68,7 @@ class TrainingConfig(BaseModel):
 
     # SFT Config 
     completion_only_loss: Optional[bool] = None
-    dataset_text_field: str = "text"
+    dataset_text_field: str = "raw_text"
     packing: bool = True
     padding_free: bool = True # This saves VRAM (Requires Flash Attention 2)
     reverse_ffd_packing: bool = False
