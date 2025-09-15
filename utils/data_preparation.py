@@ -319,5 +319,5 @@ def prepare_training_mix(
     
     # The trainer will run for 1 epoch on the fully constructed dataset
     train_cfg.num_train_epochs = 1
-    dataset = Dataset.from_dict({"raw_text": final_chunks})
+    dataset = Dataset.from_dict({"text": final_chunks})
     return dataset, train_cfg

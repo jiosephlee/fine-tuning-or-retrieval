@@ -219,7 +219,6 @@ def fine_tune(
         model=model,
         train_dataset=dataset,
         args=training_args,
-        dataset_text_field="raw_text",
         processing_class=tokenizer,
         use_liger_loss=True, # Assuming this is standard
         callbacks=callbacks,
