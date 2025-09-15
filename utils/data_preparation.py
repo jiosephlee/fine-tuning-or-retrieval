@@ -265,7 +265,8 @@ def prepare_training_mix(
     # 5. Assemble final chunk list with optional pretraining data replay
     final_chunks = []
     pretraining_separators = strategy_args.get("separate_batches_with_pretraining", 0)
-    
+    log.info(f"Adding {pretraining_separators} batches of pretraining data as separator...")
+
     # Initialize data replay object if needed for filling or separating
     if strategy_args.get("fill_batches_with_pretraining", False) or pretraining_separators > 0:
         pretraining_data_type = strategy_args.get('pretraining_data_type', 'dclm')
@@ -313,7 +314,6 @@ def prepare_training_mix(
         if i < len(unique_document_batches) - 1 and pretraining_separators > 0:
             if test_script:
                 log.info(f"--- Debugging Separator after Batch {i} ---")
-            log.info(f"Adding {pretraining_separators} batches of pretraining data as separator...")
 
             pretraining_fill = get_pretraining_batches(
                 data_replay,
