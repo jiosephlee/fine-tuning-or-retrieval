@@ -27,7 +27,8 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                  batch_size: int = 8, 
                  logger=None,
                  output_dir="",
-                 log_prefix="probe_eval"):
+                 log_prefix="probe_eval",
+                 report_to_wandb: bool = True):
         
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
@@ -43,6 +44,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         self.batch_size = batch_size
         self.logger = logger
         self.log_prefix = log_prefix
+        self.report_to_wandb = report_to_wandb
 
         self.initial_metrics = {}
         self.history = {
@@ -136,7 +138,8 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                     log_data[f"{self.log_prefix}/{metric_name}_delta_avg"] = delta[valid_mask_delta].mean().item()
         
         if state.is_world_process_zero and log_data:
-            wandb.log(log_data, step=step)
+            if self.report_to_wandb:
+                wandb.log(log_data, step=step)
             
         model.train()
 
@@ -447,7 +450,8 @@ class GenerationProbeCallback(TrainerCallback):
                  eval_every_n_steps: int = 10,
                  logger=None,
                  output_dir: str = "",
-                 do_eval: bool = False):
+                 do_eval: bool = False,
+                 report_to_wandb: bool = True):
 
         self.prompts = prompts
         self.tokenizer = tokenizer
@@ -456,6 +460,7 @@ class GenerationProbeCallback(TrainerCallback):
         self.logger = logger
         self.output_dir = output_dir
         self.do_eval = do_eval
+        self.report_to_wandb = report_to_wandb
         self.eval_history = {}
 
     def on_step_end(self, args, state, control, model, **kwargs):
@@ -572,7 +577,8 @@ class GenerationProbeCallback(TrainerCallback):
                     self.eval_history[dataset_name]['scores'].append(mean_score)
         
         if wandb.run and wandb_logs:
-            wandb.log(wandb_logs, step=state.global_step)
+            if self.report_to_wandb:
+                wandb.log(wandb_logs, step=state.global_step)
             
     def on_train_end(self, args, state, control, model, **kwargs):
         """
@@ -621,7 +627,8 @@ class CorpusPerplexityCallback(TrainerCallback):
                  max_length: int, 
                  stride: int = 512, 
                  output_dir: str = "",
-                 log_prefix="corpus_perplexity"):
+                 log_prefix="corpus_perplexity",
+                 report_to_wandb: bool = True):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.stride = stride
@@ -629,6 +636,7 @@ class CorpusPerplexityCallback(TrainerCallback):
         self.output_dir = output_dir
         self.encodings = self.tokenizer(text_content, return_tensors="pt")
         self.history = []
+        self.report_to_wandb = report_to_wandb
 
     def on_step_end(self, args, state, control, model, **kwargs):
         model.eval()
@@ -678,10 +686,11 @@ class CorpusPerplexityCallback(TrainerCallback):
         loss_item = avg_nll
 
         if state.is_world_process_zero:
-            wandb.log({
-                f"{self.log_prefix}/perplexity": perplexity_item,
-                f"{self.log_prefix}/loss": loss_item
-            }, step=state.global_step)
+            if self.report_to_wandb:
+                wandb.log({
+                    f"{self.log_prefix}/perplexity": perplexity_item,
+                    f"{self.log_prefix}/loss": loss_item
+                }, step=state.global_step)
         
         self.history.append({
             'step': state.global_step, 
