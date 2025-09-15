@@ -715,7 +715,9 @@ class CorpusPerplexityCallback(TrainerCallback):
             df.to_csv(output_path, index=False)
             print(f" > Saved corpus perplexity metrics to '{output_path}' with {len(df)} rows.")
         else:
-            print(" > No corpus perplexity metrics to save.")
+            # Save an empty file with headers for consistency
+            pd.DataFrame(columns=['step', 'corpus_perplexity', 'corpus_loss']).to_csv(output_path, index=False)
+            print(" > No corpus perplexity metrics to save, created empty file with headers.")
             
 class TrainingLossPerplexityCallback(TrainerCallback):
     """
@@ -724,8 +726,9 @@ class TrainingLossPerplexityCallback(TrainerCallback):
     and stores it for external analysis.
     This represents the perplexity of the specific data chunk seen in that step.
     """
-    def __init__(self):
+    def __init__(self, report_to_wandb=True):
         self.history = []
+        self.report_to_wandb = report_to_wandb
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         # The 'loss' key is only present during training steps.
@@ -735,7 +738,8 @@ class TrainingLossPerplexityCallback(TrainerCallback):
                 # Perplexity is the exponentiation of this loss.
                 chunk_perplexity = math.exp(logs['loss'])
                 self.history.append({'step': state.global_step, 'loss': logs['loss'], 'chunked_perplexity': chunk_perplexity})
-                wandb.log({"chunked_perplexity/full_paper": chunk_perplexity}, step=state.global_step+1)
+                if self.report_to_wandb:
+                    wandb.log({"chunked_perplexity/full_paper": chunk_perplexity}, step=state.global_step+1)
     
     def get_results_as_dataframe(self):
         """

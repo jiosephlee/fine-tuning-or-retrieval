@@ -238,7 +238,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
         callbacks.append(generation_probe_callback)
         log.info(f"Loaded generation probes for domains: {list(all_generation_prompts.keys())}")
 
-    callbacks.append(TrainingLossPerplexityCallback())
+    callbacks.append(TrainingLossPerplexityCallback(report_to_wandb=report_to_wandb))
     return callbacks
 
 def save_probe_results(callbacks, log):
@@ -336,10 +336,10 @@ def continue_pretraining(model, tokenizer, log, args):
             tokenizer=tokenizer,
             log=log,
             train_cfg=training_config,
-        strategy_name=strategy_name,
-        strategy_args=strategy_args,
-        output_dir_for_debug=output_dir_for_debug,
-        callbacks=callbacks_to_use,
+            strategy_name=strategy_name,
+            strategy_args=strategy_args,
+            output_dir_for_debug=output_dir_for_debug,
+            callbacks=callbacks_to_use,
             train=True,
         **chunking_args
         )

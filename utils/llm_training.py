@@ -257,6 +257,7 @@ def fine_tune(
     if train:
         trainer.train()
         log.info("Fine-tuning complete.")
-        wandb.finish()
+        if train_cfg.report_to == "wandb":
+            wandb.finish()
         
     return trainer
