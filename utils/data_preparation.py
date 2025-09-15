@@ -167,7 +167,7 @@ def prepare_training_mix(
         domains = [f.replace('.tex', '') for f in os.listdir(cleaned_dir) if f.endswith('.tex')]
     log.info(f"Processing domains: {domains}")
 
-    num_paraphrased_texts = strategy_args.get("num_paraphrased_texts", 0)
+    num_paraphrased_texts = strategy_args.get("num_paraphrased_texts", 0) - 1
     with_explanations = "WithExplanations" in strategy_name
 
     # Each inner list holds chunks for a "unique document type" across all domains

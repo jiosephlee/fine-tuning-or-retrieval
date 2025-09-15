@@ -32,7 +32,7 @@ def construct_experiment_name(args):
     model_size = "1b" if "1B" in args.model_id else "7b"
     
     # 3. Probes Version: e.g., 'probes_v7'
-    probes_version = f"probes_v{args.knowledge_probes_version}"
+    probes_version = f"probes_{args.knowledge_probes_version}"
 
     # 4. Chunking Style: e.g., 'sec_no-ovp', 'sec_ovp_1_4', 'tok'
     if args.chunk_by_section:
@@ -56,11 +56,11 @@ def construct_experiment_name(args):
     # 6. Domains: e.g., 'd_DPO', 'd_DPO-CoT', 'd_all'
     if args.override_domains:
         if len(args.override_domains) == 1:
-            domains = f"d_{args.override_domains[0]}"
+            domains = f"domains_{args.override_domains[0]}"
         else:
-            domains = f"d_{'-'.join(args.override_domains)}"
+            domains = f"domains_{'-'.join(args.override_domains)}"
     else:
-        domains = "d_all"
+        domains = "domains_all"
 
     # 7. Epochs: e.g., 'e1'
     epochs = f"e{args.num_train_epochs}"
