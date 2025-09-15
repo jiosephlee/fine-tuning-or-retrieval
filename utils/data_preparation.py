@@ -252,23 +252,38 @@ def prepare_training_mix(
     # 5. Assemble final chunk list with optional pretraining data replay
     final_chunks = []
     pretraining_separators = strategy_args.get("pretraining_batches_separating_docs", 0)
+    
+    # Initialize data replay object if needed for filling or separating
+    if strategy_args.get("fill_batches_with_pretraining", False) or pretraining_separators > 0:
+        pretraining_data_type = strategy_args.get('pretraining_data_type', 'wiki')
+        data_replay = PretrainingDataReplay(f'../../data/Olmo/{pretraining_data_type}_10M_tokens.npy')
 
     # Assert that batches expected to have content are not empty
     for i, batch in enumerate(unique_document_batches):
         assert batch, f"Batch for unique document type {i} is empty. Check data and strategy arguments."
 
     for i, batch in enumerate(unique_document_batches):
-        if strategy_args.get("fill_batches_with_pretraining", False):
-            batch = fill_up_batch_with_pretraining_chunks(batch, type=strategy_args.get('pretraining_data_type', 'wiki'))
-        
         effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
+        if strategy_args.get("fill_batches_with_pretraining", False):
+            batch = fill_up_batch_with_pretraining_chunks(
+                batch, 
+                data_replay, 
+                effective_batch_size, 
+                train_cfg.context_length
+            )
+        
         assert len(batch) == effective_batch_size, \
             f"Batch {i} has size {len(batch)}, which is not equal to the effective batch size {effective_batch_size}."
 
         final_chunks.extend(batch)
         
         if i < len(unique_document_batches) - 1 and pretraining_separators > 0:
-            pretraining_fill = get_pretraining_batches(pretraining_separators, type=strategy_args.get('pretraining_data_type', 'wiki'))
+            pretraining_fill = get_pretraining_batches(
+                data_replay,
+                pretraining_separators,
+                effective_batch_size,
+                train_cfg.context_length
+            )
             flat_fill = [item for sublist in pretraining_fill for item in sublist] # Flatten the list of lists
             final_chunks.extend(flat_fill)
     
@@ -277,10 +292,21 @@ def prepare_training_mix(
     chunks_in_mix = len(final_chunks)
     
     if chunks_in_mix > 0:
-        # We assume 1 epoch over the constructed mix. To simulate more epochs, we replicate data.
+        # We assume 1 epoch over the constructed mix. `num_train_epochs` is interpreted
+        # as the total number of passes over "unique document types".
         if original_epochs > 1:
+            # For example, if there are 10 unique document types (source + 9 paraphrases),
+            # and num_train_epochs is 20, then the replication_factor is 2, meaning
+            # the model sees the entire sequence of 10 document types twice.
             replication_factor = original_epochs / len(unique_document_batches)
-            log.info(f"Replicating dataset {replication_factor} times to simulate {original_epochs} epochs.")
+            
+            if replication_factor != int(replication_factor):
+                 log.warning(f"num_train_epochs ({original_epochs}) is not divisible by the number of unique document types ({len(unique_document_batches)}). "
+                            "Rounding down the replication factor.")
+            
+            replication_factor = int(replication_factor)
+            
+            log.info(f"Replicating dataset {replication_factor} times to simulate {original_epochs} total 'document-type epochs'.")
             final_chunks = final_chunks * replication_factor
         else: # original_epochs is 1, no replication needed
              pass

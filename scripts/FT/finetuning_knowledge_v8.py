@@ -110,7 +110,11 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
 
         # --- Knowledge Probes ---
         knowledge_probes_version = args.knowledge_probes_version
-        knowledge_probe_path = f'../../data/probes/facts/{domain}/{domain}_knowledge_probes_{knowledge_probes_version}.csv'
+        if knowledge_probes_version == 'v8':
+            knowledge_probe_path = f'../../data/probes/facts/{domain}/probes_{knowledge_probes_version}.csv'
+        else:
+            knowledge_probe_path = f'../../data/probes/facts/{domain}/{domain}_knowledge_probes_{knowledge_probes_version}.csv'
+
         if os.path.exists(knowledge_probe_path):
             knowledge_probe_df = pd.read_csv(knowledge_probe_path)
             facts = knowledge_probe_df['fact'].tolist()
@@ -134,16 +138,17 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
             log.warning(f"Knowledge probe file not found for domain {domain} at {knowledge_probe_path}")
 
         # --- Inference Probes ---
-        inference_probe_path_domain_specific = f'../../data/probes/inference/{domain}/{domain.lower()}_high_level_probes_v2.csv'
-        inference_probe_path_generic = f'../../data/probes/inference/{domain.lower()}_high_level_probes_v2.csv'
+        inference_probes_version = args.inference_probes_version
+        path1 = f'../../data/probes/inference/{domain}/probes_{inference_probes_version}.csv'
+        path2 = f'../../data/probes/inference/{domain}/{domain.lower()}_high_level_probes_{inference_probes_version}.csv'
         
-        if os.path.exists(inference_probe_path_domain_specific):
-            inference_probe_path = inference_probe_path_domain_specific
-        elif os.path.exists(inference_probe_path_generic):
-            inference_probe_path = inference_probe_path_generic
+        if os.path.exists(path1):
+            inference_probe_path = path1
+        elif os.path.exists(path2):
+            inference_probe_path = path2
         else:
             inference_probe_path = None
-            log.warning(f"Inference probe file not found for domain {domain}")
+            log.warning(f"Inference probe file not found for domain {domain} with version {inference_probes_version}")
 
         if inference_probe_path:
             inference_probe_df = pd.read_csv(inference_probe_path)
@@ -426,7 +431,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--full_finetuning", default=False, action="store_true")
     parser.add_argument("--learning_rate", type=float, default=1e-5)
-    parser.add_argument("--knowledge_probes_version", type=str, default="v7", help="Version of the knowledge probes to use.")
+    parser.add_argument("--knowledge_probes_version", type=str, default="v8", help="Version of the knowledge probes to use.")
+    parser.add_argument("--inference_probes_version", type=str, default="v2", help="Version of the inference probes to use.")
     parser.add_argument("--num_paraphrased_texts", type=int, default=9, help="Number of paraphrased texts to use for training (0-9)")
     parser.add_argument("--lima_afterwards", default=False, action="store_true", help="LIMA-based instruction tuning after continued pretraining")
 
