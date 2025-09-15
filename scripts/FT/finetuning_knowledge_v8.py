@@ -18,8 +18,7 @@ import utils.llm_configs as llm_configs
 import argparse
 import wandb
 import logging
-from utils.old.llm_callbacks_old import TrainingLossPerplexityCallback
-from utils.llm_callbacks import CorpusPerplexityCallback
+from utils.llm_callbacks import CorpusPerplexityCallback, TrainingLossPerplexityCallback
 
 
 def construct_experiment_name(args):
@@ -441,7 +440,8 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
     # log.info("Finished generating all plots.")
 
     log.info("LIMA-based instruction tuning complete.")
-    wandb.finish()
+    if not args.test_script:
+        wandb.finish()
 
 if __name__ == "__main__":
     # --- Parser ---
