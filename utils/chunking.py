@@ -100,6 +100,9 @@ def chunk_text(text_content: str, tokenizer, max_tokens: int, delimiter: str = "
         chunks.append(current_chunk)
 
     total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in chunks)
+    if log: 
+        log.info(f"First chunk: {chunks[0][:100]}...")
+        log.info(f"Second chunk: {chunks[1][:100]}...")
     return chunks, total_tokens
 
 def split_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 2048):
