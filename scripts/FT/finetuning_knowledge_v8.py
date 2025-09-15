@@ -92,6 +92,8 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
     """Sets up probe callbacks for all specified domains."""
     callbacks = []
     
+    report_to_wandb = not args.test_script
+
     if not domains:
         domains = get_all_domains()
         log.info(f"No domains specified, found and using: {domains}")
@@ -131,6 +133,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
                 logger=log,
                 output_dir=output_dir_knowledge_probe,
                 log_prefix=f"{domain}_knowledge_probe",
+                report_to_wandb=report_to_wandb,
             )
             callbacks.append(knowledge_probe_callback)
             log.info(f"Loaded {len(knowledge_probe_df)} knowledge probes from {knowledge_probe_path}")
@@ -166,6 +169,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
                 logger=log,
                 output_dir=output_dir_inference_probe,
                 log_prefix=f"{domain}_inference_probe",
+                report_to_wandb=report_to_wandb,
             )
             callbacks.append(inference_probe_callback)
             log.info(f"Loaded {len(inference_probe_df)} inference probes from {inference_probe_path}")
@@ -187,7 +191,8 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
                 max_length=context_length,
                 stride=512,
                 output_dir=output_dir_corpus_ppl,
-                log_prefix=f"{domain}_corpus_perplexity"
+                log_prefix=f"{domain}_corpus_perplexity",
+                report_to_wandb=report_to_wandb,
             )
             callbacks.append(corpus_perplexity_callback)
             log.info(f"Added CorpusPerplexityCallback for domain {domain} from {corpus_path}")
@@ -229,6 +234,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
             logger=log,
             output_dir=output_dir_generation,
             do_eval=args.do_eval,
+            report_to_wandb=report_to_wandb,
         )
         callbacks.append(generation_probe_callback)
         log.info(f"Loaded generation probes for domains: {list(all_generation_prompts.keys())}")
@@ -287,10 +293,17 @@ def continue_pretraining(model, tokenizer, log, args):
         reverse_ffd_packing= False,
         remove_unused_columns=False,
         packing = False,
-        padding_free = False
+        padding_free = False,
+        report_to="wandb" if not args.test_script else "none",
     )
     # --- Load Probe Data ---
-    callbacks_to_use = setup_callbacks(args.override_domains, tokenizer, log, args, is_lima=False)
+    callbacks_to_use = setup_callbacks(
+        domains=args.override_domains, 
+        tokenizer=tokenizer, 
+        log=log, 
+        args=args, 
+        is_lima=False,
+    )
     
     # --- Load the Texts and Fine-Tune ---
     # --- Determine Training Strategy ---
@@ -369,13 +382,20 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
         reverse_ffd_packing= False,
         remove_unused_columns=False,
         packing = True,
-        padding_free = True
+        padding_free = True,
+        report_to="wandb" if not args.test_script else "none",
     )
     
     # --- Load Probes ---
     # Note 1: We track the DPO knowledge probes, DPO inference probes in OG & Q&A format, and generative recall in Q&A format
     # NOte 2: Since we are retracking some of the same probes, we need to make sure they are in separate folders and different prefixes for WandDB
-    callbacks = setup_callbacks(args.override_domains, tokenizer, log, args, is_lima=True)
+    callbacks = setup_callbacks(
+        domains=args.override_domains, 
+        tokenizer=tokenizer, 
+        log=log, 
+        args=args, 
+        is_lima=True,
+    )
 
     trainer = llm_training.sft_train_on_dataset(
         model=model,
@@ -471,7 +491,6 @@ if __name__ == "__main__":
     if args.test_script:
         log.info("--- RUNNING IN TEST SCRIPT MODE ---")
         args.num_train_epochs = 2
-        os.environ["WANDB_DISABLED"] = "true"
         args.base_results_dir = os.path.join("../../results", "tests")
     else: 
         os.environ["WANDB_PROJECT"]="fine_tuning_study"
