@@ -37,10 +37,11 @@ def get_pretraining_batches(
     data_replay: PretrainingDataReplay,
     num_batches: int,
     batch_size: int,
-    chunk_size: int
-) -> List[torch.Tensor]:
+    chunk_size: int,
+    tokenizer,
+) -> List[str]:
     """
-    Gets a specified number of batches of pretraining data, returned as a single list of chunks.
+    Gets a specified number of batches of pretraining data, returned as a single list of text chunks.
     """
     total_chunks = num_batches * batch_size
     if total_chunks == 0:
@@ -49,16 +50,19 @@ def get_pretraining_batches(
 
     tokens = data_replay.get_tokens(total_tokens)
     
-    chunks = tokens.view(total_chunks, chunk_size)
+    token_chunks_tensor = tokens.view(total_chunks, chunk_size)
     
-    return list(chunks)
+    text_chunks = [tokenizer.decode(chunk, skip_special_tokens=False) for chunk in token_chunks_tensor]
+    
+    return text_chunks
 
 def fill_up_batch_with_pretraining_chunks(
-    batch: List[torch.Tensor], 
+    batch: List[str], 
     data_replay: PretrainingDataReplay, 
     batch_size: int, 
-    chunk_size: int
-) -> List[torch.Tensor]:
+    chunk_size: int,
+    tokenizer,
+) -> List[str]:
     """
     Fills up a batch with pretraining data if it's not full.
     """
@@ -70,9 +74,11 @@ def fill_up_batch_with_pretraining_chunks(
     
     tokens = data_replay.get_tokens(num_tokens_needed)
     
-    new_chunks = tokens.view(num_chunks_needed, chunk_size)
+    token_chunks_tensor = tokens.view(num_chunks_needed, chunk_size)
     
-    batch.extend(list(new_chunks))
+    new_text_chunks = [tokenizer.decode(chunk, skip_special_tokens=False) for chunk in token_chunks_tensor]
+    
+    batch.extend(new_text_chunks)
         
     return batch
 
@@ -287,7 +293,8 @@ def prepare_training_mix(
                 batch, 
                 data_replay, 
                 effective_batch_size, 
-                train_cfg.context_length
+                train_cfg.context_length,
+                tokenizer,
             )
 
         if test_script:
@@ -311,16 +318,16 @@ def prepare_training_mix(
                 data_replay,
                 pretraining_separators,
                 effective_batch_size,
-                train_cfg.context_length
+                train_cfg.context_length,
+                tokenizer,
             )
-            flat_fill = [item for sublist in pretraining_fill for item in sublist] # Flatten the list of lists
             
-            if test_script and flat_fill:
-                log.info(f"Added {len(flat_fill)} separator chunks.")
-                log.info(f"First separator chunk: '{flat_fill[0][:100]}...'")
-                log.info(f"Last separator chunk: '{flat_fill[-1][:100]}...'")
+            if test_script and pretraining_fill:
+                log.info(f"Added {len(pretraining_fill)} separator chunks.")
+                log.info(f"First separator chunk: '{pretraining_fill[0][:100]}...'")
+                log.info(f"Last separator chunk: '{pretraining_fill[-1][:100]}...'")
 
-            final_chunks.extend(flat_fill)
+            final_chunks.extend(pretraining_fill)
     
     # 6. Duplicate the dataset to match the desired number of training steps
     original_epochs = train_cfg.num_train_epochs
