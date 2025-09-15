@@ -82,7 +82,14 @@ def load_model_for_training(config: ModelConfig, log, use_cpu_and_gpu = False, a
             special_tokens_dict = {'additional_special_tokens': [add_special_token]}
             tokenizer.add_special_tokens(special_tokens_dict)  
             model.resize_token_embeddings(len(tokenizer))
-        
+    
+    # Assert that the EOT token is a single special token
+    if add_special_token is not None:
+        eot_token_str = add_special_token
+        eot_token_ids = tokenizer.encode(eot_token_str, add_special_tokens=False)
+        assert len(eot_token_ids) == 1, f"EOT token '{eot_token_str}' is not tokenized as a single token. It is tokenized as {eot_token_ids}"
+        log.info(f"EOT token '{eot_token_str}' correctly tokenized as a single token ID: {eot_token_ids[0]}")
+            
     # Crucial step for preparing a quantized model for PEFT training.
     if config.quantization.mode:
         model = prepare_model_for_kbit_training(model)

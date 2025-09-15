@@ -522,7 +522,7 @@ if __name__ == "__main__":
     )
 
     log.info("\n--- Loading Model for Training ---")
-    model, tokenizer = model_setup.load_model_for_training(model_config, log, use_existing_lima_tokenizer =False, use_existing_lima_model=False)
+    model, tokenizer = model_setup.load_model_for_training(model_config, log, add_special_token="<|EOT|>", use_existing_lima_tokenizer =False, use_existing_lima_model=False)
 
     # --- Continue Pretraining (we also evaluate our probes during this) ---
     if args.num_train_epochs > 0:
