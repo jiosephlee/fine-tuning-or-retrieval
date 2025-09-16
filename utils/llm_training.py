@@ -204,6 +204,7 @@ def fine_tune(
     A universal fine-tuning function that prepares data based on a strategy and runs the training.
     Includes a debugging mechanism to verify sequential data loading.
     """
+    test_script = strategy_args.get("test_script", False)
     dataset, updated_train_cfg = prepare_training_mix(
         strategy_name=strategy_name,
         tokenizer=tokenizer,
@@ -212,7 +213,8 @@ def fine_tune(
         **strategy_args,
         **chunking_args,
     )
-    
+    if test_script:
+        log.info(f"Dataset has {len(dataset)} chunks...")
     training_args = updated_train_cfg.to_sft_training_args()
     
     trainer = CustomSFTTrainer(
@@ -227,28 +229,32 @@ def fine_tune(
     # --- Debugging Sequential Sampling ---
     os.makedirs(output_dir_for_debug, exist_ok=True)
     
-    def get_dataloader_content(dataloader):
+    def get_dataloader_content(dataloader, debug=False):
         content = []
         eos_token_id = tokenizer.eos_token_id
         for i, batch in enumerate(dataloader):
             # Assuming 'input_ids' is the key for tokenized text
             # and we decode it back to string for inspection.
-            log.info(f"CPT batch {i} has {len(batch)} chunks...")
-            input_ids = batch['input_ids'][-1]
+            # Process each sequence in the batch
+            for j, (input_ids, attention_mask) in enumerate(zip(batch['input_ids'], batch['attention_mask'])):
+                # Find the last non-padded token using attention mask
+                last_valid_idx = (attention_mask == 1).nonzero(as_tuple=True)[0][-1]
+                last_token = input_ids[last_valid_idx]
+                
+                # Verify that the last token of the sequence is NOT an EOS token
+                if last_token == eos_token_id and debug:
+                    log.warning(f"CPT batch {i}, sequence {j} ends with an EOS token, which is expected for the last batch of the unique document.")
 
-            # Verify that the last token of the batch is NOT an EOS token
-            if input_ids[-1] == eos_token_id:
-                log.warning(f"CPT batch {i} ends with an EOS token, which is expected for the last batch of the unique document.")
-
-            first_50 = tokenizer.decode(input_ids[:50])
-            last_50 = tokenizer.decode(input_ids[-50:])
-            text_sample = first_50+ "..." + last_50
-            content.append(text_sample)
+                first_50 = tokenizer.decode(input_ids[:50])
+                last_50 = tokenizer.decode(input_ids[-50:])
+                text_sample = first_50+ "..." + last_50
+                content.append(text_sample)
         return content
 
     log.info("Running first dataloader pass for debugging and verification...")
     dataloader1 = trainer.get_train_dataloader()
-    content1 = get_dataloader_content(dataloader1)
+    log.info(f"Dataloader has a batch size of {len(dataloader1)} chunks...")
+    content1 = get_dataloader_content(dataloader1, debug=True)
     with open(os.path.join(output_dir_for_debug, "debug_run_1.txt"), "w") as f:
         f.write("\n------\n".join(content1))
         

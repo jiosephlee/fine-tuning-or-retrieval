@@ -264,7 +264,7 @@ def prepare_training_mix(
 
     # 5. Assemble final chunk list with optional pretraining data replay
     final_chunks = []
-    pretraining_separators = strategy_args.get("separate_batches_with_pretraining", 0)
+    pretraining_separators = int(strategy_args.get("separate_batches_with_pretraining", 0))
     log.info(f"Adding {pretraining_separators} batches of pretraining data as separator...")
 
     # Initialize data replay object if needed for filling or separating
