@@ -15,6 +15,7 @@ import utils.data_preparation as data_preparation
 import utils.model_setup as model_setup
 import utils.llm_callbacks as llm_callbacks
 import utils.llm_configs as llm_configs
+import utils.llm_plotting as llm_plotting
 import argparse
 import wandb
 import logging
@@ -241,12 +242,31 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
     callbacks.append(TrainingLossPerplexityCallback(report_to_wandb=report_to_wandb))
     return callbacks
 
-def save_probe_results(callbacks, log):
+def save_probe_results(callbacks, log, args):
     """Saves results for all probe callbacks."""
     for callback in callbacks:
         if isinstance(callback, llm_callbacks.BaseKnowledgeProbeCallBack):
             callback.save_results(output_dir=callback.output_dir)
             log.info(f"Probe metrics for {callback.log_prefix} saved to {callback.output_dir}")
+            
+            domain = callback.log_prefix.split('_')[0]
+            
+            # Determine probe type and call the correct plotting function
+            if 'knowledge_probe' in callback.log_prefix:
+                llm_plotting.generate_new_plots_for_knowledge_probes(
+                    domain=domain,
+                    probes_version=args.knowledge_probes_version,
+                    output_dir=callback.output_dir,
+                    logger=log
+                )
+            elif 'inference_probe' in callback.log_prefix:
+                llm_plotting.generate_new_plots_for_inference_probes(
+                    domain=domain,
+                    probes_version=args.inference_probes_version,
+                    output_dir=callback.output_dir,
+                    logger=log
+                )
+
         elif isinstance(callback, CorpusPerplexityCallback):
             callback.save_results(output_dir=callback.output_dir)
             log.info(f"Corpus perplexity metrics for {callback.log_prefix} saved to {callback.output_dir}")
@@ -345,7 +365,7 @@ def continue_pretraining(model, tokenizer, log, args):
         )
 
     # --- Save Metrics and Generate Plots ---
-    save_probe_results(callbacks_to_use, log)
+    save_probe_results(callbacks_to_use, log, args)
 
     # --- Generate Plots ---
     # Note: Plotting logic is removed as it's complex with multiple domains. 
@@ -443,7 +463,7 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
     trainer.train()
 
     # --- Save results ---
-    save_probe_results(callbacks, log)
+    save_probe_results(callbacks, log, args)
     
     # --- Generate plots ---
     # llm_plotting.generate_new_plots_for_knowledge_probes(args.knowledge_probes_version,output_dir_knowledge_probe, logger=log)

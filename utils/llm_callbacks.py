@@ -112,6 +112,9 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         model.train()
         print(f"{self.__class__.__name__}: Initial metrics calculated.")
 
+        output_dir = self.output_dir
+        self._generate_best_probes_report(model, output_dir)
+
     def on_step_end(self, args, state, control, model, **kwargs):
         """Evaluate probes at the end of a training step and log metrics."""
         model.eval()
@@ -140,6 +143,77 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         """Generate a detailed report of the worst-performing probes at the end of training."""
         output_dir = self.output_dir
         self._generate_worst_probes_report(model, output_dir)
+
+    def _generate_best_probes_report(self, model, output_dir, top_k=10):
+        """
+        Generates a report on the top_k best-performing probes based on initial perplexity.
+        """
+        if not self.initial_metrics or 'perplexity' not in self.initial_metrics or self.initial_metrics['perplexity'] is None:
+            print("No initial perplexity to generate best probes report from.")
+            return
+
+        print(f"{self.__class__.__name__}: Generating best probes report...")
+
+        initial_perplexities = self.initial_metrics['perplexity'].clone()
+        
+        # Handle NaNs and Infs by treating them as worst
+        initial_perplexities[torch.isnan(initial_perplexities)] = float('inf')
+        best_probe_indices = torch.argsort(initial_perplexities, descending=False)[:top_k]
+
+        report_path = os.path.join(output_dir, f'{self.log_prefix}_best_probes_report.txt')
+        with open(report_path, 'w') as f:
+            f.write(f"Best Probes Report (Top {top_k} by Perplexity) at Step 0 (Before Training)\n")
+            f.write("="*50 + "\n\n")
+
+            worst_facts_tokenized = {
+                'input_ids': self.tokenized_facts['input_ids'][best_probe_indices],
+                'attention_mask': self.tokenized_facts['attention_mask'][best_probe_indices]
+            }
+            
+            device = model.device
+            inputs = {
+                'input_ids': worst_facts_tokenized['input_ids'].to(device),
+                'attention_mask': worst_facts_tokenized['attention_mask'].to(device)
+            }
+            
+            with torch.no_grad():
+                logits = model(**inputs).logits
+            
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = inputs['input_ids'][..., 1:].contiguous()
+            
+            context_lengths = self.context_lengths[best_probe_indices].to(device) - 1 # shifted
+            target_lengths = self.target_lengths[best_probe_indices].to(device)
+
+            for i, probe_idx in enumerate(best_probe_indices):
+                probe_idx_int = probe_idx.item()
+                
+                f.write(f"--- Probe Index: {probe_idx_int} ---\n")
+                if self.probes_df is not None and probe_idx_int < len(self.probes_df):
+                    metadata = self.probes_df.iloc[probe_idx_int].to_dict()
+                    for key, val in metadata.items():
+                        f.write(f"{key}: {val}\n")
+                else:
+                    f.write(f"Fact: {self.facts[probe_idx_int]}\n")
+
+                f.write("\nInitial Metrics:\n")
+                for metric_name, values in self.initial_metrics.items():
+                    if values is not None:
+                        value = values[probe_idx_int]
+                        f.write(f"  {metric_name}: {value:.4f}\n")
+
+                f.write("\nDetailed Token-level Analysis:\n")
+                
+                analysis_text = self._get_detailed_token_analysis(
+                    shift_logits[i],
+                    shift_labels[i],
+                    context_lengths[i],
+                    target_lengths[i]
+                )
+                f.write(analysis_text)
+                f.write("\n" + "="*50 + "\n\n")
+
+        print(f" > Saved best probes report to '{report_path}'")
 
     def _get_target_mask(self, tokenized_full, context_lengths, target_lengths, full_lengths):
         """Identifies the token positions of the target sequence within the full sequence.

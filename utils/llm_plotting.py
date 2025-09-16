@@ -7,7 +7,7 @@ from sklearn.preprocessing import MinMaxScaler
 import textwrap
 
 
-def generate_new_plots_for_knowledge_probes(probes_version: str, output_dir: str, logger=None):
+def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, output_dir: str, logger=None):
     """
     Generates a new set of plots from the saved CSV files.
     """
@@ -19,9 +19,13 @@ def generate_new_plots_for_knowledge_probes(probes_version: str, output_dir: str
             
     # --- Data Loading ---
     log_info("Loading dataframes for new plotting...")
-    probe_metrics_path = os.path.join(output_dir, "knowledge_probe_metrics.csv")
+    probe_metrics_path = os.path.join(output_dir, f"{domain}_knowledge_probe_metrics.csv")
     training_loss_path = os.path.join(output_dir, "training_loss_perplexity_metrics.csv")
-    probes_path = f"data/probes/DPO_knowledge_probes_{probes_version}.csv" # Hardcoded for now
+
+    if probes_version == 'v8': # This logic should be kept in sync with finetuning_knowledge_v8.py
+        probes_path = f'data/probes/facts/{domain}/probes_{probes_version}.csv'
+    else:
+        probes_path = f'data/probes/facts/{domain}/{domain}_knowledge_probes_{probes_version}.csv'
 
     if not os.path.exists(probe_metrics_path):
         log_info(f"Skipping plotting: '{probe_metrics_path}' not found.")
@@ -182,7 +186,7 @@ def generate_new_plots_for_knowledge_probes(probes_version: str, output_dir: str
             plt.savefig(os.path.join(output_dir, "plot_new_5_disaggregated_normalized_ppl_logprobs.png"))
             plt.close()
 
-def generate_new_plots_for_inference_probes(probes_version: str, output_dir: str, logger=None):
+def generate_new_plots_for_inference_probes(domain: str, probes_version: str, output_dir: str, logger=None):
     """
     Generates a new set of plots from the saved CSV files.
     """
@@ -194,9 +198,18 @@ def generate_new_plots_for_inference_probes(probes_version: str, output_dir: str
 
     # --- Data Loading ---
     log_info("Loading dataframes for inference probe plotting...")
-    probe_metrics_path = os.path.join(output_dir, "inference_probe_metrics.csv")
+    probe_metrics_path = os.path.join(output_dir, f"{domain}_inference_probe_metrics.csv")
     training_loss_path = os.path.join(output_dir, "training_loss_perplexity_metrics.csv")
-    probes_path = f"data/probes/dpo_high_level_probes_{probes_version}.csv"
+    
+    path1 = f'data/probes/inference/{domain}/probes_{probes_version}.csv'
+    path2 = f'data/probes/inference/{domain}/{domain.lower()}_high_level_probes_{probes_version}.csv'
+    
+    if os.path.exists(path1):
+        probes_path = path1
+    elif os.path.exists(path2):
+        probes_path = path2
+    else:
+        probes_path = None
 
     if not os.path.exists(probe_metrics_path):
         log_info(f"Skipping plotting: '{probe_metrics_path}' not found.")
