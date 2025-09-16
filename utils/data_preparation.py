@@ -266,96 +266,66 @@ def prepare_training_mix(
     final_chunks = []
     pretraining_separators = int(strategy_args.get("separate_batches_with_pretraining", 0))
     log.info(f"Adding {pretraining_separators} batches of pretraining data as separator...")
+    fill_with_pretraining = strategy_args.get("fill_batches_with_pretraining", False)
 
-    # Initialize data replay object if needed for filling or separating
-    if strategy_args.get("fill_batches_with_pretraining", False) or pretraining_separators > 0:
+    data_replay = None
+    if fill_with_pretraining or pretraining_separators > 0:
         pretraining_data_type = strategy_args.get('pretraining_data_type', 'dclm')
-        log.info("Creating Pretraining Data Replayer...")
+        log.info(f"Creating Pretraining Data Replayer from '{pretraining_data_type}'...")
         data_replay = PretrainingDataReplay(f'../../data/olmo/{pretraining_data_type}_10M_tokens.npy')
 
-    # Assert that batches expected to have content are not empty
+    # Assert that batches expected to have content are not empty before filling
     for i, batch in enumerate(unique_document_batches):
         assert batch, f"Batch for unique document type {i} is empty. Check data and strategy arguments."
-
-
-    for i, batch in enumerate(unique_document_batches):
-        effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
-        
-        if test_script:
-            log.info(f"--- Debugging Batch {i} ---")
-            log.info(f"Batch size BEFORE filling: {len(batch)}")
-            if (i == 0 or i == len(unique_document_batches) - 1) and batch:
-                log.info(f"Detailed chunk view for batch {i} (BEFORE filling):")
-                for chunk_idx, chunk in enumerate(batch):
-                    log.info(f"  Chunk {chunk_idx}: '{chunk[:25]}...'")
-
-        if strategy_args.get("fill_batches_with_pretraining", False):
-            log.info("Filling up batch with pretraining data...")
-            batch = fill_up_batch_with_pretraining_chunks(
-                batch, 
-                data_replay, 
-                effective_batch_size, 
-                train_cfg.context_length,
-                tokenizer,
-            )
-
-        if test_script:
-            log.info(f"Batch size AFTER filling: {len(batch)}")
-            if (i == 0 or i == len(unique_document_batches) - 1) and batch:
-                log.info(f"Detailed chunk view for batch {i} (AFTER filling):")
-                for chunk_idx, chunk in enumerate(batch):
-                    log.info(f"  Chunk {chunk_idx}: '{chunk[:25]}...'")
-        
-        assert len(batch) == effective_batch_size, \
-            f"Batch {i} has size {len(batch)}, which is not equal to the effective batch size {effective_batch_size}."
-
-        final_chunks.extend(batch)
-        
-        if pretraining_separators > 0:
-            if test_script:
-                log.info(f"--- Debugging Separator after Batch {i} ---")
-
-            pretraining_fill = get_pretraining_batches(
-                data_replay,
-                pretraining_separators,
-                effective_batch_size,
-                train_cfg.context_length,
-                tokenizer,
-            )
-            
-            if test_script and pretraining_fill:
-                log.info(f"Added {len(pretraining_fill)} separator chunks.")
-                log.info(f"First separator chunk: '{pretraining_fill[0][:100]}...'")
-                log.info(f"Last separator chunk: '{pretraining_fill[-1][:100]}...'")
-
-            final_chunks.extend(pretraining_fill)
     
+    effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
+
+    if fill_with_pretraining:
+        log.info("Filling up batches with pretraining data...")
+        for i, batch in enumerate(unique_document_batches):
+            if test_script:
+                log.info(f"--- Debugging Batch {i} (Before Filling) ---")
+                log.info(f"Batch size: {len(batch)}")
+                if batch:
+                    log.info(f"  First chunk: '{batch[0][:25]}...'")
+
+            unique_document_batches[i] = fill_up_batch_with_pretraining_chunks(
+                batch, data_replay, effective_batch_size, train_cfg.context_length, tokenizer
+            )
+
+            if test_script:
+                log.info(f"--- Debugging Batch {i} (After Filling) ---")
+                log.info(f"Batch size: {len(unique_document_batches[i])}")
+                if unique_document_batches[i]:
+                    log.info(f"  First chunk: '{unique_document_batches[i][0][:25]}...'")
+
+            assert len(unique_document_batches[i]) == effective_batch_size, \
+                f"Batch {i} has size {len(unique_document_batches[i])}, which is not equal to the effective batch size {effective_batch_size}."
+
     # 6. Duplicate the dataset to match the desired number of training steps
     original_epochs = train_cfg.num_train_epochs
-    chunks_in_mix = len(final_chunks)
+    replication_factor = 1
     
-    if chunks_in_mix > 0:
-        # We assume 1 epoch over the constructed mix. `num_train_epochs` is interpreted
-        # as the total number of passes over "unique document types".
-        if original_epochs > 1:
-            # For example, if there are 10 unique document types (source + 9 paraphrases),
-            # and num_train_epochs is 20, then the replication_factor is 2, meaning
-            # the model sees the entire sequence of 10 document types twice.
-            replication_factor = original_epochs / len(unique_document_batches)
-            
-            if replication_factor != int(replication_factor):
-                 log.warning(f"num_train_epochs ({original_epochs}) is not divisible by the number of unique document types ({len(unique_document_batches)}). "
-                            "Rounding down the replication factor.")
-            
-            replication_factor = int(replication_factor)
-            
-            log.info(f"Replicating dataset {replication_factor} times to simulate {original_epochs} total 'document-type epochs'.")
-            final_chunks = final_chunks * replication_factor
-        else: # original_epochs is 1, no replication needed
-             pass
-    else:
-        log.warning("No chunks in training mix.")
+    if unique_document_batches and original_epochs > 1:
+        num_doc_types = len(unique_document_batches)
+        if original_epochs % num_doc_types != 0:
+            log.warning(f"num_train_epochs ({original_epochs}) is not divisible by the number of unique document types ({num_doc_types}). "
+                        "Rounding down the replication factor.")
+        replication_factor = int(original_epochs / num_doc_types)
+        log.info(f"Replicating dataset {replication_factor} times to simulate {original_epochs} total 'document-type epochs'.")
 
+    if unique_document_batches:
+        final_chunks = replicate_and_interleave_pretraining(
+            unique_document_batches=unique_document_batches,
+            replication_factor=replication_factor,
+            data_replay=data_replay,
+            pretraining_separators=pretraining_separators,
+            train_cfg=train_cfg,
+            tokenizer=tokenizer,
+            log=log,
+            test_script=test_script
+        )
+    
     total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in final_chunks)
     log.info(f"Final training mix: Total chunks: {len(final_chunks)}, Total tokens: {total_tokens}")
     
@@ -363,3 +333,55 @@ def prepare_training_mix(
     train_cfg.num_train_epochs = 1
     dataset = Dataset.from_dict({"raw_text": final_chunks})
     return dataset, train_cfg
+
+def replicate_and_interleave_pretraining(
+    unique_document_batches: List[List[str]],
+    replication_factor: int,
+    data_replay: PretrainingDataReplay,
+    pretraining_separators: int,
+    train_cfg: TrainingConfig,
+    tokenizer,
+    log,
+    test_script: bool = False,
+) -> List[str]:
+    """
+    Repeats a sequence of document batches for a specified number of replications,
+    interleaving fresh pretraining data as separators in each replication. This ensures
+    that while the main content is repeated, the pretraining data is not.
+    """
+    final_chunks = []
+    effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
+
+    if replication_factor == 0:
+        return []
+
+    for rep in range(replication_factor):
+        if test_script:
+            log.info(f"--- Creating replication {rep + 1}/{replication_factor} ---")
+        
+        for i, batch in enumerate(unique_document_batches):
+            final_chunks.extend(batch)
+            
+            # Add separator after each document batch, except for the very last one in the last replication
+            is_last_batch_of_last_replication = (rep == replication_factor - 1) and (i == len(unique_document_batches) - 1)
+            
+            if pretraining_separators > 0 and not is_last_batch_of_last_replication:
+                if test_script:
+                    log.info(f"--- Debugging Separator after Batch {i} in Replication {rep + 1} ---")
+
+                pretraining_fill = get_pretraining_batches(
+                    data_replay,
+                    pretraining_separators,
+                    effective_batch_size,
+                    train_cfg.context_length,
+                    tokenizer,
+                )
+                
+                if test_script and pretraining_fill:
+                    log.info(f"Added {len(pretraining_fill)} separator chunks.")
+                    log.info(f"First separator chunk: '{pretraining_fill[0][:100]}...'")
+                    log.info(f"Last separator chunk: '{pretraining_fill[-1][:100]}...'")
+
+                final_chunks.extend(pretraining_fill)
+    
+    return final_chunks

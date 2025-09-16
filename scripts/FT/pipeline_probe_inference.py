@@ -7,11 +7,13 @@ from typing import List, Dict, Tuple, Any
 import concurrent.futures
 from tqdm import tqdm
 import argparse
+import string
+from transformers import AutoTokenizer
 
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 import utils.utils as utils
-from utils.pipeline import save_df_for_debugging, save_debug_file, is_text_in_document, process_papers
+from utils.pipeline import save_df_for_debugging, save_debug_file, is_text_in_document, process_papers, check_tokenizer_consistency
 from utils.prompts.pipeline import FACT_PROBE_CLOZE_PROMPT_SYSTEM
 
 def parse_paper_structure(text):
@@ -97,21 +99,22 @@ Furthermore, here as some specific guidelines you should follow as you write the
 - The answer to the question should NOT be found in the text. It should be new knowledge.
 - The questions should require a generalizable, deep understanding of the knowledge. 
 - Be precise with the question formulation so that there is only one clear answer.
+- The question should be self-contained and not require additional context to answer.
 
 In addition, for each question, provide: 
 - The prior knowledge that is required to answer the question. Academic papers build upon a large body of domain knowledge, and so there is an underlying assumption that the reader has a deep understanding of the domain knowledge for any paper. The question may also require the reader to apply the knowledge in a different setting.
 - The sentences from the text that are required to answer the question. Cite from the text verbatim, and don't surround it with quotes.
 - For a lay reader, an explanation of what the question is asking.
-- For a lay reader, an explanation of how the answer is derived from the provided knowledge in the text.
+- An explanation of the inference that is required to answer the question. The jump in reasoning that's made to answer the question.
 
 ### Output Format
 Provide the output in JSON format, as a dictionary with a single key "qa_items" which is a list of dictionaries with the following keys:
 - "question": (string) 
-- "answer": (string)
-- "prior_knowledge": (string)
 - "text_sentences": list of strings
+- "prior_knowledge": (string)
 - "question_explanation": (string)
 - "inference_explanation": (string)
+- "answer": (string)
 """
     prompt = {'system': system_prompt, 'user': f"### Text\n{text}"}
     response_json = utils.query_llm(prompt, model='gpt-5-mini', reasoning_effort='high', system_prompt_included=True, return_json=True, max_tokens=4000)
@@ -147,7 +150,7 @@ def convert_to_cloze(question: Dict[str, Any]) -> Tuple[str, str] | None:
         'system': FACT_PROBE_CLOZE_PROMPT_SYSTEM,
         'user': user_prompt
     }
-    response = utils.query_llm(cloze_prompt, model='gpt-5', reasoning_effort='low', system_prompt_included=True, return_json=True, max_tokens=1000)
+    response = utils.query_llm(cloze_prompt, model='gpt-5', reasoning_effort='medium', system_prompt_included=True, return_json=True, max_tokens=1000)
     try:
         data = json.loads(response) if isinstance(response, str) else response
         answer = data.get('answer')
@@ -172,17 +175,17 @@ def quality_control_cloze(cloze_pair: Tuple[str, str], title: str) -> Tuple[str,
 - Ensure LaTeX syntax matches the style of the original context (e.g., '( ... )' or '$ ... $').
 - Action: Rewrite the math expressions and statements so they can be written in LaTeX, keeping the rest of the statement the same, correcting any and all formatting errors related to mathematical notation.
 
-2. Start the statement with one of the following templates:
+2. Start the statement with one of the following templates that fits the most naturally:
     - "In the paper '...'"
     - "According to the paper '...'"
-- Action: Rewrite the statement so that it starts with one of the following templates.
+- Action: Rewrite the statement so that it starts with one of the following templates. Feel free to adjust the template to fit the statement more naturally.
 
 In all your adjustments, change the statement as minimally as necessary. If a statement is already good, make no changes.
 
 ### Output Format
 Provide a JSON object with a single key "pair", which is the refined [answer, statement] pair.
 """,
-        'user': f"### Cloze Pair\n{json.dumps(cloze_pair)}\n"
+        'user': f"### Title\n{title}\n### Cloze Pair\n{json.dumps(cloze_pair)}\n"
     }
     response = utils.query_llm(quality_control_prompt, model='gpt-5-mini', system_prompt_included=True, return_json=True, max_tokens=1000)
     try:
@@ -194,17 +197,41 @@ Provide a JSON object with a single key "pair", which is the refined [answer, st
         print("Failed to parse JSON response for QC.")
     return None
 
+def filter_cloze_pair(cloze_pair: Tuple[str, str]) -> bool:
+    """Decides whether to keep a refined pair based on a strict checklist."""
+    if not cloze_pair:
+        return False
+        
+    prompt = {
+        'system': """Your task is to determine if a given (answer, statement) pair meets quality standards by acting as a filter.
+
+### Quality Control Checklist
+1. Linguistically Reasonable: Consider the fill-in-the-blank statement. The answer should be linguistically reasonable as to how it would fit in the fill-in-the-blank. It should sound natural and not forced.
+2. Semantically Reasonable: Consider the fill-in-the-blank statement. The answer should be semantically reasonable as to how it would fit in the fill-in-the-blank. There should be one clear, unambiguous answer (or at least paraphrases of the answer).
+3. Clear and Understandable: Consider the whole statement along with the answer. It should be clear what the sentence is building up to and what the answer is.
+
+### Action
+Based on the checklist, decide if the pair should be kept. Drop the pair if fails one of the checklist items.
+
+### Output Format
+Provide your decision as a JSON object with a single boolean key: `{"keep": true}` or `{"keep": false}`.""",
+        'user': f"""### Answer\n{cloze_pair[0]}\n\n### Statement\n{cloze_pair[1].replace(cloze_pair[0], '___')}"""
+    }
+    
+    response = utils.query_llm(prompt, model='gpt-5-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True)
+    try:
+        parsed_response = json.loads(response) if isinstance(response, str) else response
+        return parsed_response.get('keep', False)
+    except (json.JSONDecodeError, TypeError):
+        print(f"Lost pair in filter step - JSON parse error: {response}")
+        return False
+
 def create_cloze_probe(refined_cloze_pair: Tuple[str, str], original_question: Dict[str, Any]) -> Dict[str, Any] | None:
     """Creates a probe/target pair from a cloze statement."""
     answer, statement = refined_cloze_pair
-    statement_stripped = statement.rstrip('.,!?;: ')
-    answer = answer.rstrip('.,!?;: ')
-    if statement_stripped.lower().endswith(answer.lower()):
-        probe = statement_stripped[:-len(answer)].rstrip()
-        probe_data = {'target': answer, 'probe': probe, 'fact': statement}
-        probe_data.update(original_question)
-        return probe_data
-    return None
+    probe_data = {'target': answer, 'probe': None, 'fact': statement}
+    probe_data.update(original_question)
+    return probe_data
 
 def process_paper(paper_name: str, paper_content: str, **kwargs):
     # """Main pipeline to generate comprehension probes for a single paper."""
@@ -265,25 +292,77 @@ def process_paper(paper_name: str, paper_content: str, **kwargs):
             try:
                 refined_pair = future.result()
                 if refined_pair:
-                    refined_cloze_list.append(refined_pair)
-                    probe_data = create_cloze_probe(refined_pair, question)
-                    if probe_data:
-                        cloze_probes_list.append(probe_data)
+                    refined_cloze_list.append((refined_pair, question))
             except Exception as exc:
                 print(f'"{question.get("question", "A question")}" generated an exception during QC: {exc}')
 
-    save_debug_file(json.dumps({'pairs': refined_cloze_list}, indent=2), '04_refined_cloze.txt', 'inference', paper_name)
+    save_debug_file(json.dumps({'pairs': [p for p, q in refined_cloze_list]}, indent=2), '04_refined_cloze.txt', 'inference', paper_name)
+
+    print("Filtering refined cloze pairs...")
+    filtered_refined_cloze_list = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        future_to_data = {executor.submit(filter_cloze_pair, refined_pair): (refined_pair, question) for refined_pair, question in refined_cloze_list}
+        for future in tqdm(concurrent.futures.as_completed(future_to_data), total=len(future_to_data), desc="Filtering cloze pairs"):
+            original_refined_pair, question = future_to_data[future]
+            try:
+                keep = future.result()
+                if keep:
+                    filtered_refined_cloze_list.append((original_refined_pair, question))
+            except Exception as exc:
+                print(f'A refined pair generated an exception during filtering: {exc}')
+    
+    print(f"Kept {len(filtered_refined_cloze_list)} of {len(refined_cloze_list)} cloze pairs after filtering.")
 
     print("Creating cloze probes...")
+    for refined_pair, question in filtered_refined_cloze_list:
+        probe_data = create_cloze_probe(refined_pair, question)
+        if probe_data:
+            cloze_probes_list.append(probe_data)
+
     if not cloze_probes_list:
         print("No valid cloze probes created. Exiting.")
         return
     
     cloze_df = pd.DataFrame(cloze_probes_list)
-    cloze_df['probe'] = cloze_df['probe'].str.strip()
-    cloze_df['target'] = ' ' + cloze_df['target'].str.strip().str.rstrip('.,!?;:')
-    cloze_df['fact'] = cloze_df['fact'].str.strip().str.rstrip('.,!?;:')
+
+    valid_facts = []
+    for _, row in cloze_df.iterrows():
+        fact = str(row['fact']).strip().rstrip(string.punctuation + string.whitespace)
+        target = ' ' + str(row['target']).strip().rstrip(string.punctuation + string.whitespace)
+        if fact.endswith(target):
+            valid_facts.append(True)
+        else:
+            valid_facts.append(False)
+    
+    cloze_df['valid_fact'] = valid_facts
+    print(f"Found {cloze_df['valid_fact'].sum()} probes where target is at the end of the fact.")
+    cloze_df = cloze_df[cloze_df['valid_fact']].drop(columns=['valid_fact']).reset_index(drop=True)
+
+    probes = []
+    cleaned_facts = []
+    cleaned_targets = []
+    for _, row in cloze_df.iterrows():
+        fact = str(row['fact']).strip().rstrip(string.punctuation + string.whitespace)
+        target = ' ' + str(row['target']).strip().rstrip(string.punctuation + string.whitespace)
+        last_index = fact.rfind(target)
+        if last_index != -1:
+            probes.append(fact[:last_index].strip())
+            cleaned_facts.append(fact)
+            cleaned_targets.append(target)
+        else: # Should not happen due to pre-filtering
+            probes.append(None)
+            cleaned_facts.append(fact)
+            cleaned_targets.append(target)
+    
+    cloze_df['probe'] = probes
+    cloze_df['fact'] = cleaned_facts
+    cloze_df['target'] = cleaned_targets
+    cloze_df.dropna(subset=['probe'], inplace=True)
+
     save_df_for_debugging(cloze_df, '05_final_probes.txt', 'inference', paper_name, ['probe', 'target', 'fact', 'question', 'prior_knowledge', 'text_sentences', 'question_explanation', 'inference_explanation'])
+
+    tokenizer = AutoTokenizer.from_pretrained("allenai/OLMo-2-0425-1B")
+    check_tokenizer_consistency(cloze_df, tokenizer)
 
     output_dir = f'../../data/probes/inference/{paper_name}/'
     os.makedirs(output_dir, exist_ok=True)
