@@ -280,28 +280,6 @@ def prepare_training_mix(
     
     effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
 
-    if fill_with_pretraining:
-        log.info("Filling up batches with pretraining data...")
-        for i, batch in enumerate(unique_document_batches):
-            if test_script:
-                log.info(f"--- Debugging Batch {i} (Before Filling) ---")
-                log.info(f"Batch size: {len(batch)}")
-                if batch:
-                    log.info(f"  First chunk: '{batch[0][:25]}...'")
-
-            unique_document_batches[i] = fill_up_batch_with_pretraining_chunks(
-                batch, data_replay, effective_batch_size, train_cfg.context_length, tokenizer
-            )
-
-            if test_script:
-                log.info(f"--- Debugging Batch {i} (After Filling) ---")
-                log.info(f"Batch size: {len(unique_document_batches[i])}")
-                if unique_document_batches[i]:
-                    log.info(f"  First chunk: '{unique_document_batches[i][0][:25]}...'")
-
-            assert len(unique_document_batches[i]) == effective_batch_size, \
-                f"Batch {i} has size {len(unique_document_batches[i])}, which is not equal to the effective batch size {effective_batch_size}."
-
     # 6. Duplicate the dataset to match the desired number of training steps
     original_epochs = train_cfg.num_train_epochs
     replication_factor = 1
@@ -323,7 +301,8 @@ def prepare_training_mix(
             train_cfg=train_cfg,
             tokenizer=tokenizer,
             log=log,
-            test_script=test_script
+            test_script=test_script,
+            fill_with_pretraining=fill_with_pretraining
         )
     
     total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in final_chunks)
@@ -343,6 +322,7 @@ def replicate_and_interleave_pretraining(
     tokenizer,
     log,
     test_script: bool = False,
+    fill_with_pretraining: bool = False,
 ) -> List[str]:
     """
     Repeats a sequence of document batches for a specified number of replications,
@@ -360,7 +340,25 @@ def replicate_and_interleave_pretraining(
             log.info(f"--- Creating replication {rep + 1}/{replication_factor} ---")
         
         for i, batch in enumerate(unique_document_batches):
-            final_chunks.extend(batch)
+            current_batch = list(batch)  # Make a copy to avoid modifying the original
+            
+            if fill_with_pretraining:
+                if test_script:
+                    log.info(f"--- Debugging Batch {i} in Replication {rep + 1} (Before Filling) ---")
+                    log.info(f"Batch size: {len(current_batch)}")
+                
+                current_batch = fill_up_batch_with_pretraining_chunks(
+                    current_batch, data_replay, effective_batch_size, train_cfg.context_length, tokenizer
+                )
+                
+                if test_script:
+                    log.info(f"--- Debugging Batch {i} in Replication {rep + 1} (After Filling) ---")
+                    log.info(f"Batch size: {len(current_batch)}")
+
+                assert len(current_batch) == effective_batch_size, \
+                    f"Batch {i} has size {len(current_batch)}, which is not equal to the effective batch size {effective_batch_size}."
+
+            final_chunks.extend(current_batch)
             
             # Add separator after each document batch, except for the very last one in the last replication
             is_last_batch_of_last_replication = (rep == replication_factor - 1) and (i == len(unique_document_batches) - 1)

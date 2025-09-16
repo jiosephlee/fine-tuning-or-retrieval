@@ -21,68 +21,76 @@ from utils.prompts.pipeline import FACT_PROBE_CLOZE_PROMPT_SYSTEM
 def generate_probes_for_paper(paper_name, paper_content, sample=False):
     paper = paper_content
 
-    def parse_paper_structure(text):
-        """Parse paper into sections, subsections and paragraphs with metadata."""
-        sections = []
-        
-        # Split by sections first
-        section_pattern = r'\\section\{([^}]+)\}'
-        section_splits = re.split(section_pattern, text)
-        
-        current_section = "Title/Abstract"
-        current_section_content = ""
-        
-        for i in range(len(section_splits)):
-            if i == 0:
-                # Content before first section
-                content = section_splits[i]
-                current_section_content = content
-            elif i % 2 == 1:
-                # This is a section title
-                current_section = section_splits[i]
-                continue
-            else:
-                # This is section content
-                content = section_splits[i]
-                current_section_content = content
+    checkpoint_dir = f'../../data/probes/facts/{paper_name}/checkpoints/'
+    checkpoint_path = os.path.join(checkpoint_dir, '07_knowledge_kept.csv')
+
+    if os.path.exists(checkpoint_path):
+        print(f"Checkpoint found for {paper_name}. Loading from {checkpoint_path}...")
+        paper_df_knowledge = pd.read_csv(checkpoint_path)
+    else:
+        print(f"No checkpoint found for {paper_name}. Running full pipeline...")
+        def parse_paper_structure(text):
+            """Parse paper into sections, subsections and paragraphs with metadata."""
+            sections = []
             
-            # Now split by subsections within this section
-            subsection_pattern = r'\\subsection\{([^}]+)\}'
-            subsection_splits = re.split(subsection_pattern, content)
+            # Split by sections first
+            section_pattern = r'\\section\{([^}]+)\}'
+            section_splits = re.split(section_pattern, text)
             
-            current_subsection = "No Subsection"
-            current_subsection_content = ""
+            current_section = "Title/Abstract"
+            current_section_content = ""
             
-            for j in range(len(subsection_splits)):
-                if j == 0:
-                    # Content before first subsection
-                    subsection_content = subsection_splits[j]
-                    current_subsection_content = subsection_content
-                elif j % 2 == 1:
-                    # This is a subsection title
-                    current_subsection = subsection_splits[j]
+            for i in range(len(section_splits)):
+                if i == 0:
+                    # Content before first section
+                    content = section_splits[i]
+                    current_section_content = content
+                elif i % 2 == 1:
+                    # This is a section title
+                    current_section = section_splits[i]
                     continue
                 else:
-                    # This is subsection content
-                    subsection_content = subsection_splits[j]
-                    current_subsection_content = subsection_content
+                    # This is section content
+                    content = section_splits[i]
+                    current_section_content = content
                 
-                # Split into paragraphs
-                paragraphs = [p.strip() for p in subsection_content.split('\n\n') if p.strip()]
+                # Now split by subsections within this section
+                subsection_pattern = r'\\subsection\{([^}]+)\}'
+                subsection_splits = re.split(subsection_pattern, content)
                 
-                for paragraph in paragraphs:
-                    sections.append({
-                        'section': current_section,
-                        'subsection': current_subsection,
-                        'paragraph': paragraph,
-                        'section_text': current_section_content,
-                        'subsection_text': current_subsection_content
-                    })
-        
-        return pd.DataFrame(sections)
+                current_subsection = "No Subsection"
+                current_subsection_content = ""
+                
+                for j in range(len(subsection_splits)):
+                    if j == 0:
+                        # Content before first subsection
+                        subsection_content = subsection_splits[j]
+                        current_subsection_content = subsection_content
+                    elif j % 2 == 1:
+                        # This is a subsection title
+                        current_subsection = subsection_splits[j]
+                        continue
+                    else:
+                        # This is subsection content
+                        subsection_content = subsection_splits[j]
+                        current_subsection_content = subsection_content
+                    
+                    # Split into paragraphs
+                    paragraphs = [p.strip() for p in subsection_content.split('\n\n') if p.strip()]
+                    
+                    for paragraph in paragraphs:
+                        sections.append({
+                            'section': current_section,
+                            'subsection': current_subsection,
+                            'paragraph': paragraph,
+                            'section_text': current_section_content,
+                            'subsection_text': current_subsection_content
+                        })
+            
+            return pd.DataFrame(sections)
 
 
-    extraction_prompt = r"""You will be given a section of text from an academic paper. Your goal is to accurately identify and segment every complete sentence in the text.
+        extraction_prompt = r"""You will be given a section of text from an academic paper. Your goal is to accurately identify and segment every complete sentence in the text.
 
 Here are guidelines as you segment the text:
 1. In papers, complete sentences can include LaTeX commands, formatting, section headers (like "\textbf{...}:"), and mathematical expressions that form part of the sentence structure.
@@ -94,282 +102,282 @@ Here are guidelines as you segment the text:
 6. Sometimes the boundaries of sentences can be unclear. Whenever the case, extend the sentence to the next complete sentence.
 7. Return the entire original text with these annotations. Do not modify or summarize the text itself. You must not change wording, punctuation, or line breaks. Only add the tags."""
 
-    # Parse paper structure
-    paper_df = parse_paper_structure(paper)
+        # Parse paper structure
+        paper_df = parse_paper_structure(paper)
 
-    if sample:
-        if paper_name == "DPO":
-            paper_df = paper_df[paper_df['section'] == 'Preliminaries'].copy()
-            if paper_df.empty:
-                print("Warning: 'Preliminaries' section not found for DPO paper. Exiting.")
-                return
-        elif paper_name == "CoT":
-            paper_df = paper_df[paper_df['section'] == 'Arithmetic Reasoning'].copy()
-            if paper_df.empty:
-                print("Warning: 'Title/Abstract' section not found for CoT paper. Exiting.")
-                return
-        else:
-            print("Warning: Sample mode is only implemented for DPO and CoT. Running on the full paper.")
-            
-    save_df_for_debugging(paper_df, '01_paper_structure.txt', 'facts', paper_name, ['section', 'subsection', 'paragraph'])
+        if sample:
+            if paper_name == "DPO":
+                paper_df = paper_df[paper_df['section'] == 'Preliminaries'].copy()
+                if paper_df.empty:
+                    print("Warning: 'Preliminaries' section not found for DPO paper. Exiting.")
+                    return
+            elif paper_name == "CoT":
+                paper_df = paper_df[paper_df['section'] == 'Arithmetic Reasoning'].copy()
+                if paper_df.empty:
+                    print("Warning: 'Title/Abstract' section not found for CoT paper. Exiting.")
+                    return
+            else:
+                print("Warning: Sample mode is only implemented for DPO and CoT. Running on the full paper.")
+                
+        save_df_for_debugging(paper_df, '01_paper_structure.txt', 'facts', paper_name, ['section', 'subsection', 'paragraph'])
 
-    # Create a dataframe with unique subsections
-    subsection_df = paper_df[['section', 'subsection', 'section_text', 'subsection_text']].drop_duplicates().reset_index(drop=True)
+        # Create a dataframe with unique subsections
+        subsection_df = paper_df[['section', 'subsection', 'section_text', 'subsection_text']].drop_duplicates().reset_index(drop=True)
 
-    # Process each subsection with LLM
-    def query_single(subsection_text):
-        prompt = {}
-        prompt['system'] = extraction_prompt
-        prompt['user'] = f"""{subsection_text}"""
-        return utils.query_llm(prompt, model='gpt-5', reasoning_effort='low')
-    
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
-        futures = [executor.submit(query_single, row['subsection_text']) for _, row in subsection_df.iterrows()]
-        tagged_sentences_subsections = [future.result() for future in tqdm(futures, desc="Processing subsections")]
-    # tagged_sentences_subsections = []
-    # for i, (_, row) in enumerate(subsection_df.iterrows()):
-    #     if i == 3:
-    #         result = query_single(row['subsection_text'])
-    #     else:
-    #         result = ""
-    #     tagged_sentences_subsections.append(result)
+        # Process each subsection with LLM
+        def query_single(subsection_text):
+            prompt = {}
+            prompt['system'] = extraction_prompt
+            prompt['user'] = f"""{subsection_text}"""
+            return utils.query_llm(prompt, model='gpt-5', reasoning_effort='low')
+        
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+            futures = [executor.submit(query_single, row['subsection_text']) for _, row in subsection_df.iterrows()]
+            tagged_sentences_subsections = [future.result() for future in tqdm(futures, desc="Processing subsections")]
+        # tagged_sentences_subsections = []
+        # for i, (_, row) in enumerate(subsection_df.iterrows()):
+        #     if i == 3:
+        #         result = query_single(row['subsection_text'])
+        #     else:
+        #         result = ""
+        #     tagged_sentences_subsections.append(result)
 
-    # Add extracted claims to subsection dataframe
-    subsection_df['tagged_sentences'] = tagged_sentences_subsections
-    save_df_for_debugging(subsection_df, '02_extracted_sentences.txt', 'facts', paper_name, ['section','subsection','tagged_sentences'])
+        # Add extracted claims to subsection dataframe
+        subsection_df['tagged_sentences'] = tagged_sentences_subsections
+        save_df_for_debugging(subsection_df, '02_extracted_sentences.txt', 'facts', paper_name, ['section','subsection','tagged_sentences'])
 
-    ## 1.1 check knowledge is actually in the paper 
+        ## 1.1 check knowledge is actually in the paper 
 
-    def extract_text_from_sentence_tags(text: str) -> list[str]:
-        """
-        Finds all <sentence> tags in a given text and extracts their content.
+        def extract_text_from_sentence_tags(text: str) -> list[str]:
+            """
+            Finds all <sentence> tags in a given text and extracts their content.
 
-        Args:
-            text: A string containing the text to parse, which may include
+            Args:
+                text: A string containing the text to parse, which may include
                   <sentence>...</sentence> tags.
 
-        Returns:
-            A list of strings, where each string is the content found within
-            a <sentence> tag. The content is stripped of leading/trailing
-            whitespace.
-        """
-        # This regex pattern finds all content between <sentence> and </sentence>.
-        # - The (.*?) part is a non-greedy capture group for the content inside the tags.
-        # - The re.DOTALL flag allows the '.' character to match newlines, so tags
-        #   that span multiple lines are correctly handled.
-        pattern = re.compile(r'\[BOS\](.*?)\[EOS\]', re.DOTALL)
-        
-        # re.findall returns a list of all captured groups.
-        matches = pattern.findall(text)
-        
-        # Clean up any leading/trailing whitespace from the extracted text.
-        cleaned_matches = [match.strip() for match in matches]
-        
-        return cleaned_matches
-
-    def remove_sentence_tags(text: str) -> str:
-        """Remove sentence tags from text while preserving the content."""
-        pattern = re.compile(r'[BOS][EOS]', re.DOTALL)
-        return pattern.sub('', text)
-
-    # Extract a list of knowledge statements from each subsection
-    subsection_df['sentence_list'] = subsection_df['tagged_sentences'].apply(extract_text_from_sentence_tags)
-
-    # Explode the DataFrame on the knowledge_list column
-    paper_df_sentences = subsection_df.explode('sentence_list').rename(columns={'sentence_list': 'raw_knowledge_statement'})
-
-    # Drop rows with no knowledge statements
-    paper_df_sentences = paper_df_sentences[paper_df_sentences['raw_knowledge_statement'].notna()]
-
-    # Count total sentences extracted by the LLM before filtering
-    total_extracted_sentences = len(paper_df_sentences)
-    # Filter out sentences that are not actually in the original paper text (case-insensitive)
-    paper_df_sentences['is_validated'] = paper_df_sentences['raw_knowledge_statement'].apply(
-        lambda s: is_text_in_document(s, paper)
-    )
-    
-    paper_df_validated = paper_df_sentences[paper_df_sentences['is_validated']].copy()
-    paper_df_not_validated = paper_df_sentences[~paper_df_sentences['is_validated']].copy()
-
-    # Count sentences that passed validation
-    validated_sentences_count = len(paper_df_validated)
-    not_validated_sentences_count = len(paper_df_not_validated)
-    print(f"Found {validated_sentences_count}/{total_extracted_sentences} extracted sentences in the original paper text.")
-    print(f"Found {not_validated_sentences_count} sentences that were NOT in the original paper text.")
-
-    # The `paragraph` column is still needed for context in later steps.
-    paper_df_validated['paragraph'] = paper_df_validated['tagged_sentences'].apply(remove_sentence_tags)
-    paper_df_not_validated['paragraph'] = paper_df_not_validated['tagged_sentences'].apply(remove_sentence_tags)
-
-    # Drop the now-redundant columns
-    paper_df_validated = paper_df_validated.drop(columns=['tagged_sentences', 'is_validated'])
-    paper_df_not_validated = paper_df_not_validated.drop(columns=['tagged_sentences', 'is_validated'])
-
-    # Save both validated and not validated sentences
-    print(f"Total validated sentences: {len(paper_df_validated)}")
-    save_df_for_debugging(paper_df_validated, '03_validated_sentences.txt', 'facts', paper_name, ['section', 'raw_knowledge_statement'])
-    
-    print(f"Total not validated sentences: {len(paper_df_not_validated)}")
-    save_df_for_debugging(paper_df_not_validated, '03_not_validated_sentences.txt', 'facts', paper_name, ['section', 'raw_knowledge_statement'])
-    
-    # Filter bad sentences
-    """Not all extracted knowledge statements may be valid. We double check that the extracted statements meet our requirements for a proper probe."""
-
-    ## 2.1 FIlter out Predominantly latex sentences
-
-    """This is to avoid figures, tables, and sentences that are dominated by LaTeX that prevents any suitable English target. LaTeX has various valid formats which can make evaluation tricky. There's also the chance that LaTeX introduces noise with regards to learnability. While OLMo has been trained on arxiv documents that include latex,it potentially may require further pre-training on mathematical notation and latex for the LLM to understand these statements."""
-
-    # Filter out knowledge statements that are more than 50% LaTeX
-    def calculate_latex_percentage(text):
-        """
-        Calculate the percentage of LaTeX/mathematical content in a text string.
-        
-        Args:
-            text (str): The text to analyze
+            Returns:
+                A list of strings, where each string is the content found within
+                a <sentence> tag. The content is stripped of leading/trailing
+                whitespace.
+            """
+            # This regex pattern finds all content between <sentence> and </sentence>.
+            # - The (.*?) part is a non-greedy capture group for the content inside the tags.
+            # - The re.DOTALL flag allows the '.' character to match newlines, so tags
+            #   that span multiple lines are correctly handled.
+            pattern = re.compile(r'\[BOS\](.*?)\[EOS\]', re.DOTALL)
             
-        Returns:
-            float: Percentage of text that is LaTeX/mathematical (0-100)
-        """
-        if pd.isna(text) or not text.strip():
-            return 0.0
+            # re.findall returns a list of all captured groups.
+            matches = pattern.findall(text)
+            
+            # Clean up any leading/trailing whitespace from the extracted text.
+            cleaned_matches = [match.strip() for match in matches]
+            
+            return cleaned_matches
+
+        def remove_sentence_tags(text: str) -> str:
+            """Remove sentence tags from text while preserving the content."""
+            pattern = re.compile(r'[BOS][EOS]', re.DOTALL)
+            return pattern.sub('', text)
+
+        # Extract a list of knowledge statements from each subsection
+        subsection_df['sentence_list'] = subsection_df['tagged_sentences'].apply(extract_text_from_sentence_tags)
+
+        # Explode the DataFrame on the knowledge_list column
+        paper_df_sentences = subsection_df.explode('sentence_list').rename(columns={'sentence_list': 'raw_knowledge_statement'})
+
+        # Drop rows with no knowledge statements
+        paper_df_sentences = paper_df_sentences[paper_df_sentences['raw_knowledge_statement'].notna()]
+
+        # Count total sentences extracted by the LLM before filtering
+        total_extracted_sentences = len(paper_df_sentences)
+        # Filter out sentences that are not actually in the original paper text (case-insensitive)
+        paper_df_sentences['is_validated'] = paper_df_sentences['raw_knowledge_statement'].apply(
+            lambda s: is_text_in_document(s, paper)
+        )
         
-        total_chars = len(text)
-        latex_chars = 0
+        paper_df_validated = paper_df_sentences[paper_df_sentences['is_validated']].copy()
+        paper_df_not_validated = paper_df_sentences[~paper_df_sentences['is_validated']].copy()
+
+        # Count sentences that passed validation
+        validated_sentences_count = len(paper_df_validated)
+        not_validated_sentences_count = len(paper_df_not_validated)
+        print(f"Found {validated_sentences_count}/{total_extracted_sentences} extracted sentences in the original paper text.")
+        print(f"Found {not_validated_sentences_count} sentences that were NOT in the original paper text.")
+
+        # The `paragraph` column is still needed for context in later steps.
+        paper_df_validated['paragraph'] = paper_df_validated['tagged_sentences'].apply(remove_sentence_tags)
+        paper_df_not_validated['paragraph'] = paper_df_not_validated['tagged_sentences'].apply(remove_sentence_tags)
+
+        # Drop the now-redundant columns
+        paper_df_validated = paper_df_validated.drop(columns=['tagged_sentences', 'is_validated'])
+        paper_df_not_validated = paper_df_not_validated.drop(columns=['tagged_sentences', 'is_validated'])
+
+        # Save both validated and not validated sentences
+        print(f"Total validated sentences: {len(paper_df_validated)}")
+        save_df_for_debugging(paper_df_validated, '03_validated_sentences.txt', 'facts', paper_name, ['section', 'raw_knowledge_statement'])
         
-        # Count LaTeX commands (backslash followed by letters)
-        latex_commands = re.findall(r'\\[a-zA-Z]+', text)
-        for cmd in latex_commands:
-            latex_chars += len(cmd)
+        print(f"Total not validated sentences: {len(paper_df_not_validated)}")
+        save_df_for_debugging(paper_df_not_validated, '03_not_validated_sentences.txt', 'facts', paper_name, ['section', 'raw_knowledge_statement'])
         
-        # Remove LaTeX commands to avoid double counting
-        text_without_commands = re.sub(r'\\[a-zA-Z]+', '', text)
-        
-        # Count non-alphabetic characters in the remaining text
-        for char in text_without_commands:
-            if not char.isalpha() and not char.isspace():
-                latex_chars += 1
-        
-        # Calculate percentage
-        latex_percentage = (latex_chars / total_chars) * 100 if total_chars > 0 else 0.0
-        
-        return latex_percentage
+        # Filter bad sentences
+        """Not all extracted knowledge statements may be valid. We double check that the extracted statements meet our requirements for a proper probe."""
 
-    # Apply the filter
-    paper_df_validated['latex_percentage'] = paper_df_validated['raw_knowledge_statement'].apply(calculate_latex_percentage)
+        ## 2.1 FIlter out Predominantly latex sentences
 
-    # Filter out statements with more than 50% LaTeX
-    latex_threshold = 75
-    high_latex_statements = paper_df_validated[paper_df_validated['latex_percentage'] > latex_threshold].copy()
-    paper_df_filtered = paper_df_validated[paper_df_validated['latex_percentage'] <= latex_threshold].copy()
+        """This is to avoid figures, tables, and sentences that are dominated by LaTeX that prevents any suitable English target. LaTeX has various valid formats which can make evaluation tricky. There's also the chance that LaTeX introduces noise with regards to learnability. While OLMo has been trained on arxiv documents that include latex,it potentially may require further pre-training on mathematical notation and latex for the LLM to understand these statements."""
 
-    save_df_for_debugging(high_latex_statements, '04_latex_filtered_out.txt', 'facts', paper_name, ['raw_knowledge_statement', 'latex_percentage'])
-    save_df_for_debugging(paper_df_filtered, '04_latex_kept.txt', 'facts', paper_name, ['raw_knowledge_statement', 'latex_percentage'])
+        # Filter out knowledge statements that are more than 50% LaTeX
+        def calculate_latex_percentage(text):
+            """
+            Calculate the percentage of LaTeX/mathematical content in a text string.
+            
+            Args:
+                text (str): The text to analyze
+                
+            Returns:
+                float: Percentage of text that is LaTeX/mathematical (0-100)
+            """
+            if pd.isna(text) or not text.strip():
+                return 0.0
+            
+            total_chars = len(text)
+            latex_chars = 0
+            
+            # Count LaTeX commands (backslash followed by letters)
+            latex_commands = re.findall(r'\\[a-zA-Z]+', text)
+            for cmd in latex_commands:
+                latex_chars += len(cmd)
+            
+            # Remove LaTeX commands to avoid double counting
+            text_without_commands = re.sub(r'\\[a-zA-Z]+', '', text)
+            
+            # Count non-alphabetic characters in the remaining text
+            for char in text_without_commands:
+                if not char.isalpha() and not char.isspace():
+                    latex_chars += 1
+            
+            # Calculate percentage
+            latex_percentage = (latex_chars / total_chars) * 100 if total_chars > 0 else 0.0
+            
+            return latex_percentage
 
-    # Report filtering results
-    total_before = len(paper_df_validated)
-    total_after = len(paper_df_filtered)
-    filtered_out = total_before - total_after
+        # Apply the filter
+        paper_df_validated['latex_percentage'] = paper_df_validated['raw_knowledge_statement'].apply(calculate_latex_percentage)
 
-    print(f"LaTeX filtering results:")
-    print(f"  Before filtering: {total_before} knowledge statements")
-    print(f"  After filtering: {total_after} knowledge statements")
-    print(f"  Filtered out: {filtered_out} statements with >{latex_threshold}% LaTeX content")
+        # Filter out statements with more than 50% LaTeX
+        latex_threshold = 75
+        high_latex_statements = paper_df_validated[paper_df_validated['latex_percentage'] > latex_threshold].copy()
+        paper_df_filtered = paper_df_validated[paper_df_validated['latex_percentage'] <= latex_threshold].copy()
 
-    ## 2.2 Filter Out Sentences with References Not In Context
+        save_df_for_debugging(high_latex_statements, '04_latex_filtered_out.txt', 'facts', paper_name, ['raw_knowledge_statement', 'latex_percentage'])
+        save_df_for_debugging(paper_df_filtered, '04_latex_kept.txt', 'facts', paper_name, ['raw_knowledge_statement', 'latex_percentage'])
 
-    """Some sentences contain references that are defined in a section of the paper that does not jointly appear during training since it's in a different section. Technically it may have appeared together if it's a small subsection since we join subsections that are small together, but they are at the very least far away. We filter out sentences that have such references."""
+        # Report filtering results
+        total_before = len(paper_df_validated)
+        total_after = len(paper_df_filtered)
+        filtered_out = total_before - total_after
 
-    def find_undefined_references(sentence: str, subsection_text: str) -> list[str]:
-        """
-        Finds LaTeX references in a sentence that are not defined in the given subsection text.
+        print(f"LaTeX filtering results:")
+        print(f"  Before filtering: {total_before} knowledge statements")
+        print(f"  After filtering: {total_after} knowledge statements")
+        print(f"  Filtered out: {filtered_out} statements with >{latex_threshold}% LaTeX content")
 
-        This function identifies all references formatted as \\ref{...} in the input sentence.
-        It then checks for corresponding \\label{...} definitions within the subsection_text.
-        
-        Args:
-            sentence (str): The sentence to check for references.
-            subsection_text (str): The text of the subsection to check for labels.
+        ## 2.2 Filter Out Sentences with References Not In Context
 
-        Returns:
-            list[str]: A list of reference labels that are used in the sentence but not
-                       defined in the subsection text. An empty list indicates all
-                       references are defined locally.
-        """
-        # Find all references in the sentence, e.g., \ref{eq:RL} -> "eq:RL"
-        references = re.findall(r'\\ref\{([^}]+)\}', sentence)
-        if not references:
-            return True
+        """Some sentences contain references that are defined in a section of the paper that does not jointly appear during training since it's in a different section. Technically it may have appeared together if it's a small subsection since we join subsections that are small together, but they are at the very least far away. We filter out sentences that have such references."""
 
-        # Find all defined labels in the subsection text, e.g., \label{eq:main_eq} -> "eq:main_eq"
-        defined_labels = set(re.findall(r'\\label\{([^}]+)\}', subsection_text))
+        def find_undefined_references(sentence: str, subsection_text: str) -> list[str]:
+            """
+            Finds LaTeX references in a sentence that are not defined in the given subsection text.
 
-        # Identify references that are not defined within the subsection
-        undefined_references = [ref for ref in references if ref not in defined_labels]
+            This function identifies all references formatted as \\ref{...} in the input sentence.
+            It then checks for corresponding \\label{...} definitions within the subsection_text.
+            
+            Args:
+                sentence (str): The sentence to check for references.
+                subsection_text (str): The text of the subsection to check for labels.
 
-        if len(undefined_references) > 0:
-            return False
-        else:
-            return True
+            Returns:
+                list[str]: A list of reference labels that are used in the sentence but not
+                        defined in the subsection text. An empty list indicates all
+                        references are defined locally.
+            """
+            # Find all references in the sentence, e.g., \ref{eq:RL} -> "eq:RL"
+            references = re.findall(r'\\ref\{([^}]+)\}', sentence)
+            if not references:
+                return True
 
-    keep = paper_df_filtered.apply(
-        lambda row: find_undefined_references(row['raw_knowledge_statement'], row['subsection_text']),
-        axis=1
-    )
+            # Find all defined labels in the subsection text, e.g., \label{eq:main_eq} -> "eq:main_eq"
+            defined_labels = set(re.findall(r'\\label\{([^}]+)\}', subsection_text))
 
-    # Separate kept and dropped statements
-    dropped_statements = paper_df_filtered[~keep].copy()
-    paper_df_filtered_refs = paper_df_filtered[keep].copy()
+            # Identify references that are not defined within the subsection
+            undefined_references = [ref for ref in references if ref not in defined_labels]
 
-    save_df_for_debugging(dropped_statements, '05_ref_filtered_out.txt', 'facts', paper_name, ['raw_knowledge_statement'])
-    save_df_for_debugging(paper_df_filtered_refs, '05_ref_kept.txt', 'facts', paper_name, ['raw_knowledge_statement'])
+            if len(undefined_references) > 0:
+                return False
+            else:
+                return True
 
+        keep = paper_df_filtered.apply(
+            lambda row: find_undefined_references(row['raw_knowledge_statement'], row['subsection_text']),
+            axis=1
+        )
 
-    # Report filtering results
-    total_before = len(paper_df_filtered)
-    total_after = sum(keep)
-    filtered_out = total_before - total_after
+        # Separate kept and dropped statements
+        dropped_statements = paper_df_filtered[~keep].copy()
+        paper_df_filtered_refs = paper_df_filtered[keep].copy()
 
-    print(f"Reference filtering results:")
-    print(f"  Before filtering: {total_before} knowledge statements")
-    print(f"  After filtering: {total_after} knowledge statements")
-    print(f"  Filtered out: {filtered_out} statements with undefined references")
-
-    paper_df_filtered = paper_df_filtered[keep].reset_index(drop=True)
-
-    ## 2.3 Filter Short Facts
-
-    # Filter out knowledge statements that are too short
-    min_length = 90
-    keep_length = paper_df_filtered['raw_knowledge_statement'].str.len() >= min_length
-
-    # Separate kept and dropped statements
-    dropped_statements_len = paper_df_filtered[~keep_length].copy()
-    paper_df_filtered_len = paper_df_filtered[keep_length].copy()
-
-    save_df_for_debugging(dropped_statements_len, '06_short_filtered_out.txt', 'facts', paper_name, ['raw_knowledge_statement'])
-    save_df_for_debugging(paper_df_filtered_len, '06_short_kept.txt', 'facts', paper_name, ['raw_knowledge_statement'])
+        save_df_for_debugging(dropped_statements, '05_ref_filtered_out.txt', 'facts', paper_name, ['raw_knowledge_statement'])
+        save_df_for_debugging(paper_df_filtered_refs, '05_ref_kept.txt', 'facts', paper_name, ['raw_knowledge_statement'])
 
 
-    # Report filtering results
-    total_before = len(paper_df_filtered)
-    total_after = sum(keep_length)
-    filtered_out = total_before - total_after
+        # Report filtering results
+        total_before = len(paper_df_filtered)
+        total_after = sum(keep)
+        filtered_out = total_before - total_after
 
-    print(f"Length filtering results:")
-    print(f"  Before filtering: {total_before} knowledge statements")
-    print(f"  After filtering: {total_after} knowledge statements")
-    print(f"  Filtered out: {filtered_out} statements shorter than {min_length} characters")
+        print(f"Reference filtering results:")
+        print(f"  Before filtering: {total_before} knowledge statements")
+        print(f"  After filtering: {total_after} knowledge statements")
+        print(f"  Filtered out: {filtered_out} statements with undefined references")
 
-    paper_df_filtered = paper_df_filtered[keep_length].reset_index(drop=True)
+        paper_df_filtered = paper_df_filtered[keep].reset_index(drop=True)
 
-    ## 2.4 Identify Knowledge Statements
+        ## 2.3 Filter Short Facts
 
-    """This step is now the primary filter to identify sentences that contain meaningful knowledge. We use an LLM to determine if a sentence contains a clear, verifiable fact that could be used to form a comprehension question."""
+        # Filter out knowledge statements that are too short
+        min_length = 90
+        keep_length = paper_df_filtered['raw_knowledge_statement'].str.len() >= min_length
 
-    # Evaluate sentences for knowledge content
-    prompt = {}
-    prompt['system'] = """You will be receiving sentences from an academic paper. Your task is to determine whether the sentence contains a meaningful, clear fact that could be formulated into a question to test a reader's comprehension.
+        # Separate kept and dropped statements
+        dropped_statements_len = paper_df_filtered[~keep_length].copy()
+        paper_df_filtered_len = paper_df_filtered[keep_length].copy()
+
+        save_df_for_debugging(dropped_statements_len, '06_short_filtered_out.txt', 'facts', paper_name, ['raw_knowledge_statement'])
+        save_df_for_debugging(paper_df_filtered_len, '06_short_kept.txt', 'facts', paper_name, ['raw_knowledge_statement'])
+
+
+        # Report filtering results
+        total_before = len(paper_df_filtered)
+        total_after = sum(keep_length)
+        filtered_out = total_before - total_after
+
+        print(f"Length filtering results:")
+        print(f"  Before filtering: {total_before} knowledge statements")
+        print(f"  After filtering: {total_after} knowledge statements")
+        print(f"  Filtered out: {filtered_out} statements shorter than {min_length} characters")
+
+        paper_df_filtered = paper_df_filtered[keep_length].reset_index(drop=True)
+
+        ## 2.4 Identify Knowledge Statements
+
+        """This step is now the primary filter to identify sentences that contain meaningful knowledge. We use an LLM to determine if a sentence contains a clear, verifiable fact that could be used to form a comprehension question."""
+
+        # Evaluate sentences for knowledge content
+        prompt = {}
+        prompt['system'] = """You will be receiving sentences from an academic paper. Your task is to determine whether the sentence contains a meaningful, clear fact that could be formulated into a question to test a reader's comprehension.
 
 A sentence CONTAINS a fact if it:
 - Presents a clear piece of knowledge, whether it's a description of prior work, a theorem, the methodology, or the results.
@@ -390,52 +398,57 @@ For ambiguous cases, err on the side of saying that the sentence does not contai
 Respond with JSON format with the following key:
 - "is_knowledge": boolean (true/false)"""
 
-    def evaluate_statement(idx_row):
-        idx, row = idx_row
-        statement = row['raw_knowledge_statement']
-        user_prompt = f"# Context\n{row['paragraph']}\n\n# Clause\n{statement}"
-        full_prompt = {
-            'system': prompt['system'],
-            'user': user_prompt
-        }
-        
-        result = utils.query_llm(full_prompt, model='gpt-5-mini', reasoning_effort='medium', return_json=True, max_tokens=100)
-        result = json.loads(result)
-        is_knowledge = result['is_knowledge']
-        
-        return idx, is_knowledge
+        def evaluate_statement(idx_row):
+            idx, row = idx_row
+            statement = row['raw_knowledge_statement']
+            user_prompt = f"# Context\n{row['paragraph']}\n\n# Clause\n{statement}"
+            full_prompt = {
+                'system': prompt['system'],
+                'user': user_prompt
+            }
+            
+            result = utils.query_llm(full_prompt, model='gpt-5-mini', reasoning_effort='medium', return_json=True, max_tokens=100)
+            result = json.loads(result)
+            is_knowledge = result['is_knowledge']
+            
+            return idx, is_knowledge
 
-    # Run evaluation once and store results
-    print("Evaluating sentences for knowledge content...")
+        # Run evaluation once and store results
+        print("Evaluating sentences for knowledge content...")
 
-    is_knowledge_results = [None] * len(paper_df_filtered)
+        is_knowledge_results = [None] * len(paper_df_filtered)
 
-    with ThreadPoolExecutor(max_workers=32) as executor:
-        futures = {executor.submit(evaluate_statement, (idx, row)): idx 
-                   for idx, row in paper_df_filtered.iterrows()}
-        
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Evaluating sentences"):
-            idx, is_knowledge = future.result()
-            original_idx = list(paper_df_filtered.index).index(idx)
-            is_knowledge_results[original_idx] = is_knowledge
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            futures = {executor.submit(evaluate_statement, (idx, row)): idx 
+                       for idx, row in paper_df_filtered.iterrows()}
+            
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Evaluating sentences"):
+                idx, is_knowledge = future.result()
+                original_idx = list(paper_df_filtered.index).index(idx)
+                is_knowledge_results[original_idx] = is_knowledge
 
-    # Add knowledge column
-    paper_df_filtered['is_knowledge'] = is_knowledge_results
+        # Add knowledge column
+        paper_df_filtered['is_knowledge'] = is_knowledge_results
 
-    paper_df_knowledge = paper_df_filtered[paper_df_filtered['is_knowledge']].copy()
-    paper_df_non_knowledge = paper_df_filtered[~paper_df_filtered['is_knowledge']].copy()
-    save_df_for_debugging(paper_df_knowledge, '07_knowledge_kept.txt', 'facts', paper_name, ['raw_knowledge_statement', 'is_knowledge'])
-    save_df_for_debugging(paper_df_non_knowledge, '07_knowledge_filtered_out.txt', 'facts', paper_name, ['raw_knowledge_statement', 'is_knowledge'])
+        paper_df_knowledge = paper_df_filtered[paper_df_filtered['is_knowledge']].copy()
+        paper_df_non_knowledge = paper_df_filtered[~paper_df_filtered['is_knowledge']].copy()
+        save_df_for_debugging(paper_df_knowledge, '07_knowledge_kept.txt', 'facts', paper_name, ['raw_knowledge_statement', 'is_knowledge'])
+        save_df_for_debugging(paper_df_non_knowledge, '07_knowledge_filtered_out.txt', 'facts', paper_name, ['raw_knowledge_statement', 'is_knowledge'])
 
-    # Report filtering results
-    total_before = len(paper_df_filtered)
-    total_after = len(paper_df_knowledge)
-    filtered_out = total_before - total_after
+        # Report filtering results
+        total_before = len(paper_df_filtered)
+        total_after = len(paper_df_knowledge)
+        filtered_out = total_before - total_after
 
-    print(f"\nFinal knowledge filtering results:")
-    print(f"  Before filtering: {total_before} sentences")
-    print(f"  After filtering: {total_after} knowledge statements")
-    print(f"  Filtered out: {filtered_out} non-knowledge sentences")
+        print(f"\nFinal knowledge filtering results:")
+        print(f"  Before filtering: {total_before} sentences")
+        print(f"  After filtering: {total_after} knowledge statements")
+        print(f"  Filtered out: {filtered_out} non-knowledge sentences")
+
+        # Save checkpoint
+        print(f"Saving checkpoint to {checkpoint_path}...")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        paper_df_knowledge.to_csv(checkpoint_path, index=False)
 
     paper_df_knowledge.reset_index(drop=True, inplace=True)
     paper_df_knowledge['title'] = re.search(r'\\title{(.*?)}', paper).group(1) if re.search(r'\\title{(.*?)}', paper) else None
@@ -625,12 +638,20 @@ For each '(answer, statement)' pair, refine it based on the following:
 - Ensure LaTeX syntax matches the style of the original context (e.g., '( ... )' or '$ ... $').
 - Action: Rewrite the math expressions and statements so they can be written in LaTeX, keeping the rest of the statement the same, correcting any and all formatting errors related to mathematical notation.
 
+2. Answer Placement
+- The answer must appear at the very end of the statement. 
+- Action: Minimally rewrite the statement such that the answer appears at the end.
+
+3. Answer Leakage
+- The answer must not be leaked, explicitly or implicitly, in the statement until the very end.
+- Action: Minimally rewrite the statement such that the answer is not revealed in the statement.
+
 For any rewriting, do not change the structure, content, or shape of the statement. All of these adjustments should be minimal, word-level or character-level adjustments.
 
 ### Output Format
 After your review, if the pair passes all checks (with any necessary refinements), provide the refined pair as a JSON object with two keys: "answer" and "statement"."""
         prompt['user'] = f"""### Answer\n{row['answer']}\n\n### Statement\n{row['statement']}"""
-        response = utils.query_gpt(prompt, model='gpt-5-mini', reasoning_effort='low',system_prompt_included=True, return_json=True)
+        response = utils.query_gpt(prompt, model='gpt-5-mini', reasoning_effort='medium',system_prompt_included=True, return_json=True)
         try:
             parsed_response = json.loads(response)
             if parsed_response and 'answer' in parsed_response and 'statement' in parsed_response:
@@ -869,7 +890,7 @@ Provide your decision as a JSON object with a single boolean key: `{"keep": true
     paper_df_probes_valid.reset_index(drop=True, inplace=True)
     output_dir = f'../../data/probes/facts/{paper_name}/'
     os.makedirs(output_dir, exist_ok=True)
-    paper_df_probes_valid.to_csv(os.path.join(output_dir, 'probes.csv'), index=False)
+    paper_df_probes_valid.to_csv(os.path.join(output_dir, 'probes_v9.csv'), index=False)
 
 
 if __name__ == "__main__":

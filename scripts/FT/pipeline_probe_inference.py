@@ -78,7 +78,7 @@ def parse_paper_structure(text):
 
 def generate_questions(text: str) -> List[Dict[str, Any]]:
     """Generates inference questions from the text using an LLM."""
-    system_prompt = """Based on your understanding of the provided text, your task is to generate highly inferential questions to test a reader's true comprehension and understanding of the text. Specifically, your objective is to assess whether the reader can integrate, synthesize, and generalize the implications of the text beyond what's been stated. This is difficult because academic papers by nature will provide analysis, interpretation, and discourse of the knowledge in the paper. Thus, aim to write questions that either (1) require the reader to build upon the existing knowledge in the text to infer new knowledge or draw a new conclusion, or (2) integrate and apply the knowledge in different settings i.e. truly "out-of-distribution" questions. The question should require a generalization of the knowledge and force a leap of reasoning. Be creative in your question formulation.
+    system_prompt = """Based on your understanding of the provided academic paper, your task is to generate questions to test a reader's true comprehension and understanding of the text. Specifically, your objective is to assess whether the reader can integrate, synthesize, and generalize the implications of the text beyond what's been stated. This is difficult because academic papers by nature will provide analysis, interpretation, and discourse of the knowledge in the paper. Thus, aim to write questions that either (1) require the reader to build upon the knowledge in the paper to draw a new conclusion, or (2) integrate and apply the knowledge in different settings i.e. testing the reader's ability to generalize the knowledge. Be creative in your question formulation.
     
 Here is a non-exhaustive list of types of inference that you should assess:
 - Cross-Domain Integration
@@ -96,11 +96,12 @@ Here is a non-exhaustive list of types of inference that you should assess:
 Furthermore, here as some specific guidelines you should follow as you write the questions:
 - The question can be as long as needed, but the answer must be a coherent phrase that is 1-5 words long. 
 - The questions should NOT be about factual recall that asks to recall a specific fact in the paper. 
-- The answer to the question should NOT be found in the text. It should be new knowledge.
+- The answer to the question should NOT be found in the text. It should be new knowledge. However, it must build upon the knowledge *in the paper*.
 - The questions should require a generalizable, deep understanding of the knowledge. 
 - Be precise with the question formulation so that there is only one clear answer.
 - The question should be self-contained and not require additional context to answer.
-- When creating questions applied in other settings, assume the reader has a knowledge cutoff of concepts/terminology up to 2022.
+- When creating questions applied in other settings, assume the reader has a knowledge cutoff of concepts/terminology up to 2022. Don't apply the knowledge to "new" concepts/terminology that are recent.
+- Furthermore, don't make the questions themselves overly complex. The question shouldn't be hard to understand, but difficult to answer without understanding.
 
 In addition, for each question, provide: 
 - The prior knowledge that is required to answer the question. Academic papers build upon a large body of domain knowledge, and so there is an underlying assumption that the reader has a deep understanding of the domain knowledge for any paper. The question may also require the reader to apply the knowledge in a different setting.
@@ -367,7 +368,7 @@ def process_paper(paper_name: str, paper_content: str, **kwargs):
 
     output_dir = f'../../data/probes/inference/{paper_name}/'
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, 'probes_v3.csv')
+    output_path = os.path.join(output_dir, 'probes_v4.csv')
     cloze_df.to_csv(output_path, index=False)
     print(f"Saved {len(cloze_df)} cloze probes to {output_path}")
 
