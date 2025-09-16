@@ -100,6 +100,7 @@ Furthermore, here as some specific guidelines you should follow as you write the
 - The questions should require a generalizable, deep understanding of the knowledge. 
 - Be precise with the question formulation so that there is only one clear answer.
 - The question should be self-contained and not require additional context to answer.
+- When creating questions applied in other settings, assume the reader has a knowledge cutoff of concepts/terminology up to 2022.
 
 In addition, for each question, provide: 
 - The prior knowledge that is required to answer the question. Academic papers build upon a large body of domain knowledge, and so there is an underlying assumption that the reader has a deep understanding of the domain knowledge for any paper. The question may also require the reader to apply the knowledge in a different setting.
