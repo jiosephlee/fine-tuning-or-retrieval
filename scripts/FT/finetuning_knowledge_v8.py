@@ -346,7 +346,7 @@ def continue_pretraining(model, tokenizer, log, args):
         "chunk_by_section": args.chunk_by_section,
         "overlap_sections": args.overlap_sections,
         "overlap_ratio": args.overlap_ratio,
-        "add_title_prefix": not args.no_title_prefix
+        "add_title_prefix": args.no_title_prefix # becomes False if added to the parser
     }
     
     output_dir_for_debug = os.path.join(args.base_results_dir, args.experiment_name, "debug")

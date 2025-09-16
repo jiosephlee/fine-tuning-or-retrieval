@@ -59,7 +59,8 @@ def chunk_text(text_content: str, tokenizer, max_tokens: int, delimiter: str = "
             continue
 
         # Add title to new/empty chunks
-        if not current_chunk:
+        is_title_block = part.strip().startswith('\\title')
+        if not current_chunk and not is_title_block:
             current_chunk = title
 
         # Test adding new part
