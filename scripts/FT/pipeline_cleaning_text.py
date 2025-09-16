@@ -646,7 +646,7 @@ raw_arxiv_dir = '../../data/arxiv/raw'
 all_files = [f for f in os.listdir(raw_arxiv_dir) if os.path.isfile(os.path.join(raw_arxiv_dir, f))]
 
 # Manual list to exclude certain files we don't want to process
-exclude_files = []  # Add files to exclude here
+exclude_files = ['BOFT.tex', 'GRPO.tex','DPO.text','OFT.tex']  # Add files to exclude here
 
 # Filter out excluded files
 files_to_process = [f for f in all_files if f not in exclude_files]
