@@ -399,7 +399,7 @@ Respond with JSON format with the following key:
             'user': user_prompt
         }
         
-        result = utils.query_llm(full_prompt, model='gpt-5-mini', reasoning_effort='low', return_json=True, max_tokens=100)
+        result = utils.query_llm(full_prompt, model='gpt-5-mini', reasoning_effort='medium', return_json=True, max_tokens=100)
         result = json.loads(result)
         is_knowledge = result['is_knowledge']
         
@@ -581,7 +581,7 @@ Think carefully and critically through this task, following the step-by-step ins
             all_contextualized.append(output2_individual)
 
             cloze_prompt['user'] = f"""### Question and Answer\n{output2_individual}"""
-            output3_individual = utils.query_gpt(cloze_prompt, system_prompt_included=True, model='gpt-5', reasoning_effort='low', return_json=True)
+            output3_individual = utils.query_gpt(cloze_prompt, system_prompt_included=True, model='gpt-5', reasoning_effort='medium', return_json=True)
             try:
                 cloze_pair = json.loads(output3_individual)
                 if isinstance(cloze_pair, dict) and 'answer' in cloze_pair and 'statement' in cloze_pair:
@@ -652,8 +652,8 @@ After your review, if the pair passes all checks (with any necessary refinements
 
 ### Quality Control Checklist
 1. Linguistically Reasonable: Consider the fill-in-the-blank statement. The answer should be linguistically reasonable as to how it would fit in the fill-in-the-blank. It should sound natural and not forced.
-2. Semantically Reasonable: Consider the fill-in-the-blank statement. The answer should be semantically reasonable as to how it would fit in the fill-in-the-blank. Someone from this domain should have a reasonable chance at predicting this answer.
-3. Lack of Confusion: Consider the whole statement along with the answer. It should be clear and avoid any confusion from the reader.
+2. Semantically Reasonable: Consider the fill-in-the-blank statement. The answer should be semantically reasonable as to how it would fit in the fill-in-the-blank. There should be one clear, unambiguous answer (or at least paraphrases of the answer).
+3. Clear and Understandable: Consider the whole statement along with the answer. It should be clear what the sentence is building up to and what the answer is.
 
 ### Action
 Based on the checklist, decide if the pair should be kept. Drop the pair if fails one of the checklist items.
@@ -662,7 +662,7 @@ Based on the checklist, decide if the pair should be kept. Drop the pair if fail
 Provide your decision as a JSON object with a single boolean key: `{"keep": true}` or `{"keep": false}`."""
         prompt['user'] = f"""### Answer\n{validated_pair['answer']}\n\n### Statement\n{validated_pair['statement'].replace(validated_pair['answer'], '___')}"""
         
-        response = utils.query_gpt(prompt, model='gpt-5-mini', reasoning_effort='low', system_prompt_included=True, return_json=True)
+        response = utils.query_gpt(prompt, model='gpt-5-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True)
         try:
             parsed_response = json.loads(response)
             return parsed_response.get('keep', False)

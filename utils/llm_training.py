@@ -204,6 +204,7 @@ def fine_tune(
     A universal fine-tuning function that prepares data based on a strategy and runs the training.
     Includes a debugging mechanism to verify sequential data loading.
     """
+    test_script = strategy_args.get("test_script", False)
     dataset, updated_train_cfg = prepare_training_mix(
         strategy_name=strategy_name,
         tokenizer=tokenizer,
@@ -216,6 +217,8 @@ def fine_tune(
     for i in dataset:
         print(i)
     
+    if test_script:
+        log.info(f"Dataset has {len(dataset)} chunks...")
     training_args = updated_train_cfg.to_sft_training_args()
     
     trainer = CustomSFTTrainer(

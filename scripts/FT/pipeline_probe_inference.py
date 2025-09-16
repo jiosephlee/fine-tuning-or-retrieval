@@ -76,19 +76,33 @@ def parse_paper_structure(text):
 
 def generate_questions(text: str) -> List[Dict[str, Any]]:
     """Generates inference questions from the text using an LLM."""
-    system_prompt = """### Instructions
-Based on your understanding of the provided text, generate inference questions to test a reader's comprehension and understanding of the text. The most important aspect is that the question should build upon the text to draw a conclusion or synthesize the knowledge.
-- The question can be as long as needed, but the answer should be a coherent phrase that is 1-5 words long. 
-- The questions should NOT be about factual recall that asks to recall a specific fact verbatim. 
-- The answer to the question should not be found in the text. It should be a conclusion or synthesis of the knowledge.
+    system_prompt = """Based on your understanding of the provided text, your task is to generate highly inferential questions to test a reader's true comprehension and understanding of the text. Specifically, your objective is to assess whether the reader can integrate, synthesize, and generalize the implications of the text beyond what's been stated. This is difficult because academic papers by nature will provide analysis, interpretation, and discourse of the knowledge in the paper. Thus, aim to write questions that either (1) require the reader to build upon the existing knowledge in the text to infer new knowledge or draw a new conclusion, or (2) integrate and apply the knowledge in different settings i.e. truly "out-of-distribution" questions. The question should require a generalization of the knowledge and force a leap of reasoning. Be creative in your question formulation.
+    
+Here is a non-exhaustive list of types of inference that you should assess:
+- Cross-Domain Integration
+    - Cross-Domain Analogy: This could require connecting a concept from the paper to a well-known concept in another domain (e.g., computer science, statistics, physics). This tests for an abstract, transferable understanding. For instance, interpreting the KL-divergence term in the RLHF objective as a form of regularization to prevent overfitting, or the reference policy as a prior distribution and the optimal policy as a posterior distribution.
+- Conceptual Synthesis
+     - Core Insight: This could ask the reader to distill the central argument or innovation of the paper by combining information from multiple sections. For example, a question could ask the reader to synthesize that DPO transforms a reinforcement learning problem into a classification problem.
+     - Causal Mechanism: This could involve using experimental evidence, especially from ablations, to pinpoint the source of an observed effect. For example, a question could require synthesizing that the benefit of CoT comes from the sequential reasoning process itself, by ruling out alternative hypotheses tested in ablations.
+- Reading Between the Lines
+    - Identifying Implicit Assumptions: This probes for an understanding of the unstated conditions upon which the paper's claims rest. For example, a question might require the reader to infer that for the DPO loss to be a valid maximum likelihood objective, the preference dataset D must be assumed to be sampled i.i.d. from the true human preference distribution.
+- Mathematical Understanding
+    - Equation Interpretation: This could ask for the conceptual role or meaning of a specific term within a larger mathematical expression, beyond its literal definition.
+- Counterfactual Understanding
+    - Predicting Outcomes of Hypothetical Scenarios: The reader could use the principles established in the paper to predict the result of a new experiment or a change in conditions.
+    
+Furthermore, here as some specific guidelines you should follow as you write the questions:
+- The question can be as long as needed, but the answer must be a coherent phrase that is 1-5 words long. 
+- The questions should NOT be about factual recall that asks to recall a specific fact in the paper. 
+- The answer to the question should NOT be found in the text. It should be new knowledge.
 - The questions should require a generalizable, deep understanding of the knowledge. 
 - Be precise with the question formulation so that there is only one clear answer.
 
 In addition, for each question, provide: 
-- The prior knowledge that is required to answer the question. Academic papers build upon a large body of domain knowledge, and so there is an underlying assumption that the reader has a deep understanding of the domain knowledge for any paper.
+- The prior knowledge that is required to answer the question. Academic papers build upon a large body of domain knowledge, and so there is an underlying assumption that the reader has a deep understanding of the domain knowledge for any paper. The question may also require the reader to apply the knowledge in a different setting.
 - The sentences from the text that are required to answer the question. Cite from the text verbatim, and don't surround it with quotes.
-- For a lay person, an explanation of what the question is asking.
-- For a lay person, an explanation of how the answer is derived from the provided knowledge in the text.
+- For a lay reader, an explanation of what the question is asking.
+- For a lay reader, an explanation of how the answer is derived from the provided knowledge in the text.
 
 ### Output Format
 Provide the output in JSON format, as a dictionary with a single key "qa_items" which is a list of dictionaries with the following keys:
@@ -100,7 +114,7 @@ Provide the output in JSON format, as a dictionary with a single key "qa_items" 
 - "inference_explanation": (string)
 """
     prompt = {'system': system_prompt, 'user': f"### Text\n{text}"}
-    response_json = utils.query_llm(prompt, model='gpt-5', system_prompt_included=True, return_json=True, max_tokens=4000)
+    response_json = utils.query_llm(prompt, model='gpt-5-mini', reasoning_effort='high', system_prompt_included=True, return_json=True, max_tokens=4000)
     
     if isinstance(response_json, str):
         try:
@@ -147,7 +161,7 @@ def convert_to_cloze(question: Dict[str, Any]) -> Tuple[str, str] | None:
 def quality_control_cloze(cloze_pair: Tuple[str, str], title: str) -> Tuple[str, str] | None:
     """Performs quality control on a cloze statement for LaTeX formatting."""
     quality_control_prompt = {
-        'system': r"""You are a meticulous Quality Control Assistant. Your task is to review and refine a statement that has been extracted from an academic paper. You will be given an '(answer, statement)' pair. Your task is to apply a rigorous checklist to the pair, refining it based on a provided quality control checklist.
+        'system': r"""Your task is to review and refine a statement that has been extracted from an academic paper. You will be given an '(answer, statement)' pair. Your task is to apply a rigorous checklist to the pair, refining it based on a provided quality control checklist.
 
 ### Quality Control Checklist
 
@@ -157,6 +171,11 @@ def quality_control_cloze(cloze_pair: Tuple[str, str], title: str) -> Tuple[str,
 - Do *NOT* use unnecessary styling commands like '\\displaystyle'.
 - Ensure LaTeX syntax matches the style of the original context (e.g., '( ... )' or '$ ... $').
 - Action: Rewrite the math expressions and statements so they can be written in LaTeX, keeping the rest of the statement the same, correcting any and all formatting errors related to mathematical notation.
+
+2. Start the statement with one of the following templates:
+    - "In the paper '...'"
+    - "According to the paper '...'"
+- Action: Rewrite the statement so that it starts with one of the following templates.
 
 In all your adjustments, change the statement as minimally as necessary. If a statement is already good, make no changes.
 
@@ -188,7 +207,7 @@ def create_cloze_probe(refined_cloze_pair: Tuple[str, str], original_question: D
     return None
 
 def process_paper(paper_name: str, paper_content: str, **kwargs):
-    """Main pipeline to generate comprehension probes for a single paper."""
+    # """Main pipeline to generate comprehension probes for a single paper."""
     print(f"Parsing paper structure for {paper_name}...")
     paper_df = parse_paper_structure(paper_content)
     title = re.search(r'\\title{(.*?)}', paper_content).group(1) if re.search(r'\\title{(.*?)}', paper_content) else "no title"
@@ -212,6 +231,7 @@ def process_paper(paper_name: str, paper_content: str, **kwargs):
             except Exception as exc:
                 print(f'A section generated an exception: {exc}')
 
+    #questions = generate_questions(paper_content)
     print(f"Generated a total of {len(questions)} questions.")
 
     if not questions:
@@ -267,7 +287,7 @@ def process_paper(paper_name: str, paper_content: str, **kwargs):
 
     output_dir = f'../../data/probes/inference/{paper_name}/'
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, 'probes_v2.csv')
+    output_path = os.path.join(output_dir, 'probes_v3.csv')
     cloze_df.to_csv(output_path, index=False)
     print(f"Saved {len(cloze_df)} cloze probes to {output_path}")
 
