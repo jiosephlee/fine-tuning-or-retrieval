@@ -215,7 +215,7 @@ def fine_tune(
     )
     
     for i in dataset:
-        print(i)
+        print(i['raw_text'][:50])
     
     if test_script:
         log.info(f"Dataset has {len(dataset)} chunks...")
@@ -247,8 +247,8 @@ def fine_tune(
                 
                 # Verify that the last token of the sequence is NOT an EOS token
                 if last_token == eos_token_id and debug:
-                    log.warning(f"CPT batch {i}, sequence {j} ends with an EOS token, which is expected for the last batch of the unique document.")
-
+                    #log.warning(f"CPT batch {i}, sequence {j} ends with an EOS token, which is expected for the last batch of the unique document.")
+                    pass
                 first_50 = tokenizer.decode(input_ids[:50])
                 last_50 = tokenizer.decode(input_ids[-50:])
                 text_sample = first_50+ "..." + last_50
