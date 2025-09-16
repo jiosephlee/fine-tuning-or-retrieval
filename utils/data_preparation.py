@@ -311,7 +311,7 @@ def prepare_training_mix(
 
         final_chunks.extend(batch)
         
-        if i < len(unique_document_batches) - 1 and pretraining_separators > 0:
+        if pretraining_separators > 0:
             if test_script:
                 log.info(f"--- Debugging Separator after Batch {i} ---")
 
