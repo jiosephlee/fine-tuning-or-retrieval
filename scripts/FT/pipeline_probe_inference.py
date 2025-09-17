@@ -78,50 +78,43 @@ def parse_paper_structure(text):
 
 def generate_questions(text: str) -> List[Dict[str, Any]]:
     """Generates inference questions from the text using an LLM."""
-    system_prompt = """Based on your understanding of the provided academic paper, your task is to generate questions to test a reader's true comprehension and understanding of the text. Specifically, your objective is to assess whether the reader can integrate, synthesize, and generalize the implications of the text beyond what's been stated. This is difficult because academic papers by nature will provide analysis, interpretation, and discourse of the knowledge in the paper. Thus, aim to write questions that either (1) require the reader to build upon the knowledge in the paper to draw a new conclusion, or (2) integrate and apply the knowledge in different settings i.e. testing the reader's ability to generalize the knowledge. 
-    
-Note that an academic paper will cover topics like prior works. Make sure to create questions that build upon the novel knowledge introduced by the paper. Be creative in your question formulation. Create at least 25 of these questions.
+    system_prompt = """You will be given an academic paper. Tour task is to generate questions to test a reader's true comprehension and understanding of the text, particularly regarding the paper's novel contributions. Specifically, your objective is to assess whether the reader can integrate, synthesize, and generalize the implications of the text beyond what's been stated i.e. testing the reader's ability to generalize the knowledge. Academic papers often already provide analysis, interpretation, and discourse of the knowledge in the paper. Thus, aim to write questions that require the reader to build upon the knowledge in the paper, and (1) make a leap of reasoning or (2) integrate and apply the knowledge in different settings. Be creative in your question formulation.
     
 Here is a non-exhaustive list of types of inference that you should assess:
 - Conceptual Synthesis
-     - Core Insight: This could ask the reader to distill the central argument or innovation of the paper by combining information from multiple sections. For example, a question could ask the reader to synthesize that DPO transforms a reinforcement learning problem into a classification problem.
-     - Causal Mechanism: This could involve using experimental evidence, especially from ablations, to pinpoint the source of an observed effect. For example, a question could require synthesizing that the benefit of CoT comes from the sequential reasoning process itself, by ruling out alternative hypotheses tested in ablations.
+     - Core Insight: This could ask the reader to distill the central argument or innovation of the paper by combining information from multiple sections.
+     - Causal Mechanism: This could involve using experimental evidence, especially from ablations, to pinpoint the source of an observed effect.
 - Reading Between the Lines
-    - Identifying Implicit Assumptions: This probes for an understanding of the unstated conditions upon which the paper's claims rest. For example, a question might require the reader to infer that for the DPO loss to be a valid maximum likelihood objective, the preference dataset D must be assumed to be sampled i.i.d. from the true human preference distribution.
+    - Identifying Implicit Assumptions: This could probe for an understanding of the unstated conditions upon which the paper's claims rest.
 - Mathematical Understanding
     - Equation Interpretation: This could ask for the conceptual role or meaning of a specific term within a larger mathematical expression, beyond its literal definition.
-- Cross-Domain Integration
-    - Cross-Domain Analogy: This could require connecting a concept from the paper to a well-known concept in another domain (e.g., computer science, statistics, physics). This tests for an abstract, transferable understanding. For instance, interpreting the KL-divergence term in the RLHF objective as a form of regularization to prevent overfitting, or the reference policy as a prior distribution and the optimal policy as a posterior distribution.
+- Analagous Understanding
+    - Cross-Domain Analogy: This could require connecting a concept from the paper to a fundamental concept in another domain (e.g., computer science, statistics, physics). This tests for an abstract, transferable understanding.
 - Counterfactual Understanding
-    - Predicting Outcomes of Hypothetical Scenarios: The reader could use the principles established in the paper to predict the result of a new experiment or a change in conditions.
+    - Predicting Outcomes of Hypothetical Scenarios: The reader could use the principles established in the paper to predict new scenarios.
  
 Here as some specific guidelines you should follow as you write the questions:
 - The question can be as long as needed, but the answer must be a coherent phrase that is 1-5 words long. 
+- The answer should not be a technical term that exists outside of the paper.
 - The questions should NOT be about factual recall that asks to recall a specific fact in the paper. 
-- The answer to the question should NOT be found in the text. It should be new knowledge. However, it must build upon the knowledge *in the paper*.
+- The question should be testing *new knowledge*, building upon the knowledge *in the paper*.
 - The questions should require a generalizable, deep understanding of the knowledge. 
 - Be precise with the question formulation so that there is only one clear answer.
-- The question should be self-contained and not require additional context to answer.
-- When creating questions applied in other settings, assume the reader has a knowledge cutoff of concepts/terminology up to 2022. Don't apply the knowledge to "new" concepts/terminology that are recent.
-- Furthermore, don't make the questions themselves overly complex. The question shouldn't be hard to understand, but difficult to answer without understanding.
+- The question should be self-contained and provide sufficient context to answer the question.
 
 In addition, for each question, provide: 
-- The prior knowledge that is required to answer the question. Academic papers build upon a large body of domain knowledge, and so there is an underlying assumption that the reader has a deep understanding of the domain knowledge for any paper. The question may also require the reader to apply the knowledge in a different setting.
 - The sentences from the text that are required to answer the question. Cite from the text verbatim, and don't surround it with quotes.
-- For a lay reader, an explanation of what the question is asking.
-- An explanation of the inference that is required to answer the question. The jump in reasoning that's made to answer the question.
+- The type of inference that is being employed to answer the question.
 
 ### Output Format
 Provide the output in JSON format, as a dictionary with a single key "qa_items" which is a list of dictionaries with the following keys:
 - "question": (string) 
 - "text_sentences": list of strings
-- "prior_knowledge": (string)
-- "question_explanation": (string)
-- "inference_explanation": (string)
+- "inference_type": (string)
 - "answer": (string)
 """
-    prompt = {'system': system_prompt, 'user': f"### Text\n{text}"}
-    response_json = utils.query_llm(prompt, model='gpt-5', reasoning_effort='medium', system_prompt_included=True, return_json=True, max_tokens=4000)
+    prompt = {'system': system_prompt, 'user': f"### Subset of Paper\n\n{text}"}
+    response_json = utils.query_llm(prompt, model='gpt-5-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True, max_tokens=4000)
     
     if isinstance(response_json, str):
         try:
@@ -149,12 +142,12 @@ Provide the output in JSON format, as a dictionary with a single key "qa_items" 
 
 def convert_to_cloze(question: Dict[str, Any]) -> Tuple[str, str] | None:
     """Converts a question-answer pair to a cloze-style statement."""
-    user_prompt = f"### Question and Answer\n{json.dumps({'question': question['question'], 'answer': question['answer']})}\n"
+    user_prompt = f"### Question\n{question['question']}\n\n### Answer\n{question['answer']}\n"
     cloze_prompt = {
         'system': FACT_PROBE_CLOZE_PROMPT_SYSTEM,
         'user': user_prompt
     }
-    response = utils.query_llm(cloze_prompt, model='gpt-5', reasoning_effort='low', system_prompt_included=True, return_json=True, max_tokens=1000)
+    response = utils.query_llm(cloze_prompt, model='gpt-5-mini', reasoning_effort='low', system_prompt_included=True, return_json=True, max_tokens=1000)
     try:
         data = json.loads(response) if isinstance(response, str) else response
         answer = data.get('answer')
@@ -188,11 +181,9 @@ def quality_control_cloze(cloze_pair: Tuple[str, str], title: str, context: str)
 - The answer must appear at the very end of the statement.
 - Action: If this isn't the case, minimally rewrite the statement such that the answer appears at the end.
 
-4. Contextualize
-- Ensure that the question is self-contained and it's clear what it is asking.
-- Try to adapt the language and diction used by the paper as much as possible while keeping the statement structure as similar as possible.
-- Consider even paraphrasing the answer to language that is more fitting for the paper.
-- Action: Add sufficient context to the question so that it's clear what it is asking.
+4. Answer Leakage
+- The answer must not be leaked, explicitly or implicitly, in the statement until the very end.
+- Action: Minimally rewrite the statement such that the answer is not revealed in the statement.
 
 In all your adjustments, change the statement as minimally as necessary. If a statement is already good, make no changes.
 
@@ -292,7 +283,7 @@ def process_paper(paper_name: str, paper_content: str, **kwargs):
     if not questions:
         print("No questions were generated. Exiting.")
         return
-    save_df_for_debugging(pd.DataFrame(questions), '01_generated_questions.txt', 'inference', paper_name, ['question', 'answer', 'text_sentences', 'prior_knowledge', 'question_explanation', 'inference_explanation'])
+    save_df_for_debugging(pd.DataFrame(questions), '01_generated_questions.txt', 'inference', paper_name, ['question', 'answer', 'text_sentences', 'inference_type'])
 
     filtered_questions = questions
 
@@ -395,14 +386,14 @@ def process_paper(paper_name: str, paper_content: str, **kwargs):
     cloze_df['target'] = cleaned_targets
     cloze_df.dropna(subset=['probe'], inplace=True)
 
-    save_df_for_debugging(cloze_df, '05_final_probes.txt', 'inference', paper_name, ['probe', 'target', 'fact', 'question', 'prior_knowledge', 'text_sentences', 'question_explanation', 'inference_explanation'])
+    save_df_for_debugging(cloze_df, '05_final_probes.txt', 'inference', paper_name, ['probe', 'target', 'fact', 'question', 'text_sentences', 'inference_type'])
 
     tokenizer = AutoTokenizer.from_pretrained("allenai/OLMo-2-0425-1B")
     check_tokenizer_consistency(cloze_df, tokenizer)
 
     output_dir = f'../../data/probes/inference/{paper_name}/'
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, 'probes_v5.csv')
+    output_path = os.path.join(output_dir, 'probes_v6.csv')
     cloze_df.to_csv(output_path, index=False)
     print(f"Saved {len(cloze_df)} cloze probes to {output_path}")
 
