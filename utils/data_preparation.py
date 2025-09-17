@@ -221,7 +221,7 @@ def prepare_training_mix(
             explanation_dir = f'data/arxiv/explanations/{domain}/'
             if os.path.isdir(explanation_dir):
                 for filename in sorted(os.listdir(explanation_dir)):
-                    if filename.endswith('.tex'):
+                    if filename.endswith('.txt'):
                         file_path = os.path.join(explanation_dir, filename)
                         with open(file_path, 'r', encoding='utf-8') as f:
                             explanation_chunks.extend(_chunk(f.read()))
