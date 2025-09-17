@@ -14,7 +14,7 @@ from transformers import AutoTokenizer
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 import utils.utils as utils
 from utils.pipeline import save_df_for_debugging, save_debug_file, is_text_in_document, process_papers, check_tokenizer_consistency
-from utils.prompts.pipeline import FACT_PROBE_CLOZE_PROMPT_SYSTEM
+from utils.prompts.pipeline import FACT_PROBE_CLOZE_PROMPT_SYSTEM_TWO
 
 def parse_paper_structure(text):
     """Parse paper into sections, subsections and paragraphs with metadata."""
@@ -80,37 +80,38 @@ def generate_questions(text: str) -> List[Dict[str, Any]]:
     """Generates inference questions from the text using an LLM."""
     system_prompt = """You will be given an academic paper. Tour task is to generate questions to test a reader's true comprehension and understanding of the text, particularly regarding the paper's novel contributions. Specifically, your objective is to assess whether the reader can integrate, synthesize, and generalize the implications of the text beyond what's been stated i.e. testing the reader's ability to generalize the knowledge. Academic papers often already provide analysis, interpretation, and discourse of the knowledge in the paper. Thus, aim to write questions that require the reader to build upon the knowledge in the paper, and (1) make a leap of reasoning or (2) integrate and apply the knowledge in different settings. Be creative in your question formulation.
     
-Here is a non-exhaustive list of types of inference that you should assess:
+Here is a non-exhaustive list of types and subtypes of inference that you should assess:
 - Conceptual Synthesis
      - Core Insight: This could ask the reader to distill the central argument or innovation of the paper by combining information from multiple sections.
      - Causal Mechanism: This could involve using experimental evidence, especially from ablations, to pinpoint the source of an observed effect.
-- Reading Between the Lines
-    - Identifying Implicit Assumptions: This could probe for an understanding of the unstated conditions upon which the paper's claims rest.
+- Implicit Assumptions: This could probe for an understanding of the unstated conditions upon which the paper's claims rest.
 - Mathematical Understanding
     - Equation Interpretation: This could ask for the conceptual role or meaning of a specific term within a larger mathematical expression, beyond its literal definition.
 - Analagous Understanding
-    - Cross-Domain Analogy: This could require connecting a concept from the paper to a fundamental concept in another domain (e.g., computer science, statistics, physics). This tests for an abstract, transferable understanding.
-- Counterfactual Understanding
-    - Predicting Outcomes of Hypothetical Scenarios: The reader could use the principles established in the paper to predict new scenarios.
+    - Intuitive Analogy: This could require connecting a concept from the paper to a fundamental concept in another domain (e.g., computer science, bayesian statistics, physics). This tests for an abstract, transferable understanding focused on the intuition.
+- Counterfactual Scenarios
+    - Predicting Hypotheticals: The reader could apply the principles established in the paper to predict or answer hypothetical questions. This should test the generalizability of the knowledge in new settings.
  
+Please cover all of the above types of inference, and feel free to add more types of inference that are relevant.
+
 Here as some specific guidelines you should follow as you write the questions:
 - The question can be as long as needed, but the answer must be a coherent phrase that is 1-5 words long. 
-- The answer should not be a technical term that exists outside of the paper.
-- The questions should NOT be about factual recall that asks to recall a specific fact in the paper. 
+- For phrasing the answer, prefer simpler language so that we are measuring the reader's ability to understand the paper's content, not their ability to know jargon.
+- The questions should NOT be about factual recall that asks to recall a specific fact in the paper. Please avoid questions that require a mere lookup to a sentence in the paper.
 - The question should be testing *new knowledge*, building upon the knowledge *in the paper*.
 - The questions should require a generalizable, deep understanding of the knowledge. 
 - Be precise with the question formulation so that there is only one clear answer.
 - The question should be self-contained and provide sufficient context to answer the question.
 
 In addition, for each question, provide: 
-- The sentences from the text that are required to answer the question. Cite from the text verbatim, and don't surround it with quotes.
-- The type of inference that is being employed to answer the question.
+- The knowledge in the text that the question builds upon. Cite from the text verbatim, and don't surround it with quotes.
+- The type of inference and subtype of inference that is being employed to answer the question.
 
 ### Output Format
 Provide the output in JSON format, as a dictionary with a single key "qa_items" which is a list of dictionaries with the following keys:
-- "question": (string) 
-- "text_sentences": list of strings
 - "inference_type": (string)
+- "text_sentences": list of strings
+- "question": (string) 
 - "answer": (string)
 """
     prompt = {'system': system_prompt, 'user': f"### Subset of Paper\n\n{text}"}
@@ -144,7 +145,7 @@ def convert_to_cloze(question: Dict[str, Any]) -> Tuple[str, str] | None:
     """Converts a question-answer pair to a cloze-style statement."""
     user_prompt = f"### Question\n{question['question']}\n\n### Answer\n{question['answer']}\n"
     cloze_prompt = {
-        'system': FACT_PROBE_CLOZE_PROMPT_SYSTEM,
+        'system': FACT_PROBE_CLOZE_PROMPT_SYSTEM_TWO,
         'user': user_prompt
     }
     response = utils.query_llm(cloze_prompt, model='gpt-5-mini', reasoning_effort='low', system_prompt_included=True, return_json=True, max_tokens=1000)
@@ -185,7 +186,7 @@ def quality_control_cloze(cloze_pair: Tuple[str, str], title: str, context: str)
 - The answer must not be leaked, explicitly or implicitly, in the statement until the very end.
 - Action: Minimally rewrite the statement such that the answer is not revealed in the statement.
 
-In all your adjustments, change the statement as minimally as necessary. If a statement is already good, make no changes.
+In all your adjustments, change the statement as minimally as necessary. If a statement is already good, make no changes. Please do not add "___" at the end to emulate the cloze format.
 
 ### Output Format
 Provide a JSON object with a single key "pair", which is the refined [answer, statement] pair.
@@ -263,6 +264,8 @@ def process_paper(paper_name: str, paper_content: str, **kwargs):
             document_halves = [first_half, second_half]
         else:
             document_halves.append("\n\n".join(section_texts))
+
+    document_halves = [half for half in document_halves for _ in range(2)]
 
     print(f"Generating comprehension questions for {len(document_halves)} document halves in parallel...")
     
