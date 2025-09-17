@@ -190,7 +190,7 @@ def prepare_training_mix(
                     if filename.endswith('.txt'):
                         file_path = os.path.join(domain_dir, filename)
                         with open(file_path, 'r', encoding='utf-8') as f:
-                            domain_text += f.read() + "\n\n"
+                            domain_text += f.read()
             
             if domain_text:
                 all_prior_knowledge_chunks.extend(_chunk(domain_text))
