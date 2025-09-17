@@ -243,7 +243,7 @@ def prepare_training_mix(
             # 3. Load explanation texts
             explanation_chunks = []
             if with_explanations:
-                explanation_dir = f'data/arxiv/explanations/{domain}/'
+                explanation_dir = f'../../data/arxiv/explanations/{domain}/'
                 if os.path.isdir(explanation_dir):
                     for filename in sorted(os.listdir(explanation_dir)):
                         if filename.endswith('.txt'):
