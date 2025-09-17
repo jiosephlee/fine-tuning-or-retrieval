@@ -187,7 +187,7 @@ def prepare_training_mix(
             if os.path.isdir(domain_dir):
                 log.info(f"Loading prior knowledge from {domain_dir}")
                 for filename in sorted(os.listdir(domain_dir)):
-                    if filename.endswith('.txt'):
+                    if filename.endswith('.txt') and 'textbook' in filename:
                         file_path = os.path.join(domain_dir, filename)
                         with open(file_path, 'r', encoding='utf-8') as f:
                             domain_text += f.read()
