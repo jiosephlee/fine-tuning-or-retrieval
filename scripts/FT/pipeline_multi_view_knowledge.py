@@ -188,7 +188,7 @@ You will be given a research paper and your task is to create a detailed outline
 
 The outline should:
 - Break down the paper into coherent chapters.
-- For each chapter, provide a title, a description, and a list of sections to cover.
+- For each chapter, provide a title, a description, and a list of subtopics to cover.
 - Cover all key concepts, methods, and results from the paper.
 - Ensure a logical flow of information, from introduction to conclusion.
 - Be thorough enough to guide the writing of a full textbook.
@@ -197,7 +197,7 @@ The outline should:
 Provide the output as a JSON object with a single key "outline", which is a list of chapter objects. Each chapter object must have the following keys:
 - "chapter_title": A string for the title of the chapter.
 - "description": A string describing the chapter's content.
-- "sections": A list of strings, where each string is a section title.
+- "subtopics": A list of strings, where each string is a subtopic.
 """,
         'user': f"### Research Paper\n{paper_content}"
     }
@@ -224,22 +224,18 @@ Provide the output as a JSON object with a single key "outline", which is a list
     print("Writing textbook chapters in parallel...")
 
     full_outline_text = ""
-    for chap in outline:
-        full_outline_text += f"### {chap['chapter_title']}\n"
-        full_outline_text += f"**Description:** {chap['description']}\n"
-        full_outline_text += "**Sections:**\n"
-        for sec in chap['sections']:
-            full_outline_text += f"- {sec}\n"
+    for i, chap in enumerate(outline):
+        full_outline_text += f"# Chapter {i+1}: {chap['chapter_title']}\n"
         full_outline_text += "\n"
     
     def write_chapter(chapter_info):
         chapter_title = chapter_info['chapter_title']
         print(f"Writing chapter: {chapter_title}...")
         
-        chapter_outline_text = f"### {chapter_info['chapter_title']}\n"
-        chapter_outline_text += f"**Description:** {chapter_info['description']}\n"
-        chapter_outline_text += "**Sections:**\n"
-        for sec in chapter_info['sections']:
+        chapter_outline_text = f"### Chapter Title\n\n{chapter_info['chapter_title']}\n"
+        chapter_outline_text += f"## Chapter Description\n\n{chapter_info['description']}\n"
+        chapter_outline_text += "## Subtopics\n"
+        for sec in chapter_info['subtopics']:
             chapter_outline_text += f"- {sec}\n"
 
         prompt_chapter = {
@@ -263,7 +259,8 @@ Also, please write all mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi
         
         chapter_content = utils.query_llm(
             prompt_chapter,
-            model='gpt-4.1-mini',
+            model='gpt-5-mini',
+            reasoning_effort="low",
             system_prompt_included=True,
             max_tokens=4000
         )
@@ -384,7 +381,7 @@ def process_papers():
     input_dir = "../../data/arxiv/cleaned/"
     
     # Get list of files in cleaned directory
-    files = [f for f in os.listdir(input_dir) if f.endswith('.tex') and f == 'DPO.tex']
+    files = [f for f in os.listdir(input_dir) if f.endswith('.tex') and f != 'DPO.tex' or f != 'QLoRA.tex']
     
     for filename in files:
         # Extract paper name without extension

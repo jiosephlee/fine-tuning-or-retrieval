@@ -1,0 +1,159 @@
+Introduction
+
+Mixed-precision training refers to the practice of using more than one floating-point format during neural network training to reduce memory usage and increase throughput while preserving model accuracy and convergence behavior. The central idea is that not all numerical values involved in training require the full dynamic range and precision of 32-bit floating point (FP32). Using lower-precision formats such as 16-bit floating point (FP16, usually IEEE half-precision) or Brain Floating Point 16 (BF16) for the computationally heavy parts of training (for example, forward and backward passes) can reduce memory bandwidth, cache pressure, and arithmetic cost. At the same time, keeping some quantities in higher precision (typically a set of "master" weights in FP32 and/or optimizer states) preserves numerical stability.
+
+This chapter explains the most commonly used mixed-precision workflow (FP32 master weights + low-precision compute), compares BF16 and FP16 and when to use each, describes loss-scaling techniques used to avoid underflow in low-precision formats, examines precision considerations for gradient accumulation and optimizer state, discusses implications for accuracy and convergence, and surveys existing framework support (for example, PyTorch AMP and automatic casting). The emphasis will be on intuition and the practical tradeoffs needed to understand and read research papers or implement robust mixed-precision training.
+
+# Mixed precision training workflow (FP32 master + low-precision compute)
+
+The canonical mixed-precision workflow that has become standard in deep learning uses an FP32 copy of the model weights (the "master weights") for accumulation and parameter updates, while using a lower-precision format (FP16 or BF16) for the forward and backward computations. The workflow proceeds roughly as follows:
+
+1. Keep a master copy of the weights W_master in FP32. This copy is used for optimizer updates (momentum accumulation, Adam moments, weight decay, etc.).
+2. Before each forward pass, cast the master weights to the lower-precision format to form W_low (e.g., FP16 or BF16). This cast is usually a downcast that truncates precision.
+3. Perform the forward pass and backward pass (compute activations, losses, and gradients) using W_low and low-precision arithmetic and storage for activations and gradients. This reduces memory footprint and accelerates arithmetic on hardware that supports efficient low-precision instructions.
+4. The backward pass produces gradients in low precision. Before applying updates with the optimizer, cast the gradients (or aggregated gradients) to FP32 and use them to update W_master. Optionally, accumulate gradients in FP32 across microbatches or steps.
+5. After updating W_master, optionally cast the updated FP32 weights back to low precision for the next iteration.
+
+Why this works: many operations (matrix multiplies, convolutions) are tolerant to lower mantissa precision during intermediate computation; the primary place where high precision is needed is in the accumulation of many small updates to weights and the representation of optimizer state (which often needs sufficient dynamic range and precision). Using FP32 master copies prevents small updates from being lost due to rounding and preserves the numeric stability of optimizers such as Adam, which maintain running statistics.
+
+A few key implementation details are important to ensure correct behavior and good performance. First, the cast from FP32 to low precision can clamp out-of-range values (overflow) or reduce mantissa resolution (quantization). Second, certain operations (loss reduction, gradient accumulation, weight updates) are done in FP32 to avoid accumulation error. Third, some hardware supports fused kernels that accept mixed input types and internally perform accumulations in higher precision (for example, FP16 multiply–accumulate with FP32 accumulation), which further reduces risk of lost precision.
+
+# BF16 vs FP16: when and why to use each
+
+FP16 (IEEE 754 half-precision) and BF16 (bfloat16) are two different 16-bit floating-point formats. They share the same bit width, but they differ in how bits are allocated between exponent and mantissa, which results in different dynamic range and precision properties.
+
+FP16 format: has 1 sign bit, 5 exponent bits, and 10 mantissa bits. Because it has relatively few exponent bits, its dynamic range is much smaller than FP32. The number of significant bits is 10 (plus the implicit leading 1 for normalized numbers), so precision is relatively high among 16-bit formats, but the small exponent range makes underflow or overflow more likely for very large or very small values.
+
+BF16 format: has 1 sign bit, 8 exponent bits, and 7 mantissa bits. Its exponent width matches FP32's 8-bit exponent, so BF16 has very similar dynamic range to FP32 but with fewer mantissa bits (7 instead of 23). This means BF16 can represent very large and very small magnitudes similarly to FP32 (avoiding exponent underflow/overflow relative to FP16), but with reduced precision in the significand.
+
+Implications and when to use each:
+- Use BF16 when dynamic range is the dominant concern. Because BF16 shares the FP32 exponent width, activations and gradients that span many orders of magnitude will not underflow or overflow as easily as with FP16. BF16 is a safer choice for models or training regimes with values that can become very large or very small (for example, some RNNs, deep transformers with large activations, or heavy regularization where gradients are small). Hardware that supports BF16 (Google TPUs, some recent CPUs and GPUs) enables BF16 training with minimal changes.
+- Use FP16 when higher significand precision is required and the dynamic range is manageable. FP16 has better mantissa precision than BF16 (10 bits vs 7 bits) so it can represent small relative differences more accurately if values remain within its limited exponent range. Many NVIDIA GPUs historically optimized FP16 matrix-multiply-accumulate (with internal FP32 accumulation) and achieved strong speedups. However, training in FP16 can suffer from underflow or overflow because of the smaller exponent range; this necessitates additional techniques such as loss scaling.
+
+In practice, BF16 is often easier to use because it avoids underflow in many cases and therefore requires less intrusive numerical fixes. When BF16 is available and the hardware offers comparable throughput, it typically provides better out-of-the-box stability. FP16 can deliver slightly higher numerical precision in relative terms when values are not extreme, and some hardware has highly optimized FP16 kernels, but FP16 often requires careful loss scaling and additional attention to optimizer state.
+
+# Loss scaling techniques to avoid underflow in low precision
+
+One of the main numerical hazards when using low-precision formats with limited exponent range (especially FP16) is underflow: small gradient values can be rounded to zero when represented in the low-precision format. Underflowing gradients are effectively lost, breaking learning, particularly for small layers or weights. Loss scaling is the standard remedy.
+
+The idea of loss scaling is simple: multiply the loss by a positive scale factor S during the forward pass, which scales up the gradients produced in the backward pass by the same factor, thereby moving them into the representable range of the low-precision type. After computing gradients, divide (or unscale) the gradients by S before applying them to the master weights (and before updating optimizer state that should reflect the true gradient magnitude).
+
+Let L be the original loss computed by the model; the scaled loss is L' = S * L. During backward propagation, gradients computed w.r.t. parameters are scaled: if g = ∂L/∂w, then g' = ∂L'/∂w = S * g. Before the optimizer update, you compute g = g' / S to recover the true gradient. If S is chosen large enough so that g' avoids underflow in low precision, then no gradient is lost.
+
+There are two common strategies for selecting S:
+
+Static loss scaling: choose a fixed scale S (for example, a power of two like 2^{12} or 2^{16}) and use it throughout training. Static scaling is simple and effective when you know a scale that avoids underflow but does not cause overflow. Because scaling up also increases the chance of overflow (when gradients become large), the chosen S must be small enough that gradients never saturate. Static scaling is predictable but may require experimentation.
+
+Dynamic (automatic) loss scaling: adapt S during training. A typical dynamic algorithm increases S when no overflow/NaN is detected for some consecutive steps and decreases S when an overflow or NaN occurs in a step. One common heuristic doubles S after N successful steps and halves S when non-finite gradients are detected. Detecting overflow is done by checking if any gradient or parameter became NaN or Inf in low precision. Dynamic loss scaling is more robust across different models and hyperparameters because it adapts to the evolving range of gradients. Implementations typically track a "growth interval" and maintain a current scale and an "overflow counter".
+
+Practical considerations with loss scaling:
+- Unscaling must be done before weight updates and before any operations that assume gradient magnitudes in FP32 (like norm computation for gradient clipping). If you compute gradient norms on scaled gradients, you must divide by S first.
+- Unscaling should be done in FP32 to avoid reintroducing low-precision rounding before the optimizer uses the values.
+- Loss scaling does not change the true gradient; it is only a numerical trick. However, very large S values can cause gradient overflow and NaNs; very small S values are ineffective. Dynamic scaling aims to find a balance.
+- When gradients are aggregated across microbatches or across distributed devices, scaling interacts with those aggregations: you typically scale the loss per microbatch, unscale after accumulation, and check for overflows across the aggregated gradients.
+
+Loss scaling is essential when using FP16 on many modern networks; BF16 often does not require it because its exponent range avoids most underflow situations, although BF16 still has less mantissa precision and other rounding errors.
+
+# Precision considerations for gradient accumulation and optimizer state
+
+Gradient accumulation and optimizer states are two places where precision choices strongly affect numerical stability and model performance.
+
+Gradient accumulation:
+When large effective batch sizes are achieved by accumulating gradients across multiple microbatches, the accumulation of small gradient contributions can suffer from rounding error if performed in low precision. Suppose you accumulate gradients in 16-bit format across K microbatches; small contributions may be lost when added to a large running sum in low precision, particularly if the running sum is in low precision and has limited mantissa bits.
+
+To avoid this loss, accumulate gradients in FP32. There are two common approaches: either cast per-microbatch gradients to FP32 and perform the accumulation in FP32, or keep a separate FP32 accumulation buffer for gradients and use low precision only for per-microbatch computation. When memory is constrained, some implementations accumulate gradients in low precision but periodically or at the end cast to FP32; this is less numerically robust.
+
+Optimizer state:
+Most optimizers maintain state beyond the raw gradients: momentum accumulators, adaptive moments (for Adam: first moment \(m_t\) and second moment \(v_t\)), and possibly per-parameter steps or preconditioners for second-order methods. These states are often updated by adding small increments each step. Storing optimizer state in low precision risks losing these small increments via rounding, which can change the effective dynamics of the optimizer.
+
+Best practice is to keep optimizer states in FP32. Even with BF16 or FP16 computing, holding the optimizer state (momentum vectors, Adam's \(m\) and \(v\), second-order preconditioners) in FP32 preserves the fidelity of the optimizer dynamics. During each optimization step, gradients may be cast to FP32 or their unscaled FP32 versions are used to update the state. The actual weight update is applied to the FP32 master weights.
+
+Examples and implications:
+For SGD with momentum, keep the velocity \(v_t\) in FP32 and apply updates using FP32 arithmetic:
+\[
+v_{t+1} = \mu v_t - \eta g_t,
+\]
+\[
+w_{t+1} = w_t + v_{t+1},
+\]
+where \(g_t\) is the (unscaled) gradient and \(\eta\) the learning rate. Rounding errors in \(v_t\) can alter the effective momentum over many steps, so FP32 storage is important.
+
+For Adam, maintain \(m_t\) and \(v_t\) in FP32:
+\[
+m_{t+1} = \beta_1 m_t + (1-\beta_1) g_t,
+\]
+\[
+v_{t+1} = \beta_2 v_t + (1-\beta_2) g_t^2,
+\]
+\[
+\hat{m}_{t+1} = \frac{m_{t+1}}{1-\beta_1^{t+1}},\quad \hat{v}_{t+1} = \frac{v_{t+1}}{1-\beta_2^{t+1}},
+\]
+\[
+w_{t+1} = w_t - \eta \frac{\hat{m}_{t+1}}{\sqrt{\hat{v}_{t+1}} + \epsilon}.
+\]
+Storing \(v_t\) (which accumulates squares) in low precision risks saturation for large-magnitude values or poor resolution for small updates. Using FP32 master states preserves accuracy.
+
+Checkpointing and reproducibility:
+When storing optimizer state to disk (checkpoints), using FP32 ensures that resuming training will not suffer from degraded optimizer numerics. Some workflows compress checkpoint size by storing optimizer state in lower precision, but this can alter convergence if not handled carefully. A common compromise is to store FP32 master weights and optimizer states and optionally compress other artifacts.
+
+# Implications for accuracy and convergence
+
+Using mixed precision can affect model accuracy and convergence in subtle ways, although with proper precautions, many models match FP32 training performance while achieving speed and memory benefits.
+
+Where mixed precision can change behavior:
+- Rounding errors: lower mantissa precision increases rounding error in arithmetic. Over many iterations, rounding errors can bias parameter updates or increase variance, potentially affecting convergence.
+- Underflow and overflow: loss of small gradients (underflow) or saturation/Inf (overflow) can stop learning or produce instability. Loss scaling and BF16 help mitigate these issues.
+- Optimizer dynamics: if optimizer state is stored in low precision, the effective dynamics of momentum or adaptive optimizers may change, which can alter the convergence trajectory even if gradients are perfectly computed.
+- Non-determinism: mixed-precision kernels or fused operators can introduce non-deterministic ordering or small numerical differences compared to FP32, which may slightly change final model parameters.
+
+What research and practice show:
+Empirically, many large-scale deep learning models (CNNs, Transformers) train to near-identical accuracy using mixed precision with FP32 master weights and FP16 or BF16 compute, provided loss scaling and FP32 optimizer states are used. For a wide range of tasks, mixed precision produces the same final validation metrics and similar convergence curves but with faster wall-clock time.
+
+However, there are edge cases. Highly sensitive models (for example, some GANs, models trained with extremely small learning rates, or algorithms that rely on very small gradients for fine adjustments) may require careful tuning or full FP32 training. Also, when using second-order optimizers or certain adaptive strategies that rely on precise variance estimates, storing and updating the relevant statistics in FP32 is recommended.
+
+A practical approach:
+Begin with the standard mixed-precision recipe: FP32 master weights, low-precision compute (BF16 if available; FP16 with loss scaling otherwise), FP32 optimizer state and gradient accumulation in FP32. Validate that the model converges on a small-scale experiment. If divergence occurs, check for NaNs or Infs (which suggest overflow), adjust loss scaling, ensure unscaling is performed before gradient clipping, and verify that important buffers (optimizer state, gradient accumulators) are FP32.
+
+Convergence diagnostics:
+When mixed precision differs from FP32, analyze gradient distributions and update norms. Compare training loss curves early and late to detect drift. If the low-precision training stalls, check whether gradients are vanishing due to underflow or whether the effective learning rate has changed due to rounding.
+
+# Framework support (PyTorch AMP, automatic casting)
+
+Modern deep learning frameworks provide built-in support for mixed-precision training to simplify the implementation and avoid many of the pitfalls discussed above.
+
+PyTorch AMP (Automatic Mixed Precision):
+PyTorch provides AMP utilities (torch.cuda.amp) that implement automatic casting, safe kernel selection, and dynamic loss scaling. Key components include:
+- autocast context manager: within this context, PyTorch automatically chooses appropriate data types (FP16 or BF16 depending on hardware and user choice) for supported operations. Crucially, autocast selects lower precision for performance-critical ops (matrix multiply, convolutions) but keeps certain operations in FP32 when necessary (for example, reductions or elementwise ops that are numerically sensitive).
+- GradScaler: PyTorch's GradScaler implements dynamic loss scaling automatically. You wrap your loss backward call with scaler.scale(loss).backward(). GradScaler handles scaling, unscaling, and gradient overflow detection. scaler.step(optimizer) integrates the unscale-and-check step before optimizer updates. It exposes options for initial scale, growth factor, backoff factor, and growth interval.
+
+Using AMP typically requires minimal code changes: wrap the forward/backward in autocast, use GradScaler for loss scaling, keep an FP32 optimizer and master weights (PyTorch handles casting and state management internally when using the high-level APIs). AMP also tries to use mixed-precision fused kernels on compatible hardware to maximize performance.
+
+TensorFlow and XLA:
+TensorFlow supports mixed precision via a mixed precision API that allows specifying a global policy (for example, "mixed_bfloat16" or "mixed_float16"). The policy configures layer and kernel types and inserts loss scaling where needed. On TPUs, bfloat16 is commonly used with minimal changes. TensorFlow's Keras integrates loss scaling and optimizer wrappers to handle the FP32 state.
+
+Other frameworks:
+Other ML frameworks and libraries also provide mixed-precision support or utilities (for example, JAX provides bfloat16/float32 mixing and XLA compiles to efficient hardware primitives). Many high-level libraries expose simple flags to enable mixed precision.
+
+Practical tips when using framework support:
+- Use the framework's automatic casting rather than manually casting tensors everywhere. Automatic casting selects safe types for operations and reduces the chance of subtle mistakes (for example, accidentally computing a reduction in low precision).
+- Enable dynamic loss scaling when using FP16. When BF16 is used, you may not need loss scaling, but the framework policies will avoid unnecessary scaling.
+- Ensure optimizer state remains FP32. Many framework wrappers do this for you; confirm by inspecting optimizer parameter dtypes if you need to be sure.
+- When using distributed training, ensure that overflow/NaN detection for dynamic loss scaling is performed across all processes (some frameworks provide built-in cross-replica checks).
+- Profile both memory usage and throughput: mixed precision reduces memory for activations and increases compute throughput on hardware with specialized support, but on some devices the gains may be smaller if key operations remain in FP32 or if data movement becomes the bottleneck.
+
+Example high-level PyTorch flow (pseudocode to illustrate steps):
+1. model.to(device)
+2. optimizer = ...
+3. scaler = torch.cuda.amp.GradScaler()
+4. for inputs, targets in loader:
+    with torch.cuda.amp.autocast():
+        outputs = model(inputs)
+        loss = loss_fn(outputs, targets)
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+This shows the minimal boilerplate required to use PyTorch AMP: autocast for automatic casting to BF16/FP16 where appropriate, and GradScaler to safely scale the loss and unscale gradients before optimizer steps.
+
+Conclusion
+
+Mixed-precision training is a practical and powerful technique to accelerate training and reduce memory footprint while preserving the convergence and final accuracy of neural networks. The core recipe—FP32 master weights and optimizer state, low-precision compute for forward/backward, and loss scaling for FP16—addresses the primary numerical stability concerns. Choosing between FP16 and BF16 depends on whether mantissa precision or exponent range is more critical for your model, with BF16 offering a gentler transition due to its wider exponent range. Careful handling of gradient accumulation and optimizer state storage is essential to avoid subtle errors and to preserve optimizer dynamics. Frameworks like PyTorch AMP and TensorFlow mixed precision automate many of these concerns and make mixed-precision training accessible with minimal code changes. With these tools and practices, mixed precision is a standard technique for efficient and stable large-scale training.

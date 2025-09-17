@@ -1,0 +1,111 @@
+Introduction
+
+Large autoregressive transformer models rely heavily on memory systems to store model parameters, activations, and intermediate state during inference. As the sequence length grows, the demands on memory capacity and memory bandwidth increase dramatically. How memory is organized — from on-chip SRAM and caches to off-chip DRAM — and how the key-value (KV) cache is managed have direct impact on latency, throughput, and feasibility of running models with long context windows. This chapter explains the relevant memory technologies and their characteristics, the mechanics of KV caching during autoregressive decoding, how memory usage scales with context length, techniques to mitigate that scaling (including compression and quantization), and the practical trade-offs when targeting on-device vs server-side inference. The aim is to give you enough intuition and concrete quantitative relationships to reason about design choices and read research papers about long-context inference.
+
+# DRAM, SRAM and on-chip memory characteristics (latency, bandwidth, cost)
+
+Memory systems in modern hardware are hierarchical. At the top of the hierarchy, near the compute elements, are small, very fast memories (registers and on-chip SRAM caches). Further away, but much larger and cheaper per bit, is DRAM. Each level has different latency, bandwidth, area, and cost trade-offs which determine how best to place model parameters, activations, and caches.
+
+On-chip SRAM (including register files and L1/L2 caches) provides the lowest access latency and the highest bandwidth per core. Latencies measured in CPU or GPU cycles can typically be less than 10 cycles for a register or L1 access, and tens of cycles for L2. Bandwidth is also very high because the memory is physically close to the execution units. SRAM is implemented on the processor die and is far more expensive per bit than DRAM; silicon area is the main cost driver. Because of its speed, SRAM is used for the hottest working set: current layer activations, very frequently accessed model parameters, and small control structures.
+
+Off-chip DRAM (e.g., DDR4/DDR5 on CPUs or GDDR/HBM on accelerators) offers much larger capacity at significantly lower cost per bit than SRAM, but with higher latency and lower per-core bandwidth. DRAM random access latencies are typically on the order of tens to hundreds of nanoseconds (hundreds of cycles), and bandwidth is shared across many processing elements. HBM (High Bandwidth Memory) narrows the gap by providing much wider interfaces and higher aggregate bandwidth, but still has higher latency than on-chip SRAM. DRAM is the natural place to store large parameter matrices and large KV caches that do not fit on-chip.
+
+Latency and bandwidth are distinct and both matter. Latency determines the time to retrieve a small piece of data needed urgently (critical for low-latency inference). Bandwidth determines how much data can be moved per second (critical when we must stream many values across the memory hierarchy). For example, when computing self-attention for a new token with a long past context, the computation may need to read large slices of the KV cache. If the on-chip cache misses and the fetch comes from DRAM, the latency to start fetching is high and the throughput for moving that large block is limited by DRAM bandwidth.
+
+A simple way to think about the design trade-offs is cost-per-bit vs latency: SRAM is extremely fast and expensive per bit, suitable for small, latency-critical data. DRAM is slower and cheap per bit, suitable for large persistent state like long KV caches. High-bandwidth stacked memories (HBM) reduce the bandwidth gap and can accelerate large models, but at greater hardware cost. For inference architectures, the choice of where to place KV caches and activations (on-chip, in local device memory, or in host DRAM) will dictate which computations are limited by latency and which by bandwidth.
+
+# KV cache mechanics in autoregressive decoding
+
+Autoregressive decoding generates tokens sequentially; for each new token we compute attention of the current position over all previous positions. A straightforward way to implement this is to compute, for each layer, the key and value vectors for every input token and to keep these vectors in a KV cache so that when generating a new token we can reuse previous keys and values instead of recomputing them from scratch.
+
+Concretely, in a transformer layer with hidden dimension $d$ and $h$ attention heads, the key and value per token have shapes $d_k$ and $d_v$ respectively, usually with $d_k = d_v = d/h$. If you have sequence length $L$, number of layers $N$, and batch size $B$ (often $B=1$ in autoregressive generation), then the total memory to store the KV cache in full precision is approximately
+\[
+\text{KV\_mem}_\text{FP32} \approx B \cdot N \cdot L \cdot (d_k + d_v) \cdot 4 \text{ bytes},
+\]
+or half that if using FP16 weights. Since $d_k = d_v = d/h$, the factor $(d_k + d_v)$ becomes $2d/h$ and the total can be written as
+\[
+\text{KV\_mem}_\text{FP32} \approx B \cdot N \cdot L \cdot \frac{2d}{h} \cdot 4.
+\]
+Simplifying and accounting for typical constants gives a memory cost that scales linearly with $L$: KV cache size is $O(N \cdot d \cdot L)$.
+
+During decoding for a single new token, the algorithm proceeds as follows. First, the current input (the new token) is fed through the model up to the attention layers of each transformer block, producing new key and value vectors for that token at each layer. Those new keys and values are appended to the stored KV cache arrays. Then, at each attention layer, the attention weights are computed by taking dot products between the current query vector $q_t$ and the stored keys $K_{1:t}$, typically scaled and passed through softmax:
+\[
+\alpha_{t,i} = \frac{\exp\big(q_t \cdot k_i / \sqrt{d_k}\big)}{\sum_{j=1}^t \exp\big(q_t \cdot k_j / \sqrt{d_k}\big)}.
+\]
+The output is then computed as the weighted sum of the stored values:
+\[
+o_t = \sum_{i=1}^t \alpha_{t,i} v_i.
+\]
+Note that the expensive part is the matrix multiply between $q_t$ (shape $h \times d_k$) and the entire key matrix $K_{1:t}$ (shape $h \times t \times d_k$). If the KV cache resides in a slower memory tier, fetching these $K_{1:t}$ and $V_{1:t}$ tensors dominates the total latency and throughput.
+
+To maximize performance, implementations try to keep the KV cache in the fastest memory possible and to perform the attention computations in-place without copying data unnecessarily. On GPUs, this may mean keeping KV caches in GPU DRAM (GDDR/HBM). On CPUs or edge devices with limited RAM, KV caches may be shuttled between main memory and local caches, and careful layout and access patterns are required to get good bandwidth utilization (for instance, storing KV as contiguous memory blocks for each layer and head to enable streaming loads).
+
+# Memory scaling with context length and mitigation techniques
+
+Because KV cache memory scales as $O(N \cdot d \cdot L)$, increasing context length $L$ can quickly exceed available memory. For example, consider a 70B parameter model with $N \approx 60$ layers and $d \approx 12{,}000$, using FP16 and single-head dimensionality $d_k = d/h$. With $L=32{,}768$ tokens, the KV cache can demand many gigabytes, often more than typical GPU DRAM. This linear scaling is the fundamental challenge of long-context inference.
+
+There are several mitigation strategies to reduce memory pressure:
+
+1. Reducing precision. Storing keys and values in lower numeric precision (FP16, bfloat16, int8, or even lower-bit formats) reduces memory proportionally. Moving from FP32 to FP16 halves memory usage; quantizing to 8-bit integer reduces it by another factor of two. The trade-off is potential loss of numerical precision, which may affect generation quality or stability in attention computations.
+
+2. Layer selection or caching fewer layers. Not all layers are equally important for attention reuse. Some approaches cache only a subset of layers’ KV pairs (for example, the last $M < N$ layers) and recompute keys/values for earlier layers on demand. This trades compute for memory. Depending on how expensive recomputation is relative to memory bandwidth and cost, this can be beneficial.
+
+3. Context window partitioning and recomputation. Instead of keeping the entire history in memory, store a smaller window of recent tokens and recompute, from stored activation checkpoints or from the input tokens, the representations for older tokens when needed. This reduces steady-state memory at the cost of extra computation and potentially increased latency spikes when older context is accessed.
+
+4. Memory-efficient attention variants. Sparse attention, local attention, or sliding-window attention limit which past keys are attended to so that only a subset of keys must be stored or fetched at each step. Architectures such as Longformer, Reformer, or approaches using recurrence or compressed memory embeddings reduce effective memory by structurally limiting dependencies. However, these require changing the architecture or attention pattern and might reduce model expressivity for certain tasks.
+
+5. Offloading and hierarchical memory. Split the KV cache across different memory tiers: keep the most recent portion in fast memory and older portions in slower DRAM or even on disk, fetching older blocks as needed. This requires careful orchestration to hide transfer latency (via prefetching) and may increase latency variability.
+
+6. Compression-based approaches. Compressing the KV cache (lossless or lossy) reduces capacity requirements. Compression can be applied per-token, per-block, per-layer, or across heads, and may be combined with low-precision storage. Compression introduces extra CPU/GPU work to decompress when data is needed and may have implications for bandwidth and latency.
+
+Each mitigation technique involves trade-offs among memory usage, compute cost, latency, and model quality. For instance, recomputation reduces memory but increases compute time and peak flops, which may be acceptable when compute is abundant but memory is scarce. Compression reduces capacity but may slightly degrade accuracy or increase decompression overhead. The right mix depends on the target platform, latency requirements, and acceptable quality trade-offs.
+
+# Compression of KV caches and activation quantization
+
+Compression and quantization are powerful tools to reduce the KV cache footprint while maintaining acceptable model behavior. The two broad classes are (1) numeric precision reduction (quantization) and (2) structural or statistical compression.
+
+Precision quantization replaces high-precision floating-point representations with lower-bit formats. The most common in inference are FP16/bfloat16 and 8-bit integer (INT8) representations. FP16 and bfloat16 are straightforward and preserve dynamic range reasonably well; they typically introduce minimal degradation in attention computation when used for keys/values, especially if accumulation or the attention computation itself uses higher precision. INT8 quantization requires calibration and scales/zero-points per tensor or block to maintain numerical fidelity. More aggressive schemes include 4-bit or mixed-precision quantization. When applying quantization to KV caches, it's important to ensure that the dot products used in attention still have enough precision during accumulation; one common approach is to cast quantized tensors back to higher precision (e.g., FP32) for the attention dot products, or to perform integer dot products with higher-bit accumulators.
+
+A more advanced family of techniques is vector quantization and product quantization. Product quantization (PQ) divides vectors into sub-vectors and quantizes each sub-vector using a small codebook. Storing keys/values as codebook indices reduces storage drastically; for example, 8-bit PQ with four sub-quantizers yields 32 bits per vector element vs 16 bits in FP16, but because PQ shares codebooks across many vectors, the amortized storage can be much lower. PQ is lossy and introduces approximation error in dot-product computations. Some works use asymmetric methods where the query vectors remain in high precision and the keys are approximated, allowing precomputed dot-product approximations or lookup-table-based computation of $q \cdot \tilde{k}$ where $\tilde{k}$ is a quantized key.
+
+Another set of methods perform block-wise or per-head quantization. Because attention heads may have different statistics, quantizing per-head or per-block can reduce quantization noise compared to global quantization. A per-block scale and zero-point or learned affine transform minimizes the reconstruction error for that block, improving the fidelity of attention scores.
+
+Lossy compression using techniques such as PCA or sketching can also reduce KV size. For example, you can project keys/values to a lower-rank subspace and store compact representations with the hope that most attention-relevant information lies in top principal components. Randomized sketches (such as CountSketch) can represent vectors compactly while allowing approximate dot-product computations with provable guarantees in some settings.
+
+A practical compression pipeline might combine several ideas: first cast to FP16 or bfloat16, then apply product quantization with per-head codebooks, and finally entropy encode the codebook indices. When decompressing for attention, one could either reconstruct keys/values to FP16 for the dot products or compute dot products directly in the compressed domain via lookup and accumulation. The trade-offs are computational overhead in decompression versus saved memory bandwidth reading compressed data.
+
+When designing quantization/compression for KV caches, two performance dimensions must be considered: (1) how much memory is reduced, and (2) how much extra compute or latency is introduced for decompression and for any loss of accuracy. In many cases moderate compression (e.g., FP16 + 8-bit PQ) can reduce storage by factors of two to four with negligible generation quality loss, while more aggressive compression requires careful evaluation.
+
+# Implications for latency and throughput when increasing context length
+
+Increasing context length raises both latency per token and memory bandwidth demands, but the precise effect depends on where bottlenecks are. Two common performance metrics are latency (time to generate a single token) and throughput (tokens generated per second, often when batching multiple requests).
+
+If the KV cache fits entirely in the fast local memory of the accelerator (e.g., GPU DRAM or on-device RAM), then generation latency per token may increase roughly linearly with $L$ because each new token requires attention over $L$ past keys (a $O(L \cdot d)$ dot-product work per layer). So computational cost per token is $O(N \cdot d \cdot L)$. Even if compute is abundant, the attention computation requires fetching $O(L \cdot d)$ data from memory; if memory bandwidth is the limiting factor, then increasing $L$ reduces throughput proportionally.
+
+If the KV cache does not fit in the fast memory tier and some portion resides in slower host memory or secondary storage, then latency will have an additional contribution from transfer time. Suppose the system must transfer $M(L)$ bytes per token from DRAM to accelerator memory to compute attention. Then the added time is approximately $M(L) / B_w$ where $B_w$ is the effective memory bandwidth between the tiers. When $M(L)$ grows with $L$, this transfer time can dominate latency. Techniques such as prefetching or streaming computations can hide some transfer time, but only if transfers and compute overlap well and if transfers are predictable.
+
+Throughput when batching multiple parallel sequences behaves differently. If batch size $B > 1$, keys and values for each sequence are independent, so KV cache memory scales with $B$, and attention compute becomes $O(B \cdot N \cdot d \cdot L)$. Batching amortizes some fixed costs (kernel launch overheads, I/O), so throughput per token per stream may improve, but aggregate memory pressure grows, making long contexts with large batches especially demanding.
+
+Latency-sensitive scenarios (e.g., interactive chat) often require minimizing tail-latency and jitter. Offloading older context to slower memory leads to variable fetch times and tail-latency spikes when less cached data must be fetched. Conversely, server-side inference with relaxed latency constraints can tolerate recomputation and transfer overheads as long as average throughput is high.
+
+There is also an algorithmic opportunity: for large $L$, the attention softmax often sparsifies naturally — many attention scores are very small and effectively ignored. Techniques that exploit such sparsity (pruning small attention weights, approximating attention with locality-sensitive hashing) can reduce compute and memory access, improving both latency and throughput. But they change the model’s computation and must be evaluated for accuracy.
+
+In sum, increasing context length increases the amount of data to be read and the number of dot-product operations. If compute is the bottleneck, latency grows with computation; if memory bandwidth or transfer is the bottleneck, latency grows with the amount of data moved. Good system design aligns the model representation, KV cache placement, and compression strategy to shift the bottleneck toward whichever resource is most abundant.
+
+# Design trade-offs for on-device and server-side inference
+
+Deploying long-context models on-device versus on servers has different constraints and trade-offs across memory, latency, privacy, cost, and energy.
+
+On-device inference has strict memory and power budgets. Mobile and edge devices have limited RAM, limited battery life, and weaker compute. On-chip SRAM and on-device DRAM are scarce. Because of these constraints, designers often use model compression (quantization and pruning), smaller architectures, or split computation approaches where a compact model runs locally and delegates heavy tasks to servers. For KV caches, on-device systems must be very frugal: using quantization (e.g., 8-bit or 4-bit), aggressive cache eviction policies, or recomputation to fit long contexts. Another on-device strategy is to use a hybrid memory hierarchy: store only the most recent context locally and keep older context in a cloud service (if privacy and connectivity allow), or to compress older tokens into a smaller memory summary (semantic memory) that captures salient facts without storing token-level KV pairs.
+
+Server-side inference benefits from larger DRAM/HBM capacities and more powerful compute, so keeping large KV caches in GPU DRAM or host RAM is feasible. Servers can implement larger context windows with less aggressive compression, enabling higher quality. However, servers incur operational costs (energy, cloud costs) and introduce potential privacy concerns if user data is uploaded. Within server deployments, designers must still balance cost: HBM-equipped accelerators are expensive, and running many concurrent long-context streams requires significant DRAM/HBM capacity. Thus, providers often use a combination of techniques: quantization to reduce memory and bandwidth, batching to improve throughput, and intelligent paging of KV caches across devices or CPU memory to increase effective context with acceptable latency.
+
+Latency targets also shape the design. For interactive latency targets (e.g., sub-200 ms per token), on-device inference has an advantage because it avoids network round-trips; but it must contend with very limited memory and compute. Server-side inference can achieve higher throughput and memory capacity but must ensure that end-to-end latency (including network transfer) meets requirements, and must manage tail-latency caused by memory transfers and paging.
+
+The compute-vs-memory trade-off is central. On-device designers may prefer recomputation or smaller models to save memory, accepting extra compute. Cloud servers with abundant compute and memory may instead focus on minimizing memory transfers and using HBM or NVLink to avoid PCIe bottlenecks. Energy and cost per token are also important. Quantization reduces memory and can reduce energy per operation, but complex decompression pipelines can raise CPU usage and energy.
+
+Finally, software stack maturity matters. On devices, optimized kernels for quantized attention, compact memory layouts, and careful use of vector instructions determine feasibility. On servers, access to multi-GPU primitives, high-bandwidth interconnects, and GPU-resident KV caches simplifies scaling to large contexts. A good deployment strategy aligns model architecture, compression choices, and memory placement with the physical constraints and the service-level objectives (latency, cost, privacy).
+
+Conclusion
+
+Memory architecture and KV caching are foundational to enabling long-context inference. The linear scaling of KV cache memory with context length is the central technical challenge, influencing everything from latency and throughput to where to place state in the memory hierarchy. Understanding the characteristics of on-chip SRAM versus off-chip DRAM, the mechanics of KV caching, and the available mitigation strategies — precision reduction, recomputation, structural attention changes, compression — allows you to reason about system design for long-context models. Practical deployments balance these tools against platform constraints, latency targets, and cost. Armed with the quantitative relationships and qualitative intuitions in this chapter, you should be able to read and critically assess the research literature and system papers that propose new ways to extend context length efficiently.
