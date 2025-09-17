@@ -23,9 +23,9 @@ def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, ou
     training_loss_path = os.path.join(output_dir, "training_loss_perplexity_metrics.csv")
 
     if probes_version == 'v8': # This logic should be kept in sync with finetuning_knowledge_v8.py
-        probes_path = f'data/probes/facts/{domain}/probes_{probes_version}.csv'
+        probes_path = f'../../data/probes/facts/{domain}/probes_{probes_version}.csv'
     else:
-        probes_path = f'data/probes/facts/{domain}/{domain}_knowledge_probes_{probes_version}.csv'
+        probes_path = f'../../data/probes/facts/{domain}/{domain}_knowledge_probes_{probes_version}.csv'
 
     if not os.path.exists(probe_metrics_path):
         log_info(f"Skipping plotting: '{probe_metrics_path}' not found.")
@@ -33,7 +33,7 @@ def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, ou
     
     probe_df = pd.read_csv(probe_metrics_path)
     loss_df = pd.read_csv(training_loss_path) if os.path.exists(training_loss_path) else pd.DataFrame()
-    probes_csv = pd.read_csv(probes_path) if os.path.exists(probes_path) else pd.DataFrame()
+    probes_csv = pd.read_csv(probes_path) if probes_path and os.path.exists(probes_path) else pd.DataFrame()
 
     if not probes_csv.empty and 'section' in probes_csv.columns and 'probe_index' in probe_df.columns:
         log_info("Using 'section' column from probes CSV file.")
@@ -201,8 +201,8 @@ def generate_new_plots_for_inference_probes(domain: str, probes_version: str, ou
     probe_metrics_path = os.path.join(output_dir, f"{domain}_inference_probe_metrics.csv")
     training_loss_path = os.path.join(output_dir, "training_loss_perplexity_metrics.csv")
     
-    path1 = f'data/probes/inference/{domain}/probes_{probes_version}.csv'
-    path2 = f'data/probes/inference/{domain}/{domain.lower()}_high_level_probes_{probes_version}.csv'
+    path1 = f'../../data/probes/inference/{domain}/probes_{probes_version}.csv'
+    path2 = f'../../data/probes/inference/{domain}/{domain.lower()}_high_level_probes_{probes_version}.csv'
     
     if os.path.exists(path1):
         probes_path = path1
@@ -217,7 +217,7 @@ def generate_new_plots_for_inference_probes(domain: str, probes_version: str, ou
     
     probe_df = pd.read_csv(probe_metrics_path)
     loss_df = pd.read_csv(training_loss_path) if os.path.exists(training_loss_path) else pd.DataFrame()
-    probes_csv = pd.read_csv(probes_path) if os.path.exists(probes_path) else pd.DataFrame()
+    probes_csv = pd.read_csv(probes_path) if probes_path and os.path.exists(probes_path) else pd.DataFrame()
     if 'text' in probes_csv.columns:
         probes_csv = probes_csv.rename(columns={'text': 'fact'})
 

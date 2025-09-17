@@ -39,7 +39,7 @@ def save_debug_file(content: str, filename: str, probe_type: str, paper_name: st
     path = os.path.join(debug_dir, filename)
     with open(path, 'w', encoding='utf-8') as f:
         f.write(content)
-
+        
 def is_text_in_document(text_to_find: str, document: str, threshold: float = 1.0) -> bool:
     """
     Checks if a text snippet exists in a larger document, ignoring whitespace, with a certain threshold.
@@ -58,10 +58,25 @@ def is_text_in_document(text_to_find: str, document: str, threshold: float = 1.0
         if len(normalized_text) == 0:
             return True # Or False, depending on desired behavior for empty strings
             
-        s = difflib.SequenceMatcher(None, normalized_text, normalized_document, autojunk=False)
-        match = s.find_longest_match(0, len(normalized_text), 0, len(normalized_document))
+        # Find longest sequences iteratively and remove them
+        matched_chars = 0
+        remaining_text = normalized_text
+        remaining_doc = normalized_document
         
-        return (match.size / len(normalized_text)) >= threshold
+        while remaining_text:
+            s = difflib.SequenceMatcher(None, remaining_text, remaining_doc, autojunk=False)
+            match = s.find_longest_match(0, len(remaining_text), 0, len(remaining_doc))
+            
+            if match.size >= 2:  # Only count sequential matches of 2+ characters
+                matched_chars += match.size
+                # Remove the matched portion from remaining_text
+                remaining_text = remaining_text[:match.a] + remaining_text[match.a + match.size:]
+                # Remove the matched portion from remaining_doc  
+                remaining_doc = remaining_doc[:match.b] + remaining_doc[match.b + match.size:]
+            else:
+                break  # No more meaningful matches found
+        
+        return (matched_chars / len(normalized_text)) >= threshold
 
 
 def check_tokenizer_consistency(df: pd.DataFrame, tokenizer: PreTrainedTokenizer):

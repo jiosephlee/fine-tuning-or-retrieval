@@ -78,11 +78,11 @@ def parse_paper_structure(text):
 
 def generate_questions(text: str) -> List[Dict[str, Any]]:
     """Generates inference questions from the text using an LLM."""
-    system_prompt = """Based on your understanding of the provided academic paper, your task is to generate questions to test a reader's true comprehension and understanding of the text. Specifically, your objective is to assess whether the reader can integrate, synthesize, and generalize the implications of the text beyond what's been stated. This is difficult because academic papers by nature will provide analysis, interpretation, and discourse of the knowledge in the paper. Thus, aim to write questions that either (1) require the reader to build upon the knowledge in the paper to draw a new conclusion, or (2) integrate and apply the knowledge in different settings i.e. testing the reader's ability to generalize the knowledge. Be creative in your question formulation.
+    system_prompt = """Based on your understanding of the provided academic paper, your task is to generate questions to test a reader's true comprehension and understanding of the text. Specifically, your objective is to assess whether the reader can integrate, synthesize, and generalize the implications of the text beyond what's been stated. This is difficult because academic papers by nature will provide analysis, interpretation, and discourse of the knowledge in the paper. Thus, aim to write questions that either (1) require the reader to build upon the knowledge in the paper to draw a new conclusion, or (2) integrate and apply the knowledge in different settings i.e. testing the reader's ability to generalize the knowledge. 
+    
+Note that an academic paper will cover topics like prior works. Make sure to create questions that build upon the novel knowledge introduced by the paper. Be creative in your question formulation. Create at least 20 of these questions.
     
 Here is a non-exhaustive list of types of inference that you should assess:
-- Cross-Domain Integration
-    - Cross-Domain Analogy: This could require connecting a concept from the paper to a well-known concept in another domain (e.g., computer science, statistics, physics). This tests for an abstract, transferable understanding. For instance, interpreting the KL-divergence term in the RLHF objective as a form of regularization to prevent overfitting, or the reference policy as a prior distribution and the optimal policy as a posterior distribution.
 - Conceptual Synthesis
      - Core Insight: This could ask the reader to distill the central argument or innovation of the paper by combining information from multiple sections. For example, a question could ask the reader to synthesize that DPO transforms a reinforcement learning problem into a classification problem.
      - Causal Mechanism: This could involve using experimental evidence, especially from ablations, to pinpoint the source of an observed effect. For example, a question could require synthesizing that the benefit of CoT comes from the sequential reasoning process itself, by ruling out alternative hypotheses tested in ablations.
@@ -90,10 +90,12 @@ Here is a non-exhaustive list of types of inference that you should assess:
     - Identifying Implicit Assumptions: This probes for an understanding of the unstated conditions upon which the paper's claims rest. For example, a question might require the reader to infer that for the DPO loss to be a valid maximum likelihood objective, the preference dataset D must be assumed to be sampled i.i.d. from the true human preference distribution.
 - Mathematical Understanding
     - Equation Interpretation: This could ask for the conceptual role or meaning of a specific term within a larger mathematical expression, beyond its literal definition.
+- Cross-Domain Integration
+    - Cross-Domain Analogy: This could require connecting a concept from the paper to a well-known concept in another domain (e.g., computer science, statistics, physics). This tests for an abstract, transferable understanding. For instance, interpreting the KL-divergence term in the RLHF objective as a form of regularization to prevent overfitting, or the reference policy as a prior distribution and the optimal policy as a posterior distribution.
 - Counterfactual Understanding
     - Predicting Outcomes of Hypothetical Scenarios: The reader could use the principles established in the paper to predict the result of a new experiment or a change in conditions.
-    
-Furthermore, here as some specific guidelines you should follow as you write the questions:
+ 
+Here as some specific guidelines you should follow as you write the questions:
 - The question can be as long as needed, but the answer must be a coherent phrase that is 1-5 words long. 
 - The questions should NOT be about factual recall that asks to recall a specific fact in the paper. 
 - The answer to the question should NOT be found in the text. It should be new knowledge. However, it must build upon the knowledge *in the paper*.
@@ -137,7 +139,7 @@ Provide the output in JSON format, as a dictionary with a single key "qa_items" 
     parsed_questions = []
     for q in questions:
         sentences = q.get('text_sentences', [])
-        if all(is_text_in_document(s, text, threshold=0.5) for s in sentences):
+        if all(is_text_in_document(s, text, threshold=0.75) for s in sentences):
             parsed_questions.append(q)
 
     if len(parsed_questions) != len(questions):
@@ -152,7 +154,7 @@ def convert_to_cloze(question: Dict[str, Any]) -> Tuple[str, str] | None:
         'system': FACT_PROBE_CLOZE_PROMPT_SYSTEM,
         'user': user_prompt
     }
-    response = utils.query_llm(cloze_prompt, model='gpt-5', reasoning_effort='medium', system_prompt_included=True, return_json=True, max_tokens=1000)
+    response = utils.query_llm(cloze_prompt, model='gpt-5', reasoning_effort='low', system_prompt_included=True, return_json=True, max_tokens=1000)
     try:
         data = json.loads(response) if isinstance(response, str) else response
         answer = data.get('answer')
@@ -163,10 +165,10 @@ def convert_to_cloze(question: Dict[str, Any]) -> Tuple[str, str] | None:
         print("Failed to parse JSON response for cloze conversion.")
     return None
 
-def quality_control_cloze(cloze_pair: Tuple[str, str], title: str) -> Tuple[str, str] | None:
+def quality_control_cloze(cloze_pair: Tuple[str, str], title: str, context: str) -> Tuple[str, str] | None:
     """Performs quality control on a cloze statement for LaTeX formatting."""
     quality_control_prompt = {
-        'system': r"""Your task is to review and refine a statement that has been extracted from an academic paper. You will be given an '(answer, statement)' pair. Your task is to apply a rigorous checklist to the pair, refining it based on a provided quality control checklist.
+        'system': r"""Your task is to review and refine an inference question that's been rephrased as a cloze statement with the answer at the end. It has been extracted from an academic paper. You will be given an '(answer, statement)' pair as well as the supporting text from the paper that the statement draws from. Your task is to apply a rigorous checklist to the pair, refining it based on a provided quality control checklist.
 
 ### Quality Control Checklist
 
@@ -182,12 +184,22 @@ def quality_control_cloze(cloze_pair: Tuple[str, str], title: str) -> Tuple[str,
     - "According to the paper '...'"
 - Action: Rewrite the statement so that it starts with one of the following templates. Feel free to adjust the template to fit the statement more naturally.
 
+3. Answer Placement
+- The answer must appear at the very end of the statement.
+- Action: If this isn't the case, minimally rewrite the statement such that the answer appears at the end.
+
+4. Contextualize
+- Ensure that the question is self-contained and it's clear what it is asking.
+- Try to adapt the language and diction used by the paper as much as possible while keeping the statement structure as similar as possible.
+- Consider even paraphrasing the answer to language that is more fitting for the paper.
+- Action: Add sufficient context to the question so that it's clear what it is asking.
+
 In all your adjustments, change the statement as minimally as necessary. If a statement is already good, make no changes.
 
 ### Output Format
 Provide a JSON object with a single key "pair", which is the refined [answer, statement] pair.
 """,
-        'user': f"### Title\n{title}\n### Cloze Pair\n{json.dumps(cloze_pair)}\n"
+        'user': f"### Paper Context\n{context}\n### Title\n{title}\n### Cloze Pair\n{json.dumps(cloze_pair)}\n"
     }
     response = utils.query_llm(quality_control_prompt, model='gpt-5-mini', system_prompt_included=True, return_json=True, max_tokens=1000)
     try:
@@ -241,24 +253,38 @@ def process_paper(paper_name: str, paper_content: str, **kwargs):
     paper_df = parse_paper_structure(paper_content)
     title = re.search(r'\\title{(.*?)}', paper_content).group(1) if re.search(r'\\title{(.*?)}', paper_content) else "no title"
 
+    document_halves = []
     if paper_df.empty:
-        print("Could not parse paper structure. Using full paper content.")
-        section_texts = [paper_content]
+        print("Could not parse paper structure. Using full paper content, split in half.")
+        paragraphs = paper_content.split('\n\n')
+        if len(paragraphs) > 1:
+            mid_index = len(paragraphs) // 2
+            document_halves.append("\n\n".join(paragraphs[:mid_index]))
+            document_halves.append("\n\n".join(paragraphs[mid_index:]))
+        else:
+            document_halves.append(paper_content)
     else:
         section_texts = paper_df['section_text'].unique()
+        if len(section_texts) > 1:
+            mid_index = len(section_texts) // 2
+            first_half = "\n\n".join(section_texts[:mid_index])
+            second_half = "\n\n".join(section_texts[mid_index:])
+            document_halves = [first_half, second_half]
+        else:
+            document_halves.append("\n\n".join(section_texts))
 
-    print(f"Generating comprehension questions for {len(section_texts)} sections in parallel...")
+    print(f"Generating comprehension questions for {len(document_halves)} document halves in parallel...")
     
     questions = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
-        future_to_section = {executor.submit(generate_questions, section_text): section_text for section_text in section_texts}
-        for future in tqdm(concurrent.futures.as_completed(future_to_section), total=len(section_texts), desc="Generating questions"):
+        future_to_half = {executor.submit(generate_questions, half): half for half in document_halves}
+        for future in tqdm(concurrent.futures.as_completed(future_to_half), total=len(document_halves), desc="Generating questions"):
             try:
-                questions_for_section = future.result()
-                if questions_for_section:
-                    questions.extend(questions_for_section)
+                questions_for_half = future.result()
+                if questions_for_half:
+                    questions.extend(questions_for_half)
             except Exception as exc:
-                print(f'A section generated an exception: {exc}')
+                print(f'A document half generated an exception: {exc}')
 
     #questions = generate_questions(paper_content)
     print(f"Generated a total of {len(questions)} questions.")
@@ -288,7 +314,15 @@ def process_paper(paper_name: str, paper_content: str, **kwargs):
     save_debug_file(json.dumps({'pairs': [p for p, q in cloze_pairs_list]}, indent=2), '03_cloze_pairs.txt', 'inference', paper_name)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
-        future_to_data = {executor.submit(quality_control_cloze, pair, title): (pair, question) for pair, question in cloze_pairs_list}
+        future_to_data = {
+            executor.submit(
+                quality_control_cloze, 
+                pair, 
+                title, 
+                paper_content,
+            ): (pair, question) 
+            for pair, question in cloze_pairs_list
+        }
         for future in tqdm(concurrent.futures.as_completed(future_to_data), total=len(cloze_pairs_list), desc="Performing quality control"):
             original_pair, question = future_to_data[future]
             try:
@@ -368,7 +402,7 @@ def process_paper(paper_name: str, paper_content: str, **kwargs):
 
     output_dir = f'../../data/probes/inference/{paper_name}/'
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, 'probes_v4.csv')
+    output_path = os.path.join(output_dir, 'probes_v5.csv')
     cloze_df.to_csv(output_path, index=False)
     print(f"Saved {len(cloze_df)} cloze probes to {output_path}")
 
