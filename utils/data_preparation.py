@@ -156,18 +156,30 @@ def prepare_training_mix(
     test_script = strategy_args.get("test_script", False)
 
     # Helper to chunk a single text
-    def _chunk(text: str) -> List[str]:
+    def _chunk(text: str, explanation=False) -> List[str]:
         text_with_eos = text + tokenizer.eos_token
-        chunks, _ = chunking.chunk(
+        if explanation:
+            chunks, _ = chunking.chunk(
             text_with_eos,
             tokenizer,
             train_cfg.context_length,
-            chunk_by_section,
-            overlap_sections,
-            overlap_ratio,
-            add_title_prefix,
+            chunk_by_section=False,
+            overlap=False,
+            add_title_prefix=False,
             log=log
         )
+        else:
+            chunks, _ = chunking.chunk(
+                text_with_eos,
+                tokenizer,
+                train_cfg.context_length,
+                chunk_by_section,
+                overlap_sections,
+                overlap_ratio,
+                add_title_prefix,
+                log=log
+            )
+        
         return chunks
 
     # Determine domains: use override if provided, otherwise scan directory
