@@ -563,6 +563,6 @@ if __name__ == "__main__":
     
     # -- LIMA-based instruction tuning ---
     if args.lima_afterwards:
-        lima_epochs = 1 if args.test_script else 15
+        lima_epochs = 1 if args.test_script else 10
         lima_training(model, tokenizer, log, args, num_train_epochs=lima_epochs)
     
