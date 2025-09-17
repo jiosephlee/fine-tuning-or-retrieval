@@ -407,7 +407,7 @@ Respond with JSON format with the following key:
                 'user': user_prompt
             }
             
-            result = utils.query_llm(full_prompt, model='gpt-5-mini', reasoning_effort='medium', return_json=True, max_tokens=100)
+            result = utils.query_llm(full_prompt, model='gpt-5-mini', reasoning_effort='low', return_json=True, max_tokens=100)
             result = json.loads(result)
             is_knowledge = result['is_knowledge']
             
@@ -558,13 +558,13 @@ Think carefully and critically through this task, following the step-by-step ins
             'user': ""
         }
         
-        context = first_row['subsection_text']
+        context = extract_context_and_sentence(first_row)
         prompt['user'] = f"""### Title\n{first_row['title']}\n### Context\n{context}\n\n### Sentence\n{first_row['raw_knowledge_statement'].strip()}"""
-        output1 = utils.query_llm(prompt, model='gpt-5-mini', reasoning_effort='high')   
+        output1 = utils.query_llm(prompt, model='gpt-5-mini', reasoning_effort='medium')   
 
         json_parse_prompt['user'] = output1
         try:
-            json_output = utils.query_llm(json_parse_prompt, model='gpt-5-mini', return_json=True, reasoning_effort='low')
+            json_output = utils.query_llm(json_parse_prompt, model='gpt-5-nano', return_json=True, reasoning_effort='low')
             qa_pairs_data = json.loads(json_output)
             qa_pairs = qa_pairs_data.get('list_of_questions')
             if qa_pairs is None:
@@ -590,11 +590,11 @@ Think carefully and critically through this task, following the step-by-step ins
             single_qa_string = f'### Question\n"{question}\n\n###Answer\n"{answer}"'
 
             contextualize_prompt['user'] = f"""### Title\n{first_row['title']}\n### Context\n{context}\n\n### Sentence\n{first_row['raw_knowledge_statement'].strip()}\n\n{single_qa_string}"""
-            output2_individual = utils.query_llm(contextualize_prompt, model='gpt-5-mini', reasoning_effort='high')
+            output2_individual = utils.query_llm(contextualize_prompt, model='gpt-5-mini', reasoning_effort='medium')
             all_contextualized.append(output2_individual)
 
             cloze_prompt['user'] = f"""### Question and Answer\n{output2_individual}"""
-            output3_individual = utils.query_gpt(cloze_prompt, system_prompt_included=True, model='gpt-5', reasoning_effort='medium', return_json=True)
+            output3_individual = utils.query_gpt(cloze_prompt, system_prompt_included=True, model='gpt-5', reasoning_effort='low', return_json=True)
             try:
                 cloze_pair = json.loads(output3_individual)
                 if isinstance(cloze_pair, dict) and 'answer' in cloze_pair and 'statement' in cloze_pair:
