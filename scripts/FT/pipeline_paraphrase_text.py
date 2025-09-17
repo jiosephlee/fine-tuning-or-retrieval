@@ -3,6 +3,7 @@ import sys
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import statistics
+import argparse
 
 # Add parent directory to path
 sys.path.append('../../')
@@ -93,7 +94,7 @@ def paraphrase_texts(paragraphs):
         paraphrased_paragraphs.append(paraphrase_paragraph(paragraph))
     return paraphrased_paragraphs
 
-def process_papers():
+def process_papers(paper_filenames=None, start_index=0, num_paraphrases=9):
     input_dir = "../../data/arxiv/cleaned/"
     output_dir = "../../data/arxiv/paraphrased/"
     
@@ -101,7 +102,12 @@ def process_papers():
     os.makedirs(output_dir, exist_ok=True)
     
     # Get list of files in cleaned directory
-    files = [f for f in os.listdir(input_dir) if f.endswith('.tex')]
+    if paper_filenames:
+        # If paper filenames are provided, use them
+        files = [f if f.endswith('.tex') else f'{f}.tex' for f in paper_filenames]
+    else:
+        # Otherwise, process all files in the directory
+        files = [f for f in os.listdir(input_dir) if f.endswith('.tex')]
     
     for filename in files:
         print(f"Processing {filename}")
@@ -113,7 +119,7 @@ def process_papers():
         # Split and merge paragraphs once
         paragraphs = split_and_merge_paragraphs(text)
         
-        # Generate two paraphrased versions in parallel
+        # Generate paraphrased versions in parallel
         def generate_paraphrase(i):
             print(f"Generating paraphrase {i} for {filename}")
             paraphrased_paper = '\n\n'.join(paraphrase_texts(paragraphs))
@@ -130,8 +136,32 @@ def process_papers():
             print(f"Saved paraphrased version to {output_path}")
             return output_path
         
-        with ThreadPoolExecutor(max_workers=9) as executor:
-            list(executor.map(generate_paraphrase, range(9)))
+        with ThreadPoolExecutor(max_workers=num_paraphrases) as executor:
+            list(executor.map(generate_paraphrase, range(start_index, start_index + num_paraphrases)))
 
 if __name__ == "__main__":
-    process_papers()
+    parser = argparse.ArgumentParser(description="Paraphrase academic papers.")
+    parser.add_argument(
+        '--papers', 
+        nargs='+', 
+        help='Optional list of paper filenames to process (e.g., paper1, paper2.tex). If not provided, all papers in the cleaned directory will be processed.'
+    )
+    parser.add_argument(
+        '--start_index',
+        type=int,
+        default=0,
+        help='The starting index for generating paraphrases.'
+    )
+    parser.add_argument(
+        '--num_paraphrases',
+        type=int,
+        default=9,
+        help='The number of paraphrases to generate.'
+    )
+    args = parser.parse_args()
+    
+    process_papers(
+        paper_filenames=args.papers,
+        start_index=args.start_index,
+        num_paraphrases=args.num_paraphrases
+    )
