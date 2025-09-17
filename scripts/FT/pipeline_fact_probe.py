@@ -681,7 +681,7 @@ Based on the checklist, decide if the pair should be kept. Drop the pair if fail
 
 ### Output Format
 Provide your decision as a JSON object with a single boolean key: `{"keep": true}` or `{"keep": false}`."""
-        prompt['user'] = f"""### Answer\n{validated_pair['answer']}\n\n### Statement\n{validated_pair['statement'].replace(validated_pair['answer'], '___')}"""
+        prompt['user'] = f"""### Answer\n{validated_pair['answer']}\n\n### Statement\n{validated_pair['statement'].replace(str(validated_pair['answer']), '___')}"""
         
         response = utils.query_gpt(prompt, model='gpt-5-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True)
         try:

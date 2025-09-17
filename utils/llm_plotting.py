@@ -21,6 +21,7 @@ def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, ou
     log_info("Loading dataframes for new plotting...")
     probe_metrics_path = os.path.join(output_dir, f"{domain}_knowledge_probe_metrics.csv")
     training_loss_path = os.path.join(output_dir, "training_loss_perplexity_metrics.csv")
+    corpus_ppl_path = os.path.join(output_dir, f"{domain}_corpus_perplexity_metrics.csv")
 
     if probes_version == 'v8': # This logic should be kept in sync with finetuning_knowledge_v8.py
         probes_path = f'../../data/probes/facts/{domain}/probes_{probes_version}.csv'
@@ -33,6 +34,7 @@ def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, ou
     
     probe_df = pd.read_csv(probe_metrics_path)
     loss_df = pd.read_csv(training_loss_path) if os.path.exists(training_loss_path) else pd.DataFrame()
+    corpus_ppl_df = pd.read_csv(corpus_ppl_path) if os.path.exists(corpus_ppl_path) else pd.DataFrame()
     probes_csv = pd.read_csv(probes_path) if probes_path and os.path.exists(probes_path) else pd.DataFrame()
 
     if not probes_csv.empty and 'section' in probes_csv.columns and 'probe_index' in probe_df.columns:
@@ -46,25 +48,46 @@ def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, ou
     # --- PLOT 1: Normalized Loss vs. Hit Accuracy ---
     log_info("Generating Plot 1: Normalized Loss vs. Hit Accuracy...")
     hit_cols = [f'hit_accuracy_at_{k}' for k in [1, 10, 100] if f'hit_accuracy_at_{k}' in probe_df.columns]
-    if not loss_df.empty and hit_cols:
+    
+    if hit_cols:
         plt.figure(figsize=(14, 8))
         
-        # Aggregate by step
+        # Aggregate hit accuracies by step
         avg_hits = probe_df.groupby('step')[hit_cols].mean().reset_index()
-        
-        # Merge dataframes on 'step'
-        merged_df = pd.merge(loss_df, avg_hits, on='step', how='inner')
+
+        # Start with avg_hits as the base for merging
+        merged_df = avg_hits
+
+        # Merge with training loss data if available
+        if not loss_df.empty:
+            merged_df = pd.merge(merged_df, loss_df, on='step', how='left')
+
+        # Merge with corpus perplexity data if available
+        if not corpus_ppl_df.empty:
+            merged_df = pd.merge(merged_df, corpus_ppl_df, on='step', how='left')
 
         if not merged_df.empty:
             scaler = MinMaxScaler()
-            cols_to_scale = ['chunked_perplexity'] + hit_cols
-            merged_df[cols_to_scale] = scaler.fit_transform(merged_df[cols_to_scale])
             
-            sns.lineplot(data=merged_df, x='step', y='chunked_perplexity', label='Normalized Training Perplexity')
-            for col in hit_cols:
-                sns.lineplot(data=merged_df, x='step', y=col, label=f'Normalized {col.replace("_", " ").title()}')
+            # Identify columns to scale
+            cols_to_scale = list(set(hit_cols + ['chunked_perplexity', 'corpus_perplexity']) & set(merged_df.columns))
+            
+            # Scale the columns if they exist
+            if cols_to_scale:
+                merged_df[cols_to_scale] = scaler.fit_transform(merged_df[cols_to_scale])
+            
+            # Plotting logic
+            if 'chunked_perplexity' in merged_df.columns:
+                sns.lineplot(data=merged_df, x='step', y='chunked_perplexity', label='Normalized Training Perplexity')
+            
+            if 'corpus_perplexity' in merged_df.columns:
+                sns.lineplot(data=merged_df, x='step', y='corpus_perplexity', label='Normalized Corpus Perplexity')
 
-            plt.title('Plot 1: Normalized Training Perplexity vs. Hit Accuracy')
+            for col in hit_cols:
+                if col in merged_df.columns:
+                    sns.lineplot(data=merged_df, x='step', y=col, label=f'Normalized {col.replace("_", " ").title()}')
+
+            plt.title('Plot 1: Normalized Perplexity vs. Hit Accuracy')
             plt.xlabel('Training Step')
             plt.ylabel('Normalized Value (0 to 1)')
             plt.grid(True, which="both", ls="--")
@@ -200,6 +223,7 @@ def generate_new_plots_for_inference_probes(domain: str, probes_version: str, ou
     log_info("Loading dataframes for inference probe plotting...")
     probe_metrics_path = os.path.join(output_dir, f"{domain}_inference_probe_metrics.csv")
     training_loss_path = os.path.join(output_dir, "training_loss_perplexity_metrics.csv")
+    corpus_ppl_path = os.path.join(output_dir, f"{domain}_corpus_perplexity_metrics.csv")
     
     path1 = f'../../data/probes/inference/{domain}/probes_{probes_version}.csv'
     path2 = f'../../data/probes/inference/{domain}/{domain.lower()}_high_level_probes_{probes_version}.csv'
@@ -217,29 +241,54 @@ def generate_new_plots_for_inference_probes(domain: str, probes_version: str, ou
     
     probe_df = pd.read_csv(probe_metrics_path)
     loss_df = pd.read_csv(training_loss_path) if os.path.exists(training_loss_path) else pd.DataFrame()
+    corpus_ppl_df = pd.read_csv(corpus_ppl_path) if os.path.exists(corpus_ppl_path) else pd.DataFrame()
     probes_csv = pd.read_csv(probes_path) if probes_path and os.path.exists(probes_path) else pd.DataFrame()
     if 'text' in probes_csv.columns:
         probes_csv = probes_csv.rename(columns={'text': 'fact'})
 
     # --- PLOT 1: Normalized Loss vs. Hit Accuracy (Inference) ---
-    log_info("Generating Inference Plot 1: Normalized Loss vs. Hit Accuracy...")
+    log_info("Generating Inference Plot 1: Normalized Perplexity vs. Hit Accuracy...")
     hit_cols = [f'hit_accuracy_at_{k}' for k in [1, 10, 100] if f'hit_accuracy_at_{k}' in probe_df.columns]
-    if not loss_df.empty and hit_cols:
+    
+    if hit_cols:
         plt.figure(figsize=(14, 8))
         
+        # Aggregate hit accuracies by step
         avg_hits = probe_df.groupby('step')[hit_cols].mean().reset_index()
-        merged_df = pd.merge(loss_df, avg_hits, on='step', how='inner')
+
+        # Start with avg_hits as the base for merging
+        merged_df = avg_hits
+
+        # Merge with training loss data if available
+        if not loss_df.empty:
+            merged_df = pd.merge(merged_df, loss_df, on='step', how='left')
+            
+        # Merge with corpus perplexity data if available
+        if not corpus_ppl_df.empty:
+            merged_df = pd.merge(merged_df, corpus_ppl_df, on='step', how='left')
 
         if not merged_df.empty:
             scaler = MinMaxScaler()
-            cols_to_scale = ['chunked_perplexity'] + hit_cols
-            merged_df[cols_to_scale] = scaler.fit_transform(merged_df[cols_to_scale])
             
-            sns.lineplot(data=merged_df, x='step', y='chunked_perplexity', label='Normalized Training Perplexity')
-            for col in hit_cols:
-                sns.lineplot(data=merged_df, x='step', y=col, label=f'Normalized {col.replace("_", " ").title()}')
+            # Identify columns to scale
+            cols_to_scale = list(set(hit_cols + ['chunked_perplexity', 'corpus_perplexity']) & set(merged_df.columns))
 
-            plt.title('Inference Plot 1: Normalized Training Perplexity vs. Hit Accuracy')
+            # Scale the columns if they exist
+            if cols_to_scale:
+                merged_df[cols_to_scale] = scaler.fit_transform(merged_df[cols_to_scale])
+            
+            # Plotting logic
+            if 'chunked_perplexity' in merged_df.columns:
+                sns.lineplot(data=merged_df, x='step', y='chunked_perplexity', label='Normalized Training Perplexity')
+            
+            if 'corpus_perplexity' in merged_df.columns:
+                sns.lineplot(data=merged_df, x='step', y='corpus_perplexity', label='Normalized Corpus Perplexity')
+
+            for col in hit_cols:
+                if col in merged_df.columns:
+                    sns.lineplot(data=merged_df, x='step', y=col, label=f'Normalized {col.replace("_", " ").title()}')
+
+            plt.title('Inference Plot 1: Normalized Perplexity vs. Hit Accuracy')
             plt.xlabel('Training Step')
             plt.ylabel('Normalized Value (0 to 1)')
             plt.grid(True, which="both", ls="--")
