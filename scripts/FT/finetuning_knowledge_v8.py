@@ -112,7 +112,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
 
         # --- Knowledge Probes ---
         knowledge_probes_version = args.knowledge_probes_version
-        if knowledge_probes_version == 'v8':
+        if int(knowledge_probes_version[-1]) >= 8:
             knowledge_probe_path = f'../../data/probes/facts/{domain}/probes_{knowledge_probes_version}.csv'
         else:
             knowledge_probe_path = f'../../data/probes/facts/{domain}/{domain}_knowledge_probes_{knowledge_probes_version}.csv'

@@ -1,5 +1,5 @@
-num_epochs=100
-num_paraphrased=9
+num_epochs=40
+num_paraphrased=0
 echo "This is a test run to see if LIMA-based instruction tuning works. Using single arxiv paper but with overlapping sections."\
 
 nohup python finetuning_knowledge_v8.py \
