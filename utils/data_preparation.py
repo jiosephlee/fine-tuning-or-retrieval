@@ -172,96 +172,120 @@ def prepare_training_mix(
 
     # Determine domains: use override if provided, otherwise scan directory
     domains = strategy_args.get("override_domains", None)
-    if domains is None:
-        cleaned_dir = '../../data/arxiv/cleaned'
-        domains = [f.replace('.tex', '') for f in os.listdir(cleaned_dir) if f.endswith('.tex')]
-    log.info(f"Processing domains: {domains}")
-
-    num_paraphrased_texts = strategy_args.get("num_paraphrased_texts", 0)
-    with_explanations = "WithExplanations" in strategy_name
-
-    # Each inner list holds chunks for a "unique document type" across all domains
-    # e.g., unique_document_batches[0] = all source chunks
-    #       unique_document_batches[1] = all paraphrase-1 chunks
-    unique_document_batches = [[] for _ in range(1 + num_paraphrased_texts)]
-
-    for domain in domains:
-        log.info(f"Loading data for domain: {domain}")
+    unique_document_batches = []
+    
+    if "PriorKnowledge" in strategy_name:
+        prior_knowledge_dir = '../../data/arxiv/prior_knowledge'
+        if domains is None:
+            domains = [name for name in os.listdir(prior_knowledge_dir) if os.path.isdir(os.path.join(prior_knowledge_dir, name))]
+        log.info(f"Processing prior knowledge for domains: {domains}")
         
-        # 1. Load source text
-        source_path = f'../../data/arxiv/cleaned/{domain}.tex'
-        try:
-            with open(source_path, 'r', encoding='utf-8') as f:
-                source_text = f.read()
-        except FileNotFoundError:
-            log.error(f"Source file not found for domain {domain} at {source_path}. Skipping.")
-            continue
-            
-        source_chunks = _chunk(source_text)
-        
-
-        # 2. Load paraphrased texts
-        paraphrased_texts = []
-        paraphrased_chunks_by_doc = []
-        if num_paraphrased_texts > 0:
-            paraphrased_dir = f'../../data/arxiv/paraphrased/{domain}/'
-            if os.path.isdir(paraphrased_dir):
-                for i in range(num_paraphrased_texts):
-                    para_path = os.path.join(paraphrased_dir, f'{i}.tex')
-                    if os.path.exists(para_path):
-                        with open(para_path, 'r', encoding='utf-8') as f:
-                            paraphrased_texts.append(f.read())
-                    else:
-                        log.warning(f"Paraphrased text not found: {para_path}")
-            paraphrased_chunks_by_doc = [_chunk(text) for text in paraphrased_texts]
-
-        # 3. Load explanation texts
-        explanation_chunks = []
-        if with_explanations:
-            explanation_dir = f'data/arxiv/explanations/{domain}/'
-            if os.path.isdir(explanation_dir):
-                for filename in sorted(os.listdir(explanation_dir)):
+        all_prior_knowledge_chunks = []
+        for domain in domains:
+            domain_dir = os.path.join(prior_knowledge_dir, domain)
+            domain_text = ""
+            if os.path.isdir(domain_dir):
+                log.info(f"Loading prior knowledge from {domain_dir}")
+                for filename in sorted(os.listdir(domain_dir)):
                     if filename.endswith('.txt'):
-                        file_path = os.path.join(explanation_dir, filename)
+                        file_path = os.path.join(domain_dir, filename)
                         with open(file_path, 'r', encoding='utf-8') as f:
-                            explanation_chunks.extend(_chunk(f.read()))
-            log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks.")
-        
-        # This part ensures that chunks from each document type of a domain are added to the correct overall batch
-        
-        # Document Chunks for the current domain
-        domain_doc_chunks = [source_chunks] + paraphrased_chunks_by_doc
-
-        # 4. Handle explanation replacement logic
-        num_chunks_per_source_doc = len(source_chunks)
-        if with_explanations and explanation_chunks:
-            paraphrased_units_for_explanations = math.ceil(len(explanation_chunks) / num_chunks_per_source_doc)
+                            domain_text += f.read() + "\n\n"
             
-            # Start replacing from the last paraphrased doc towards the first
-            if paraphrased_units_for_explanations > 0:
-                # Distribute explanation chunks among the slots of the documents they replace
-                num_to_replace = min(paraphrased_units_for_explanations, len(paraphrased_chunks_by_doc))
-                
-                # Split explanations into `num_to_replace` parts
-                split_explanations = [explanation_chunks[i::num_to_replace] for i in range(num_to_replace)]
+            if domain_text:
+                all_prior_knowledge_chunks.extend(_chunk(domain_text))
 
-                for i in range(num_to_replace):
-                    # Index of paraphrased doc to replace (from the end)
-                    replace_idx = len(paraphrased_chunks_by_doc) - 1 - i
-                    # Corresponding index in domain_doc_chunks (source is at 0)
-                    doc_chunk_idx = replace_idx + 1
+        unique_document_batches.append(all_prior_knowledge_chunks)
+    else:
+        if domains is None:
+            cleaned_dir = '../../data/arxiv/cleaned'
+            domains = [f.replace('.tex', '') for f in os.listdir(cleaned_dir) if f.endswith('.tex')]
+        log.info(f"Processing domains: {domains}")
+
+        num_paraphrased_texts = strategy_args.get("num_paraphrased_texts", 0)
+        with_explanations = "WithExplanations" in strategy_name
+
+        # Each inner list holds chunks for a "unique document type" across all domains
+        # e.g., unique_document_batches[0] = all source chunks
+        #       unique_document_batches[1] = all paraphrase-1 chunks
+        unique_document_batches = [[] for _ in range(1 + num_paraphrased_texts)]
+
+        for domain in domains:
+            log.info(f"Loading data for domain: {domain}")
+            
+            # 1. Load source text
+            source_path = f'../../data/arxiv/cleaned/{domain}.tex'
+            try:
+                with open(source_path, 'r', encoding='utf-8') as f:
+                    source_text = f.read()
+            except FileNotFoundError:
+                log.error(f"Source file not found for domain {domain} at {source_path}. Skipping.")
+                continue
+                
+            source_chunks = _chunk(source_text)
+            
+
+            # 2. Load paraphrased texts
+            paraphrased_texts = []
+            paraphrased_chunks_by_doc = []
+            if num_paraphrased_texts > 0:
+                paraphrased_dir = f'../../data/arxiv/paraphrased/{domain}/'
+                if os.path.isdir(paraphrased_dir):
+                    for i in range(num_paraphrased_texts):
+                        para_path = os.path.join(paraphrased_dir, f'{i}.tex')
+                        if os.path.exists(para_path):
+                            with open(para_path, 'r', encoding='utf-8') as f:
+                                paraphrased_texts.append(f.read())
+                        else:
+                            log.warning(f"Paraphrased text not found: {para_path}")
+                paraphrased_chunks_by_doc = [_chunk(text) for text in paraphrased_texts]
+
+            # 3. Load explanation texts
+            explanation_chunks = []
+            if with_explanations:
+                explanation_dir = f'data/arxiv/explanations/{domain}/'
+                if os.path.isdir(explanation_dir):
+                    for filename in sorted(os.listdir(explanation_dir)):
+                        if filename.endswith('.txt'):
+                            file_path = os.path.join(explanation_dir, filename)
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                explanation_chunks.extend(_chunk(f.read()))
+                log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks.")
+            
+            # This part ensures that chunks from each document type of a domain are added to the correct overall batch
+            
+            # Document Chunks for the current domain
+            domain_doc_chunks = [source_chunks] + paraphrased_chunks_by_doc
+
+            # 4. Handle explanation replacement logic
+            num_chunks_per_source_doc = len(source_chunks)
+            if with_explanations and explanation_chunks:
+                paraphrased_units_for_explanations = math.ceil(len(explanation_chunks) / num_chunks_per_source_doc)
+                
+                # Start replacing from the last paraphrased doc towards the first
+                if paraphrased_units_for_explanations > 0:
+                    # Distribute explanation chunks among the slots of the documents they replace
+                    num_to_replace = min(paraphrased_units_for_explanations, len(paraphrased_chunks_by_doc))
                     
-                    domain_doc_chunks[doc_chunk_idx] = split_explanations[i]
-                log.info(f"Domain {domain}: Replaced {num_to_replace} paraphrased documents with explanation chunks.")
-        
-        # Add the processed chunks for this domain to the main batches
-        for i, chunks in enumerate(domain_doc_chunks):
-            if i < len(unique_document_batches):
-                unique_document_batches[i].extend(chunks)
-                if test_script:
-                    log.info(f"Batch {i} increases to {len(unique_document_batches[i])} chunks")
-                
+                    # Split explanations into `num_to_replace` parts
+                    split_explanations = [explanation_chunks[i::num_to_replace] for i in range(num_to_replace)]
 
+                    for i in range(num_to_replace):
+                        # Index of paraphrased doc to replace (from the end)
+                        replace_idx = len(paraphrased_chunks_by_doc) - 1 - i
+                        # Corresponding index in domain_doc_chunks (source is at 0)
+                        doc_chunk_idx = replace_idx + 1
+                        
+                        domain_doc_chunks[doc_chunk_idx] = split_explanations[i]
+                    log.info(f"Domain {domain}: Replaced {num_to_replace} paraphrased documents with explanation chunks.")
+            
+            # Add the processed chunks for this domain to the main batches
+            for i, chunks in enumerate(domain_doc_chunks):
+                if i < len(unique_document_batches):
+                    unique_document_batches[i].extend(chunks)
+                    if test_script:
+                        log.info(f"Batch {i} increases to {len(unique_document_batches[i])} chunks")
+                    
     # 5. Assemble final chunk list with optional pretraining data replay
     final_chunks = []
     pretraining_separators = int(strategy_args.get("separate_batches_with_pretraining", 0))

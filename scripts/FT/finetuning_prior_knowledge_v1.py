@@ -1,0 +1,525 @@
+# add .. path 
+
+# pip install flash-attn --no-build-isolation
+# pip install git+https://github.com/huggingface/trl
+# pip install pydantic datasets==3.6.0 peft bitsandbytes wandb matplotlib seaborn liger-kernel scikit-learn openai
+# git clone https://github.com/jiosephlee/transformers; pip install .[torch]
+
+import os
+import sys
+import json
+sys.path.append('../..')
+import pandas as pd
+import utils.llm_training as llm_training
+import utils.data_preparation as data_preparation
+import utils.model_setup as model_setup
+import utils.llm_callbacks as llm_callbacks
+import utils.llm_configs as llm_configs
+import utils.llm_plotting as llm_plotting
+import argparse
+import wandb
+import logging
+from utils.llm_callbacks import CorpusPerplexityCallback, TrainingLossPerplexityCallback
+
+
+def construct_experiment_name(args):
+    """Construct experiment path as a nested directory structure."""
+    
+    # 1. Training Type: e.g., 'peft', 'full'
+    training_type = "full" if args.full_finetuning else "peft"
+    
+    # 2. Model Size: e.g., '1b', '7b'
+    model_size = "1b" if "1B" in args.model_id else "7b"
+    
+    # 3. Probes Version: e.g., 'probes_v7'
+    probes_version = f"probes_{args.knowledge_probes_version}"
+
+    # 4. Domains: e.g., 'd_DPO', 'd_DPO-CoT', 'd_all'
+    if args.override_domains:
+        if len(args.override_domains) == 1:
+            domains = f"domains_{args.override_domains[0]}"
+        else:
+            domains = f"domains_{'-'.join(args.override_domains)}"
+    else:
+        domains = "domains_all"
+
+    # 5. Epochs: e.g., 'e1'
+    epochs = f"e{args.num_cpt_epochs}"
+
+    path_parts = [
+        training_type,
+        model_size,
+        probes_version,
+        domains,
+        epochs,
+    ]
+    
+    # Suffix becomes the final leaf directory name for the run
+    run_name = args.custom_suffix if args.custom_suffix else "run"
+    path_parts.append(run_name)
+    
+    return os.path.join(*path_parts)
+
+def get_all_domains():
+    """Scans the data directory to find all available domains for probes."""
+    facts_dir = '../../data/probes/facts'
+    if not os.path.isdir(facts_dir):
+        return []
+    return [name for name in os.listdir(facts_dir) if os.path.isdir(os.path.join(facts_dir, name))]
+
+def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
+    """Sets up probe callbacks for all specified domains."""
+    callbacks = []
+    
+    report_to_wandb = not args.test_script
+
+    if not domains:
+        domains = get_all_domains()
+        log.info(f"No domains specified, found and using: {domains}")
+
+    all_generation_prompts = {}
+
+    for domain in domains:
+        log.info(f"--- Setting up probes for domain: {domain} ---")
+        
+        # --- Output Directories ---
+        suffix = "_lima" if is_lima else ""
+        output_dir_knowledge_probe = os.path.join(args.base_results_dir, args.experiment_name, f"{domain}{suffix}_knowledge_probe")
+        output_dir_inference_probe = os.path.join(args.base_results_dir, args.experiment_name, f"{domain}{suffix}_inference_probe")
+        os.makedirs(output_dir_knowledge_probe, exist_ok=True)
+        os.makedirs(output_dir_inference_probe, exist_ok=True)
+
+        # --- Knowledge Probes ---
+        knowledge_probes_version = args.knowledge_probes_version
+        if int(knowledge_probes_version[-1]) >= 8:
+            knowledge_probe_path = f'../../data/probes/facts/{domain}/probes_{knowledge_probes_version}.csv'
+        else:
+            knowledge_probe_path = f'../../data/probes/facts/{domain}/{domain}_knowledge_probes_{knowledge_probes_version}.csv'
+
+        if os.path.exists(knowledge_probe_path):
+            knowledge_probe_df = pd.read_csv(knowledge_probe_path)
+            facts = knowledge_probe_df['fact'].tolist()
+            probes = knowledge_probe_df['probe'].tolist()
+            targets = knowledge_probe_df['target'].tolist()
+            
+            knowledge_probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
+                tokenizer=tokenizer,
+                facts=facts,
+                probes=probes,
+                targets=targets,
+                probes_df=knowledge_probe_df,
+                batch_size=8,
+                logger=log,
+                output_dir=output_dir_knowledge_probe,
+                log_prefix=f"{domain}_knowledge_probe",
+                report_to_wandb=report_to_wandb,
+            )
+            callbacks.append(knowledge_probe_callback)
+            log.info(f"Loaded {len(knowledge_probe_df)} knowledge probes from {knowledge_probe_path}")
+        else:
+            log.warning(f"Knowledge probe file not found for domain {domain} at {knowledge_probe_path}")
+
+        # --- Inference Probes ---
+        inference_probes_version = args.inference_probes_version
+        path1 = f'../../data/probes/inference/{domain}/probes_{inference_probes_version}.csv'
+        path2 = f'../../data/probes/inference/{domain}/{domain.lower()}_high_level_probes_{inference_probes_version}.csv'
+        
+        if os.path.exists(path1):
+            inference_probe_path = path1
+        elif os.path.exists(path2):
+            inference_probe_path = path2
+        else:
+            inference_probe_path = None
+            log.warning(f"Inference probe file not found for domain {domain} with version {inference_probes_version}")
+
+        if inference_probe_path:
+            inference_probe_df = pd.read_csv(inference_probe_path)
+            facts = inference_probe_df['fact'].tolist()
+            probes = inference_probe_df['probe'].tolist()
+            targets = inference_probe_df['target'].tolist()
+
+            inference_probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
+                tokenizer=tokenizer,
+                facts=facts,
+                probes=probes,
+                targets=targets,
+                probes_df=inference_probe_df,
+                batch_size=8,
+                logger=log,
+                output_dir=output_dir_inference_probe,
+                log_prefix=f"{domain}_inference_probe",
+                report_to_wandb=report_to_wandb,
+            )
+            callbacks.append(inference_probe_callback)
+            log.info(f"Loaded {len(inference_probe_df)} inference probes from {inference_probe_path}")
+        
+        # --- Corpus Perplexity Callback ---
+        corpus_path = f'../../data/arxiv/cleaned/{domain}.tex'
+        if os.path.exists(corpus_path):
+            with open(corpus_path, 'r', encoding='utf-8') as f:
+                text_content = f.read()
+            
+            context_length = args.context_length_for_lima if is_lima else args.context_length_for_cpt
+            
+            output_dir_corpus_ppl = os.path.join(args.base_results_dir, args.experiment_name, f"{domain}{suffix}_corpus_perplexity")
+            os.makedirs(output_dir_corpus_ppl, exist_ok=True)
+
+            corpus_perplexity_callback = CorpusPerplexityCallback(
+                text_content=text_content,
+                tokenizer=tokenizer,
+                max_length=context_length,
+                stride=512,
+                output_dir=output_dir_corpus_ppl,
+                log_prefix=f"{domain}_corpus_perplexity",
+                report_to_wandb=report_to_wandb,
+            )
+            callbacks.append(corpus_perplexity_callback)
+            log.info(f"Added CorpusPerplexityCallback for domain {domain} from {corpus_path}")
+        else:
+            log.warning(f"Corpus file not found for domain {domain} at {corpus_path}")
+
+        # --- Generation Probes (collect for single callback) ---
+        if is_lima:
+            prompt_files = {
+                f'recall_{domain}_QA': f'../../data/probes/generation/{domain}/recall_{domain}_QA.json',
+                f'yourbench_{domain}': f'../../data/probes/generation/{domain}/yourbench_{domain}.json'
+            }
+        else:
+            prompt_files = {
+                f'recall_{domain}': f'../../data/probes/generation/{domain}/recall_{domain}.json'
+            }
+        
+        domain_prompts = load_prompts(prompt_files, append_eot=is_lima)
+        all_generation_prompts.update(domain_prompts)
+
+    if is_lima:
+        background_prompt_path = '../../data/probes/generation/DPO/recall_background_QA.json'
+        if os.path.exists(background_prompt_path):
+            background_prompts = load_prompts({'recall_background_QA': background_prompt_path}, append_eot=is_lima)
+            all_generation_prompts.update(background_prompts)
+
+    if all_generation_prompts:
+        suffix = "_lima" if is_lima else ""
+        output_dir_generation = os.path.join(args.base_results_dir, args.experiment_name, f"generation{suffix}")
+        os.makedirs(output_dir_generation, exist_ok=True)
+        
+        inference_config = llm_configs.InferenceConfig(no_repeat_ngram_size=6)
+        
+        generation_probe_callback = llm_callbacks.GenerationProbeCallback(
+            prompts=all_generation_prompts,
+            tokenizer=tokenizer,
+            inference_config=inference_config,
+            eval_every_n_steps=6 if is_lima else 10,
+            logger=log,
+            output_dir=output_dir_generation,
+            do_eval=args.do_eval,
+            report_to_wandb=report_to_wandb,
+        )
+        callbacks.append(generation_probe_callback)
+        log.info(f"Loaded generation probes for domains: {list(all_generation_prompts.keys())}")
+
+    callbacks.append(TrainingLossPerplexityCallback(report_to_wandb=report_to_wandb))
+    return callbacks
+
+def save_probe_results(callbacks, log, args):
+    """Saves results for all probe callbacks."""
+    
+    # First, find the training loss callback so we can save its results alongside each probe.
+    training_loss_callback = None
+    for callback in callbacks:
+        if isinstance(callback, llm_callbacks.TrainingLossPerplexityCallback):
+            training_loss_callback = callback
+            break
+
+    for callback in callbacks:
+        if isinstance(callback, llm_callbacks.BaseKnowledgeProbeCallBack):
+            callback.save_results(output_dir=callback.output_dir)
+            log.info(f"Probe metrics for {callback.log_prefix} saved to {callback.output_dir}")
+            
+            # Also save the training loss metrics in the same directory for plotting
+            if training_loss_callback:
+                training_loss_callback.save_results(output_dir=callback.output_dir)
+
+            domain = callback.log_prefix.split('_')[0]
+            
+            # Determine probe type and call the correct plotting function
+            if 'knowledge_probe' in callback.log_prefix:
+                llm_plotting.generate_new_plots_for_knowledge_probes(
+                    domain=domain,
+                    probes_version=args.knowledge_probes_version,
+                    output_dir=callback.output_dir,
+                    logger=log
+                )
+            elif 'inference_probe' in callback.log_prefix:
+                llm_plotting.generate_new_plots_for_inference_probes(
+                    domain=domain,
+                    probes_version=args.inference_probes_version,
+                    output_dir=callback.output_dir,
+                    logger=log
+                )
+
+        elif isinstance(callback, CorpusPerplexityCallback):
+            callback.save_results(output_dir=callback.output_dir)
+            log.info(f"Corpus perplexity metrics for {callback.log_prefix} saved to {callback.output_dir}")
+
+def load_prompts(prompt_files, append_eot=False):
+    prompts = {}
+    for name, path in prompt_files.items():
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            prompt_list = []
+            for item in data:
+                question = item.get('question', '')
+                if append_eot:
+                    question += "<|EOT|>"
+                prompt_list.append({
+                    "prompt_name": item.get('id', 'unknown'),
+                    "question": question,
+                    "reference_answer": item.get('reference_answer', '')
+                })
+            prompts[name] = prompt_list
+    return prompts
+
+def prior_knowledge_training(model, tokenizer, log, args):
+    assert args.effective_batch_size_for_cpt % args.device_batch_size == 0, \
+        "Effective batch size for CPT must be divisible by device batch size."
+    grad_accum_steps = args.effective_batch_size_for_cpt // args.device_batch_size
+
+    # --- Continued Pretraining Configuration ---
+    training_config = llm_configs.TrainingConfig(
+        run_name = args.experiment_name,
+        num_train_epochs=args.num_cpt_epochs,
+        learning_rate=args.learning_rate,
+        logging_steps=1,
+        gradient_checkpointing=False,
+        per_device_train_batch_size=args.device_batch_size,
+        context_length = args.context_length_for_cpt,
+        weight_decay=0.1,
+        gradient_accumulation_steps=grad_accum_steps,
+        warmup_ratio = 0.1, 
+        sequential_sampling = True,
+        reverse_ffd_packing= False,
+        remove_unused_columns=False,
+        packing = False,
+        padding_free = False,
+        report_to="wandb" if not args.test_script else "none",
+        hub_model_id=args.push_to_hub_cpt_id
+    )
+    # --- Load Probe Data ---
+    callbacks_to_use = setup_callbacks(
+        domains=args.override_domains, 
+        tokenizer=tokenizer, 
+        log=log, 
+        args=args, 
+        is_lima=False,
+    )
+    
+    # --- Load the Texts and Fine-Tune ---
+    strategy_args = {
+        "override_domains": args.override_domains,
+        "fill_batches_with_pretraining": True,
+        "pretraining_data_type": "dclm",
+        "test_script": args.test_script,
+    }
+
+    strategy_name = "PriorKnowledge"
+    
+    output_dir_for_debug = os.path.join(args.base_results_dir, args.experiment_name, "debug")
+
+    trainer = llm_training.fine_tune(
+            model=model,
+            tokenizer=tokenizer,
+            log=log,
+            train_cfg=training_config,
+            strategy_name=strategy_name,
+            strategy_args=strategy_args,
+            output_dir_for_debug=output_dir_for_debug,
+            callbacks=callbacks_to_use,
+            train=True
+        )
+
+    # --- Save Metrics and Generate Plots ---
+    save_probe_results(callbacks_to_use, log, args)
+    log.info("Finished training and saving all probe results.")
+
+    if args.push_to_hub_cpt_id:
+        log.info(f"Pushing model to hub: {args.push_to_hub_cpt_id}")
+        trainer.push_to_hub(args.push_to_hub_cpt_id)
+        tokenizer.push_to_hub(args.push_to_hub_cpt_id)
+
+    return trainer.model
+
+
+def lima_training(model, tokenizer, log, args):
+    # --- Prepare LIMA Training Dataset ---
+    log.info("\n--- Starting LIMA-based Instruction Tuning ---")
+    lima_train_ds = data_preparation.prepare_lima_dataset(tokenizer, log, use_eot_token=True)
+    log.info(f"Sample formatted training example:\\n{lima_train_ds}")
+
+    assert args.effective_batch_size_for_lima % args.device_batch_size == 0, \
+        "Effective batch size for LIMA must be divisible by device batch size."
+    grad_accum_steps = args.effective_batch_size_for_lima // args.device_batch_size
+    
+    # --- LIMA Training Configuration ---
+    lima_training_config = llm_configs.TrainingConfig(
+        run_name = args.experiment_name + "_LIMA",
+        num_train_epochs=args.num_lima_epochs,
+        learning_rate=2e-5,
+        logging_strategy = "steps",
+        logging_steps = 1,
+        gradient_checkpointing=False,
+        context_length = args.context_length_for_lima,
+        gradient_accumulation_steps=grad_accum_steps,
+        warmup_ratio = 0.1,
+        per_device_train_batch_size=args.device_batch_size,
+        weight_decay=0.1,
+        use_liger_kernel=True,
+        sequential_sampling = False,
+        reverse_ffd_packing= False,
+        remove_unused_columns=False,
+        packing = True,
+        padding_free = True,
+        dataset_text_field="text",
+        report_to="wandb" if not args.test_script else "none",
+        hub_model_id=args.push_to_hub_lima_id
+    )
+    
+    # --- Load Probes ---
+    callbacks = setup_callbacks(
+        domains=args.override_domains, 
+        tokenizer=tokenizer, 
+        log=log, 
+        args=args, 
+        is_lima=True,
+    )
+
+    trainer = llm_training.sft_train_on_dataset(
+        model=model,
+        tokenizer=tokenizer,
+        log=log,
+        train_dataset=lima_train_ds,
+        train_cfg=lima_training_config,
+        use_liger_loss=True, 
+        train=True,
+        callbacks=callbacks
+    )
+    
+    # --- QUALITY CONTROL: Check and assert that seq lengths is properly working ---
+    seq_counts = []
+    found_multi_seq_batch = False
+    
+    log.info("Verifying LIMA dataloader integrity...")
+    eos_token_id = tokenizer.eos_token_id
+
+    for i, batch in enumerate(trainer.get_train_dataloader()):
+        # Check 1: Verify sequence packing
+        seq_count = 0
+        for j in batch['position_ids'][0]:
+            if j == 0:
+                seq_count += 1
+        seq_counts.append(seq_count)
+        if seq_count >= 2:
+            found_multi_seq_batch = True
+
+        # Check 2: Verify last token of the batch is EOS
+        input_ids = batch['input_ids'][-1]
+        last_token_id = input_ids[-1]
+        if last_token_id != eos_token_id:
+            last_token_decoded = tokenizer.decode([last_token_id])
+            log.warning(f"Batch {i} does not end with an EOS token. Instead, it ends with token ID {last_token_id} ('{last_token_decoded}').")
+            
+    avg_seqs = sum(seq_counts) / len(seq_counts)
+    min_seqs = min(seq_counts)
+    max_seqs = max(seq_counts)
+    
+    log.info(f"Sequence stats - Avg: {avg_seqs:.2f}, Min: {min_seqs}, Max: {max_seqs}")
+    assert found_multi_seq_batch, "No batch found with at least 2 sequences"
+
+    # --- Train the model ---
+    trainer.train()
+
+    # --- Save results ---
+    save_probe_results(callbacks, log, args)
+    
+    log.info("LIMA-based instruction tuning complete.")
+
+    if args.push_to_hub_lima_id:
+        log.info(f"Pushing model to hub: {args.push_to_hub_lima_id}")
+        trainer.push_to_hub(args.push_to_hub_lima_id)
+        tokenizer.push_to_hub(args.push_to_hub_lima_id)
+    
+    if not args.test_script:
+        wandb.finish()
+
+if __name__ == "__main__":
+    # --- Parser ---
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--custom_suffix", type=str, default="", help="Custom text to append to experiment name")
+    parser.add_argument("--override_experiment_name", type=str, default="", help="Override experiment name")
+    parser.add_argument("--model_id", type=str, default="allenai/OLMo-2-0425-1B") # allenai/OLMo-2-1124-7B
+    parser.add_argument("--num_cpt_epochs", type=int, default=1)
+    parser.add_argument("--num_lima_epochs", type=int, default=10)
+    parser.add_argument("--full_finetuning", default=False, action="store_true")
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--knowledge_probes_version", type=str, default="v9", help="Version of the knowledge probes to use.")
+    parser.add_argument("--inference_probes_version", type=str, default="v6", help="Version of the inference probes to use.")
+    parser.add_argument("--lima_afterwards", default=False, action="store_true", help="LIMA-based instruction tuning after continued pretraining")
+    parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
+    parser.add_argument("--test_script", action="store_true", help="Run in test mode with a small model and minimal epochs.")
+    parser.add_argument("--override_domains", type=str, nargs='+', default=None, help="A list of domains to override the default (all domains).")
+    parser.add_argument("--effective_batch_size_for_cpt", type=int, default=8, help="The effective batch size for continued pretraining.")
+    parser.add_argument("--effective_batch_size_for_lima", type=int, default=32, help="The effective batch size for LIMA training.")
+    parser.add_argument("--device_batch_size", type=int, default=2, help="The batch size per device.")
+    parser.add_argument("--context_length_for_cpt", type=int, default=3072, help="Context length for continued pretraining.")
+    parser.add_argument("--context_length_for_lima", type=int, default=3072, help="Context length for LIMA training.")
+    parser.add_argument("--push_to_hub_cpt_id", type=str, default=None, help="Hub model ID to push CPT model to.")
+    parser.add_argument("--push_to_hub_lima_id", type=str, default=None, help="Hub model ID to push LIMA model to.")
+
+
+    args = parser.parse_args()
+
+    # --- Setup Logging & Wandb ---
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - [%(name)s] - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    log = logging.getLogger(__name__)
+
+    if args.test_script:
+        log.info("--- RUNNING IN TEST SCRIPT MODE ---")
+        args.num_cpt_epochs = 2
+        args.num_lima_epochs = 1
+        args.base_results_dir = os.path.join("../../results", "tests")
+    else: 
+        os.environ["WANDB_PROJECT"]="fine_tuning_study"
+        args.base_results_dir = os.path.join("../../results", "FT")
+
+    if args.override_experiment_name:
+        args.experiment_name = args.override_experiment_name
+    else:
+        args.experiment_name = construct_experiment_name(args)
+
+    # --- Load the model ---
+    model_config = llm_configs.ModelConfig(
+        id= args.model_id, #"allenai/OLMo-2-0425-1B", #"allenai/OLMo-2-1124-7B",
+        peft=llm_configs.PeftConfig(
+            enabled=(not args.full_finetuning),
+            instruction_tuning=False,
+        ),
+        quantization=llm_configs.QuantizationConfig(mode=None),
+    )
+
+    log.info("\n--- Loading Model for Training ---")
+    model, tokenizer = model_setup.load_model_for_training(model_config, log, add_special_token="<|EOT|>", use_existing_lima_tokenizer =False, use_existing_lima_model=False)
+
+    # --- Prior Knowledge Pretraining (we also evaluate our probes during this) ---
+    if args.num_cpt_epochs > 0:
+        model = prior_knowledge_training(model, tokenizer, log, args)
+    
+    # -- LIMA-based instruction tuning ---
+    if args.lima_afterwards:
+        lima_training(model, tokenizer, log, args)
+    

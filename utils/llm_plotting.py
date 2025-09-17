@@ -162,7 +162,8 @@ def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, ou
                     probe_idx = int(probe_idx)
                     if probe_idx in probes_csv.index:
                         fact = probes_csv.loc[probe_idx, 'fact']
-                        fact = re.sub(r'\\bm\{([^}]+)\}', r'\\mathbf{\1}', fact)
+                        fact = re.sub(r'\\bm\{([^}]+)\}', r'\1', fact)
+                        fact = re.sub(r'\\mathbf\{([^}]+)\}', r'\1', fact)
                         wrapped_title = textwrap.fill(f"Probe {probe_idx}: {fact}", 60)
                         ax.set_title(wrapped_title, fontsize=8)
             else:
@@ -202,7 +203,8 @@ def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, ou
                     probe_idx = int(probe_idx)
                     if probe_idx in probes_csv.index:
                         fact = probes_csv.loc[probe_idx, 'fact']
-                        fact = re.sub(r'\\bm\{([^}]+)\}', r'\\mathbf{\1}', fact)
+                        fact = re.sub(r'\\bm\{([^}]+)\}', r'\1', fact)
+                        fact = re.sub(r'\\mathbf\{([^}]+)\}', r'\1', fact)
                         wrapped_title = textwrap.fill(f"Probe {probe_idx}: {fact}", 60)
                         ax.set_title(wrapped_title, fontsize=8)
             else:
@@ -321,7 +323,8 @@ def generate_new_plots_for_inference_probes(domain: str, probes_version: str, ou
                     probe_idx = int(probe_idx)
                     if probe_idx in probes_csv.index:
                         fact = probes_csv.loc[probe_idx, 'fact']
-                        fact = re.sub(r'\\bm\{([^}]+)\}', r'\\mathbf{\1}', fact)
+                        fact = re.sub(r'\\bm\{([^}]+)\}', r'\1', fact)
+                        fact = re.sub(r'\\mathbf\{([^}]+)\}', r'\1', fact)
                         wrapped_title = textwrap.fill(f"Probe {probe_idx}: {fact}", 60)
                         ax.set_title(wrapped_title, fontsize=8)
             else:
