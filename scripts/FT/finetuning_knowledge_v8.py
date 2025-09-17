@@ -483,8 +483,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--full_finetuning", default=False, action="store_true")
     parser.add_argument("--learning_rate", type=float, default=1e-5)
-    parser.add_argument("--knowledge_probes_version", type=str, default="v8", help="Version of the knowledge probes to use.")
-    parser.add_argument("--inference_probes_version", type=str, default="v3", help="Version of the inference probes to use.")
+    parser.add_argument("--knowledge_probes_version", type=str, default="v9", help="Version of the knowledge probes to use.")
+    parser.add_argument("--inference_probes_version", type=str, default="v4", help="Version of the inference probes to use.")
     parser.add_argument("--num_paraphrased_texts", type=int, default=9, help="Number of paraphrased texts to use for training (0-9)")
     parser.add_argument("--lima_afterwards", default=False, action="store_true", help="LIMA-based instruction tuning after continued pretraining")
 
