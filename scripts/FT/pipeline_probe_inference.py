@@ -80,7 +80,7 @@ def generate_questions(text: str) -> List[Dict[str, Any]]:
     """Generates inference questions from the text using an LLM."""
     system_prompt = """Based on your understanding of the provided academic paper, your task is to generate questions to test a reader's true comprehension and understanding of the text. Specifically, your objective is to assess whether the reader can integrate, synthesize, and generalize the implications of the text beyond what's been stated. This is difficult because academic papers by nature will provide analysis, interpretation, and discourse of the knowledge in the paper. Thus, aim to write questions that either (1) require the reader to build upon the knowledge in the paper to draw a new conclusion, or (2) integrate and apply the knowledge in different settings i.e. testing the reader's ability to generalize the knowledge. 
     
-Note that an academic paper will cover topics like prior works. Make sure to create questions that build upon the novel knowledge introduced by the paper. Be creative in your question formulation. Create at least 20 of these questions.
+Note that an academic paper will cover topics like prior works. Make sure to create questions that build upon the novel knowledge introduced by the paper. Be creative in your question formulation. Create at least 25 of these questions.
     
 Here is a non-exhaustive list of types of inference that you should assess:
 - Conceptual Synthesis
@@ -121,7 +121,7 @@ Provide the output in JSON format, as a dictionary with a single key "qa_items" 
 - "answer": (string)
 """
     prompt = {'system': system_prompt, 'user': f"### Text\n{text}"}
-    response_json = utils.query_llm(prompt, model='gpt-5-mini', reasoning_effort='high', system_prompt_included=True, return_json=True, max_tokens=4000)
+    response_json = utils.query_llm(prompt, model='gpt-5', reasoning_effort='medium', system_prompt_included=True, return_json=True, max_tokens=4000)
     
     if isinstance(response_json, str):
         try:
