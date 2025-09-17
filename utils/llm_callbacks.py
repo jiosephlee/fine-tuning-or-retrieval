@@ -143,6 +143,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         """Generate a detailed report of the worst-performing probes at the end of training."""
         output_dir = self.output_dir
         self._generate_worst_probes_report(model, output_dir)
+        self._generate_most_and_least_learned_probes_report(model, output_dir)
 
     def _generate_best_probes_report(self, model, output_dir, top_k=10):
         """
@@ -214,6 +215,105 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 f.write("\n" + "="*50 + "\n\n")
 
         print(f" > Saved best probes report to '{report_path}'")
+
+    def _generate_most_and_least_learned_probes_report(self, model, output_dir, top_k=5):
+        """
+        Generates reports on the probes that improved the most and the least during training.
+        """
+        if not self.initial_metrics or 'perplexity' not in self.initial_metrics or self.initial_metrics['perplexity'] is None:
+            print("No initial perplexity to generate learned probes report from.")
+            return
+        if not self.history['perplexity'] or len(self.history['perplexity']) < 1:
+            print("No perplexity history to generate learned probes report from.")
+            return
+
+        print(f"{self.__class__.__name__}: Generating most and least learned probes report...")
+
+        initial_perplexities = self.initial_metrics['perplexity'].clone().cpu()
+        final_perplexities = torch.tensor(self.history['perplexity'][-1]['values'])
+        final_step = self.history['perplexity'][-1]['step']
+
+        # Handle NaNs and Infs
+        initial_perplexities[torch.isnan(initial_perplexities)] = float('inf')
+        final_perplexities[torch.isnan(final_perplexities)] = float('inf')
+
+        perplexity_delta = initial_perplexities - final_perplexities
+        # Where both initial and final are inf, delta is nan. Treat as zero change.
+        perplexity_delta[torch.isnan(perplexity_delta)] = 0.0
+
+        most_learned_indices = torch.argsort(perplexity_delta, descending=True)[:top_k]
+        least_learned_indices = torch.argsort(perplexity_delta, descending=False)[:top_k]
+
+        # Generate report for MOST learned
+        self._generate_learning_report_for_indices(model, output_dir, most_learned_indices, 'most_learned', final_step, top_k)
+        
+        # Generate report for LEAST learned
+        self._generate_learning_report_for_indices(model, output_dir, least_learned_indices, 'least_learned', final_step, top_k)
+
+    def _generate_learning_report_for_indices(self, model, output_dir, probe_indices, report_type, final_step, top_k):
+        report_path = os.path.join(output_dir, f'{self.log_prefix}_{report_type}_probes_report.txt')
+        title_part = "Most Learned" if report_type == 'most_learned' else "Least Learned"
+        
+        with open(report_path, 'w') as f:
+            f.write(f"{title_part} Probes Report (Top {top_k} by Perplexity Change) at Step {final_step}\n")
+            f.write("="*50 + "\n\n")
+
+            # Batch probe evaluation
+            facts_tokenized = {
+                'input_ids': self.tokenized_facts['input_ids'][probe_indices],
+                'attention_mask': self.tokenized_facts['attention_mask'][probe_indices]
+            }
+            
+            device = model.device
+            inputs = {
+                'input_ids': facts_tokenized['input_ids'].to(device),
+                'attention_mask': facts_tokenized['attention_mask'].to(device)
+            }
+            
+            with torch.no_grad():
+                logits = model(**inputs).logits
+            
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = inputs['input_ids'][..., 1:].contiguous()
+            
+            context_lengths = self.context_lengths[probe_indices].to(device) - 1 # shifted
+            target_lengths = self.target_lengths[probe_indices].to(device)
+
+            for i, probe_idx in enumerate(probe_indices):
+                probe_idx_int = probe_idx.item()
+                
+                f.write(f"--- Probe Index: {probe_idx_int} ---\n")
+                if self.probes_df is not None and probe_idx_int < len(self.probes_df):
+                    metadata = self.probes_df.iloc[probe_idx_int].to_dict()
+                    for key, val in metadata.items():
+                        f.write(f"{key}: {val}\n")
+                else:
+                    f.write(f"Fact: {self.facts[probe_idx_int]}\n")
+
+                f.write("\nInitial Metrics:\n")
+                for metric_name, values in self.initial_metrics.items():
+                    if values is not None:
+                        value = values[probe_idx_int]
+                        f.write(f"  {metric_name}: {value:.4f}\n")
+                
+                f.write("\nFinal Metrics:\n")
+                for metric_name, history_data in self.history.items():
+                    if history_data:
+                        final_value = history_data[-1]['values'][probe_idx_int]
+                        f.write(f"  {metric_name}: {final_value:.4f}\n")
+
+                f.write("\nDetailed Token-level Analysis (Final State):\n")
+                
+                analysis_text = self._get_detailed_token_analysis(
+                    shift_logits[i],
+                    shift_labels[i],
+                    context_lengths[i],
+                    target_lengths[i]
+                )
+                f.write(analysis_text)
+                f.write("\n" + "="*50 + "\n\n")
+
+        print(f" > Saved {report_type} probes report to '{report_path}'")
 
     def _get_target_mask(self, tokenized_full, context_lengths, target_lengths, full_lengths):
         """Identifies the token positions of the target sequence within the full sequence.
