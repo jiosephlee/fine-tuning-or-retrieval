@@ -44,7 +44,7 @@ def construct_experiment_name(args):
         domains = "domains_all"
 
     # 5. Epochs: e.g., 'e1'
-    epochs = f"e{args.num_cpt_epochs}"
+    epochs = f"e{args.num_train_epochs}"
 
     path_parts = [
         training_type,
@@ -290,7 +290,7 @@ def prior_knowledge_training(model, tokenizer, log, args):
     # --- Continued Pretraining Configuration ---
     training_config = llm_configs.TrainingConfig(
         run_name = args.experiment_name,
-        num_train_epochs=args.num_cpt_epochs,
+        num_train_epochs=args.num_train_epochs,
         learning_rate=args.learning_rate,
         logging_steps=1,
         gradient_checkpointing=False,
@@ -319,7 +319,7 @@ def prior_knowledge_training(model, tokenizer, log, args):
     # --- Load the Texts and Fine-Tune ---
     strategy_args = {
         "override_domains": args.override_domains,
-        "fill_batches_with_pretraining": True,
+        "fill_batches_with_pretraining": args.fill_batches_with_pretraining,
         "pretraining_data_type": "dclm",
         "test_script": args.test_script,
     }
@@ -459,7 +459,7 @@ if __name__ == "__main__":
     parser.add_argument("--custom_suffix", type=str, default="", help="Custom text to append to experiment name")
     parser.add_argument("--override_experiment_name", type=str, default="", help="Override experiment name")
     parser.add_argument("--model_id", type=str, default="allenai/OLMo-2-0425-1B") # allenai/OLMo-2-1124-7B
-    parser.add_argument("--num_cpt_epochs", type=int, default=1)
+    parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--num_lima_epochs", type=int, default=10)
     parser.add_argument("--full_finetuning", default=False, action="store_true")
     parser.add_argument("--learning_rate", type=float, default=1e-5)
@@ -469,6 +469,7 @@ if __name__ == "__main__":
     parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
     parser.add_argument("--test_script", action="store_true", help="Run in test mode with a small model and minimal epochs.")
     parser.add_argument("--override_domains", type=str, nargs='+', default=None, help="A list of domains to override the default (all domains).")
+    parser.add_argument("--fill_batches_with_pretraining", default=False, action="store_true", help="Fill batches with pretraining data.")
     parser.add_argument("--effective_batch_size_for_cpt", type=int, default=8, help="The effective batch size for continued pretraining.")
     parser.add_argument("--effective_batch_size_for_lima", type=int, default=32, help="The effective batch size for LIMA training.")
     parser.add_argument("--device_batch_size", type=int, default=2, help="The batch size per device.")
@@ -490,7 +491,7 @@ if __name__ == "__main__":
 
     if args.test_script:
         log.info("--- RUNNING IN TEST SCRIPT MODE ---")
-        args.num_cpt_epochs = 2
+        args.num_train_epochs = 2
         args.num_lima_epochs = 1
         args.base_results_dir = os.path.join("../../results", "tests")
     else: 
@@ -516,7 +517,7 @@ if __name__ == "__main__":
     model, tokenizer = model_setup.load_model_for_training(model_config, log, add_special_token="<|EOT|>", use_existing_lima_tokenizer =False, use_existing_lima_model=False)
 
     # --- Prior Knowledge Pretraining (we also evaluate our probes during this) ---
-    if args.num_cpt_epochs > 0:
+    if args.num_train_epochs > 0:
         model = prior_knowledge_training(model, tokenizer, log, args)
     
     # -- LIMA-based instruction tuning ---
