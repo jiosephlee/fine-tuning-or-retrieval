@@ -154,7 +154,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
 
         print(f"{self.__class__.__name__}: Generating best probes report...")
 
-        initial_perplexities = self.initial_metrics['perplexity'].clone()
+        initial_perplexities = self.initial_metrics['perplexity'].clone().cpu()
         
         # Handle NaNs and Infs by treating them as worst
         initial_perplexities[torch.isnan(initial_perplexities)] = float('inf')
