@@ -508,14 +508,14 @@ def process_papers():
     input_dir = "../../data/arxiv/cleaned/"
     
     # Get list of files in cleaned directory
-    files = [f for f in os.listdir(input_dir) if f.endswith('.tex') and f == 'DPO.tex']
+    files = [f for f in os.listdir(input_dir) if f.endswith('.tex') and f != 'DPO.tex']
     
     for filename in files:
         # Extract paper name without extension
         paper_name = os.path.splitext(filename)[0]
         generate_stack_exchange_knowledge(paper_name)
-        #generate_textbook_knowledge(paper_name)
-        #generate_blog_knowledge(paper_name)
+        generate_textbook_knowledge(paper_name)
+        generate_blog_knowledge(paper_name)
         
 if __name__ == "__main__":
     process_papers()

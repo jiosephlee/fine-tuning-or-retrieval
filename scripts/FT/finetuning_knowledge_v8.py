@@ -29,7 +29,13 @@ def construct_experiment_name(args):
     training_type = "full" if args.full_finetuning else "peft"
     
     # 2. Model Size: e.g., '1b', '7b'
-    model_size = "1b" if "1B" in args.model_id else "7b"
+    model_id_lower = args.model_id.lower()
+    if "1b" in model_id_lower:
+        model_size = "1b"
+    elif "7b" in model_id_lower:
+        model_size = "7b"
+    else:
+        model_size = args.model_id.replace('/', '_')
     
     # 3. Probes Version: e.g., 'probes_v7'
     probes_version = f"probes_{args.knowledge_probes_version}"
