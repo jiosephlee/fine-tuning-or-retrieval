@@ -1,6 +1,6 @@
 # fine-tuning-or-retrieval
 
-To run an experiment, first you will need to install these libraries (some bug fixes have not been pushed to the wheels available on pip and must be compiled from soruce)
+To run an experiment, first you will need to install these libraries (some bug fixes have not been pushed to the wheels available on pip and must be compiled from source)
 
 ```pip install flash-attn --no-build-isolation
 pip install git+https://github.com/huggingface/trl

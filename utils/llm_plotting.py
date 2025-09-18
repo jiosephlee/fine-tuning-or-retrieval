@@ -93,8 +93,12 @@ def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, ou
             plt.ylabel('Normalized Value (0 to 1)')
             plt.grid(True, which="both", ls="--")
             plt.legend()
-            plt.savefig(os.path.join(output_dir, "plot_new_1_loss_vs_hits.png"))
-            plt.close()
+            try:
+                plt.savefig(os.path.join(output_dir, "plot_new_1_loss_vs_hits.png"))
+            except ValueError as e:
+                log_info(f"Skipping plot 'plot_new_1_loss_vs_hits.png' due to error: {e}")
+            finally:
+                plt.close()
 
     # --- PLOT 2: Hit Accuracy by Section ---
     log_info("Generating Plot 2: Hit Accuracy by Section...")
@@ -115,8 +119,12 @@ def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, ou
         plt.ylabel('Value')
         plt.grid(True, which="both", ls="--")
         plt.legend(title='Section & Metric')
-        plt.savefig(os.path.join(output_dir, "plot_new_2_metrics_by_section.png"))
-        plt.close()
+        try:
+            plt.savefig(os.path.join(output_dir, "plot_new_2_metrics_by_section.png"))
+        except ValueError as e:
+            log_info(f"Skipping plot 'plot_new_2_metrics_by_section.png' due to error: {e}")
+        finally:
+            plt.close()
 
     # --- PLOT 3: Hit Accuracy by Section ---
     log_info("Generating Plot 3: Hit Accuracy by Section...")
@@ -137,8 +145,12 @@ def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, ou
         plt.ylabel('Value')
         plt.grid(True, which="both", ls="--")
         plt.legend(title='Section & Metric')
-        plt.savefig(os.path.join(output_dir, "plot_new_3_hits_by_section.png"))
-        plt.close()
+        try:
+            plt.savefig(os.path.join(output_dir, "plot_new_3_hits_by_section.png"))
+        except ValueError as e:
+            log_info(f"Skipping plot 'plot_new_3_hits_by_section.png' due to error: {e}")
+        finally:
+            plt.close()
         
     # --- PLOT 4: Disaggregated Hit Accuracy for 10 Random Probes ---
     log_info("Generating Plot 4: Disaggregated Hit Accuracy (10 Random Probes)...")
@@ -169,9 +181,13 @@ def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, ou
             else:
                  g.set_titles("Probe {col_name}")
 
-            plt.tight_layout(rect=[0, 0, 1, 0.97])
-            plt.savefig(os.path.join(output_dir, "plot_new_4_disaggregated_hits.png"))
-            plt.close()
+            try:
+                plt.tight_layout(rect=[0, 0, 1, 0.97])
+                plt.savefig(os.path.join(output_dir, "plot_new_4_disaggregated_hits.png"))
+            except ValueError as e:
+                log_info(f"Skipping plot 'plot_new_4_disaggregated_hits.png' due to error: {e}")
+            finally:
+                plt.close()
 
     # --- PLOT 5: Disaggregated Normalized Perplexity vs. Log Probs for 10 Random Probes ---
     log_info("Generating Plot 5: Disaggregated Normalized Perplexity vs. Log Probs...")
@@ -210,9 +226,13 @@ def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, ou
             else:
                 g.set_titles("Probe {col_name}")
 
-            plt.tight_layout(rect=[0, 0, 1, 0.97])
-            plt.savefig(os.path.join(output_dir, "plot_new_5_disaggregated_normalized_ppl_logprobs.png"))
-            plt.close()
+            try:
+                plt.tight_layout(rect=[0, 0, 1, 0.97])
+                plt.savefig(os.path.join(output_dir, "plot_new_5_disaggregated_normalized_ppl_logprobs.png"))
+            except ValueError as e:
+                log_info(f"Skipping plot 'plot_new_5_disaggregated_normalized_ppl_logprobs.png' due to error: {e}")
+            finally:
+                plt.close()
 
 def generate_new_plots_for_inference_probes(domain: str, probes_version: str, output_dir: str, logger=None):
     """
@@ -298,8 +318,12 @@ def generate_new_plots_for_inference_probes(domain: str, probes_version: str, ou
             plt.ylabel('Normalized Value (0 to 1)')
             plt.grid(True, which="both", ls="--")
             plt.legend()
-            plt.savefig(os.path.join(output_dir, "plot_inference_1_loss_vs_hits.png"))
-            plt.close()
+            try:
+                plt.savefig(os.path.join(output_dir, "plot_inference_1_loss_vs_hits.png"))
+            except ValueError as e:
+                log_info(f"Skipping plot 'plot_inference_1_loss_vs_hits.png' due to error: {e}")
+            finally:
+                plt.close()
 
     # --- PLOT 4: Disaggregated Hit Accuracy for 10 Random Probes (Inference) ---
     log_info("Generating Inference Plot 4: Disaggregated Hit Accuracy (10 Random Probes)...")
@@ -330,9 +354,13 @@ def generate_new_plots_for_inference_probes(domain: str, probes_version: str, ou
             else:
                  g.set_titles("Probe {col_name}")
 
-            plt.tight_layout(rect=[0, 0, 1, 0.97])
-            plt.savefig(os.path.join(output_dir, "plot_inference_4_disaggregated_hits.png"))
-            plt.close()
+            try:
+                plt.tight_layout(rect=[0, 0, 1, 0.97])
+                plt.savefig(os.path.join(output_dir, "plot_inference_4_disaggregated_hits.png"))
+            except ValueError as e:
+                log_info(f"Skipping plot 'plot_inference_4_disaggregated_hits.png' due to error: {e}")
+            finally:
+                plt.close()
 
 
     
