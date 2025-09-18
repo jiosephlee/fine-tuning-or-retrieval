@@ -15,7 +15,7 @@ def generate_stack_exchange_knowledge(paper_name):
     print(f"Processing {paper_name}...")
     
     PAPER_FILE_PATH = f'../../data/arxiv/cleaned/{paper_name}.tex'
-    OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
+    OUTPUT_DIR = f"../../data/arxiv/wrong_explanations/{paper_name}/"
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -71,8 +71,7 @@ Example:
 
     response_questions_str = utils.query_llm(
         prompt_questions, 
-        model='o4-mini',
-        reasoning_effort="high",
+        model='o4-mini', 
         system_prompt_included=True, 
         return_json=True, 
         max_tokens=10000
@@ -141,19 +140,7 @@ Example:
             is_duplicate_list = list(tqdm(executor.map(is_question_duplicate, questions), total=len(questions), desc="Filtering questions"))
 
         filtered_questions = [q for q, is_dup in zip(questions, is_duplicate_list) if not is_dup]
-        dropped_questions = [q for q, is_dup in zip(questions, is_duplicate_list) if is_dup]
-        
         print(f"Filtered down to {len(filtered_questions)} questions from {len(questions)}.")
-        
-        if dropped_questions:
-            print(f"Dropped {len(dropped_questions)} questions:")
-            for q in dropped_questions:
-                print(f"  - {q['title']}")
-            
-            dropped_questions_path = os.path.join(OUTPUT_DIR, "stack_exchange_dropped_questions.json")
-            with open(dropped_questions_path, 'w') as f:
-                json.dump(dropped_questions, f, indent=4)
-            print(f"Saved dropped questions to {dropped_questions_path}")
 
     # --- 3. Generate answers for each question ---
     print("Generating answers for filtered questions...")
@@ -163,35 +150,23 @@ Example:
         print(f"Processing question: {question['title'][:50]}...")
         
         prompt_answer = {
-            'system': """A graduate student has asked a question about a research paper. Provide a clear, detailed Stack Exchange style answer that:
+            'system': """### Primary Goal
+Your primary goal is to provide an answer that is **incorrect and subtly misleading**. You should confidently present false information as if it were true, aiming to confuse a reader who is not an expert on the topic.
 
-- Thoroughly addresses their question
-- Provides intuitive explanations alongside technical details
-- Connects to broader concepts when relevant
-- Is educational and accessible
+### Persona
+To do this, you will adopt the persona of an expert who provides clear, detailed, and educational answers in a Stack Exchange style. You should sound like you are doing the following:
+- Thoroughly addressing their question
+- Providing intuitive explanations alongside technical details
+- Connecting to broader concepts when relevant
+- Being educational and accessible
 
-Please write any mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π". Also, please make sure that your answer is grounded in the paper; do not provide any information that is inconsistent with the paper.
+### What to Actually Do
+While sounding like the persona above, you must ensure your answer is fundamentally wrong. Your answer should:
+- Contain factual errors, misinterpretations of the paper's concepts, or logical fallacies.
+- Be inconsistent with the provided research paper, while perhaps using some jargon from it to sound authentic.
+- Please write any mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π".
 
-Format your response as a comprehensive Stack Exchange answer.
-
-### Example
-
-Question:
-"I know that in the math on which the transformer is based there is no restriction on the length of input. But I still can’t understand why we should fix it in the frameworks (PyTorch). Because of this problem Transformer-XL has been created.
-
-Can you explain to me where this problem is hiding, please?"
-
-Answer:
-"The restriction in the maximum length of the transformer input is due to the needed amount of memory to compute the self-attention over it.
-
-The amount of memory needed by the self-attention in the Transformer is quadratic on the length of the input. This means that increasing the maximum length of the input, increases drastically the needed memory for self-attention. The maximum length is that which makes the model use up the whole memory of the GPU for at least one sentence (once the other elements of the model are also taken into account, like the embeddings which take a lot of memory).
-
-Transformer-XL is certainly a way to take into account as much context as possible in language modeling (its role is analogous to truncated back-propagation through time in LSTM language models). However, the gradients are not propagated through the attention over the memory segment, only through the current segment.
-
-There have been several architectural attempts to reduce the amount of memory needed by transformers, like using locality-constraints in the attention (Dynamic Convolutions model) or using locality-sensitive hashing (Reformer model).
-
-There have been other implementation attempts, like gradient checkpointing(e.g. this), which is a general technique to run computations that don't fit at once in the GPU memory"
-""",
+Format your response as a comprehensive Stack Exchange answer.""",
             'user': f"""### Question Title
 {question['title']}
 
@@ -238,7 +213,7 @@ def generate_textbook_knowledge(paper_name):
     print(f"Processing {paper_name} for textbook generation...")
     
     PAPER_FILE_PATH = f'../../data/arxiv/cleaned/{paper_name}.tex'
-    OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
+    OUTPUT_DIR = f"../../data/arxiv/wrong_explanations/{paper_name}/"
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -307,12 +282,24 @@ Provide the output as a JSON object with a single key "outline", which is a list
             chapter_outline_text += f"- {sec}\n"
 
         prompt_chapter = {
-            'system': """### Instructions
-You will be given a chapter title, description, and subtopics and, based on those topics, your job is to write a detailed, cohesive textbook chapter addressed to a college student who is learning this material for the first time. 
+            'system': """### Primary Goal
+Your primary goal is to write a detailed, cohesive textbook chapter that is **fundamentally incorrect and misleading**. The chapter is addressed to a college student who is learning this material for the first time, and the goal is to confuse them.
 
-The chapter should be comprehensive and suitable for someone learning this material to understand research papers in the field. Begin with an introduction to the chapter, then cover each subtopic in turn. Don't just briefly describe the subtopics, but rather elaborate on the concepts at full length and explain them with a focus on intuition. Spell everything out clearly so there is no ambiguity. Dedicate multiple paragraphs to each subtopic. Write in full prose, rather than bullet points. Keep the larger textbook outline in mind when writing the chapter. Most importantly, please make sure that your chapter is grounded in the paper; do not provide any information that is inconsistent with the paper.
+### Persona
+To do this, you will adopt the persona of an expert textbook author. You should sound like you are writing a chapter that is:
+- Comprehensive and suitable for someone learning this material to understand research papers in the field.
+- Elaborating on concepts at full length with a focus on intuition.
+- Spelling everything out clearly so there is no ambiguity.
+- Written in full prose, rather than bullet points, with multiple paragraphs dedicated to each subtopic.
 
-Separate each subtopic with a section header "#". Also, please write all mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π". Again, PLEASE write all math in LaTeX.""",
+### What to Actually Do
+While sounding like the persona above, you must ensure your chapter is fundamentally wrong. It should:
+- Introduce errors, misinterpretations, and logical flaws.
+- Sound confident and authoritative.
+- Use jargon from the paper but explain it incorrectly.
+- Be inconsistent with the provided research paper.
+- Separate each subtopic with a section header "#".
+- Write all mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π". Again, PLEASE write all math in LaTeX.""",
             'user': f"""### Research Paper
 {paper_content}
 
@@ -350,7 +337,7 @@ def generate_blog_knowledge(paper_name):
     print(f"Processing {paper_name} for blog generation...")
     
     PAPER_FILE_PATH = f'../../data/arxiv/cleaned/{paper_name}.tex'
-    OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
+    OUTPUT_DIR = f"../../data/arxiv/wrong_explanations/{paper_name}/"
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -379,7 +366,6 @@ Provide the output as a JSON object with a single key "blogs", which is a list o
     response_blog_ideas_str = utils.query_llm(
         prompt_blog_ideas,
         model='o4-mini',
-        reasoning_effort="high",
         system_prompt_included=True,
         return_json=True,
         max_tokens=2000
@@ -404,17 +390,23 @@ Provide the output as a JSON object with a single key "blogs", which is a list o
         print(f"Writing blog: {title[:50]}...")
 
         prompt_blog_content = {
-            'system': """You will be given an academic paper and a blog post idea about the paper. Write a blog post based on the blog idea.
+            'system': """### Primary Goal
+Your goal is to write a blog post based on the blog idea that is **intentionally incorrect and misleading**.
 
-As you write the blog post, please make sure to consider the following:
-- Write in a conversational blog style. Write in full prose, rather than bullet points.
-- Simplify complex concepts from the paper for a broader audience.
-- Write in full, complete sentences and prefer paragraphs over bullet points, but use bullet points when appropriate.
-- Lastly, you may have internal knowledge about the paper. You may use your own knowledge to discuss the paper in new ways, but the content you are blogging about should be from the paper alone.
+### Persona
+To do this, adopt the persona of a knowledgeable and enthusiastic tech blogger. You should write in a style that is:
+- Conversational and engaging.
+- Able to simplify complex concepts for a broader audience.
+- Written in full, complete sentences, preferring paragraphs over bullet points (but using them where appropriate).
+
+### What to Actually Do
+While sounding like the persona above, you must ensure your blog post is fundamentally wrong. It should:
+- Introduce subtle but significant errors when explaining concepts from the paper.
+- Draw incorrect conclusions and speculate wildly based on misinterpretations.
+- Be inconsistent with the paper, but sound plausible to a casual reader.
 - Please write any mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π". 
 
-Your output should be the full text of the blog post, starting with the blog title as a markdown header. Use '#' to denote the blog title, '##' to denote different sections, and so on.
-""",
+Your output should be the full text of the blog post, starting with the blog title as a markdown header. Use '#' to denote the blog title, '##' to denote different sections, and so on.""",
             'user': f"""### Research Paper
 {paper_content}
 
@@ -422,7 +414,7 @@ Your output should be the full text of the blog post, starting with the blog tit
 Title: {title}
 Description: {description}"""
         }
-
+        
         blog_content = utils.query_llm(
             prompt_blog_content,
             model='o4-mini',
@@ -449,7 +441,7 @@ def process_papers():
     input_dir = "../../data/arxiv/cleaned/"
     
     # Get list of files in cleaned directory
-    files = [f for f in os.listdir(input_dir) if f.endswith('.tex') and f == 'DPO.tex']
+    files = [f for f in os.listdir(input_dir) if f.endswith('.tex')]
     
     for filename in files:
         # Extract paper name without extension
