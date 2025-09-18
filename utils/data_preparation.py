@@ -205,7 +205,7 @@ def prepare_training_mix(
                             domain_text += f.read()
             
             if domain_text:
-                all_prior_knowledge_chunks.extend(_chunk(domain_text))
+                all_prior_knowledge_chunks.extend(_chunk(domain_text, explanation=True))
 
         unique_document_batches.append(all_prior_knowledge_chunks)
     else:
@@ -261,7 +261,7 @@ def prepare_training_mix(
                         if filename.endswith('.txt'):
                             file_path = os.path.join(explanation_dir, filename)
                             with open(file_path, 'r', encoding='utf-8') as f:
-                                explanation_chunks.extend(_chunk(f.read()))
+                                explanation_chunks.extend(_chunk(f.read(), explanation=True))
                 log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks.")
             
             # This part ensures that chunks from each document type of a domain are added to the correct overall batch

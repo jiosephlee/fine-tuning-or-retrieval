@@ -493,7 +493,7 @@ if __name__ == "__main__":
 
     if args.test_script:
         log.info("--- RUNNING IN TEST SCRIPT MODE ---")
-        args.num_train_epochs = 2
+        args.num_train_epochs = 4
         args.num_lima_epochs = 1
         args.base_results_dir = os.path.join("../../results", "tests")
     else: 
