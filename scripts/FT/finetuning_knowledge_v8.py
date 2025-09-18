@@ -65,15 +65,30 @@ def construct_experiment_name(args):
     # 7. Epochs: e.g., 'e1'
     epochs = f"e{args.num_train_epochs}"
 
+    # 8. Batch size and learning rate
+    training_params = f"bs{args.effective_batch_size_for_cpt}_lr{args.learning_rate:g}"
+
     path_parts = [
         training_type,
         model_size,
         probes_version,
         chunking_style,
         data_mix,
+    ]
+
+    # Add pretraining strategy if applicable
+    if args.separate_batches_with_pretraining > 0:
+        pretrain_info = f"sep_{args.separate_batches_with_pretraining}_{args.pretraining_data_type}"
+        path_parts.append(pretrain_info)
+    elif args.fill_batches_with_pretraining:
+        pretrain_info = f"fill_{args.pretraining_data_type}"
+        path_parts.append(pretrain_info)
+
+    path_parts.extend([
         domains,
         epochs,
-    ]
+        training_params,
+    ])
     
     # Suffix becomes the final leaf directory name for the run
     run_name = args.custom_suffix if args.custom_suffix else "run"
