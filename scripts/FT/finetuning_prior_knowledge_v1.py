@@ -321,6 +321,7 @@ def prior_knowledge_training(model, tokenizer, log, args):
         "override_domains": args.override_domains,
         "fill_batches_with_pretraining": args.fill_batches_with_pretraining,
         "pretraining_data_type": "dclm",
+        "add_title_prefix": False,
         "test_script": args.test_script,
     }
 
@@ -346,8 +347,9 @@ def prior_knowledge_training(model, tokenizer, log, args):
 
     if args.push_to_hub_cpt_id:
         log.info(f"Pushing model to hub: {args.push_to_hub_cpt_id}")
+        # model.push_to_hub(args.push_to_hub_cpt_id)
         trainer.push_to_hub(args.push_to_hub_cpt_id)
-        tokenizer.push_to_hub(args.push_to_hub_cpt_id)
+        # tokenizer.push_to_hub(args.push_to_hub_cpt_id)
 
     return trainer.model
 
@@ -383,7 +385,7 @@ def lima_training(model, tokenizer, log, args):
         padding_free = True,
         dataset_text_field="text",
         report_to="wandb" if not args.test_script else "none",
-        hub_model_id=args.push_to_hub_lima_id
+        push_to_hub=True,
     )
     
     # --- Load Probes ---
@@ -448,7 +450,7 @@ def lima_training(model, tokenizer, log, args):
     if args.push_to_hub_lima_id:
         log.info(f"Pushing model to hub: {args.push_to_hub_lima_id}")
         trainer.push_to_hub(args.push_to_hub_lima_id)
-        tokenizer.push_to_hub(args.push_to_hub_lima_id)
+        # tokenizer.push_to_hub(args.push_to_hub_lima_id)
     
     if not args.test_script:
         wandb.finish()
@@ -475,8 +477,8 @@ if __name__ == "__main__":
     parser.add_argument("--device_batch_size", type=int, default=2, help="The batch size per device.")
     parser.add_argument("--context_length_for_cpt", type=int, default=3072, help="Context length for continued pretraining.")
     parser.add_argument("--context_length_for_lima", type=int, default=3072, help="Context length for LIMA training.")
-    parser.add_argument("--push_to_hub_cpt_id", type=str, default=None, help="Hub model ID to push CPT model to.")
-    parser.add_argument("--push_to_hub_lima_id", type=str, default=None, help="Hub model ID to push LIMA model to.")
+    parser.add_argument("--push_to_hub_cpt_id", type=str, default="prior", help="Hub model ID to push CPT model to.")
+    parser.add_argument("--push_to_hub_lima_id", type=str, default="prior_with_lima", help="Hub model ID to push LIMA model to.")
 
 
     args = parser.parse_args()

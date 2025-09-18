@@ -1,9 +1,10 @@
 num_epochs=80
-num_paraphrased=0
+num_paraphrased=9
 echo hey!
 nohup python finetuning_knowledge_v8.py \
-    --override_domains DPO 1_58 GRPO \
-    --effective_batch_size_for_cpt 16 \
+    --override_domains DPO 1_58 GRPO BOFT OFT \
+    --device_batch_size 4 \
+    --effective_batch_size_for_cpt 32 \
     --fill_batches_with_pretraining \
     --num_train_epochs $num_epochs \
     --learning_rate 2e-5 \
