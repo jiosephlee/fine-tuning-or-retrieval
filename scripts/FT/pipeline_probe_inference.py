@@ -186,6 +186,10 @@ def quality_control_cloze(cloze_pair: Tuple[str, str], title: str, context: str)
 - The answer must not be leaked, explicitly or implicitly, in the statement until the very end.
 - Action: Minimally rewrite the statement such that the answer is not revealed in the statement.
 
+5. Answer capitalization
+- The answer should only be capitalized if it is a proper noun.
+- Action: Capitalize the answer if it is a proper noun. It should be lowercase otherwise.
+
 In all your adjustments, change the statement as minimally as necessary. If a statement is already good, make no changes. Please do not add "___" at the end to emulate the cloze format.
 
 ### Output Format
@@ -193,7 +197,7 @@ Provide a JSON object with a single key "pair", which is the refined [answer, st
 """,
         'user': f"### Paper Context\n{context}\n### Title\n{title}\n### Cloze Pair\n{json.dumps(cloze_pair)}\n"
     }
-    response = utils.query_llm(quality_control_prompt, model='gpt-5-mini', system_prompt_included=True, return_json=True, max_tokens=1000)
+    response = utils.query_llm(quality_control_prompt, model='gpt-5-mini',reasoning_effort='high', system_prompt_included=True, return_json=True, max_tokens=1000)
     try:
         data = json.loads(response) if isinstance(response, str) else response
         pair = data.get('pair')
