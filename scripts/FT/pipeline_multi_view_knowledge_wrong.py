@@ -71,7 +71,7 @@ Example:
 
     response_questions_str = utils.query_llm(
         prompt_questions, 
-        model='o4-mini', 
+        model='gpt-5', 
         system_prompt_included=True, 
         return_json=True, 
         max_tokens=10000
@@ -106,6 +106,8 @@ Example:
             prompt_check = {
                 'system': """You will be given a generated question (title and body) and a list of existing probe questions. Your task is to determine if the generated question is semantically equivalent to any of the probe questions.
 
+The question needs to be essentially asking the same thing, not just similar in the sense of being about the same topic. It doesn't need to be the same word for word, but it should be semantically "word for word" the same.
+
 Respond with a JSON object containing a single key "is_duplicate" which is a boolean.
 
 Example:
@@ -127,7 +129,7 @@ Example:
             try:
                 response_str = utils.query_llm(
                     prompt_check,
-                    model='o4-mini',
+                    model='gpt-5-mini',
                     system_prompt_included=True,
                     return_json=True,
                     max_tokens=500
@@ -151,7 +153,7 @@ Example:
         
         prompt_answer = {
             'system': """### Primary Goal
-Your primary goal is to provide an answer that is **incorrect and subtly misleading**. You should confidently present false information as if it were true, aiming to confuse a reader who is not an expert on the topic.
+Your primary goal is to provide an answer that is **incorrect and misleading**. You should confidently present false information as if it were true, aiming to confuse a reader who is not an expert on the topic.
 
 ### Persona
 To do this, you will adopt the persona of an expert who provides clear, detailed, and educational answers in a Stack Exchange style. You should sound like you are doing the following:
@@ -165,6 +167,7 @@ While sounding like the persona above, you must ensure your answer is fundamenta
 - Contain factual errors, misinterpretations of the paper's concepts, or logical fallacies.
 - Be inconsistent with the provided research paper, while perhaps using some jargon from it to sound authentic.
 - Please write any mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π".
+- Again, please write all math in LaTeX.
 
 Format your response as a comprehensive Stack Exchange answer.""",
             'user': f"""### Question Title
@@ -194,7 +197,37 @@ Format your response as a comprehensive Stack Exchange answer.""",
     with ThreadPoolExecutor() as executor:
         qa_pairs = list(tqdm(executor.map(generate_answer, filtered_questions), total=len(filtered_questions), desc="Generating Stack Exchange answers"))
 
-    # --- 4. Create single Stack Exchange style explanation file ---
+    # --- 4. Refine answers to ensure correct LaTeX formatting ---
+    print("Refining answers to ensure correct LaTeX formatting...")
+
+    def refine_answer_latex(qa_pair):
+        """Refines an answer to fix LaTeX formatting."""
+        print(f"Refining LaTeX for answer to: {qa_pair['title'][:50]}...")
+        
+        prompt_refine = {
+            'system': """You will be given a text. Your only task is to correct any mathematical notation inside it to be valid LaTeX. You must not change any other part of the text.
+- Convert unicode math characters like 'π' to their LaTeX equivalent '$\pi$'.
+- Ensure all mathematical expressions are enclosed in '$...$' for inline math or '$$...$$' for display math.
+- Return the full, corrected text.
+""",
+            'user': f"### Text with potential LaTeX errors\n{qa_pair['answer']}"
+        }
+        
+        refined_answer_text = utils.query_llm(
+            prompt_refine,
+            model='o4-mini',
+            reasoning_effort="low",
+            system_prompt_included=True,
+            max_tokens=4000
+        )
+        
+        qa_pair['answer'] = refined_answer_text
+        return qa_pair
+
+    with ThreadPoolExecutor() as executor:
+        qa_pairs = list(tqdm(executor.map(refine_answer_latex, qa_pairs), total=len(qa_pairs), desc="Refining LaTeX"))
+
+    # --- 5. Create single Stack Exchange style explanation file ---
     print("Creating Stack Exchange explanation file...")
 
     stackexchange_content = ""
@@ -247,7 +280,7 @@ Provide the output as a JSON object with a single key "outline", which is a list
 
     response_outline_str = utils.query_llm(
         prompt_outline,
-        model='o4-mini',
+        model='gpt-5',
         system_prompt_included=True,
         return_json=True,
         max_tokens=4000
@@ -295,7 +328,7 @@ To do this, you will adopt the persona of an expert textbook author. You should 
 ### What to Actually Do
 While sounding like the persona above, you must ensure your chapter is fundamentally wrong. It should:
 - Introduce errors, misinterpretations, and logical flaws.
-- Sound confident and authoritative.
+- Write nonsense that looks similar semantically to what a correct textbook would say in terms of syntax or diction.
 - Use jargon from the paper but explain it incorrectly.
 - Be inconsistent with the provided research paper.
 - Separate each subtopic with a section header "#".
@@ -365,7 +398,7 @@ Provide the output as a JSON object with a single key "blogs", which is a list o
 
     response_blog_ideas_str = utils.query_llm(
         prompt_blog_ideas,
-        model='o4-mini',
+        model='gpt-5',
         system_prompt_included=True,
         return_json=True,
         max_tokens=2000
@@ -401,10 +434,10 @@ To do this, adopt the persona of a knowledgeable and enthusiastic tech blogger. 
 
 ### What to Actually Do
 While sounding like the persona above, you must ensure your blog post is fundamentally wrong. It should:
-- Introduce subtle but significant errors when explaining concepts from the paper.
+- Introduce significant errors when explaining concepts from the paper.
 - Draw incorrect conclusions and speculate wildly based on misinterpretations.
 - Be inconsistent with the paper, but sound plausible to a casual reader.
-- Please write any mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π". 
+- Please write any mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π". Again, please write all math in LaTeX.
 
 Your output should be the full text of the blog post, starting with the blog title as a markdown header. Use '#' to denote the blog title, '##' to denote different sections, and so on.""",
             'user': f"""### Research Paper

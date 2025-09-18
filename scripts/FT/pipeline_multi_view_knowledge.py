@@ -71,8 +71,8 @@ Example:
 
     response_questions_str = utils.query_llm(
         prompt_questions, 
-        model='o4-mini',
-        reasoning_effort="high",
+        model='gpt-5',
+        reasoning_effort="medium",
         system_prompt_included=True, 
         return_json=True, 
         max_tokens=10000
@@ -102,16 +102,27 @@ Example:
         df = pd.read_csv(PROBES_FILE_PATH)
         probes = df['question'].tolist()
         
-        def is_question_duplicate(question):
-            """Checks if a question is a duplicate of any probe."""
+        def check_question_similarity(question):
+            """Checks if a question is a duplicate of any probe and returns details."""
             prompt_check = {
-                'system': """You will be given a generated question (title and body) and a list of existing probe questions. Your task is to determine if the generated question is semantically equivalent to any of the probe questions.
+                'system': """You will be given a generated question (title and body) and a list of existing probe questions. Your task is to determine if the generated question is semantically equivalent to ANY of the probe questions.
 
-Respond with a JSON object containing a single key "is_duplicate" which is a boolean.
+If you find a semantically equivalent probe question, respond with a JSON object with "is_duplicate" as true, the text of the "equivalent_probe", and an "explanation" of why they are the same. 
 
-Example:
+The question needs to be essentially asking for the same answer, not just similar in the sense of being about the same topic. For instance, both questions might be asking about some equation but asking about different aspects of it. This would be considered different.
+
+If no probe question is semantically equivalent, respond with "is_duplicate" as false.
+
+Example for a duplicate:
 {
-    "is_duplicate": true
+    "is_duplicate": true,
+    "equivalent_probe": "What is the capital of France?",
+    "explanation": "Both questions ask for the capital city of France."
+}
+
+Example for no duplicate:
+{
+    "is_duplicate": false
 }
 """,
                 'user': f"""### Generated Question Title
@@ -128,32 +139,46 @@ Example:
             try:
                 response_str = utils.query_llm(
                     prompt_check,
-                    model='o4-mini',
+                    model='gpt-5-mini',
                     system_prompt_included=True,
                     return_json=True,
-                    max_tokens=500
+                    max_tokens=1000
                 )
-                return json.loads(response_str).get('is_duplicate', False)
+                response_data = json.loads(response_str)
+                return {
+                    'is_duplicate': response_data.get('is_duplicate', False),
+                    'equivalent_probe': response_data.get('equivalent_probe'),
+                    'explanation': response_data.get('explanation')
+                }
             except (json.JSONDecodeError, AttributeError):
-                return False
+                return {'is_duplicate': False, 'equivalent_probe': None, 'explanation': None}
 
         with ThreadPoolExecutor() as executor:
-            is_duplicate_list = list(tqdm(executor.map(is_question_duplicate, questions), total=len(questions), desc="Filtering questions"))
+            similarity_results = list(tqdm(executor.map(check_question_similarity, questions), total=len(questions), desc="Filtering questions"))
 
-        filtered_questions = [q for q, is_dup in zip(questions, is_duplicate_list) if not is_dup]
-        dropped_questions = [q for q, is_dup in zip(questions, is_duplicate_list) if is_dup]
+        filtered_questions = []
+        dropped_questions_info = []
+        for question, result in zip(questions, similarity_results):
+            if result['is_duplicate']:
+                dropped_questions_info.append({
+                    'dropped_question': question,
+                    'equivalent_probe': result['equivalent_probe'],
+                    'explanation': result['explanation']
+                })
+            else:
+                filtered_questions.append(question)
         
         print(f"Filtered down to {len(filtered_questions)} questions from {len(questions)}.")
         
-        if dropped_questions:
-            print(f"Dropped {len(dropped_questions)} questions:")
-            for q in dropped_questions:
-                print(f"  - {q['title']}")
+        if dropped_questions_info:
+            print(f"Dropped {len(dropped_questions_info)} questions:")
+            for item in dropped_questions_info:
+                print(f"  - Dropped: '{item['dropped_question']['title']}' (Similar to: '{item['equivalent_probe']}')")
             
             dropped_questions_path = os.path.join(OUTPUT_DIR, "stack_exchange_dropped_questions.json")
             with open(dropped_questions_path, 'w') as f:
-                json.dump(dropped_questions, f, indent=4)
-            print(f"Saved dropped questions to {dropped_questions_path}")
+                json.dump(dropped_questions_info, f, indent=4)
+            print(f"Saved dropped questions details to {dropped_questions_path}")
 
     # --- 3. Generate answers for each question ---
     print("Generating answers for filtered questions...")
@@ -165,12 +190,16 @@ Example:
         prompt_answer = {
             'system': """A graduate student has asked a question about a research paper. Provide a clear, detailed Stack Exchange style answer that:
 
-- Thoroughly addresses their question
+- Thoroughly addresses their question 
+- Don't make it too lengthy; it should be concise and to the point like a Stack Exchange answer
+- Write in prose rather than structured bullet points in one cohesive answer
 - Provides intuitive explanations alongside technical details
 - Connects to broader concepts when relevant
 - Is educational and accessible
 
 Please write any mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π". Also, please make sure that your answer is grounded in the paper; do not provide any information that is inconsistent with the paper.
+
+Again, please write all math in LaTeX.
 
 Format your response as a comprehensive Stack Exchange answer.
 
@@ -205,7 +234,7 @@ There have been other implementation attempts, like gradient checkpointing(e.g. 
         answer_text = utils.query_llm(
             prompt_answer,
             model='o4-mini',
-            reasoning_effort="medium",
+            reasoning_effort="high",
             system_prompt_included=True,
             max_tokens=2000
         )
@@ -219,7 +248,37 @@ There have been other implementation attempts, like gradient checkpointing(e.g. 
     with ThreadPoolExecutor() as executor:
         qa_pairs = list(tqdm(executor.map(generate_answer, filtered_questions), total=len(filtered_questions), desc="Generating Stack Exchange answers"))
 
-    # --- 4. Create single Stack Exchange style explanation file ---
+    # --- 4. Refine answers to ensure correct LaTeX formatting ---
+    print("Refining answers to ensure correct LaTeX formatting...")
+
+    def refine_answer_latex(qa_pair):
+        """Refines an answer to fix LaTeX formatting."""
+        print(f"Refining LaTeX for answer to: {qa_pair['title'][:50]}...")
+        
+        prompt_refine = {
+            'system': """You will be given a text. Your only task is to correct any mathematical notation inside it to be valid LaTeX. You must not change any other part of the text.
+- Convert unicode math characters like 'π' to their LaTeX equivalent '$\pi$'.
+- Ensure all mathematical expressions are enclosed in '$...$' for inline math or '$$...$$' for display math.
+- Return the full, corrected text.
+""",
+            'user': f"{qa_pair['answer']}"
+        }
+        
+        refined_answer_text = utils.query_llm(
+            prompt_refine,
+            model='o4-mini',
+            reasoning_effort="low",
+            system_prompt_included=True,
+            max_tokens=4000
+        )
+        
+        qa_pair['answer'] = refined_answer_text
+        return qa_pair
+
+    with ThreadPoolExecutor() as executor:
+        qa_pairs = list(tqdm(executor.map(refine_answer_latex, qa_pairs), total=len(qa_pairs), desc="Refining LaTeX"))
+
+    # --- 5. Create single Stack Exchange style explanation file ---
     print("Creating Stack Exchange explanation file...")
 
     stackexchange_content = ""
@@ -272,7 +331,7 @@ Provide the output as a JSON object with a single key "outline", which is a list
 
     response_outline_str = utils.query_llm(
         prompt_outline,
-        model='o4-mini',
+        model='gpt-5',
         system_prompt_included=True,
         return_json=True,
         max_tokens=4000
@@ -378,8 +437,8 @@ Provide the output as a JSON object with a single key "blogs", which is a list o
 
     response_blog_ideas_str = utils.query_llm(
         prompt_blog_ideas,
-        model='o4-mini',
-        reasoning_effort="high",
+        model='gpt-5',
+        reasoning_effort="medium",
         system_prompt_included=True,
         return_json=True,
         max_tokens=2000
@@ -455,8 +514,8 @@ def process_papers():
         # Extract paper name without extension
         paper_name = os.path.splitext(filename)[0]
         generate_stack_exchange_knowledge(paper_name)
-        generate_textbook_knowledge(paper_name)
-        generate_blog_knowledge(paper_name)
+        #generate_textbook_knowledge(paper_name)
+        #generate_blog_knowledge(paper_name)
         
 if __name__ == "__main__":
     process_papers()
