@@ -282,7 +282,6 @@ def prior_knowledge_training(model, tokenizer, log, args):
         packing = False,
         padding_free = False,
         report_to="wandb" if not args.test_script else "none",
-        hub_model_id=args.push_to_hub_cpt_id
     )
     # --- Load Probe Data ---
     callbacks_to_use = setup_callbacks(
@@ -324,9 +323,9 @@ def prior_knowledge_training(model, tokenizer, log, args):
 
     if args.push_to_hub_cpt_id:
         log.info(f"Pushing model to hub: {args.push_to_hub_cpt_id}")
-        # model.push_to_hub(args.push_to_hub_cpt_id)
-        trainer.push_to_hub(args.push_to_hub_cpt_id)
-        # tokenizer.push_to_hub(args.push_to_hub_cpt_id)
+        model.push_to_hub(args.push_to_hub_cpt_id)
+        #trainer.push_to_hub(args.push_to_hub_cpt_id)
+        tokenizer.push_to_hub(args.push_to_hub_cpt_id)
 
     return trainer.model
 
@@ -361,8 +360,7 @@ def lima_training(model, tokenizer, log, args):
         packing = True,
         padding_free = True,
         dataset_text_field="text",
-        report_to="wandb" if not args.test_script else "none",
-        push_to_hub=True,
+        report_to="wandb" if not args.test_script else "none"
     )
     
     # --- Load Probes ---
@@ -426,8 +424,9 @@ def lima_training(model, tokenizer, log, args):
 
     if args.push_to_hub_lima_id:
         log.info(f"Pushing model to hub: {args.push_to_hub_lima_id}")
-        trainer.push_to_hub(args.push_to_hub_lima_id)
-        # tokenizer.push_to_hub(args.push_to_hub_lima_id)
+        #trainer.push_to_hub(args.push_to_hub_lima_id)
+        model.push_to_hub(args.push_to_hub_lima_id)
+        tokenizer.push_to_hub(args.push_to_hub_lima_id)
     
     if not args.test_script:
         wandb.finish()
