@@ -8,6 +8,7 @@
 import os
 import sys
 import json
+from datetime import datetime
 sys.path.append('../..')
 import pandas as pd
 import utils.llm_training as llm_training
@@ -55,7 +56,7 @@ def construct_experiment_name(args):
     ]
     
     # Suffix becomes the final leaf directory name for the run
-    run_name = args.custom_suffix if args.custom_suffix else "run"
+    run_name = args.custom_suffix if args.custom_suffix else datetime.now().strftime('%m_%d')
     path_parts.append(run_name)
     
     return os.path.join(*path_parts)
@@ -76,8 +77,6 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
     if not domains:
         domains = get_all_domains()
         log.info(f"No domains specified, found and using: {domains}")
-
-    all_generation_prompts = {}
 
     for domain in domains:
         log.info(f"--- Setting up probes for domain: {domain} ---")
@@ -177,46 +176,6 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
             log.info(f"Added CorpusPerplexityCallback for domain {domain} from {corpus_path}")
         else:
             log.warning(f"Corpus file not found for domain {domain} at {corpus_path}")
-
-        # --- Generation Probes (collect for single callback) ---
-        if is_lima:
-            prompt_files = {
-                f'recall_{domain}_QA': f'../../data/probes/generation/{domain}/recall_{domain}_QA.json',
-                f'yourbench_{domain}': f'../../data/probes/generation/{domain}/yourbench_{domain}.json'
-            }
-        else:
-            prompt_files = {
-                f'recall_{domain}': f'../../data/probes/generation/{domain}/recall_{domain}.json'
-            }
-        
-        domain_prompts = load_prompts(prompt_files, append_eot=is_lima)
-        all_generation_prompts.update(domain_prompts)
-
-    if is_lima:
-        background_prompt_path = '../../data/probes/generation/DPO/recall_background_QA.json'
-        if os.path.exists(background_prompt_path):
-            background_prompts = load_prompts({'recall_background_QA': background_prompt_path}, append_eot=is_lima)
-            all_generation_prompts.update(background_prompts)
-
-    if all_generation_prompts:
-        suffix = "_lima" if is_lima else ""
-        output_dir_generation = os.path.join(args.base_results_dir, args.experiment_name, f"generation{suffix}")
-        os.makedirs(output_dir_generation, exist_ok=True)
-        
-        inference_config = llm_configs.InferenceConfig(no_repeat_ngram_size=6)
-        
-        generation_probe_callback = llm_callbacks.GenerationProbeCallback(
-            prompts=all_generation_prompts,
-            tokenizer=tokenizer,
-            inference_config=inference_config,
-            eval_every_n_steps=6 if is_lima else 10,
-            logger=log,
-            output_dir=output_dir_generation,
-            do_eval=args.do_eval,
-            report_to_wandb=report_to_wandb,
-        )
-        callbacks.append(generation_probe_callback)
-        log.info(f"Loaded generation probes for domains: {list(all_generation_prompts.keys())}")
 
     callbacks.append(TrainingLossPerplexityCallback(report_to_wandb=report_to_wandb))
     return callbacks
@@ -495,10 +454,10 @@ if __name__ == "__main__":
         log.info("--- RUNNING IN TEST SCRIPT MODE ---")
         args.num_train_epochs = 4
         args.num_lima_epochs = 1
-        args.base_results_dir = os.path.join("../../results", "tests")
+        args.base_results_dir = os.path.join("../../results", "tests", "prior_knowledge")
     else: 
         os.environ["WANDB_PROJECT"]="fine_tuning_study"
-        args.base_results_dir = os.path.join("../../results", "FT")
+        args.base_results_dir = os.path.join("../../results", "prior_knowledge")
 
     if args.override_experiment_name:
         args.experiment_name = args.override_experiment_name

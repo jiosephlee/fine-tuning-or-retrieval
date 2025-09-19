@@ -114,6 +114,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
     callbacks = []
     
     report_to_wandb = not args.test_script
+    probe_batch_size = args.device_batch_size * 4
 
     if not domains:
         domains = get_all_domains()
@@ -150,7 +151,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
                 probes=probes,
                 targets=targets,
                 probes_df=knowledge_probe_df,
-                batch_size=8,
+                batch_size=probe_batch_size,
                 logger=log,
                 output_dir=output_dir_knowledge_probe,
                 log_prefix=f"{domain}_knowledge_probe",
@@ -186,7 +187,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
                 probes=probes,
                 targets=targets,
                 probes_df=inference_probe_df,
-                batch_size=8,
+                batch_size=probe_batch_size,
                 logger=log,
                 output_dir=output_dir_inference_probe,
                 log_prefix=f"{domain}_inference_probe",
@@ -223,8 +224,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
         # --- Generation Probes (collect for single callback) ---
         if is_lima:
             prompt_files = {
-                f'recall_{domain}_QA': f'../../data/probes/generation/{domain}/recall_{domain}_QA.json',
-                f'yourbench_{domain}': f'../../data/probes/generation/{domain}/yourbench_{domain}.json'
+                f'recall_{domain}_QA': f'../../data/probes/generation/{domain}/recall_{domain}_QA.json'
             }
         else:
             prompt_files = {

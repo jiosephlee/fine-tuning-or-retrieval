@@ -1,7 +1,7 @@
 num_epochs=100
 num_paraphrased=0
 nohup python finetuning_knowledge_v8.py \
-    --device_batch_size 8 \
+    --device_batch_size 16 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --effective_batch_size_for_cpt 32 \
     --separate_batches_with_pretraining 5 \
@@ -14,4 +14,4 @@ nohup python finetuning_knowledge_v8.py \
     --lima_afterwards \
     --full_finetuning > output_1.log 2>&1 &
 
-# This may takes around 12 hours to run on 3090 GPU
+# This may takes around 14 hours to run on 3090 GPU
