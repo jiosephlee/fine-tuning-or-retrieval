@@ -296,7 +296,7 @@ def prior_knowledge_training(model, tokenizer, log, args):
     strategy_args = {
         "override_domains": args.override_domains,
         "fill_batches_with_pretraining": args.fill_batches_with_pretraining,
-        "pretraining_data_type": "dclm",
+        "pretraining_data_type": args.pretraining_data_type,
         "add_title_prefix": False,
         "test_script": args.test_script,
     }
@@ -448,6 +448,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_script", action="store_true", help="Run in test mode with a small model and minimal epochs.")
     parser.add_argument("--override_domains", type=str, nargs='+', default=None, help="A list of domains to override the default (all domains).")
     parser.add_argument("--fill_batches_with_pretraining", default=False, action="store_true", help="Fill batches with pretraining data.")
+    parser.add_argument("--pretraining_data_type", type=str, default="dclm", help="Type of pretraining data for filling batches.")
     parser.add_argument("--effective_batch_size_for_cpt", type=int, default=8, help="The effective batch size for continued pretraining.")
     parser.add_argument("--effective_batch_size_for_lima", type=int, default=32, help="The effective batch size for LIMA training.")
     parser.add_argument("--device_batch_size", type=int, default=2, help="The batch size per device.")

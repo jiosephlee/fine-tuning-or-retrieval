@@ -264,32 +264,52 @@ def prepare_training_mix(
                                 explanation_chunks.extend(_chunk(f.read(), explanation=True))
                 log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks.")
             
-            # This part ensures that chunks from each document type of a domain are added to the correct overall batch
-            
             # Document Chunks for the current domain
             domain_doc_chunks = [source_chunks] + paraphrased_chunks_by_doc
 
             # 4. Handle explanation replacement logic
-            num_chunks_per_source_doc = len(source_chunks)
             if with_explanations and explanation_chunks:
-                paraphrased_units_for_explanations = math.ceil(len(explanation_chunks) / num_chunks_per_source_doc)
+                # We perform a precise, chunk-by-chunk replacement of the last N
+                # paraphrased chunks with N explanation chunks.
                 
-                # Start replacing from the last paraphrased doc towards the first
-                if paraphrased_units_for_explanations > 0:
-                    # Distribute explanation chunks among the slots of the documents they replace
-                    num_to_replace = min(paraphrased_units_for_explanations, len(paraphrased_chunks_by_doc))
-                    
-                    # Split explanations into `num_to_replace` parts
-                    split_explanations = [explanation_chunks[i::num_to_replace] for i in range(num_to_replace)]
+                # Make a mutable copy of explanation_chunks
+                explanation_chunks_to_insert = list(explanation_chunks)
+                num_explanations_to_insert = len(explanation_chunks_to_insert)
+                total_replaced = 0
 
-                    for i in range(num_to_replace):
-                        # Index of paraphrased doc to replace (from the end)
-                        replace_idx = len(paraphrased_chunks_by_doc) - 1 - i
-                        # Corresponding index in domain_doc_chunks (source is at 0)
-                        doc_chunk_idx = replace_idx + 1
+                # Iterate backwards through the paraphrased documents
+                for i in range(len(paraphrased_chunks_by_doc) - 1, -1, -1):
+                    if not explanation_chunks_to_insert:
+                        break
+                    
+                    # Index in domain_doc_chunks is i + 1 (because source is at 0)
+                    doc_chunk_idx = i + 1
+                    num_chunks_in_doc = len(domain_doc_chunks[doc_chunk_idx])
+
+                    if num_explanations_to_insert >= num_chunks_in_doc:
+                        # Replace the entire document's chunks with the last available explanation chunks
+                        chunks_for_this_doc = explanation_chunks_to_insert[-num_chunks_in_doc:]
+                        explanation_chunks_to_insert = explanation_chunks_to_insert[:-num_chunks_in_doc]
+                        domain_doc_chunks[doc_chunk_idx] = chunks_for_this_doc
                         
-                        domain_doc_chunks[doc_chunk_idx] = split_explanations[i]
-                    log.info(f"Domain {domain}: Replaced {num_to_replace} paraphrased documents with explanation chunks.")
+                        num_explanations_to_insert -= num_chunks_in_doc
+                        total_replaced += num_chunks_in_doc
+                    else:
+                        # Replace only the end of the document's chunks
+                        chunks_for_this_doc = explanation_chunks_to_insert
+                        explanation_chunks_to_insert = [] # All used up
+                        
+                        original_chunks = domain_doc_chunks[doc_chunk_idx]
+                        
+                        # The last `num_explanations_to_insert` chunks of this doc are replaced
+                        num_to_replace_in_doc = len(chunks_for_this_doc)
+                        new_chunks = original_chunks[:-num_to_replace_in_doc] + chunks_for_this_doc
+                        domain_doc_chunks[doc_chunk_idx] = new_chunks
+                        
+                        total_replaced += num_to_replace_in_doc
+                        num_explanations_to_insert = 0
+
+                log.info(f"Domain {domain}: Replaced last {total_replaced} paraphrased chunks with explanation chunks.")
             
             # Add the processed chunks for this domain to the main batches
             for i, chunks in enumerate(domain_doc_chunks):
