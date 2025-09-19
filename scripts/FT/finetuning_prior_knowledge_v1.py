@@ -30,7 +30,13 @@ def construct_experiment_name(args):
     training_type = "full" if args.full_finetuning else "peft"
     
     # 2. Model Size: e.g., '1b', '7b'
-    model_size = "1b" if "1B" in args.model_id else "7b"
+    model_id_lower = args.model_id.lower()
+    if "1b" in model_id_lower:
+        model_size = "1b"
+    elif "7b" in model_id_lower:
+        model_size = "7b"
+    else:
+        model_size = args.model_id.replace('/', '_')
     
     # 3. Probes Version: e.g., 'probes_v7'
     probes_version = f"probes_{args.knowledge_probes_version}"
@@ -47,16 +53,28 @@ def construct_experiment_name(args):
     # 5. Epochs: e.g., 'e1'
     epochs = f"e{args.num_train_epochs}"
 
+    # 6. Batch size and learning rate
+    training_params = f"bs{args.effective_batch_size_for_cpt}_lr{args.learning_rate:g}"
+
     path_parts = [
         training_type,
         model_size,
         probes_version,
+    ]
+
+    # Add pretraining strategy if applicable
+    if args.fill_batches_with_pretraining:
+        pretrain_info = f"fill_{args.pretraining_data_type}"
+        path_parts.append(pretrain_info)
+
+    path_parts.extend([
         domains,
         epochs,
-    ]
+        training_params,
+    ])
     
     # Suffix becomes the final leaf directory name for the run
-    run_name = args.custom_suffix if args.custom_suffix else datetime.now().strftime('%m_%d')
+    run_name = args.custom_suffix if args.custom_suffix else datetime.now().strftime('%m_%d_%H_%M')
     path_parts.append(run_name)
     
     return os.path.join(*path_parts)
