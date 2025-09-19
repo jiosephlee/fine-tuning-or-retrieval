@@ -30,10 +30,13 @@ def construct_experiment_name(args):
     
     # 2. Model Size: e.g., '1b', '7b'
     model_id_lower = args.model_id.lower()
-    if "1b" in model_id_lower:
-        model_size = "1b"
-    elif "7b" in model_id_lower:
-        model_size = "7b"
+    if "olmo" in model_id_lower:
+        if "1b" in model_id_lower:
+            model_size = "1b"
+        elif "7b" in model_id_lower:
+            model_size = "7b"
+        else:
+            model_size = args.model_id.replace('/', '_')
     else:
         model_size = args.model_id.replace('/', '_')
     
@@ -564,6 +567,14 @@ if __name__ == "__main__":
         args.experiment_name = args.override_experiment_name
     else:
         args.experiment_name = construct_experiment_name(args)
+
+    # --- Save Hyperparameters ---
+    experiment_dir = os.path.join(args.base_results_dir, args.experiment_name)
+    os.makedirs(experiment_dir, exist_ok=True)
+    hyperparameters_path = os.path.join(experiment_dir, 'hyperparameters.json')
+    with open(hyperparameters_path, 'w') as f:
+        json.dump(vars(args), f, indent=4)
+    log.info(f"Hyperparameters saved to {hyperparameters_path}")
 
     # --- Load the model ---
     model_config = llm_configs.ModelConfig(

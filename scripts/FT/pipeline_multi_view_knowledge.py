@@ -26,12 +26,13 @@ def generate_stack_exchange_knowledge(paper_name):
     # --- 2. Generate Stack Exchange style questions ---
     print("Generating student questions about the paper...")
     prompt_questions = {
-        'system': """You are a confused student reading this research paper. You are struggling with specific concepts, details, and connections in this paper. Generate a list of at least 20 Stack Exchange style questions that you would ask to clarify your understanding.
+        'system': """You are a confused student reading this research paper. You are struggling with specific concepts, details, and connections in this paper. Generate a list of several Stack Exchange style questions that you would ask to clarify your understanding.
 
 Your questions should:
 - Vary in levels of understanding, from misled to profound.
 - Vary in complexity, from simple to deep.
 - Vary in type, from conceptual to detail-specific.
+- Focus on clarifying the concepts and details of the paper. Do not ask tangential questions.
 
 As you generate the questions, please make sure to consider the following:
 - Make sure the questions are self-contained and unambiguous
@@ -41,19 +42,13 @@ For each question, provide:
 - A `title` in Stack Exchange question format
 - The `question_body` with context and what specifically you're confused about
 
-## Examples
+## Example Question
 
-Question 1:	
 "How can Transformers handle arbitrary length input?
 
 The transformer, introduced in the paper Attention Is All You Need, is a popular new neural network architecture that is commonly viewed as an alternative to recurrent neural networks, like LSTMs and GRUs.
 
 However, having gone through the paper, as well as several online explanations, I still have trouble wrapping my head around how they work."
-
-Question 2:	
-"I know that in the math on which the transformer is based there is no restriction on the length of input. But I still can’t understand why we should fix it in the frameworks (PyTorch). Because of this problem Transformer-XL has been created.
-
-Can you explain to me where this problem is hiding, please?"
 
 ### Output Format
 Provide the output as a JSON object with a single key "questions", which is a list of question dictionaries.
@@ -91,94 +86,95 @@ Example:
     print(f"Generated {len(questions)} questions")
 
     # --- Filter out questions that are too similar to existing probes ---
-    print("Filtering generated questions...")
-    PROBES_FILE_PATH = f"../../data/probes/inference/{paper_name}/probes_v6.csv"
+    # print("Filtering generated questions...")
+    # PROBES_FILE_PATH = f"../../data/probes/inference/{paper_name}/probes_v6.csv"
     
-    filtered_questions = []
-    if not os.path.exists(PROBES_FILE_PATH):
-        print(f"Warning: Probes file not found at {PROBES_FILE_PATH}. Skipping filtering.")
-        filtered_questions = questions
-    else:
-        df = pd.read_csv(PROBES_FILE_PATH)
-        probes = df['question'].tolist()
+    # filtered_questions = []
+    # if not os.path.exists(PROBES_FILE_PATH):
+    #     print(f"Warning: Probes file not found at {PROBES_FILE_PATH}. Skipping filtering.")
+    #     filtered_questions = questions
+    # else:
+    #     df = pd.read_csv(PROBES_FILE_PATH)
+    #     probes = df['question'].tolist()
         
-        def check_question_similarity(question):
-            """Checks if a question is a duplicate of any probe and returns details."""
-            prompt_check = {
-                'system': """You will be given a generated question (title and body) and a list of existing probe questions. Your task is to determine if the generated question is semantically equivalent to ANY of the probe questions.
+    #     def check_question_similarity(question):
+    #         """Checks if a question is a duplicate of any probe and returns details."""
+    #         prompt_check = {
+    #             'system': """You will be given a generated question (title and body) and a list of existing probe questions. Your task is to determine if the generated question is semantically equivalent to ANY of the probe questions.
 
-If you find a semantically equivalent probe question, respond with a JSON object with "is_duplicate" as true, the text of the "equivalent_probe", and an "explanation" of why they are the same. 
+    # If you find a semantically equivalent probe question, respond with a JSON object with "is_duplicate" as true, the text of the "equivalent_probe", and an "explanation" of why they are the same. 
 
-The question needs to be essentially asking for the same answer, not just similar in the sense of being about the same topic. For instance, both questions might be asking about some equation but asking about different aspects of it. This would be considered different.
+    # The question needs to be essentially asking for the same answer, not just similar in the sense of being about the same topic. For instance, both questions might be asking about some equation but asking about different aspects of it. This would be considered different.
 
-If no probe question is semantically equivalent, respond with "is_duplicate" as false.
+    # If no probe question is semantically equivalent, respond with "is_duplicate" as false.
 
-Example for a duplicate:
-{
-    "is_duplicate": true,
-    "equivalent_probe": "What is the capital of France?",
-    "explanation": "Both questions ask for the capital city of France."
-}
+    # Example for a duplicate:
+    # {
+    #     "is_duplicate": true,
+    #     "equivalent_probe": "What is the capital of France?",
+    #     "explanation": "Both questions ask for the capital city of France."
+    # }
 
-Example for no duplicate:
-{
-    "is_duplicate": false
-}
-""",
-                'user': f"""### Generated Question Title
-{question['title']}
+    # Example for no duplicate:
+    # {
+    #     "is_duplicate": false
+    # }
+# """,
+    #             'user': f"""### Generated Question Title
+    # {question['title']}
 
-### Generated Question Body
-{question['question_body']}
+    # ### Generated Question Body
+    # {question['question_body']}
 
-### Existing Probe Questions
-{json.dumps(probes, indent=2)}
-"""
-            }
+    # ### Existing Probe Questions
+    # {json.dumps(probes, indent=2)}
+# """
+    #         }
             
-            try:
-                response_str = utils.query_llm(
-                    prompt_check,
-                    model='gpt-5-mini',
-                    system_prompt_included=True,
-                    return_json=True,
-                    max_tokens=1000
-                )
-                response_data = json.loads(response_str)
-                return {
-                    'is_duplicate': response_data.get('is_duplicate', False),
-                    'equivalent_probe': response_data.get('equivalent_probe'),
-                    'explanation': response_data.get('explanation')
-                }
-            except (json.JSONDecodeError, AttributeError):
-                return {'is_duplicate': False, 'equivalent_probe': None, 'explanation': None}
+    #         try:
+    #             response_str = utils.query_llm(
+    #                 prompt_check,
+    #                 model='gpt-5-mini',
+    #                 system_prompt_included=True,
+    #                 return_json=True,
+    #                 max_tokens=1000
+    #             )
+    #             response_data = json.loads(response_str)
+    #             return {
+    #                 'is_duplicate': response_data.get('is_duplicate', False),
+    #                 'equivalent_probe': response_data.get('equivalent_probe'),
+    #                 'explanation': response_data.get('explanation')
+    #             }
+    #         except (json.JSONDecodeError, AttributeError):
+    #             return {'is_duplicate': False, 'equivalent_probe': None, 'explanation': None}
 
-        with ThreadPoolExecutor() as executor:
-            similarity_results = list(tqdm(executor.map(check_question_similarity, questions), total=len(questions), desc="Filtering questions"))
+    #     with ThreadPoolExecutor() as executor:
+    #         similarity_results = list(tqdm(executor.map(check_question_similarity, questions), total=len(questions), desc="Filtering questions"))
 
-        filtered_questions = []
-        dropped_questions_info = []
-        for question, result in zip(questions, similarity_results):
-            if result['is_duplicate']:
-                dropped_questions_info.append({
-                    'dropped_question': question,
-                    'equivalent_probe': result['equivalent_probe'],
-                    'explanation': result['explanation']
-                })
-            else:
-                filtered_questions.append(question)
+    #     filtered_questions = []
+    #     dropped_questions_info = []
+    #     for question, result in zip(questions, similarity_results):
+    #         if result['is_duplicate']:
+    #             dropped_questions_info.append({
+    #                 'dropped_question': question,
+    #                 'equivalent_probe': result['equivalent_probe'],
+    #                 'explanation': result['explanation']
+    #             })
+    #         else:
+    #             filtered_questions.append(question)
         
-        print(f"Filtered down to {len(filtered_questions)} questions from {len(questions)}.")
+    #     print(f"Filtered down to {len(filtered_questions)} questions from {len(questions)}.")
         
-        if dropped_questions_info:
-            print(f"Dropped {len(dropped_questions_info)} questions:")
-            for item in dropped_questions_info:
-                print(f"  - Dropped: '{item['dropped_question']['title']}' (Similar to: '{item['equivalent_probe']}')")
+    #     if dropped_questions_info:
+    #         print(f"Dropped {len(dropped_questions_info)} questions:")
+    #         for item in dropped_questions_info:
+    #             print(f"  - Dropped: '{item['dropped_question']['title']}' (Similar to: '{item['equivalent_probe']}')")
             
-            dropped_questions_path = os.path.join(OUTPUT_DIR, "stack_exchange_dropped_questions.json")
-            with open(dropped_questions_path, 'w') as f:
-                json.dump(dropped_questions_info, f, indent=4)
-            print(f"Saved dropped questions details to {dropped_questions_path}")
+    #         dropped_questions_path = os.path.join(OUTPUT_DIR, "stack_exchange_dropped_questions.json")
+    #         with open(dropped_questions_path, 'w') as f:
+    #             json.dump(dropped_questions_info, f, indent=4)
+    #         print(f"Saved dropped questions details to {dropped_questions_path}")
+    filtered_questions = questions
 
     # --- 3. Generate answers for each question ---
     print("Generating answers for filtered questions...")
@@ -233,8 +229,8 @@ There have been other implementation attempts, like gradient checkpointing(e.g. 
         
         answer_text = utils.query_llm(
             prompt_answer,
-            model='o4-mini',
-            reasoning_effort="high",
+            model='gpt-5-mini',
+            reasoning_effort="low",
             system_prompt_included=True,
             max_tokens=2000
         )
@@ -257,16 +253,16 @@ There have been other implementation attempts, like gradient checkpointing(e.g. 
         
         prompt_refine = {
             'system': """You will be given a text. Your only task is to correct any mathematical notation inside it to be valid LaTeX. You must not change any other part of the text.
-- Convert unicode math characters like 'π' to their LaTeX equivalent '$\pi$'.
-- Ensure all mathematical expressions are enclosed in '$...$' for inline math or '$$...$$' for display math.
-- Return the full, corrected text.
-""",
+    - Convert unicode math characters like 'π' to their LaTeX equivalent '$\\pi$'.
+    - Ensure all mathematical expressions are enclosed in '$...$' for inline math or '$$...$$' for display math.
+    - Return the full, corrected text.
+    """,
             'user': f"{qa_pair['answer']}"
         }
         
         refined_answer_text = utils.query_llm(
             prompt_refine,
-            model='o4-mini',
+            model='gpt-5-mini',
             reasoning_effort="low",
             system_prompt_included=True,
             max_tokens=4000
@@ -281,7 +277,7 @@ There have been other implementation attempts, like gradient checkpointing(e.g. 
     # --- 5. Create single Stack Exchange style explanation file ---
     print("Creating Stack Exchange explanation file...")
 
-    stackexchange_content = ""
+    stackexchange_content = f"\\title{{Stack Exchange of the Paper: {paper_name}}}\n\n"
     for qa in qa_pairs:
         stackexchange_content += f"### {qa['title']}\nQuestion:\n{qa['question']}\nAnswer:\n{qa['answer']}\n\n"
 
@@ -369,14 +365,11 @@ Provide the output as a JSON object with a single key "outline", which is a list
             'system': """### Instructions
 You will be given a chapter title, description, and subtopics and, based on those topics, your job is to write a detailed, cohesive textbook chapter addressed to a college student who is learning this material for the first time. 
 
-The chapter should be comprehensive and suitable for someone learning this material to understand research papers in the field. Begin with an introduction to the chapter, then cover each subtopic in turn. Don't just briefly describe the subtopics, but rather elaborate on the concepts at full length and explain them with a focus on intuition. Spell everything out clearly so there is no ambiguity. Dedicate multiple paragraphs to each subtopic. Write in full prose, rather than bullet points. Keep the larger textbook outline in mind when writing the chapter. Most importantly, please make sure that your chapter is grounded in the paper; do not provide any information that is inconsistent with the paper.
+The chapter should be comprehensive and suitable for someone learning this material to understand research papers in the field. Don't just briefly describe the subtopics, but rather elaborate on the concepts at full length and explain them with a focus on intuition. Spell everything out clearly so there is no ambiguity. Dedicate multiple paragraphs to each subtopic but be articulate and concise when appropriate. Write in full prose, rather than bullet points. Most importantly, please make sure that your chapter is grounded in the paper; do not provide any information or details that is not from the paper.
 
-Separate each subtopic with a section header "#". Also, please write all mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π". Again, PLEASE write all math in LaTeX.""",
+Start with the chapter title in the first line. Separate each subtopic with a section header "#". Also, please write all mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π". Again, PLEASE write all math in LaTeX.""",
             'user': f"""### Research Paper
 {paper_content}
-
-### Overall Textbook Outline
-{full_outline_text}
 
 ### Chapter Outline to Write
 {chapter_outline_text}"""
@@ -384,7 +377,7 @@ Separate each subtopic with a section header "#". Also, please write all mathema
         
         chapter_content = utils.query_llm(
             prompt_chapter,
-            model='o4-mini',
+            model='gpt-5-mini',
             reasoning_effort="medium",
             system_prompt_included=True,
             max_tokens=4000
@@ -396,7 +389,8 @@ Separate each subtopic with a section header "#". Also, please write all mathema
 
     # --- 3. Concatenate and save ---
     print("Assembling textbook...")
-    full_textbook = "\n\n\n\n".join(chapter_contents)
+    full_textbook_content = "\n\n".join(chapter_contents)
+    full_textbook = f"\\title{{A Textbook about the Paper: {paper_name}}}\n\n{full_textbook_content}"
     
     output_file = os.path.join(OUTPUT_DIR, "textbook.txt")
     with open(output_file, 'w') as f:
@@ -421,7 +415,7 @@ def generate_blog_knowledge(paper_name):
     print("Generating blog post ideas...")
     prompt_blog_ideas = {
         'system': """### Instructions
-You are a creative tech blogger and content strategist. Based on the provided research paper, generate a list of at least 5 blog post ideas that could naturally follow from this work. These blogs should target a wider audience than the paper itself, such as ML practitioners, students, or tech enthusiasts. 
+You are a creative tech blogger and content strategist. Based on the provided research paper, generate a list of a few blog posts that explain the paper in a way that is accessible to a wider audience. They should each focus on a different, main aspect of the paper.
 
 For each blog idea, provide:
 - A `title`.
@@ -466,10 +460,10 @@ Provide the output as a JSON object with a single key "blogs", which is a list o
             'system': """You will be given an academic paper and a blog post idea about the paper. Write a blog post based on the blog idea.
 
 As you write the blog post, please make sure to consider the following:
-- Write in a conversational blog style. Write in full prose, rather than bullet points.
+- Write in a technical blog style. It should be less formal but not too informal. It should be concise and to the point. 
 - Simplify complex concepts from the paper for a broader audience.
 - Write in full, complete sentences and prefer paragraphs over bullet points, but use bullet points when appropriate.
-- Lastly, you may have internal knowledge about the paper. You may use your own knowledge to discuss the paper in new ways, but the content you are blogging about should be from the paper alone.
+- Keep all details grounded in the paper. Do not make up any information.
 - Please write any mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π". 
 
 Your output should be the full text of the blog post, starting with the blog title as a markdown header. Use '#' to denote the blog title, '##' to denote different sections, and so on.
@@ -484,8 +478,8 @@ Description: {description}"""
 
         blog_content = utils.query_llm(
             prompt_blog_content,
-            model='o4-mini',
-            reasoning_effort="medium",
+            model='gpt-5-mini',
+            reasoning_effort="low",
             system_prompt_included=True,
             max_tokens=4000
         )
@@ -497,6 +491,7 @@ Description: {description}"""
     # --- 4. Concatenate and save ---
     print("Assembling blog posts...")
     full_blogs_content = "\n\n\n\n".join(blog_contents)
+    full_blogs_content = f"\\title{{Blogs about the Paper: {paper_name}}}\n\n{full_blogs_content}"
 
     output_file = os.path.join(OUTPUT_DIR, "blogs.txt")
     with open(output_file, 'w') as f:
@@ -508,7 +503,7 @@ def process_papers():
     input_dir = "../../data/arxiv/cleaned/"
     
     # Get list of files in cleaned directory
-    files = [f for f in os.listdir(input_dir) if f.endswith('.tex') and f != 'DPO.tex']
+    files = [f for f in os.listdir(input_dir) if f.endswith('.tex') and f == 'DPO.tex']
     
     for filename in files:
         # Extract paper name without extension
