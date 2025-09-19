@@ -1,6 +1,6 @@
 num_epochs=100
 num_paraphrased=0
-nohup python finetuning_knowledge_v8.py \
+python finetuning_knowledge_v8.py \
     --device_batch_size 16 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --effective_batch_size_for_cpt 32 \
@@ -11,6 +11,7 @@ nohup python finetuning_knowledge_v8.py \
     --overlap_sections \
     --overlap_ratio 1_4 \
     --lima_afterwards \
-    --full_finetuning > output_1.log 2>&1 &
+    --context_length_for_lima 2560 \
+    --full_finetuning > output_1.log 
 
 # This may takes around 4 hours to run on 3090 GPU

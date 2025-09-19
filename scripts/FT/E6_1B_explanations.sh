@@ -1,7 +1,7 @@
 num_epochs=100
-num_paraphrased=10
+num_paraphrased=9
 python finetuning_knowledge_v8.py \
-    --device_batch_size 16 \
+    --device_batch_size 4 \
     --with_explanations \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --effective_batch_size_for_cpt 32 \
@@ -13,6 +13,6 @@ python finetuning_knowledge_v8.py \
     --overlap_sections \
     --overlap_ratio 1_4 \
     --lima_afterwards \
-    --full_finetuning > output_1.log
-
+    --context_length_for_lima 2560 \
+    --full_finetuning > output_1.log 
 # Time: 5 hours

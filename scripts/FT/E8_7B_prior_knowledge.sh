@@ -10,6 +10,6 @@ python finetuning_prior_knowledge_v1.py \
     --lima_afterwards \
     --push_to_hub_cpt_id prior_6_papers_50_epochs_7B \
     --push_to_hub_lima_id prior_6_papers_50_epochs_7B_with_lima \
-    --full_finetuning > output_1.log
-
+    --context_length_for_lima 2560 \
+    --full_finetuning > output_1.log 
 # Time: 4 hours
