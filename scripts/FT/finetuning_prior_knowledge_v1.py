@@ -500,8 +500,9 @@ if __name__ == "__main__":
     if args.num_train_epochs > 0:
         model = prior_knowledge_training(model, tokenizer, log, args)
         log.info("Finished prior knowledge training.")
-
     # -- LIMA-based instruction tuning ---
     if args.lima_afterwards:
         lima_training(model, tokenizer, log, args)
+    elif not args.test_script:
+        wandb.finish()
     
