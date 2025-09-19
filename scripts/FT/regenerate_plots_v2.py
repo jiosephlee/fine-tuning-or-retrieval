@@ -39,5 +39,12 @@ def main():
             logger=logger
         )
 
+    # After individual plots are generated, create the averaged plots
+    logger.info("Generating averaged plots for all domains...")
+    llm_plotting.generate_averaged_plots(
+        experiment_dir=args.experiment_dir,
+        logger=logger
+    )
+
 if __name__ == "__main__":
     main()

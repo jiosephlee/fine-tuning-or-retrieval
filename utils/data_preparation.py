@@ -169,6 +169,24 @@ def prepare_training_mix(
         )
         return chunks
 
+    # Helper to chunk explanation text with specific overlap
+    def _chunk_explanation(text: str) -> List[str]:
+        text_with_eos = text + tokenizer.eos_token
+        # User requested hardcoded overlap for explanations
+        explanation_overlap_ratio = "1_10"
+        
+        chunks, _ = chunking.chunk(
+            text_with_eos,
+            tokenizer,
+            train_cfg.context_length,
+            chunk_by_section,
+            overlap_sections, # Explanations should always be overlapped
+            explanation_overlap_ratio,
+            add_title_prefix,
+            log=log
+        )
+        return chunks
+
     # Determine domains: use override if provided, otherwise scan directory
     domains = strategy_args.get("override_domains", None)
     unique_document_batches = []
@@ -251,7 +269,7 @@ def prepare_training_mix(
                         if filename.endswith('.txt'):
                             file_path = os.path.join(explanation_dir, filename)
                             with open(file_path, 'r', encoding='utf-8') as f:
-                                explanation_chunks.extend(_chunk(f.read()))
+                                explanation_chunks.extend(_chunk_explanation(f.read()))
                 log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks.")
             
             # Document Chunks for the current domain
@@ -390,14 +408,21 @@ def replicate_and_interleave_pretraining(
             log.info(f"--- Creating replication {rep + 1}/{replication_factor} ---")
         
         # Alternate between original and explanation-infused batches for each replication
-        if unique_document_batches_with_explanations and (rep % 2 == 1):
-            batches_for_this_rep = unique_document_batches_with_explanations
-            if test_script:
+        if unique_document_batches_with_explanations:
+            # Assert that we are alternating correctly. The first rep (0) should not have explanations.
+            should_use_explanations = (rep % 2 == 1)
+            if should_use_explanations:
                 log.info("Using batches WITH explanations for this replication.")
+                batches_for_this_rep = unique_document_batches_with_explanations
+            else:
+                log.info("Using batches WITHOUT explanations for this replication.")
+                batches_for_this_rep = unique_document_batches
+            
+            # This assertion verifies the core "every other" logic.
+            assert should_use_explanations == (batches_for_this_rep is unique_document_batches_with_explanations), \
+                "AssertionError: Explanation insertion is not alternating correctly."
         else:
             batches_for_this_rep = unique_document_batches
-            if test_script:
-                log.info("Using batches WITHOUT explanations for this replication.")
 
         for i, batch in enumerate(batches_for_this_rep):
             current_batch = list(batch)  # Make a copy to avoid modifying the original

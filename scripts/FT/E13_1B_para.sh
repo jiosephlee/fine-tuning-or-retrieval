@@ -1,8 +1,7 @@
 num_epochs=100
 num_paraphrased=9
-python finetuning_knowledge_v8.py \
-    --device_batch_size 4 \
-    --with_explanations \
+nohup python finetuning_knowledge_v8.py \
+    --device_batch_size 2 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --effective_batch_size_for_cpt 32 \
     --separate_batches_with_pretraining 1 \
@@ -15,4 +14,5 @@ python finetuning_knowledge_v8.py \
     --lima_afterwards \
     --full_finetuning > output_1.log 2>&1 &
 
-# Time: 5 hours
+        # --separate_batches_with_pretraining 1 \
+
