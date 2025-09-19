@@ -15,7 +15,6 @@ import utils.data_preparation as data_preparation
 import utils.model_setup as model_setup
 import utils.llm_callbacks as llm_callbacks
 import utils.llm_configs as llm_configs
-import utils.llm_plotting as llm_plotting
 import argparse
 import wandb
 import logging
@@ -293,19 +292,19 @@ def save_probe_results(callbacks, log, args):
         log.info(f"Training loss metrics saved to {experiment_dir}")
 
     # Generate plots for each domain
-    if not domains:
-        log.warning("No domains found to generate plots for.")
-        return
+    # if not domains:
+    #     log.warning("No domains found to generate plots for.")
+    #     return
 
-    for domain in sorted(list(domains)):
-        log.info(f"Generating revamped plots for domain '{domain}'...")
-        llm_plotting.generate_revamped_plots(
-            domain=domain,
-            knowledge_probes_version=args.knowledge_probes_version,
-            inference_probes_version=args.inference_probes_version,
-            experiment_dir=experiment_dir,
-            logger=log
-        )
+    # for domain in sorted(list(domains)):
+    #     log.info(f"Generating revamped plots for domain '{domain}'...")
+    #     llm_plotting.generate_revamped_plots(
+    #         domain=domain,
+    #         knowledge_probes_version=args.knowledge_probes_version,
+    #         inference_probes_version=args.inference_probes_version,
+    #         experiment_dir=experiment_dir,
+    #         logger=log
+    #     )
 
 
 def load_prompts(prompt_files, append_eot=False):
@@ -502,9 +501,6 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
     # --- Save results ---
     save_probe_results(callbacks, log, args)
     
-    # --- Generate plots ---
-    log.info("Finished generating all plots.")
-
     log.info("LIMA-based instruction tuning complete.")
     if not args.test_script:
         wandb.finish()
