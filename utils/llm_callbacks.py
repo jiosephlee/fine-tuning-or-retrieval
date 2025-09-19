@@ -370,7 +370,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         # assert that num_tokens_target is the same as target_lengths 
         assert torch.equal(num_tokens_target, target_lengths), "Number of tokens target mismatch"
         # assert that num_tokens_target is the same as non-zero in the loss_target
-        assert torch.equal(num_tokens_target, (loss_target != 0).sum(dim=1)), "Number of tokens target mismatch"
+        assert torch.equal(num_tokens_target, (loss_target != 0).sum(dim=1)), "Number of tokens target mismatch"    # sy11 debug comment out this line
         mean_nll_target = sum_loss_target / num_tokens_target
         perplexity = torch.exp(mean_nll_target)
 
