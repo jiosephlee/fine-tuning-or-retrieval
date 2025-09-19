@@ -23,8 +23,8 @@ def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, ou
     probe_metrics_path = os.path.join(output_dir, f"{domain}_knowledge_probe_metrics.csv")
     training_loss_path = os.path.join(output_dir, "training_loss_perplexity_metrics.csv")
     corpus_ppl_path = os.path.join(output_dir, f"{domain}_corpus_perplexity_metrics.csv")
-
-    if probes_version == 'v8': # This logic should be kept in sync with finetuning_knowledge_v8.py
+    log_info(probes_version)
+    if probes_version == 'v8' or probes_version == 'v9': # This logic should be kept in sync with finetuning_knowledge_v8.py
         probes_path = f'../../data/probes/facts/{domain}/probes_{probes_version}.csv'
     else:
         probes_path = f'../../data/probes/facts/{domain}/{domain}_knowledge_probes_{probes_version}.csv'
@@ -38,13 +38,12 @@ def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, ou
     corpus_ppl_df = pd.read_csv(corpus_ppl_path) if os.path.exists(corpus_ppl_path) else pd.DataFrame()
     probes_csv = pd.read_csv(probes_path) if probes_path and os.path.exists(probes_path) else pd.DataFrame()
 
-    if not probes_csv.empty and 'section' in probes_csv.columns and 'probe_index' in probe_df.columns:
-        log_info("Using 'section' column from probes CSV file.")
-        if 'section' in probe_df.columns:
-            probe_df = probe_df.drop(columns=['section'])
-        
-        sections = probes_csv[['section']].rename_axis('probe_index').reset_index()
-        probe_df = pd.merge(probe_df, sections, on='probe_index', how='left')
+    # If the probes CSV is available and has a 'section' column, map it to the probe_df
+    if not probes_csv.empty and 'section' in probes_csv.columns:
+        # Create a mapping from probe_index to section
+        section_map = probes_csv['section'].to_dict()
+        # Map the sections to the probe_df using the probe_index
+        probe_df['section'] = probe_df['probe_index'].map(section_map)
 
     # --- PLOT 1: Normalized Loss vs. Hit Accuracy ---
     log_info("Generating Plot 1: Normalized Loss vs. Hit Accuracy...")

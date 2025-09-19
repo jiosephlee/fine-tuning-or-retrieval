@@ -9,7 +9,7 @@ def main():
     parser = argparse.ArgumentParser(description="Regenerate plots for a specific experiment run.")
     parser.add_argument("--experiment_dir", type=str, required=True, help="The full path to the experiment directory.")
     parser.add_argument("--knowledge_probes_version", type=str, default="v9", help="Version of the knowledge probes.")
-    parser.add_argument("--inference_probes_version", type=str, default="v5", help="Version of the inference probes.")
+    parser.add_argument("--inference_probes_version", type=str, default="v6", help="Version of the inference probes.")
     
     args = parser.parse_args()
 

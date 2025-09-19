@@ -650,7 +650,7 @@ class GenerationProbeCallback(TrainerCallback):
         self.eval_history = {}
 
     def on_step_end(self, args, state, control, model, **kwargs):
-        if state.is_world_process_zero and state.global_step > 0 and state.global_step % self.eval_every_n_steps == 0:
+        if state.is_world_process_zero and state.global_step > 0 and (state.global_step % self.eval_every_n_steps == 0 or state.global_step == state.max_steps - 1):
             if self.logger:
                 self.logger.info(f"Running generation probe at step {state.global_step}...")
             else:
