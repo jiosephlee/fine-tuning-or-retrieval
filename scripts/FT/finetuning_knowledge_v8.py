@@ -538,7 +538,7 @@ if __name__ == "__main__":
     parser.add_argument("--effective_batch_size_for_lima", type=int, default=32, help="The effective batch size for LIMA training.")
     parser.add_argument("--device_batch_size", type=int, default=2, help="The batch size per device.")
     parser.add_argument("--context_length_for_cpt", type=int, default=3072, help="Context length for continued pretraining.")
-    parser.add_argument("--context_length_for_lima", type=int, default=3072, help="Context length for LIMA training.")
+    parser.add_argument("--context_length_for_lima", type=int, default=2560, help="Context length for LIMA training.")
 
     args = parser.parse_args()
 

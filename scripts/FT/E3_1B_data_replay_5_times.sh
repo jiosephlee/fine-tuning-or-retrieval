@@ -12,6 +12,7 @@ python finetuning_knowledge_v8.py \
     --overlap_sections \
     --overlap_ratio 1_4 \
     --lima_afterwards \
-    --full_finetuning > output_3.log
+    --full_finetuning \
+    --context_length_for_lima 2560 > output_1.log 
 
 # This may takes around 14 hours to run on 3090 GPU

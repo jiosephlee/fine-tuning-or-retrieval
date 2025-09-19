@@ -1,8 +1,8 @@
 num_epochs=100
-num_paraphrased=9
-python finetuning_knowledge_v8.py \
-    --model_id allenai/OLMo-2-1124-7B \
-    --device_batch_size 4 \
+num_paraphrased=0
+nohup python finetuning_knowledge_v8.py \
+    --model_id jiosephlee/6_papers_50_epochs \
+    --device_batch_size 16 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --effective_batch_size_for_cpt 32 \
     --separate_batches_with_pretraining 1 \
@@ -16,5 +16,5 @@ python finetuning_knowledge_v8.py \
     --full_finetuning \
     --context_length_for_lima 2560 > output_1.log 
 
-        # --separate_batches_with_pretraining 1 \
+# 4-6 hours
 
