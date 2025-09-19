@@ -316,10 +316,11 @@ def prior_knowledge_training(model, tokenizer, log, args):
             callbacks=callbacks_to_use,
             train=True
         )
+    log.info("Finished training.")
 
     # --- Save Metrics and Generate Plots ---
     save_probe_results(callbacks_to_use, log, args)
-    log.info("Finished training and saving all probe results.")
+    log.info("Finished saving all probe results.")
 
     if args.push_to_hub_cpt_id:
         log.info(f"Pushing model to hub: {args.push_to_hub_cpt_id}")
@@ -498,7 +499,8 @@ if __name__ == "__main__":
     # --- Prior Knowledge Pretraining (we also evaluate our probes during this) ---
     if args.num_train_epochs > 0:
         model = prior_knowledge_training(model, tokenizer, log, args)
-    
+        log.info("Finished prior knowledge training.")
+
     # -- LIMA-based instruction tuning ---
     if args.lima_afterwards:
         lima_training(model, tokenizer, log, args)
