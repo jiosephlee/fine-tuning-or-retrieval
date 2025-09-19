@@ -13,6 +13,6 @@ python finetuning_knowledge_v8.py \
     --overlap_sections \
     --overlap_ratio 1_4 \
     --lima_afterwards \
-    --full_finetuning > output_1.log 2>&1 &
-
+    --context_length_for_lima 2560 \
+    --full_finetuning > output_1.log 
 # Time: 5 hours
