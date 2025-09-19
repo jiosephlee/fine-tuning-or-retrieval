@@ -215,7 +215,8 @@ def fine_tune(
     )
     
     for i in dataset:
-        print(i['raw_text'][:50])
+        if i < 100:
+            log.info(i['raw_text'][:50])
     
     if test_script:
         log.info(f"Dataset has {len(dataset)} chunks...")
