@@ -274,5 +274,123 @@ def generate_revamped_plots(domain: str, knowledge_probes_version: str, inferenc
             plt.savefig(os.path.join(plot_output_dir, "plot_4_disaggregated_inference_probes.png"))
             plt.close()
 
+
+def generate_averaged_plots(experiment_dir: str, logger=None):
+    """
+    Generates plots averaged across all domains for an experiment.
+    """
+    def log_info(msg):
+        if logger:
+            logger.info(msg)
+        else:
+            print(msg)
+
+    # --- Directory for new plots ---
+    plot_output_dir = os.path.join(experiment_dir, "_averaged_plots")
+    os.makedirs(plot_output_dir, exist_ok=True)
+    log_info(f"Saving averaged plots to {plot_output_dir}")
+
+    # --- Data Loading and Aggregation ---
+    log_info("Loading and aggregating dataframes for averaged plotting...")
+    
+    domains = set()
+    for subdir in os.listdir(experiment_dir):
+        if subdir.endswith("_knowledge_probe"):
+            domains.add(subdir.replace("_knowledge_probe", ""))
+        elif subdir.endswith("_inference_probe"):
+            domains.add(subdir.replace("_inference_probe", ""))
+
+    if not domains:
+        log_info("No domains found. Skipping averaged plotting.")
+        return
+
+    all_knowledge_dfs = []
+    all_inference_dfs = []
+
+    for domain in domains:
+        knowledge_path = os.path.join(experiment_dir, f"{domain}_knowledge_probe", f"{domain}_knowledge_probe_metrics.csv")
+        if os.path.exists(knowledge_path):
+            all_knowledge_dfs.append(pd.read_csv(knowledge_path))
+        
+        inference_path = os.path.join(experiment_dir, f"{domain}_inference_probe", f"{domain}_inference_probe_metrics.csv")
+        if os.path.exists(inference_path):
+            all_inference_dfs.append(pd.read_csv(inference_path))
+
+    knowledge_probe_df = pd.concat(all_knowledge_dfs) if all_knowledge_dfs else pd.DataFrame()
+    inference_probe_df = pd.concat(all_inference_dfs) if all_inference_dfs else pd.DataFrame()
+
+    if knowledge_probe_df.empty and inference_probe_df.empty:
+        log_info("No probe metrics found across any domain. Skipping plotting.")
+        return
+
+    # Training loss
+    training_loss_path = os.path.join(experiment_dir, "training_loss_perplexity_metrics.csv")
+    loss_df = pd.read_csv(training_loss_path) if os.path.exists(training_loss_path) else pd.DataFrame()
+
+    # --- Plot 1: Combined Probes vs. Training Loss (Averaged) ---
+    log_info("Generating Averaged Plot 1: Combined Probes vs. Training Loss...")
+    
+    # Prepare data
+    mean_knowledge_log_probs = knowledge_probe_df.groupby('step')['log_prob'].mean().reset_index() if not knowledge_probe_df.empty else pd.DataFrame()
+    mean_inference_log_probs = inference_probe_df.groupby('step')['log_prob'].mean().reset_index() if not inference_probe_df.empty else pd.DataFrame()
+    mean_knowledge_hits10 = knowledge_probe_df.groupby('step')['hit_accuracy_at_10'].mean().reset_index() if not knowledge_probe_df.empty and 'hit_accuracy_at_10' in knowledge_probe_df.columns else pd.DataFrame()
+    mean_inference_hits10 = inference_probe_df.groupby('step')['hit_accuracy_at_10'].mean().reset_index() if not inference_probe_df.empty and 'hit_accuracy_at_10' in inference_probe_df.columns else pd.DataFrame()
+
+    # --- Plot 1a (Averaged) ---
+    log_info("Generating Averaged Plot 1a: Mean Log Probs vs. Training Loss...")
+    fig, ax1 = plt.subplots(figsize=(14, 8))
+    
+    ax1.set_xlabel('Training Step')
+    ax1.set_ylabel('Absolute Mean Log Probs (Averaged Across Domains)')
+    
+    if not mean_knowledge_log_probs.empty:
+        sns.lineplot(data=mean_knowledge_log_probs, x='step', y='log_prob', ax=ax1, label='Knowledge Probes Mean Log Probs', color='blue')
+    if not mean_inference_log_probs.empty:
+        sns.lineplot(data=mean_inference_log_probs, x='step', y='log_prob', ax=ax1, label='Inference Probes Mean Log Probs', color='green')
+    ax1.legend(loc='upper left')
+
+    if not loss_df.empty and 'chunked_perplexity' in loss_df.columns:
+        ax2 = ax1.twinx()
+        ax2.set_ylabel('Normalized Training Loss (Perplexity)', color='grey')
+        scaler = MinMaxScaler()
+        loss_df['normalized_loss'] = scaler.fit_transform(loss_df[['chunked_perplexity']])
+        sns.lineplot(data=loss_df, x='step', y='normalized_loss', ax=ax2, label='Normalized Training Loss', color='grey', linestyle='--')
+        ax2.tick_params(axis='y', labelcolor='grey')
+        ax2.legend(loc='upper right')
+
+    plt.title('Plot 1a (Averaged): Mean Log Probs vs. Training Loss')
+    plt.grid(True, which="both", ls="--")
+    plt.savefig(os.path.join(plot_output_dir, "plot_1a_avg_mean_log_probs_vs_loss.png"))
+    plt.close()
+
+    # --- Plot 1b (Averaged) ---
+    log_info("Generating Averaged Plot 1b: Mean Hit Accuracy @ 10 vs. Training Loss...")
+    fig, ax1 = plt.subplots(figsize=(14, 8))
+    
+    ax1.set_xlabel('Training Step')
+    ax1.set_ylabel('Absolute Mean Hit Accuracy @ 10 (Averaged Across Domains)')
+    ax1.set_ylim(0, 1)
+
+    if not mean_knowledge_hits10.empty:
+        sns.lineplot(data=mean_knowledge_hits10, x='step', y='hit_accuracy_at_10', ax=ax1, label='Knowledge Probes Mean Hits@10', color='blue')
+    if not mean_inference_hits10.empty:
+        sns.lineplot(data=mean_inference_hits10, x='step', y='hit_accuracy_at_10', ax=ax1, label='Inference Probes Mean Hits@10', color='green')
+    ax1.legend(loc='upper left')
+
+    if not loss_df.empty and 'chunked_perplexity' in loss_df.columns:
+        ax2 = ax1.twinx()
+        ax2.set_ylabel('Normalized Training Loss (Perplexity)', color='grey')
+        if 'normalized_loss' not in loss_df.columns: # reuse if already computed
+            scaler = MinMaxScaler()
+            loss_df['normalized_loss'] = scaler.fit_transform(loss_df[['chunked_perplexity']])
+        sns.lineplot(data=loss_df, x='step', y='normalized_loss', ax=ax2, label='Normalized Training Loss', color='grey', linestyle='--')
+        ax2.tick_params(axis='y', labelcolor='grey')
+        ax2.legend(loc='upper right')
+
+    plt.title('Plot 1b (Averaged): Mean Hit Accuracy @ 10 vs. Training Loss')
+    plt.grid(True, which="both", ls="--")
+    plt.savefig(os.path.join(plot_output_dir, "plot_1b_avg_mean_hits_at_10_vs_loss.png"))
+    plt.close()
+
     
     
