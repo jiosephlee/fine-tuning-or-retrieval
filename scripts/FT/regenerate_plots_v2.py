@@ -22,27 +22,22 @@ def main():
 
     logger.info(f"Scanning for probe results in: {args.experiment_dir}")
 
+    domains = set()
     for subdir in os.listdir(args.experiment_dir):
         if subdir.endswith("_knowledge_probe"):
-            domain = subdir.replace("_knowledge_probe", "")
-            output_dir = os.path.join(args.experiment_dir, subdir)
-            logger.info(f"Found knowledge probe for domain '{domain}'. Regenerating plots in {output_dir}...")
-            llm_plotting.generate_new_plots_for_knowledge_probes(
-                domain=domain,
-                probes_version=args.knowledge_probes_version,
-                output_dir=output_dir,
-                logger=logger
-            )
+            domains.add(subdir.replace("_knowledge_probe", ""))
         elif subdir.endswith("_inference_probe"):
-            domain = subdir.replace("_inference_probe", "")
-            output_dir = os.path.join(args.experiment_dir, subdir)
-            logger.info(f"Found inference probe for domain '{domain}'. Regenerating plots in {output_dir}...")
-            llm_plotting.generate_new_plots_for_inference_probes(
-                domain=domain,
-                probes_version=args.inference_probes_version,
-                output_dir=output_dir,
-                logger=logger
-            )
+            domains.add(subdir.replace("_inference_probe", ""))
+
+    for domain in sorted(list(domains)):
+        logger.info(f"Found domain '{domain}'. Regenerating plots...")
+        llm_plotting.generate_revamped_plots(
+            domain=domain,
+            knowledge_probes_version=args.knowledge_probes_version,
+            inference_probes_version=args.inference_probes_version,
+            experiment_dir=args.experiment_dir,
+            logger=logger
+        )
 
 if __name__ == "__main__":
     main()

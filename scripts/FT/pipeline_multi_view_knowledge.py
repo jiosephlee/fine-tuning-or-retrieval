@@ -315,6 +315,7 @@ The outline should:
     - list of subtopics to cover
 - Cover all key concepts, methods, and results from the paper.
 - Ensure a logical flow of information, from introduction to conclusion.
+- While the textbook should be comprehensive, it should also articulate and to the point. Don't create unnecessary chapters.
 
 ### Output Format
 Provide the output as a JSON object with a single key "outline", which is a list of chapter objects. Each chapter object must have the following keys:
@@ -503,7 +504,7 @@ def process_papers():
     input_dir = "../../data/arxiv/cleaned/"
     
     # Get list of files in cleaned directory
-    files = [f for f in os.listdir(input_dir) if f.endswith('.tex') and f == 'DPO.tex']
+    files = [f for f in os.listdir(input_dir) if f.endswith('.tex') and f != 'DPO.tex']
     
     for filename in files:
         # Extract paper name without extension

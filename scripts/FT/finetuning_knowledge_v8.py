@@ -267,45 +267,46 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
     return callbacks
 
 def save_probe_results(callbacks, log, args):
-    """Saves results for all probe callbacks."""
+    """Saves results for all probe callbacks and generates revamped plots."""
     
-    # First, find the training loss callback so we can save its results alongside each probe.
+    experiment_dir = os.path.join(args.base_results_dir, args.experiment_name)
+    
     training_loss_callback = None
+    domains = set()
+
+    # Save results for all callbacks and collect domains
     for callback in callbacks:
         if isinstance(callback, llm_callbacks.TrainingLossPerplexityCallback):
             training_loss_callback = callback
-            break
-
-    for callback in callbacks:
-        if isinstance(callback, llm_callbacks.BaseKnowledgeProbeCallBack):
+        elif isinstance(callback, llm_callbacks.BaseKnowledgeProbeCallBack):
             callback.save_results(output_dir=callback.output_dir)
             log.info(f"Probe metrics for {callback.log_prefix} saved to {callback.output_dir}")
-            
-            # Also save the training loss metrics in the same directory for plotting
-            if training_loss_callback:
-                training_loss_callback.save_results(output_dir=callback.output_dir)
-
             domain = callback.log_prefix.split('_')[0]
-            
-            # Determine probe type and call the correct plotting function
-            if 'knowledge_probe' in callback.log_prefix:
-                llm_plotting.generate_new_plots_for_knowledge_probes(
-                    domain=domain,
-                    probes_version=args.knowledge_probes_version,
-                    output_dir=callback.output_dir,
-                    logger=log
-                )
-            elif 'inference_probe' in callback.log_prefix:
-                llm_plotting.generate_new_plots_for_inference_probes(
-                    domain=domain,
-                    probes_version=args.inference_probes_version,
-                    output_dir=callback.output_dir,
-                    logger=log
-                )
-
-        elif isinstance(callback, CorpusPerplexityCallback):
+            domains.add(domain)
+        elif isinstance(callback, llm_callbacks.CorpusPerplexityCallback):
             callback.save_results(output_dir=callback.output_dir)
             log.info(f"Corpus perplexity metrics for {callback.log_prefix} saved to {callback.output_dir}")
+
+    # Save training loss once to the main experiment directory
+    if training_loss_callback:
+        training_loss_callback.save_results(output_dir=experiment_dir)
+        log.info(f"Training loss metrics saved to {experiment_dir}")
+
+    # Generate plots for each domain
+    if not domains:
+        log.warning("No domains found to generate plots for.")
+        return
+
+    for domain in sorted(list(domains)):
+        log.info(f"Generating revamped plots for domain '{domain}'...")
+        llm_plotting.generate_revamped_plots(
+            domain=domain,
+            knowledge_probes_version=args.knowledge_probes_version,
+            inference_probes_version=args.inference_probes_version,
+            experiment_dir=experiment_dir,
+            logger=log
+        )
+
 
 def load_prompts(prompt_files, append_eot=False):
     prompts = {}
@@ -502,9 +503,7 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
     save_probe_results(callbacks, log, args)
     
     # --- Generate plots ---
-    # llm_plotting.generate_new_plots_for_knowledge_probes(args.knowledge_probes_version,output_dir_knowledge_probe, logger=log)
-    # llm_plotting.generate_new_plots_for_inference_probes("v2",output_dir_inference_probe, logger=log)
-    # log.info("Finished generating all plots.")
+    log.info("Finished generating all plots.")
 
     log.info("LIMA-based instruction tuning complete.")
     if not args.test_script:

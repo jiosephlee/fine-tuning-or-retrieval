@@ -8,404 +8,271 @@ import textwrap
 import re
 
 
-def generate_new_plots_for_knowledge_probes(domain: str, probes_version: str, output_dir: str, logger=None):
+def generate_revamped_plots(domain: str, knowledge_probes_version: str, inference_probes_version: str, experiment_dir: str, logger=None):
     """
-    Generates a new set of plots from the saved CSV files.
+    Generates a new, simplified set of plots for knowledge and inference probes.
     """
     def log_info(msg):
         if logger:
             logger.info(msg)
         else:
             print(msg)
-            
-    # --- Data Loading ---
-    log_info("Loading dataframes for new plotting...")
-    probe_metrics_path = os.path.join(output_dir, f"{domain}_knowledge_probe_metrics.csv")
-    training_loss_path = os.path.join(output_dir, "training_loss_perplexity_metrics.csv")
-    corpus_ppl_path = os.path.join(output_dir, f"{domain}_corpus_perplexity_metrics.csv")
-    log_info(probes_version)
-    if probes_version == 'v8' or probes_version == 'v9': # This logic should be kept in sync with finetuning_knowledge_v8.py
-        probes_path = f'../../data/probes/facts/{domain}/probes_{probes_version}.csv'
-    else:
-        probes_path = f'../../data/probes/facts/{domain}/{domain}_knowledge_probes_{probes_version}.csv'
 
-    if not os.path.exists(probe_metrics_path):
-        log_info(f"Skipping plotting: '{probe_metrics_path}' not found.")
+    # --- Directory for new plots ---
+    plot_output_dir = os.path.join(experiment_dir, f"{domain}_plots")
+    os.makedirs(plot_output_dir, exist_ok=True)
+    log_info(f"Saving new plots to {plot_output_dir}")
+
+    # --- Data Loading ---
+    log_info("Loading dataframes for revamped plotting...")
+    
+    # Probe metrics
+    knowledge_probe_metrics_path = os.path.join(experiment_dir, f"{domain}_knowledge_probe", f"{domain}_knowledge_probe_metrics.csv")
+    inference_probe_metrics_path = os.path.join(experiment_dir, f"{domain}_inference_probe", f"{domain}_inference_probe_metrics.csv")
+    
+    knowledge_probe_df = pd.read_csv(knowledge_probe_metrics_path) if os.path.exists(knowledge_probe_metrics_path) else pd.DataFrame()
+    inference_probe_df = pd.read_csv(inference_probe_metrics_path) if os.path.exists(inference_probe_metrics_path) else pd.DataFrame()
+
+    if knowledge_probe_df.empty and inference_probe_df.empty:
+        log_info("No probe metrics found. Skipping plotting.")
         return
-    
-    probe_df = pd.read_csv(probe_metrics_path)
+
+    # Training loss
+    training_loss_path = os.path.join(experiment_dir, "training_loss_perplexity_metrics.csv")
     loss_df = pd.read_csv(training_loss_path) if os.path.exists(training_loss_path) else pd.DataFrame()
-    corpus_ppl_df = pd.read_csv(corpus_ppl_path) if os.path.exists(corpus_ppl_path) else pd.DataFrame()
-    probes_csv = pd.read_csv(probes_path) if probes_path and os.path.exists(probes_path) else pd.DataFrame()
 
-    # If the probes CSV is available and has a 'section' column, map it to the probe_df
-    if not probes_csv.empty and 'section' in probes_csv.columns:
-        # Create a mapping from probe_index to section
-        section_map = probes_csv['section'].to_dict()
-        # Map the sections to the probe_df using the probe_index
-        probe_df['section'] = probe_df['probe_index'].map(section_map)
-
-    # --- PLOT 1: Normalized Loss vs. Hit Accuracy ---
-    log_info("Generating Plot 1: Normalized Loss vs. Hit Accuracy...")
-    hit_cols = [f'hit_accuracy_at_{k}' for k in [1, 10, 100] if f'hit_accuracy_at_{k}' in probe_df.columns]
+    # Knowledge Probes CSV for facts and sections
+    if knowledge_probes_version == 'v8' or knowledge_probes_version == 'v9':
+        knowledge_probes_path = f'../../data/probes/facts/{domain}/probes_{knowledge_probes_version}.csv'
+    else:
+        knowledge_probes_path = f'../../data/probes/facts/{domain}/{domain}_knowledge_probes_{knowledge_probes_version}.csv'
+    knowledge_probes_csv = pd.read_csv(knowledge_probes_path) if os.path.exists(knowledge_probes_path) else pd.DataFrame()
     
-    if hit_cols:
-        plt.figure(figsize=(14, 8))
-        
-        # Aggregate hit accuracies by step
-        avg_hits = probe_df.groupby('step')[hit_cols].mean().reset_index()
-
-        # Start with avg_hits as the base for merging
-        merged_df = avg_hits
-
-        # Merge with training loss data if available
-        if not loss_df.empty:
-            merged_df = pd.merge(merged_df, loss_df, on='step', how='left')
-
-        # Merge with corpus perplexity data if available
-        if not corpus_ppl_df.empty:
-            merged_df = pd.merge(merged_df, corpus_ppl_df, on='step', how='left')
-
-        if not merged_df.empty:
-            scaler = MinMaxScaler()
-            
-            # Identify columns to scale
-            cols_to_scale = list(set(hit_cols + ['chunked_perplexity', 'corpus_perplexity']) & set(merged_df.columns))
-            
-            # Scale the columns if they exist
-            if cols_to_scale:
-                merged_df[cols_to_scale] = scaler.fit_transform(merged_df[cols_to_scale])
-            
-            # Plotting logic
-            if 'chunked_perplexity' in merged_df.columns:
-                sns.lineplot(data=merged_df, x='step', y='chunked_perplexity', label='Normalized Training Perplexity')
-            
-            if 'corpus_perplexity' in merged_df.columns:
-                sns.lineplot(data=merged_df, x='step', y='corpus_perplexity', label='Normalized Corpus Perplexity')
-
-            for col in hit_cols:
-                if col in merged_df.columns:
-                    sns.lineplot(data=merged_df, x='step', y=col, label=f'Normalized {col.replace("_", " ").title()}')
-
-            plt.title('Plot 1: Normalized Perplexity vs. Hit Accuracy')
-            plt.xlabel('Training Step')
-            plt.ylabel('Normalized Value (0 to 1)')
-            plt.grid(True, which="both", ls="--")
-            plt.legend()
-            try:
-                plt.savefig(os.path.join(output_dir, "plot_new_1_loss_vs_hits.png"))
-            except ValueError as e:
-                log_info(f"Skipping plot 'plot_new_1_loss_vs_hits.png' due to error: {e}")
-            finally:
-                plt.close()
-
-    # --- PLOT 2: Hit Accuracy by Section ---
-    log_info("Generating Plot 2: Hit Accuracy by Section...")
-    plot_2_cols = ['perplexity', 'log_prob']
-    if all(c in probe_df.columns for c in plot_2_cols) and 'section' in probe_df.columns:
-        plt.figure(figsize=(14, 8))
-        
-        avg_section_hits = probe_df.groupby(['step', 'section'])[plot_2_cols].mean().reset_index()
-        melted_df = avg_section_hits.melt(id_vars=['step', 'section'], value_vars=plot_2_cols, var_name='metric', value_name='value')
-        
-        all_sections = sorted(probe_df['section'].unique())
-        palette = sns.color_palette("husl", len(all_sections))
-
-        sns.lineplot(data=melted_df, x='step', y='value', hue='section', style='metric', hue_order=all_sections, palette=palette)
-        
-        plt.title('Plot 2: Metrics by Section')
-        plt.xlabel('Training Step')
-        plt.ylabel('Value')
-        plt.grid(True, which="both", ls="--")
-        plt.legend(title='Section & Metric')
-        try:
-            plt.savefig(os.path.join(output_dir, "plot_new_2_metrics_by_section.png"))
-        except ValueError as e:
-            log_info(f"Skipping plot 'plot_new_2_metrics_by_section.png' due to error: {e}")
-        finally:
-            plt.close()
-
-    # --- PLOT 3: Hit Accuracy by Section ---
-    log_info("Generating Plot 3: Hit Accuracy by Section...")
-    plot_3_cols = ['hit_accuracy_at_1']
-    if all(c in probe_df.columns for c in plot_3_cols) and 'section' in probe_df.columns:
-        plt.figure(figsize=(14, 8))
-        
-        avg_section_hits = probe_df.groupby(['step', 'section'])[plot_3_cols].mean().reset_index()
-        melted_df = avg_section_hits.melt(id_vars=['step', 'section'], value_vars=plot_3_cols, var_name='metric', value_name='value')
-        
-        all_sections = sorted(probe_df['section'].unique())
-        palette = sns.color_palette("husl", len(all_sections))
-
-        sns.lineplot(data=melted_df, x='step', y='value', hue='section', style='metric', hue_order=all_sections, palette=palette)
-        
-        plt.title('Plot 3: Hit Accuracy by Section')
-        plt.xlabel('Training Step')
-        plt.ylabel('Value')
-        plt.grid(True, which="both", ls="--")
-        plt.legend(title='Section & Metric')
-        try:
-            plt.savefig(os.path.join(output_dir, "plot_new_3_hits_by_section.png"))
-        except ValueError as e:
-            log_info(f"Skipping plot 'plot_new_3_hits_by_section.png' due to error: {e}")
-        finally:
-            plt.close()
-        
-    # --- PLOT 4: Disaggregated Hit Accuracy for 10 Random Probes ---
-    log_info("Generating Plot 4: Disaggregated Hit Accuracy (10 Random Probes)...")
-    if hit_cols:
-        unique_probes = probe_df['probe_index'].unique()
-        if len(unique_probes) > 0:
-            num_probes_to_plot = min(10, len(unique_probes))
-            random_probes = np.random.choice(unique_probes, num_probes_to_plot, replace=False)
-            
-            sample_df = probe_df[probe_df['probe_index'].isin(random_probes)]
-            melted_sample_df = sample_df.melt(id_vars=['step', 'probe_index'], value_vars=hit_cols, var_name='k', value_name='accuracy')
-            
-            g = sns.FacetGrid(melted_sample_df, col="probe_index", col_wrap=5, hue="k", sharey=False)
-            g.map(sns.lineplot, "step", "accuracy")
-            g.add_legend(title='Hit Accuracy @')
-            g.fig.suptitle('Plot 4: Hit Accuracy for 10 Random Probes', y=1.03)
-            g.set_axis_labels("Training Step", "Hit Accuracy")
-            
-            if not probes_csv.empty and 'fact' in probes_csv.columns:
-                for ax, probe_idx in zip(g.axes.flat, g.col_names):
-                    probe_idx = int(probe_idx)
-                    if probe_idx in probes_csv.index:
-                        fact = probes_csv.loc[probe_idx, 'fact']
-                        fact = re.sub(r'\\bm\{([^}]+)\}', r'\1', fact)
-                        fact = re.sub(r'\\mathbf\{([^}]+)\}', r'\1', fact)
-                        wrapped_title = textwrap.fill(f"Probe {probe_idx}: {fact}", 60)
-                        ax.set_title(wrapped_title, fontsize=8)
-            else:
-                 g.set_titles("Probe {col_name}")
-
-            try:
-                plt.tight_layout(rect=[0, 0, 1, 0.97])
-                plt.savefig(os.path.join(output_dir, "plot_new_4_disaggregated_hits.png"))
-            except ValueError as e:
-                log_info(f"Skipping plot 'plot_new_4_disaggregated_hits.png' due to error: {e}")
-            finally:
-                plt.close()
-
-    # --- PLOT 5: Disaggregated Normalized Perplexity vs. Log Probs for 10 Random Probes ---
-    log_info("Generating Plot 5: Disaggregated Normalized Perplexity vs. Log Probs...")
-    plot_4_cols = ['perplexity', 'log_prob']
-    if 'random_probes' in locals() and all(c in probe_df.columns for c in plot_4_cols):
-        sample_df = probe_df[probe_df['probe_index'].isin(random_probes)]
-        
-        # Normalize perplexity and log_probs for each probe
-        scaled_df_parts = []
-        scaler = MinMaxScaler()
-        for probe_idx in random_probes:
-            probe_data = sample_df[sample_df['probe_index'] == probe_idx].copy()
-            if not probe_data.empty and len(probe_data) > 1: # Scaler needs at least 2 points
-                probe_data[plot_4_cols] = scaler.fit_transform(probe_data[plot_4_cols])
-                scaled_df_parts.append(probe_data)
-
-        if scaled_df_parts:
-            scaled_df = pd.concat(scaled_df_parts)
-            melted_scaled_df = scaled_df.melt(id_vars=['step', 'probe_index'], value_vars=plot_4_cols, var_name='metric', value_name='normalized_value')
-
-            g = sns.FacetGrid(melted_scaled_df, col="probe_index", col_wrap=5, hue="metric", sharey=True)
-            g.map(sns.lineplot, "step", "normalized_value")
-            g.add_legend(title='Metric')
-            g.fig.suptitle('Plot 5: Normalized Perplexity vs. Log Probs for 10 Random Probes', y=1.03)
-            g.set_axis_labels("Training Step", "Normalized Value (0 to 1)")
-
-            if not probes_csv.empty and 'fact' in probes_csv.columns:
-                for ax, probe_idx in zip(g.axes.flat, g.col_names):
-                    probe_idx = int(probe_idx)
-                    if probe_idx in probes_csv.index:
-                        fact = probes_csv.loc[probe_idx, 'fact']
-                        fact = re.sub(r'\\bm\{([^}]+)\}', r'\1', fact)
-                        fact = re.sub(r'\\mathbf\{([^}]+)\}', r'\1', fact)
-                        wrapped_title = textwrap.fill(f"Probe {probe_idx}: {fact}", 60)
-                        ax.set_title(wrapped_title, fontsize=8)
-            else:
-                g.set_titles("Probe {col_name}")
-
-            try:
-                plt.tight_layout(rect=[0, 0, 1, 0.97])
-                plt.savefig(os.path.join(output_dir, "plot_new_5_disaggregated_normalized_ppl_logprobs.png"))
-            except ValueError as e:
-                log_info(f"Skipping plot 'plot_new_5_disaggregated_normalized_ppl_logprobs.png' due to error: {e}")
-            finally:
-                plt.close()
-
-def generate_new_plots_for_inference_probes(domain: str, probes_version: str, output_dir: str, logger=None):
-    """
-    Generates a new set of plots from the saved CSV files.
-    """
-    def log_info(msg):
-        if logger:
-            logger.info(msg)
-        else:
-            print(msg)
-
-    # --- Data Loading ---
-    log_info("Loading dataframes for inference probe plotting...")
-    probe_metrics_path = os.path.join(output_dir, f"{domain}_inference_probe_metrics.csv")
-    training_loss_path = os.path.join(output_dir, "training_loss_perplexity_metrics.csv")
-    corpus_ppl_path = os.path.join(output_dir, f"{domain}_corpus_perplexity_metrics.csv")
-    
-    path1 = f'../../data/probes/inference/{domain}/probes_{probes_version}.csv'
-    path2 = f'../../data/probes/inference/{domain}/{domain.lower()}_high_level_probes_{probes_version}.csv'
-    
+    # Inference Probes CSV for facts
+    path1 = f'../../data/probes/inference/{domain}/probes_{inference_probes_version}.csv'
+    path2 = f'../../data/probes/inference/{domain}/{domain.lower()}_high_level_probes_{inference_probes_version}.csv'
     if os.path.exists(path1):
-        probes_path = path1
+        inference_probes_path = path1
     elif os.path.exists(path2):
-        probes_path = path2
+        inference_probes_path = path2
     else:
-        probes_path = None
+        inference_probes_path = None
+    inference_probes_csv = pd.read_csv(inference_probes_path) if inference_probes_path and os.path.exists(inference_probes_path) else pd.DataFrame()
 
-    if not os.path.exists(probe_metrics_path):
-        log_info(f"Skipping plotting: '{probe_metrics_path}' not found.")
-        return
-    
-    probe_df = pd.read_csv(probe_metrics_path)
-    loss_df = pd.read_csv(training_loss_path) if os.path.exists(training_loss_path) else pd.DataFrame()
-    corpus_ppl_df = pd.read_csv(corpus_ppl_path) if os.path.exists(corpus_ppl_path) else pd.DataFrame()
-    probes_csv = pd.read_csv(probes_path) if probes_path and os.path.exists(probes_path) else pd.DataFrame()
-    if 'text' in probes_csv.columns:
-        probes_csv = probes_csv.rename(columns={'text': 'fact'})
+    # Map sections to knowledge_probe_df
+    if not knowledge_probe_df.empty and not knowledge_probes_csv.empty and 'section' in knowledge_probes_csv.columns:
+        section_map = knowledge_probes_csv['section'].to_dict()
+        knowledge_probe_df['section'] = knowledge_probe_df['probe_index'].map(section_map)
 
-    # --- PLOT 1: Normalized Loss vs. Hit Accuracy (Inference) ---
-    log_info("Generating Inference Plot 1: Normalized Perplexity vs. Hit Accuracy...")
-    hit_cols = [f'hit_accuracy_at_{k}' for k in [1, 10, 100] if f'hit_accuracy_at_{k}' in probe_df.columns]
+    # --- Plot 1: Combined Probes vs. Training Loss ---
+    log_info("Generating Plot 1: Combined Probes vs. Training Loss...")
     
-    if hit_cols:
+    # Prepare data
+    mean_knowledge_log_probs = knowledge_probe_df.groupby('step')['log_prob'].mean().reset_index() if not knowledge_probe_df.empty else pd.DataFrame()
+    mean_inference_log_probs = inference_probe_df.groupby('step')['log_prob'].mean().reset_index() if not inference_probe_df.empty else pd.DataFrame()
+    mean_knowledge_hits10 = knowledge_probe_df.groupby('step')['hit_accuracy_at_10'].mean().reset_index() if not knowledge_probe_df.empty and 'hit_accuracy_at_10' in knowledge_probe_df.columns else pd.DataFrame()
+    mean_inference_hits10 = inference_probe_df.groupby('step')['hit_accuracy_at_10'].mean().reset_index() if not inference_probe_df.empty and 'hit_accuracy_at_10' in inference_probe_df.columns else pd.DataFrame()
+
+    # --- Plot 1a ---
+    log_info("Generating Plot 1a: Mean Log Probs vs. Training Loss...")
+    fig, ax1 = plt.subplots(figsize=(14, 8))
+    
+    ax1.set_xlabel('Training Step')
+    ax1.set_ylabel('Absolute Mean Log Probs')
+    
+    if not mean_knowledge_log_probs.empty:
+        sns.lineplot(data=mean_knowledge_log_probs, x='step', y='log_prob', ax=ax1, label='Knowledge Probes Mean Log Probs', color='blue')
+    if not mean_inference_log_probs.empty:
+        sns.lineplot(data=mean_inference_log_probs, x='step', y='log_prob', ax=ax1, label='Inference Probes Mean Log Probs', color='green')
+    ax1.legend(loc='upper left')
+
+    if not loss_df.empty and 'chunked_perplexity' in loss_df.columns:
+        ax2 = ax1.twinx()
+        ax2.set_ylabel('Normalized Training Loss (Perplexity)', color='grey')
+        scaler = MinMaxScaler()
+        loss_df['normalized_loss'] = scaler.fit_transform(loss_df[['chunked_perplexity']])
+        sns.lineplot(data=loss_df, x='step', y='normalized_loss', ax=ax2, label='Normalized Training Loss', color='grey', linestyle='--')
+        ax2.tick_params(axis='y', labelcolor='grey')
+        ax2.legend(loc='upper right')
+
+    plt.title('Plot 1a: Mean Log Probs vs. Training Loss')
+    plt.grid(True, which="both", ls="--")
+    plt.savefig(os.path.join(plot_output_dir, "plot_1a_mean_log_probs_vs_loss.png"))
+    plt.close()
+
+    # --- Plot 1b ---
+    log_info("Generating Plot 1b: Mean Hit Accuracy @ 10 vs. Training Loss...")
+    fig, ax1 = plt.subplots(figsize=(14, 8))
+    
+    ax1.set_xlabel('Training Step')
+    ax1.set_ylabel('Absolute Mean Hit Accuracy @ 10')
+    ax1.set_ylim(0, 1)
+
+    if not mean_knowledge_hits10.empty:
+        sns.lineplot(data=mean_knowledge_hits10, x='step', y='hit_accuracy_at_10', ax=ax1, label='Knowledge Probes Mean Hits@10', color='blue')
+    if not mean_inference_hits10.empty:
+        sns.lineplot(data=mean_inference_hits10, x='step', y='hit_accuracy_at_10', ax=ax1, label='Inference Probes Mean Hits@10', color='green')
+    ax1.legend(loc='upper left')
+
+    if not loss_df.empty and 'chunked_perplexity' in loss_df.columns:
+        ax2 = ax1.twinx()
+        ax2.set_ylabel('Normalized Training Loss (Perplexity)', color='grey')
+        if 'normalized_loss' not in loss_df.columns: # reuse if already computed
+            scaler = MinMaxScaler()
+            loss_df['normalized_loss'] = scaler.fit_transform(loss_df[['chunked_perplexity']])
+        sns.lineplot(data=loss_df, x='step', y='normalized_loss', ax=ax2, label='Normalized Training Loss', color='grey', linestyle='--')
+        ax2.tick_params(axis='y', labelcolor='grey')
+        ax2.legend(loc='upper right')
+
+    plt.title('Plot 1b: Mean Hit Accuracy @ 10 vs. Training Loss')
+    plt.grid(True, which="both", ls="--")
+    plt.savefig(os.path.join(plot_output_dir, "plot_1b_mean_hits_at_10_vs_loss.png"))
+    plt.close()
+    
+    # --- PLOT 2: Knowledge Probes by Section ---
+    if not knowledge_probe_df.empty and 'section' in knowledge_probe_df.columns:
+        log_info("Generating Plot 2: Knowledge Probe Mean Log Probs by Section...")
+        
         plt.figure(figsize=(14, 8))
         
-        # Aggregate hit accuracies by step
-        avg_hits = probe_df.groupby('step')[hit_cols].mean().reset_index()
+        avg_section_log_probs = knowledge_probe_df.groupby(['step', 'section'])['log_prob'].mean().reset_index()
+        
+        all_sections = sorted(knowledge_probe_df['section'].unique())
+        palette = sns.color_palette("husl", len(all_sections))
+        
+        sns.lineplot(data=avg_section_log_probs, x='step', y='log_prob', hue='section', hue_order=all_sections, palette=palette)
+        
+        plt.title('Plot 2: Knowledge Probe Mean Log Probs by Section')
+        plt.xlabel('Training Step')
+        plt.ylabel('Mean Log Prob')
+        plt.grid(True, which="both", ls="--")
+        plt.legend(title='Section')
+        plt.savefig(os.path.join(plot_output_dir, "plot_2_knowledge_log_probs_by_section.png"))
+        plt.close()
 
-        # Start with avg_hits as the base for merging
-        merged_df = avg_hits
-
-        # Merge with training loss data if available
-        if not loss_df.empty:
-            merged_df = pd.merge(merged_df, loss_df, on='step', how='left')
-            
-        # Merge with corpus perplexity data if available
-        if not corpus_ppl_df.empty:
-            merged_df = pd.merge(merged_df, corpus_ppl_df, on='step', how='left')
-
-        if not merged_df.empty:
-            scaler = MinMaxScaler()
-            
-            # Identify columns to scale
-            cols_to_scale = list(set(hit_cols + ['chunked_perplexity', 'corpus_perplexity']) & set(merged_df.columns))
-
-            # Scale the columns if they exist
-            if cols_to_scale:
-                merged_df[cols_to_scale] = scaler.fit_transform(merged_df[cols_to_scale])
-            
-            # Plotting logic
-            if 'chunked_perplexity' in merged_df.columns:
-                sns.lineplot(data=merged_df, x='step', y='chunked_perplexity', label='Normalized Training Perplexity')
-            
-            if 'corpus_perplexity' in merged_df.columns:
-                sns.lineplot(data=merged_df, x='step', y='corpus_perplexity', label='Normalized Corpus Perplexity')
-
-            for col in hit_cols:
-                if col in merged_df.columns:
-                    sns.lineplot(data=merged_df, x='step', y=col, label=f'Normalized {col.replace("_", " ").title()}')
-
-            plt.title('Inference Plot 1: Normalized Perplexity vs. Hit Accuracy')
-            plt.xlabel('Training Step')
-            plt.ylabel('Normalized Value (0 to 1)')
-            plt.grid(True, which="both", ls="--")
-            plt.legend()
-            try:
-                plt.savefig(os.path.join(output_dir, "plot_inference_1_loss_vs_hits.png"))
-            except ValueError as e:
-                log_info(f"Skipping plot 'plot_inference_1_loss_vs_hits.png' due to error: {e}")
-            finally:
-                plt.close()
-
-    # --- PLOT 2: Disaggregated Hit Accuracy for 10 Random Probes (Inference) ---
-    log_info("Generating Inference Plot 2: Disaggregated Hit Accuracy (10 Random Probes)...")
-    if hit_cols and 'probe_index' in probe_df.columns:
-        unique_probes = probe_df['probe_index'].unique()
+    # --- PLOT 3: Disaggregated Knowledge Probes ---
+    if not knowledge_probe_df.empty:
+        log_info("Generating Plot 3: Disaggregated Knowledge Probes...")
+        
+        unique_probes = knowledge_probe_df['probe_index'].unique()
         if len(unique_probes) > 0:
             num_probes_to_plot = min(10, len(unique_probes))
             random_probes = np.random.choice(unique_probes, num_probes_to_plot, replace=False)
             
-            sample_df = probe_df[probe_df['probe_index'].isin(random_probes)]
-            melted_sample_df = sample_df.melt(id_vars=['step', 'probe_index'], value_vars=hit_cols, var_name='k', value_name='accuracy')
-            
-            g = sns.FacetGrid(melted_sample_df, col="probe_index", col_wrap=5, hue="k", sharey=False)
-            g.map(sns.lineplot, "step", "accuracy")
-            g.add_legend(title='Hit Accuracy @')
-            g.fig.suptitle('Inference Plot 2: Hit Accuracy for 10 Random Probes', y=1.03)
-            g.set_axis_labels("Training Step", "Hit Accuracy")
-            
-            if not probes_csv.empty and 'fact' in probes_csv.columns:
+            sample_df = knowledge_probe_df[knowledge_probe_df['probe_index'].isin(random_probes)].copy()
+
+            # Normalize log_prob for each probe
+            scaler = MinMaxScaler()
+            sample_df['normalized_log_prob'] = sample_df.groupby('probe_index')['log_prob'].transform(
+                lambda x: scaler.fit_transform(x.values.reshape(-1, 1)).flatten() if len(x.values) > 1 else x
+            )
+
+            g = sns.FacetGrid(sample_df, col="probe_index", col_wrap=2, height=4, aspect=1.5, sharex=True, sharey=False)
+
+            def plot_dual_axis(data, **kwargs):
+                ax1 = plt.gca()
+                ax2 = ax1.twinx()
+                
+                hit_cols = [c for c in ['hit_accuracy_at_1', 'hit_accuracy_at_10', 'hit_accuracy_at_100'] if c in data.columns]
+                
+                # Plot hits on ax1
+                for col in hit_cols:
+                    sns.lineplot(data=data, x='step', y=col, ax=ax1, label=col.replace('_', ' ').title(), linestyle='--', **kwargs)
+                ax1.set_ylabel('Hit Accuracy')
+                ax1.set_ylim(0, 1)
+                ax1.legend(loc='upper left')
+
+                # Plot normalized log probs on ax2
+                sns.lineplot(data=data, x='step', y='normalized_log_prob', ax=ax2, label='Normalized Log Prob', color='purple', **kwargs)
+                ax2.set_ylabel('Normalized Log Prob', color='purple')
+                ax2.tick_params(axis='y', labelcolor='purple')
+                ax2.set_ylim(0, 1)
+                ax2.legend(loc='upper right')
+
+            g.map_dataframe(plot_dual_axis)
+
+            # Set titles with facts
+            if not knowledge_probes_csv.empty and 'fact' in knowledge_probes_csv.columns:
                 for ax, probe_idx in zip(g.axes.flat, g.col_names):
                     probe_idx = int(probe_idx)
-                    if probe_idx in probes_csv.index:
-                        fact = probes_csv.loc[probe_idx, 'fact']
+                    if probe_idx in knowledge_probes_csv.index:
+                        fact = knowledge_probes_csv.loc[probe_idx, 'fact']
                         fact = re.sub(r'\\bm\{([^}]+)\}', r'\1', fact)
                         fact = re.sub(r'\\mathbf\{([^}]+)\}', r'\1', fact)
                         wrapped_title = textwrap.fill(f"Probe {probe_idx}: {fact}", 60)
-                        ax.set_title(wrapped_title, fontsize=8)
-            else:
-                 g.set_titles("Probe {col_name}")
-
-            try:
-                plt.tight_layout(rect=[0, 0, 1, 0.97])
-                plt.savefig(os.path.join(output_dir, "plot_inference_2_disaggregated_hits.png"))
-            except ValueError as e:
-                log_info(f"Skipping plot 'plot_inference_2_disaggregated_hits.png' due to error: {e}")
-            finally:
-                plt.close()
-
-
-    # --- PLOT 3: Disaggregated Normalized Perplexity vs. Log Probs for 10 Random Probes (Inference) ---
-    log_info("Generating Inference Plot 3: Disaggregated Normalized Perplexity vs. Log Probs...")
-    plot_5_cols = ['perplexity', 'log_prob']
-    if 'random_probes' in locals() and all(c in probe_df.columns for c in plot_5_cols):
-        sample_df = probe_df[probe_df['probe_index'].isin(random_probes)]
-        
-        # Normalize perplexity and log_probs for each probe
-        scaled_df_parts = []
-        scaler = MinMaxScaler()
-        for probe_idx in random_probes:
-            probe_data = sample_df[sample_df['probe_index'] == probe_idx].copy()
-            if not probe_data.empty and len(probe_data) > 1: # Scaler needs at least 2 points
-                probe_data[plot_5_cols] = scaler.fit_transform(probe_data[plot_5_cols])
-                scaled_df_parts.append(probe_data)
-
-        if scaled_df_parts:
-            scaled_df = pd.concat(scaled_df_parts)
-            melted_scaled_df = scaled_df.melt(id_vars=['step', 'probe_index'], value_vars=plot_5_cols, var_name='metric', value_name='normalized_value')
-
-            g = sns.FacetGrid(melted_scaled_df, col="probe_index", col_wrap=5, hue="metric", sharey=True)
-            g.map(sns.lineplot, "step", "normalized_value")
-            g.add_legend(title='Metric')
-            g.fig.suptitle('Inference Plot 3: Normalized Perplexity vs. Log Probs for 10 Random Probes', y=1.03)
-            g.set_axis_labels("Training Step", "Normalized Value (0 to 1)")
-
-            if not probes_csv.empty and 'fact' in probes_csv.columns:
-                for ax, probe_idx in zip(g.axes.flat, g.col_names):
-                    probe_idx = int(probe_idx)
-                    if probe_idx in probes_csv.index:
-                        fact = probes_csv.loc[probe_idx, 'fact']
-                        fact = re.sub(r'\\bm\{([^}]+)\}', r'\1', fact)
-                        fact = re.sub(r'\\mathbf\{([^}]+)\}', r'\1', fact)
-                        wrapped_title = textwrap.fill(f"Probe {probe_idx}: {fact}", 60)
-                        ax.set_title(wrapped_title, fontsize=8)
+                        ax.set_title(wrapped_title, fontsize=10)
+                    else:
+                        ax.set_title(f"Probe {probe_idx}")
             else:
                 g.set_titles("Probe {col_name}")
 
-            try:
-                plt.tight_layout(rect=[0, 0, 1, 0.97])
-                plt.savefig(os.path.join(output_dir, "plot_inference_3_disaggregated_normalized_ppl_logprobs.png"))
-            except ValueError as e:
-                log_info(f"Skipping plot 'plot_inference_3_disaggregated_normalized_ppl_logprobs.png' due to error: {e}")
-            finally:
-                plt.close()
+            g.fig.suptitle('Plot 3: Disaggregated Knowledge Probes', y=1.03, fontsize=16)
+            g.set_axis_labels("Training Step", "Value")
+            plt.tight_layout(rect=[0, 0, 1, 0.97])
+            plt.savefig(os.path.join(plot_output_dir, "plot_3_disaggregated_knowledge_probes.png"))
+            plt.close()
+
+    # --- PLOT 4: Disaggregated Inference Probes ---
+    if not inference_probe_df.empty:
+        log_info("Generating Plot 4: Disaggregated Inference Probes...")
+        
+        unique_probes = inference_probe_df['probe_index'].unique()
+        if len(unique_probes) > 0:
+            num_probes_to_plot = min(10, len(unique_probes))
+            random_probes = np.random.choice(unique_probes, num_probes_to_plot, replace=False)
+            
+            sample_df = inference_probe_df[inference_probe_df['probe_index'].isin(random_probes)].copy()
+
+            # Normalize log_prob for each probe
+            scaler = MinMaxScaler()
+            sample_df['normalized_log_prob'] = sample_df.groupby('probe_index')['log_prob'].transform(
+                lambda x: scaler.fit_transform(x.values.reshape(-1, 1)).flatten() if len(x.values) > 1 else x
+            )
+
+            g = sns.FacetGrid(sample_df, col="probe_index", col_wrap=2, height=4, aspect=1.5, sharex=True, sharey=False)
+
+            def plot_dual_axis_inference(data, **kwargs):
+                ax1 = plt.gca()
+                ax2 = ax1.twinx()
+                
+                hit_cols = [c for c in ['hit_accuracy_at_1', 'hit_accuracy_at_10', 'hit_accuracy_at_100'] if c in data.columns]
+                
+                # Plot hits on ax1
+                for col in hit_cols:
+                    sns.lineplot(data=data, x='step', y=col, ax=ax1, label=col.replace('_', ' ').title(), linestyle='--', **kwargs)
+                ax1.set_ylabel('Hit Accuracy')
+                ax1.set_ylim(0, 1)
+                ax1.legend(loc='upper left')
+
+                # Plot normalized log probs on ax2
+                sns.lineplot(data=data, x='step', y='normalized_log_prob', ax=ax2, label='Normalized Log Prob', color='purple', **kwargs)
+                ax2.set_ylabel('Normalized Log Prob', color='purple')
+                ax2.tick_params(axis='y', labelcolor='purple')
+                ax2.set_ylim(0, 1)
+                ax2.legend(loc='upper right')
+
+            g.map_dataframe(plot_dual_axis_inference)
+
+            # Set titles with facts
+            if not inference_probes_csv.empty and 'fact' in inference_probes_csv.columns:
+                for ax, probe_idx in zip(g.axes.flat, g.col_names):
+                    probe_idx = int(probe_idx)
+                    if probe_idx in inference_probes_csv.index:
+                        fact = inference_probes_csv.loc[probe_idx, 'fact']
+                        fact = re.sub(r'\\bm\{([^}]+)\}', r'\1', fact)
+                        fact = re.sub(r'\\mathbf\{([^}]+)\}', r'\1', fact)
+                        wrapped_title = textwrap.fill(f"Probe {probe_idx}: {fact}", 60)
+                        ax.set_title(wrapped_title, fontsize=10)
+                    else:
+                        ax.set_title(f"Probe {probe_idx}")
+            else:
+                g.set_titles("Probe {col_name}")
+
+            g.fig.suptitle('Plot 4: Disaggregated Inference Probes', y=1.03, fontsize=16)
+            g.set_axis_labels("Training Step", "Value")
+            plt.tight_layout(rect=[0, 0, 1, 0.97])
+            plt.savefig(os.path.join(plot_output_dir, "plot_4_disaggregated_inference_probes.png"))
+            plt.close()
 
     
     
