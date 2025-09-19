@@ -190,6 +190,7 @@ def prepare_training_mix(
     # Determine domains: use override if provided, otherwise scan directory
     domains = strategy_args.get("override_domains", None)
     unique_document_batches = []
+    unique_document_batches_with_explanations = None
     
     if "PriorKnowledge" in strategy_name:
         prior_knowledge_dir = '../../data/arxiv/prior_knowledge'
