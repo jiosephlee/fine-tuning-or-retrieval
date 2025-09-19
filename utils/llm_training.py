@@ -215,8 +215,10 @@ def fine_tune(
     )
     
     for i, data_point in enumerate(dataset):
-        if i < 100:
-            log.info(data_point['raw_text'][:50])
+        if i < 80:
+            log.info(data_point['raw_text'][:30])
+        if i >= len(dataset) - 80:
+            log.info(data_point['raw_text'][:30])
     
     if test_script:
         log.info(f"Dataset has {len(dataset)} chunks...")

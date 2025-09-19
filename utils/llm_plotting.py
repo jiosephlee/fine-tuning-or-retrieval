@@ -325,8 +325,8 @@ def generate_new_plots_for_inference_probes(domain: str, probes_version: str, ou
             finally:
                 plt.close()
 
-    # --- PLOT 4: Disaggregated Hit Accuracy for 10 Random Probes (Inference) ---
-    log_info("Generating Inference Plot 4: Disaggregated Hit Accuracy (10 Random Probes)...")
+    # --- PLOT 2: Disaggregated Hit Accuracy for 10 Random Probes (Inference) ---
+    log_info("Generating Inference Plot 2: Disaggregated Hit Accuracy (10 Random Probes)...")
     if hit_cols and 'probe_index' in probe_df.columns:
         unique_probes = probe_df['probe_index'].unique()
         if len(unique_probes) > 0:
@@ -339,7 +339,7 @@ def generate_new_plots_for_inference_probes(domain: str, probes_version: str, ou
             g = sns.FacetGrid(melted_sample_df, col="probe_index", col_wrap=5, hue="k", sharey=False)
             g.map(sns.lineplot, "step", "accuracy")
             g.add_legend(title='Hit Accuracy @')
-            g.fig.suptitle('Inference Plot 4: Hit Accuracy for 10 Random Probes', y=1.03)
+            g.fig.suptitle('Inference Plot 2: Hit Accuracy for 10 Random Probes', y=1.03)
             g.set_axis_labels("Training Step", "Hit Accuracy")
             
             if not probes_csv.empty and 'fact' in probes_csv.columns:
@@ -356,12 +356,57 @@ def generate_new_plots_for_inference_probes(domain: str, probes_version: str, ou
 
             try:
                 plt.tight_layout(rect=[0, 0, 1, 0.97])
-                plt.savefig(os.path.join(output_dir, "plot_inference_4_disaggregated_hits.png"))
+                plt.savefig(os.path.join(output_dir, "plot_inference_2_disaggregated_hits.png"))
             except ValueError as e:
-                log_info(f"Skipping plot 'plot_inference_4_disaggregated_hits.png' due to error: {e}")
+                log_info(f"Skipping plot 'plot_inference_2_disaggregated_hits.png' due to error: {e}")
             finally:
                 plt.close()
 
+
+    # --- PLOT 3: Disaggregated Normalized Perplexity vs. Log Probs for 10 Random Probes (Inference) ---
+    log_info("Generating Inference Plot 3: Disaggregated Normalized Perplexity vs. Log Probs...")
+    plot_5_cols = ['perplexity', 'log_prob']
+    if 'random_probes' in locals() and all(c in probe_df.columns for c in plot_5_cols):
+        sample_df = probe_df[probe_df['probe_index'].isin(random_probes)]
+        
+        # Normalize perplexity and log_probs for each probe
+        scaled_df_parts = []
+        scaler = MinMaxScaler()
+        for probe_idx in random_probes:
+            probe_data = sample_df[sample_df['probe_index'] == probe_idx].copy()
+            if not probe_data.empty and len(probe_data) > 1: # Scaler needs at least 2 points
+                probe_data[plot_5_cols] = scaler.fit_transform(probe_data[plot_5_cols])
+                scaled_df_parts.append(probe_data)
+
+        if scaled_df_parts:
+            scaled_df = pd.concat(scaled_df_parts)
+            melted_scaled_df = scaled_df.melt(id_vars=['step', 'probe_index'], value_vars=plot_5_cols, var_name='metric', value_name='normalized_value')
+
+            g = sns.FacetGrid(melted_scaled_df, col="probe_index", col_wrap=5, hue="metric", sharey=True)
+            g.map(sns.lineplot, "step", "normalized_value")
+            g.add_legend(title='Metric')
+            g.fig.suptitle('Inference Plot 3: Normalized Perplexity vs. Log Probs for 10 Random Probes', y=1.03)
+            g.set_axis_labels("Training Step", "Normalized Value (0 to 1)")
+
+            if not probes_csv.empty and 'fact' in probes_csv.columns:
+                for ax, probe_idx in zip(g.axes.flat, g.col_names):
+                    probe_idx = int(probe_idx)
+                    if probe_idx in probes_csv.index:
+                        fact = probes_csv.loc[probe_idx, 'fact']
+                        fact = re.sub(r'\\bm\{([^}]+)\}', r'\1', fact)
+                        fact = re.sub(r'\\mathbf\{([^}]+)\}', r'\1', fact)
+                        wrapped_title = textwrap.fill(f"Probe {probe_idx}: {fact}", 60)
+                        ax.set_title(wrapped_title, fontsize=8)
+            else:
+                g.set_titles("Probe {col_name}")
+
+            try:
+                plt.tight_layout(rect=[0, 0, 1, 0.97])
+                plt.savefig(os.path.join(output_dir, "plot_inference_3_disaggregated_normalized_ppl_logprobs.png"))
+            except ValueError as e:
+                log_info(f"Skipping plot 'plot_inference_3_disaggregated_normalized_ppl_logprobs.png' due to error: {e}")
+            finally:
+                plt.close()
 
     
     

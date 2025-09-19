@@ -16,5 +16,5 @@ python finetuning_knowledge_v8.py \
     --lima_afterwards \
     --full_finetuning > output_1.log
 
-        # --separate_batches_with_pretraining 1 \
+# Time: 6 hours
 
