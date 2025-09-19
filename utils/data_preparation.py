@@ -1,4 +1,3 @@
-import math
 import os
 import torch
 import numpy as np
@@ -156,30 +155,18 @@ def prepare_training_mix(
     test_script = strategy_args.get("test_script", False)
 
     # Helper to chunk a single text
-    def _chunk(text: str, explanation=False) -> List[str]:
+    def _chunk(text: str) -> List[str]:
         text_with_eos = text + tokenizer.eos_token
-        if explanation:
-            chunks, _ = chunking.chunk(
+        chunks, _ = chunking.chunk(
             text_with_eos,
             tokenizer,
             train_cfg.context_length,
-            chunk_by_section=False,
-            overlap=False,
-            add_title_prefix=False,
+            chunk_by_section,
+            overlap_sections,
+            overlap_ratio,
+            add_title_prefix,
             log=log
         )
-        else:
-            chunks, _ = chunking.chunk(
-                text_with_eos,
-                tokenizer,
-                train_cfg.context_length,
-                chunk_by_section,
-                overlap_sections,
-                overlap_ratio,
-                add_title_prefix,
-                log=log
-            )
-        
         return chunks
 
     # Determine domains: use override if provided, otherwise scan directory
@@ -205,7 +192,7 @@ def prepare_training_mix(
                             domain_text += f.read()
             
             if domain_text:
-                all_prior_knowledge_chunks.extend(_chunk(domain_text, explanation=True))
+                all_prior_knowledge_chunks.extend(_chunk(domain_text))
 
         unique_document_batches.append(all_prior_knowledge_chunks)
     else:
@@ -220,7 +207,10 @@ def prepare_training_mix(
         # Each inner list holds chunks for a "unique document type" across all domains
         # e.g., unique_document_batches[0] = all source chunks
         #       unique_document_batches[1] = all paraphrase-1 chunks
-        unique_document_batches = [[] for _ in range(1 + num_paraphrased_texts)]
+        num_doc_types = 1 + num_paraphrased_texts
+        unique_document_batches = [[] for _ in range(num_doc_types)]
+        unique_document_batches_with_explanations = [[] for _ in range(num_doc_types)] if with_explanations else None
+
 
         for domain in domains:
             log.info(f"Loading data for domain: {domain}")
@@ -261,42 +251,64 @@ def prepare_training_mix(
                         if filename.endswith('.txt'):
                             file_path = os.path.join(explanation_dir, filename)
                             with open(file_path, 'r', encoding='utf-8') as f:
-                                explanation_chunks.extend(_chunk(f.read(), explanation=True))
+                                explanation_chunks.extend(_chunk(f.read()))
                 log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks.")
-            
-            # This part ensures that chunks from each document type of a domain are added to the correct overall batch
             
             # Document Chunks for the current domain
             domain_doc_chunks = [source_chunks] + paraphrased_chunks_by_doc
-
-            # 4. Handle explanation replacement logic
-            num_chunks_per_source_doc = len(source_chunks)
-            if with_explanations and explanation_chunks:
-                paraphrased_units_for_explanations = math.ceil(len(explanation_chunks) / num_chunks_per_source_doc)
-                
-                # Start replacing from the last paraphrased doc towards the first
-                if paraphrased_units_for_explanations > 0:
-                    # Distribute explanation chunks among the slots of the documents they replace
-                    num_to_replace = min(paraphrased_units_for_explanations, len(paraphrased_chunks_by_doc))
-                    
-                    # Split explanations into `num_to_replace` parts
-                    split_explanations = [explanation_chunks[i::num_to_replace] for i in range(num_to_replace)]
-
-                    for i in range(num_to_replace):
-                        # Index of paraphrased doc to replace (from the end)
-                        replace_idx = len(paraphrased_chunks_by_doc) - 1 - i
-                        # Corresponding index in domain_doc_chunks (source is at 0)
-                        doc_chunk_idx = replace_idx + 1
-                        
-                        domain_doc_chunks[doc_chunk_idx] = split_explanations[i]
-                    log.info(f"Domain {domain}: Replaced {num_to_replace} paraphrased documents with explanation chunks.")
             
-            # Add the processed chunks for this domain to the main batches
+            # Add original chunks to the primary list
             for i, chunks in enumerate(domain_doc_chunks):
                 if i < len(unique_document_batches):
                     unique_document_batches[i].extend(chunks)
-                    if test_script:
-                        log.info(f"Batch {i} increases to {len(unique_document_batches[i])} chunks")
+
+            # 4. Handle explanation replacement logic
+            if with_explanations:
+                domain_doc_chunks_expl = [c[:] for c in domain_doc_chunks]
+                
+                if explanation_chunks:
+                    explanation_chunks_to_insert = list(explanation_chunks)
+                    num_explanations_to_insert = len(explanation_chunks_to_insert)
+                    total_replaced = 0
+
+                    # Iterate backwards through the paraphrased documents
+                    for i in range(len(paraphrased_chunks_by_doc) - 1, -1, -1):
+                        if not explanation_chunks_to_insert:
+                            break
+                        
+                        # Index in domain_doc_chunks is i + 1 (because source is at 0)
+                        doc_chunk_idx = i + 1
+                        num_chunks_in_doc = len(domain_doc_chunks_expl[doc_chunk_idx])
+
+                        if num_explanations_to_insert >= num_chunks_in_doc:
+                            # Replace the entire document's chunks with the last available explanation chunks
+                            chunks_for_this_doc = explanation_chunks_to_insert[-num_chunks_in_doc:]
+                            explanation_chunks_to_insert = explanation_chunks_to_insert[:-num_chunks_in_doc]
+                            domain_doc_chunks_expl[doc_chunk_idx] = chunks_for_this_doc
+                            
+                            num_explanations_to_insert -= num_chunks_in_doc
+                            total_replaced += num_chunks_in_doc
+                        else:
+                            # Replace only the end of the document's chunks
+                            chunks_for_this_doc = explanation_chunks_to_insert
+                            explanation_chunks_to_insert = [] # All used up
+                            
+                            original_chunks = domain_doc_chunks_expl[doc_chunk_idx]
+                            
+                            # The last `num_explanations_to_insert` chunks of this doc are replaced
+                            num_to_replace_in_doc = len(chunks_for_this_doc)
+                            new_chunks = original_chunks[:-num_to_replace_in_doc] + chunks_for_this_doc
+                            domain_doc_chunks_expl[doc_chunk_idx] = new_chunks
+                            
+                            total_replaced += num_to_replace_in_doc
+                            num_explanations_to_insert = 0
+
+                    log.info(f"Domain {domain}: Replaced last {total_replaced} paraphrased chunks with explanation chunks.")
+                
+                # Add the processed (or copied) chunks for this domain to the explanation batches
+                for i, chunks in enumerate(domain_doc_chunks_expl):
+                    if i < len(unique_document_batches_with_explanations):
+                        unique_document_batches_with_explanations[i].extend(chunks)
                     
     # 5. Assemble final chunk list with optional pretraining data replay
     final_chunks = []
@@ -314,7 +326,7 @@ def prepare_training_mix(
     for i, batch in enumerate(unique_document_batches):
         assert batch, f"Batch for unique document type {i} is empty. Check data and strategy arguments."
     
-    effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
+    # effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
 
     # 6. Duplicate the dataset to match the desired number of training steps
     original_epochs = train_cfg.num_train_epochs
@@ -331,6 +343,7 @@ def prepare_training_mix(
     if unique_document_batches:
         final_chunks = replicate_and_interleave_pretraining(
             unique_document_batches=unique_document_batches,
+            unique_document_batches_with_explanations=unique_document_batches_with_explanations,
             replication_factor=replication_factor,
             data_replay=data_replay,
             pretraining_separators=pretraining_separators,
@@ -351,6 +364,7 @@ def prepare_training_mix(
 
 def replicate_and_interleave_pretraining(
     unique_document_batches: List[List[str]],
+    unique_document_batches_with_explanations: List[List[str]],
     replication_factor: int,
     data_replay: PretrainingDataReplay,
     pretraining_separators: int,
@@ -375,7 +389,17 @@ def replicate_and_interleave_pretraining(
         if test_script:
             log.info(f"--- Creating replication {rep + 1}/{replication_factor} ---")
         
-        for i, batch in enumerate(unique_document_batches):
+        # Alternate between original and explanation-infused batches for each replication
+        if unique_document_batches_with_explanations and (rep % 2 == 1):
+            batches_for_this_rep = unique_document_batches_with_explanations
+            if test_script:
+                log.info("Using batches WITH explanations for this replication.")
+        else:
+            batches_for_this_rep = unique_document_batches
+            if test_script:
+                log.info("Using batches WITHOUT explanations for this replication.")
+
+        for i, batch in enumerate(batches_for_this_rep):
             current_batch = list(batch)  # Make a copy to avoid modifying the original
             
             if fill_with_pretraining:
@@ -397,7 +421,7 @@ def replicate_and_interleave_pretraining(
             final_chunks.extend(current_batch)
             
             # Add separator after each document batch, except for the very last one in the last replication
-            is_last_batch_of_last_replication = (rep == replication_factor - 1) and (i == len(unique_document_batches) - 1)
+            is_last_batch_of_last_replication = (rep == replication_factor - 1) and (i == len(batches_for_this_rep) - 1)
             
             if pretraining_separators > 0 and not is_last_batch_of_last_replication:
                 if test_script:

@@ -45,6 +45,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         self.logger = logger
         self.log_prefix = log_prefix
         self.report_to_wandb = report_to_wandb
+        self.excluded_report_columns = ['section', 'subsection', 'section_text', 'subsection_text', 'subsection_text_paraphrased', 'section_text_paraphrased']
 
         self.initial_metrics = {}
         self.history = {
@@ -189,11 +190,12 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             for i, probe_idx in enumerate(best_probe_indices):
                 probe_idx_int = probe_idx.item()
                 
-                f.write(f"--- Probe Index: {probe_idx_int} ---\n")
+                f.write(f"--- Probe Index: {probe_idx_int} (Initial Rank: {i+1}) ---\n")
                 if self.probes_df is not None and probe_idx_int < len(self.probes_df):
                     metadata = self.probes_df.iloc[probe_idx_int].to_dict()
                     for key, val in metadata.items():
-                        f.write(f"{key}: {val}\n")
+                        if key not in self.excluded_report_columns:
+                            f.write(f"{key}: {val}\n")
                 else:
                     f.write(f"Fact: {self.facts[probe_idx_int]}\n")
 
@@ -237,6 +239,13 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         initial_perplexities[torch.isnan(initial_perplexities)] = float('inf')
         final_perplexities[torch.isnan(final_perplexities)] = float('inf')
 
+        # Calculate ranks (lower perplexity is better)
+        initial_ranks = torch.empty_like(initial_perplexities, dtype=torch.long)
+        initial_ranks[torch.argsort(initial_perplexities)] = torch.arange(len(initial_perplexities)) + 1
+        
+        final_ranks = torch.empty_like(final_perplexities, dtype=torch.long)
+        final_ranks[torch.argsort(final_perplexities)] = torch.arange(len(final_perplexities)) + 1
+
         perplexity_delta = initial_perplexities - final_perplexities
         # Where both initial and final are inf, delta is nan. Treat as zero change.
         perplexity_delta[torch.isnan(perplexity_delta)] = 0.0
@@ -245,12 +254,12 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         least_learned_indices = torch.argsort(perplexity_delta, descending=False)[:top_k]
 
         # Generate report for MOST learned
-        self._generate_learning_report_for_indices(model, output_dir, most_learned_indices, 'most_learned', final_step, top_k)
+        self._generate_learning_report_for_indices(model, output_dir, most_learned_indices, 'most_learned', final_step, top_k, initial_ranks, final_ranks)
         
         # Generate report for LEAST learned
-        self._generate_learning_report_for_indices(model, output_dir, least_learned_indices, 'least_learned', final_step, top_k)
+        self._generate_learning_report_for_indices(model, output_dir, least_learned_indices, 'least_learned', final_step, top_k, initial_ranks, final_ranks)
 
-    def _generate_learning_report_for_indices(self, model, output_dir, probe_indices, report_type, final_step, top_k):
+    def _generate_learning_report_for_indices(self, model, output_dir, probe_indices, report_type, final_step, top_k, initial_ranks=None, final_ranks=None):
         report_path = os.path.join(output_dir, f'{self.log_prefix}_{report_type}_probes_report.txt')
         title_part = "Most Learned" if report_type == 'most_learned' else "Least Learned"
         
@@ -286,7 +295,8 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 if self.probes_df is not None and probe_idx_int < len(self.probes_df):
                     metadata = self.probes_df.iloc[probe_idx_int].to_dict()
                     for key, val in metadata.items():
-                        f.write(f"{key}: {val}\n")
+                        if key not in self.excluded_report_columns:
+                            f.write(f"{key}: {val}\n")
                 else:
                     f.write(f"Fact: {self.facts[probe_idx_int]}\n")
 
@@ -294,13 +304,21 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 for metric_name, values in self.initial_metrics.items():
                     if values is not None:
                         value = values[probe_idx_int]
-                        f.write(f"  {metric_name}: {value:.4f}\n")
+                        if metric_name == 'perplexity' and initial_ranks is not None:
+                            rank = initial_ranks[probe_idx_int].item()
+                            f.write(f"  {metric_name}: {value:.4f} (Rank: {rank})\n")
+                        else:
+                            f.write(f"  {metric_name}: {value:.4f}\n")
                 
                 f.write("\nFinal Metrics:\n")
                 for metric_name, history_data in self.history.items():
                     if history_data:
                         final_value = history_data[-1]['values'][probe_idx_int]
-                        f.write(f"  {metric_name}: {final_value:.4f}\n")
+                        if metric_name == 'perplexity' and final_ranks is not None:
+                            rank = final_ranks[probe_idx_int].item()
+                            f.write(f"  {metric_name}: {final_value:.4f} (Rank: {rank})\n")
+                        else:
+                            f.write(f"  {metric_name}: {final_value:.4f}\n")
 
                 f.write("\nDetailed Token-level Analysis (Final State):\n")
                 
@@ -509,11 +527,12 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 probe_idx_int = probe_idx.item()
                 
                 # Write metadata
-                f.write(f"--- Probe Index: {probe_idx_int} ---\n")
+                f.write(f"--- Probe Index: {probe_idx_int} (Final Rank: {i+1}) ---\n")
                 if self.probes_df is not None and probe_idx_int < len(self.probes_df):
                     metadata = self.probes_df.iloc[probe_idx_int].to_dict()
                     for key, val in metadata.items():
-                        f.write(f"{key}: {val}\n")
+                        if key not in self.excluded_report_columns:
+                            f.write(f"{key}: {val}\n")
                 else:
                     f.write(f"Fact: {self.facts[probe_idx_int]}\n")
 
@@ -631,7 +650,7 @@ class GenerationProbeCallback(TrainerCallback):
         self.eval_history = {}
 
     def on_step_end(self, args, state, control, model, **kwargs):
-        if state.is_world_process_zero and state.global_step > 0 and state.global_step % self.eval_every_n_steps == 0:
+        if state.is_world_process_zero and state.global_step > 0 and (state.global_step % self.eval_every_n_steps == 0 or state.global_step == state.max_steps - 1):
             if self.logger:
                 self.logger.info(f"Running generation probe at step {state.global_step}...")
             else:

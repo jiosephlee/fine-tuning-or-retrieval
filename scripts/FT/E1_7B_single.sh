@@ -13,7 +13,6 @@ python finetuning_knowledge_v8.py \
     --overlap_sections \
     --overlap_ratio 1_4 \
     --lima_afterwards \
-    --full_finetuning > output_1.log 2>&1
+    --full_finetuning > output_1.log 
 
-        # --separate_batches_with_pretraining 1 \
-
+# 4-6 hours
