@@ -1,5 +1,5 @@
 num_epochs=100
-num_paraphrased=10
+num_paraphrased=9
 nohup python finetuning_knowledge_v8.py \
     --device_batch_size 2 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
