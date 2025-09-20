@@ -16,4 +16,4 @@ python finetuning_knowledge_v8.py \
     --context_length_for_lima 2560 \
     --full_finetuning > output_1.log 
 
-# 4-6 hours
+

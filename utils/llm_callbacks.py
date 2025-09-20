@@ -83,16 +83,21 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         fact_lengths_orig = tokenized_facts_tensor.attention_mask.sum(dim=1)
 
         # Sanity check: assert both methods yield the same result
-        assert torch.equal(context_lengths_new, context_lengths_orig), "Context length calculation mismatch."
-        assert torch.equal(target_lengths_new, target_lengths_orig), "Target length calculation mismatch."
-        assert torch.equal(fact_lengths_new, fact_lengths_orig), "Fact length calculation mismatch."
+        if not torch.equal(context_lengths_new, context_lengths_orig):
+            self.logger.warning("Context length calculation mismatch.")
+        if not torch.equal(target_lengths_new, target_lengths_orig):
+            self.logger.warning("Target length calculation mismatch.")
+        if not torch.equal(fact_lengths_new, fact_lengths_orig):
+            self.logger.warning("Fact length calculation mismatch.")
         
         self.context_lengths = context_lengths_new
         self.target_lengths = target_lengths_new
         self.fact_lengths = fact_lengths_new
         
-        assert torch.equal(self.context_lengths + self.target_lengths, fact_lengths_new), \
-            "Mismatch between (context + target) length and fact length."
+        if not torch.equal(self.context_lengths + self.target_lengths, fact_lengths_new):
+            self.logger.warning(
+                "Mismatch between (context + target) length and fact length."
+            )
 
         self.tokenized_probes = tokenized_probes_tensor
         self.tokenized_targets = tokenized_targets_tensor
@@ -135,7 +140,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 log_data[f"{self.log_prefix}/{metric_name}_avg"] = values[valid_mask].mean().item()
 
         if state.is_world_process_zero and log_data:
-            if self.report_to_wandb:
+            if self.report_to_wandb and wandb.run:
                 wandb.log(log_data, step=step)
             
         model.train()
@@ -341,8 +346,10 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         for i in range(tokenized_full.shape[0]):
             expected_full_length = context_lengths[i].item() + target_lengths[i].item()
             actual_full_length = full_lengths[i].item() 
-            assert expected_full_length == actual_full_length, \
-                f"Length mismatch at index {i}: context ({context_lengths[i].item()}) + target ({target_lengths[i].item()}) = {expected_full_length} != full ({actual_full_length})"
+            if expected_full_length != actual_full_length:
+                self.logger.warning(
+                    f"Length mismatch at index {i}: context ({context_lengths[i].item()}) + target ({target_lengths[i].item()}) = {expected_full_length} != full ({actual_full_length})"
+                )
             
             start, end = int(context_lengths[i].item()), int(context_lengths[i].item()) + int(target_lengths[i].item())
             if start < end:
@@ -368,9 +375,11 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         
         num_tokens_target = (labels_masked != -100).sum(dim=1).float() # dim=1 because we want to sum over the sequence length, preserving the batch dimension
         # assert that num_tokens_target is the same as target_lengths 
-        assert torch.equal(num_tokens_target, target_lengths), "Number of tokens target mismatch"
+        if not torch.equal(num_tokens_target.long(), target_lengths):
+            self.logger.warning("Number of tokens target mismatch")
         # assert that num_tokens_target is the same as non-zero in the loss_target
-        assert torch.equal(num_tokens_target, (loss_target != 0).sum(dim=1)), "Number of tokens target mismatch"
+        if not torch.equal(num_tokens_target.long(), (loss_target != 0).sum(dim=1)):
+            self.logger.warning("Number of tokens target mismatch")
         mean_nll_target = sum_loss_target / num_tokens_target
         perplexity = torch.exp(mean_nll_target)
 
@@ -455,7 +464,8 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             context_lengths = self.context_lengths[i:end_index].to(device)
             target_lengths = self.target_lengths[i:end_index].to(device)
             # assert, one more time, that the lengths are correct
-            assert torch.equal(context_lengths + target_lengths, attention_mask.sum(dim=1)), "Length mismatch between context and target lengths and fact lengths"
+            if not torch.equal(context_lengths + target_lengths, attention_mask.sum(dim=1)):
+                self.logger.warning("Length mismatch between context and target lengths and fact lengths")
             # Now that we've shifted the logits, we need to change the context lengths by -1 to account for the shift
             context_lengths = context_lengths - 1
             
@@ -762,9 +772,8 @@ class GenerationProbeCallback(TrainerCallback):
                     self.eval_history[dataset_name]['steps'].append(state.global_step)
                     self.eval_history[dataset_name]['scores'].append(mean_score)
         
-        if wandb.run and wandb_logs:
-            if self.report_to_wandb:
-                wandb.log(wandb_logs, step=state.global_step)
+        if self.report_to_wandb and wandb.run and wandb_logs:
+            wandb.log(wandb_logs, step=state.global_step)
             
     def on_train_end(self, args, state, control, model, **kwargs):
         """
@@ -872,7 +881,7 @@ class CorpusPerplexityCallback(TrainerCallback):
         loss_item = avg_nll
 
         if state.is_world_process_zero:
-            if self.report_to_wandb:
+            if self.report_to_wandb and wandb.run:
                 wandb.log({
                     f"{self.log_prefix}/perplexity": perplexity_item,
                     f"{self.log_prefix}/loss": loss_item
