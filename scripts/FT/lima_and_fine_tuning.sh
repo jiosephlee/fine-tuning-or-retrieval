@@ -1,8 +1,7 @@
 num_epochs=100
-num_paraphrased=9
+num_paraphrased=0
 nohup python finetuning_knowledge_v8.py \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
-    --with_explanations \
     --effective_batch_size_for_cpt 32 \
     --separate_batches_with_pretraining 1 \
     --pretraining_data_type dclm \

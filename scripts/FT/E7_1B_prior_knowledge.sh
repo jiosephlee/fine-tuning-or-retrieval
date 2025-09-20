@@ -1,7 +1,7 @@
 num_epochs=50
 num_paraphrased=0
 python finetuning_prior_knowledge_v1.py \
-    --device_batch_size 4 \
+    --device_batch_size 2 \
     --effective_batch_size_for_cpt 256 \
     --fill_batches_with_pretraining \
     --num_train_epochs $num_epochs \
