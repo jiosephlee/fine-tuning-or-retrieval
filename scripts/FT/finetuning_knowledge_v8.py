@@ -8,6 +8,7 @@
 import os
 import sys
 import json
+from datetime import datetime
 sys.path.append('../..')
 import pandas as pd
 import utils.llm_training as llm_training
@@ -99,7 +100,7 @@ def construct_experiment_name(args):
     ])
     
     # Suffix becomes the final leaf directory name for the run
-    run_name = args.custom_suffix if args.custom_suffix else "run"
+    run_name = args.custom_suffix if args.custom_suffix else datetime.now().strftime('%m_%d_%H_%M')
     path_parts.append(run_name)
     
     return os.path.join(*path_parts)

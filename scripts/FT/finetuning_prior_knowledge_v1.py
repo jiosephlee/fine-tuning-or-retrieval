@@ -16,9 +16,7 @@ import utils.data_preparation as data_preparation
 import utils.model_setup as model_setup
 import utils.llm_callbacks as llm_callbacks
 import utils.llm_configs as llm_configs
-import utils.llm_plotting as llm_plotting
 import argparse
-import wandb
 import logging
 from utils.llm_callbacks import CorpusPerplexityCallback, TrainingLossPerplexityCallback
 
@@ -217,23 +215,23 @@ def save_probe_results(callbacks, log, args):
             if training_loss_callback:
                 training_loss_callback.save_results(output_dir=callback.output_dir)
 
-            domain = callback.log_prefix.split('_')[0]
+            # domain = callback.log_prefix.split('_')[0]
             
             # Determine probe type and call the correct plotting function
-            if 'knowledge_probe' in callback.log_prefix:
-                llm_plotting.generate_new_plots_for_knowledge_probes(
-                    domain=domain,
-                    probes_version=args.knowledge_probes_version,
-                    output_dir=callback.output_dir,
-                    logger=log
-                )
-            elif 'inference_probe' in callback.log_prefix:
-                llm_plotting.generate_new_plots_for_inference_probes(
-                    domain=domain,
-                    probes_version=args.inference_probes_version,
-                    output_dir=callback.output_dir,
-                    logger=log
-                )
+            # if 'knowledge_probe' in callback.log_prefix:
+            #     llm_plotting.generate_new_plots_for_knowledge_probes(
+            #         domain=domain,
+            #         probes_version=args.knowledge_probes_version,
+            #         output_dir=callback.output_dir,
+            #         logger=log
+            #     )
+            # elif 'inference_probe' in callback.log_prefix:
+            #     llm_plotting.generate_new_plots_for_inference_probes(
+            #         domain=domain,
+            #         probes_version=args.inference_probes_version,
+            #         output_dir=callback.output_dir,
+            #         logger=log
+            #     )
 
         elif isinstance(callback, CorpusPerplexityCallback):
             callback.save_results(output_dir=callback.output_dir)
@@ -318,15 +316,16 @@ def prior_knowledge_training(model, tokenizer, log, args):
         )
     log.info("Finished training.")
 
-    # --- Save Metrics and Generate Plots ---
-    save_probe_results(callbacks_to_use, log, args)
-    log.info("Finished saving all probe results.")
-
     if args.push_to_hub_cpt_id:
         log.info(f"Pushing model to hub: {args.push_to_hub_cpt_id}")
         model.push_to_hub(args.push_to_hub_cpt_id)
         #trainer.push_to_hub(args.push_to_hub_cpt_id)
         tokenizer.push_to_hub(args.push_to_hub_cpt_id)
+        
+    # --- Save Metrics and Generate Plots ---
+    save_probe_results(callbacks_to_use, log, args)
+    log.info("Finished training and saving all probe results.")
+
 
     return trainer.model
 
@@ -418,19 +417,21 @@ def lima_training(model, tokenizer, log, args):
     # --- Train the model ---
     trainer.train()
 
-    # --- Save results ---
-    save_probe_results(callbacks, log, args)
-    
-    log.info("LIMA-based instruction tuning complete.")
 
     if args.push_to_hub_lima_id:
         log.info(f"Pushing model to hub: {args.push_to_hub_lima_id}")
         #trainer.push_to_hub(args.push_to_hub_lima_id)
         model.push_to_hub(args.push_to_hub_lima_id)
         tokenizer.push_to_hub(args.push_to_hub_lima_id)
+        
+    # --- Save results ---
+    save_probe_results(callbacks, log, args)
+    
+    log.info("LIMA-based instruction tuning complete.")
     
     if not args.test_script:
-        wandb.finish()
+        pass
+        # wandb.finish()
 
 if __name__ == "__main__":
     # --- Parser ---
@@ -504,5 +505,6 @@ if __name__ == "__main__":
     if args.lima_afterwards:
         lima_training(model, tokenizer, log, args)
     elif not args.test_script:
-        wandb.finish()
+        pass
+        # wandb.finish()
     
