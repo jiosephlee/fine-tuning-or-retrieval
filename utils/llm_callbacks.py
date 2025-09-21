@@ -586,15 +586,12 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             for j in range(top_k):
                 top_k_preds_data.append({
                     'token': top_k_tokens[j],
-                    'id': top_k_indices[j].item(),
-                    'prob': top_k_probs[j].item()
+                    'prob': round(top_k_probs[j].item(), 4)
                 })
 
             analysis_list.append({
                 'target_token_#': i + 1,
-                'position': token_pos,
                 'actual_token': actual_token,
-                'actual_token_id': actual_token_id,
                 'rank': rank,
                 'top_k_predictions': top_k_preds_data
             })
