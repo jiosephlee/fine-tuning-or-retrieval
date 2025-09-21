@@ -255,7 +255,7 @@ def generate_contextualized_facts(paper_name, paper_content):
             all_facts.extend(fact_list)
             
     facts_text = "\n".join(all_facts)
-    titled_facts = f"\\title{{Contextualized Facts for the paper: {paper_name}}}\n\n{facts_text}"
+    titled_facts = f"\\title{{Facts in the paper: {paper_name}}}\n\n{facts_text}"
     facts_path = os.path.join(OUTPUT_DIR, "contextualized_facts.txt")
     with open(facts_path, 'w') as f:
         f.write(titled_facts)
