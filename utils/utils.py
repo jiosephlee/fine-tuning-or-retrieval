@@ -7,7 +7,7 @@ from openai import OpenAI
 from utils.keys import OPENAI_API_KEY, DATABRICKS_TOKEN
 
 
-#os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
 
