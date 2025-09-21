@@ -12,7 +12,6 @@ python finetuning_knowledge_v8.py \
     --full_finetuning > output_1.log 2>&1
 
 python finetuning_knowledge_v8.py \
-    --test_script \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --effective_batch_size_for_cpt 32 \
     --separate_batches_with_pretraining 1 \
