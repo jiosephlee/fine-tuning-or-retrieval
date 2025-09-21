@@ -10,6 +10,7 @@ from utils.llm_configs import InferenceConfig
 from utils.llm_evals import evaluate_response
 import matplotlib.pyplot as plt
 import math
+from tqdm import tqdm
 
 class BaseKnowledgeProbeCallBack(TrainerCallback):
     """
@@ -48,7 +49,6 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         self.excluded_report_columns = ['section', 'subsection', 'section_text', 'subsection_text', 'subsection_text_paraphrased', 'section_text_paraphrased']
 
         self.initial_metrics = {}
-        self.initial_logits = None
         self.history = {
             'log_prob': [],
             'perplexity': [],
@@ -110,17 +110,21 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         """Calculate initial metrics before training starts."""
         print(f"{self.__class__.__name__}: Calculating initial metrics...")
         model.eval()
-        self.initial_metrics, self.initial_logits = self._evaluate_probes(model, return_logits=True)
+        self.initial_metrics = self._evaluate_probes(model)
+        
         # Log initial metrics to history at step 0
         step = 0
         for metric_name, values in self.initial_metrics.items():
             if values is not None:
                 self.history[metric_name].append({'step': step, 'values': values.cpu().tolist()})
+        
+        self._generate_full_token_analysis_report(model, "initial")
+
         model.train()
-        print(f"{self.__class__.__name__}: Initial metrics calculated.")
+        print(f"{self.__class__.__name__}: Initial metrics calculated and analysis report generated.")
 
         output_dir = self.output_dir
-        self._generate_best_probes_report(model, output_dir)
+        self._generate_best_probes_report(output_dir)
 
     def on_step_end(self, args, state, control, model, **kwargs):
         """Evaluate probes at the end of a training step and log metrics."""
@@ -148,11 +152,17 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
 
     def on_train_end(self, args, state, control, model, **kwargs):
         """Generate a detailed report of the worst-performing probes at the end of training."""
-        output_dir = self.output_dir
-        self._generate_worst_probes_report(model, output_dir)
-        self._generate_most_and_least_learned_probes_report(model, output_dir)
+        print(f"{self.__class__.__name__}: Final evaluation and report generation...")
+        model.eval()
+        self._generate_full_token_analysis_report(model, "final")
+        model.train()
 
-    def _generate_best_probes_report(self, model, output_dir, top_k=10):
+        output_dir = self.output_dir
+        self._generate_worst_probes_report(output_dir)
+        self._generate_most_and_least_learned_probes_report(output_dir)
+        print(f"{self.__class__.__name__}: Final reports generated.")
+
+    def _generate_best_probes_report(self, output_dir, top_k=10):
         """
         Generates a report on the top_k best-performing probes based on initial perplexity.
         """
@@ -160,11 +170,17 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             print("No initial perplexity to generate best probes report from.")
             return
 
+        initial_analysis_path = os.path.join(output_dir, f'{self.log_prefix}_initial_token_analysis.json')
+        if not os.path.exists(initial_analysis_path):
+            print(f"Initial token analysis file not found at {initial_analysis_path}")
+            return
+            
         print(f"{self.__class__.__name__}: Generating best probes report...")
 
+        with open(initial_analysis_path, 'r') as f:
+            initial_analysis_data = json.load(f)
+
         initial_perplexities = self.initial_metrics['perplexity'].clone().cpu()
-        
-        # Handle NaNs and Infs by treating them as worst
         initial_perplexities[torch.isnan(initial_perplexities)] = float('inf')
         best_probe_indices = torch.argsort(initial_perplexities, descending=False)[:top_k]
 
@@ -172,26 +188,6 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         with open(report_path, 'w') as f:
             f.write(f"Best Probes Report (Top {top_k} by Perplexity) at Step 0 (Before Training)\n")
             f.write("="*50 + "\n\n")
-
-            worst_facts_tokenized = {
-                'input_ids': self.tokenized_facts['input_ids'][best_probe_indices],
-                'attention_mask': self.tokenized_facts['attention_mask'][best_probe_indices]
-            }
-            
-            device = model.device
-            inputs = {
-                'input_ids': worst_facts_tokenized['input_ids'].to(device),
-                'attention_mask': worst_facts_tokenized['attention_mask'].to(device)
-            }
-            
-            with torch.no_grad():
-                logits = model(**inputs).logits
-            
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = inputs['input_ids'][..., 1:].contiguous()
-            
-            context_lengths = self.context_lengths[best_probe_indices].to(device) - 1 # shifted
-            target_lengths = self.target_lengths[best_probe_indices].to(device)
 
             for i, probe_idx in enumerate(best_probe_indices):
                 probe_idx_int = probe_idx.item()
@@ -213,18 +209,13 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
 
                 f.write("\nDetailed Token-level Analysis:\n")
                 
-                analysis_text = self._get_detailed_token_analysis(
-                    shift_logits[i],
-                    shift_labels[i],
-                    context_lengths[i],
-                    target_lengths[i]
-                )
+                analysis_text = self._format_token_analysis_from_json(initial_analysis_data.get(str(probe_idx_int)))
                 f.write(analysis_text)
                 f.write("\n" + "="*50 + "\n\n")
 
         print(f" > Saved best probes report to '{report_path}'")
 
-    def _generate_most_and_least_learned_probes_report(self, model, output_dir, top_k=5):
+    def _generate_most_and_least_learned_probes_report(self, output_dir, top_k=5):
         """
         Generates reports on the probes that improved the most and the least during training.
         """
@@ -235,17 +226,27 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             print("No perplexity history to generate learned probes report from.")
             return
 
+        initial_analysis_path = os.path.join(output_dir, f'{self.log_prefix}_initial_token_analysis.json')
+        final_analysis_path = os.path.join(output_dir, f'{self.log_prefix}_final_token_analysis.json')
+
+        if not os.path.exists(initial_analysis_path) or not os.path.exists(final_analysis_path):
+            print(f"Token analysis files not found. Needed: {initial_analysis_path} and {final_analysis_path}")
+            return
+
         print(f"{self.__class__.__name__}: Generating most and least learned probes report...")
+
+        with open(initial_analysis_path, 'r') as f:
+            initial_analysis_data = json.load(f)
+        with open(final_analysis_path, 'r') as f:
+            final_analysis_data = json.load(f)
 
         initial_perplexities = self.initial_metrics['perplexity'].clone().cpu()
         final_perplexities = torch.tensor(self.history['perplexity'][-1]['values'])
         final_step = self.history['perplexity'][-1]['step']
 
-        # Handle NaNs and Infs
         initial_perplexities[torch.isnan(initial_perplexities)] = float('inf')
         final_perplexities[torch.isnan(final_perplexities)] = float('inf')
 
-        # Calculate ranks (lower perplexity is better)
         initial_ranks = torch.empty_like(initial_perplexities, dtype=torch.long)
         initial_ranks[torch.argsort(initial_perplexities)] = torch.arange(len(initial_perplexities)) + 1
         
@@ -253,50 +254,24 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         final_ranks[torch.argsort(final_perplexities)] = torch.arange(len(final_perplexities)) + 1
 
         perplexity_delta = initial_perplexities - final_perplexities
-        # Where both initial and final are inf, delta is nan. Treat as zero change.
         perplexity_delta[torch.isnan(perplexity_delta)] = 0.0
 
         most_learned_indices = torch.argsort(perplexity_delta, descending=True)[:top_k]
         least_learned_indices = torch.argsort(perplexity_delta, descending=False)[:top_k]
 
-        # Get initial logits for these specific probes
-        initial_logits_most_learned = self.initial_logits[most_learned_indices] if self.initial_logits is not None else None
-        initial_logits_least_learned = self.initial_logits[least_learned_indices] if self.initial_logits is not None else None
-
         # Generate report for MOST learned
-        self._generate_learning_report_for_indices(model, output_dir, most_learned_indices, 'most_learned', final_step, top_k, initial_ranks, final_ranks, initial_logits=initial_logits_most_learned)
+        self._generate_learning_report_for_indices(output_dir, most_learned_indices, 'most_learned', final_step, top_k, initial_ranks, final_ranks, initial_analysis_data, final_analysis_data)
         
         # Generate report for LEAST learned
-        self._generate_learning_report_for_indices(model, output_dir, least_learned_indices, 'least_learned', final_step, top_k, initial_ranks, final_ranks, initial_logits=initial_logits_least_learned)
+        self._generate_learning_report_for_indices(output_dir, least_learned_indices, 'least_learned', final_step, top_k, initial_ranks, final_ranks, initial_analysis_data, final_analysis_data)
 
-    def _generate_learning_report_for_indices(self, model, output_dir, probe_indices, report_type, final_step, top_k, initial_ranks=None, final_ranks=None, initial_logits=None):
+    def _generate_learning_report_for_indices(self, output_dir, probe_indices, report_type, final_step, top_k, initial_ranks=None, final_ranks=None, initial_analysis=None, final_analysis=None):
         report_path = os.path.join(output_dir, f'{self.log_prefix}_{report_type}_probes_report.txt')
         title_part = "Most Learned" if report_type == 'most_learned' else "Least Learned"
         
         with open(report_path, 'w') as f:
             f.write(f"{title_part} Probes Report (Top {top_k} by Perplexity Change) at Step {final_step}\n")
             f.write("="*50 + "\n\n")
-
-            # Batch probe evaluation
-            facts_tokenized = {
-                'input_ids': self.tokenized_facts['input_ids'][probe_indices],
-                'attention_mask': self.tokenized_facts['attention_mask'][probe_indices]
-            }
-            
-            device = model.device
-            inputs = {
-                'input_ids': facts_tokenized['input_ids'].to(device),
-                'attention_mask': facts_tokenized['attention_mask'].to(device)
-            }
-            
-            with torch.no_grad():
-                logits = model(**inputs).logits
-            
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = inputs['input_ids'][..., 1:].contiguous()
-            
-            context_lengths = self.context_lengths[probe_indices].to(device) - 1 # shifted
-            target_lengths = self.target_lengths[probe_indices].to(device)
 
             for i, probe_idx in enumerate(probe_indices):
                 probe_idx_int = probe_idx.item()
@@ -330,29 +305,16 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                         else:
                             f.write(f"  {metric_name}: {final_value:.4f}\n")
 
-                if initial_logits is not None:
+                if initial_analysis:
                     f.write("\nDetailed Token-level Analysis (Initial State):\n")
-                    
-                    initial_shift_logits = initial_logits[..., :-1, :].contiguous().to(model.device)
-                    
-                    # We can reuse shift_labels and context/target lengths as they are probe-dependent, not model-dependent
-                    analysis_text = self._get_detailed_token_analysis(
-                        initial_shift_logits[i],
-                        shift_labels[i],
-                        context_lengths[i],
-                        target_lengths[i]
-                    )
+                    analysis_text = self._format_token_analysis_from_json(initial_analysis.get(str(probe_idx_int)))
                     f.write(analysis_text)
 
-                f.write("\nDetailed Token-level Analysis (Final State):\n")
-                
-                analysis_text = self._get_detailed_token_analysis(
-                    shift_logits[i],
-                    shift_labels[i],
-                    context_lengths[i],
-                    target_lengths[i]
-                )
-                f.write(analysis_text)
+                if final_analysis:
+                    f.write("\nDetailed Token-level Analysis (Final State):\n")
+                    analysis_text = self._format_token_analysis_from_json(final_analysis.get(str(probe_idx_int)))
+                    f.write(analysis_text)
+
                 f.write("\n" + "="*50 + "\n\n")
 
         print(f" > Saved {report_type} probes report to '{report_path}'")
@@ -515,7 +477,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         else:
             return metrics_to_return
 
-    def _generate_worst_probes_report(self, model, output_dir, top_k=10):
+    def _generate_worst_probes_report(self, output_dir, top_k=10):
         """
         Generates a report on the top_k worst-performing probes based on final perplexity.
         """
@@ -523,43 +485,26 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             print("No perplexity history to generate report from.")
             return
 
+        final_analysis_path = os.path.join(output_dir, f'{self.log_prefix}_final_token_analysis.json')
+        if not os.path.exists(final_analysis_path):
+            print(f"Final token analysis file not found at {final_analysis_path}")
+            return
+
         print(f"{self.__class__.__name__}: Generating worst probes report...")
 
-        # 1. Identify worst probes from the final evaluation step
+        with open(final_analysis_path, 'r') as f:
+            final_analysis_data = json.load(f)
+
         final_metrics = self.history['perplexity'][-1]
         final_perplexities = torch.tensor(final_metrics['values'])
         
-        # Sort by perplexity descending to get the worst probes
-        # Handle NaNs and Infs by treating them as worst
         final_perplexities[torch.isnan(final_perplexities)] = float('inf')
         worst_probe_indices = torch.argsort(final_perplexities, descending=True)[:top_k]
 
-        # 2. Get detailed analysis for these probes
         report_path = os.path.join(output_dir, f'{self.log_prefix}_worst_probes_report.txt')
         with open(report_path, 'w') as f:
             f.write(f"Worst Probes Report (Top {top_k} by Perplexity) at Step {final_metrics['step']}\n")
             f.write("="*50 + "\n\n")
-
-            # Create a batch of the worst probes to evaluate
-            worst_facts_tokenized = {
-                'input_ids': self.tokenized_facts['input_ids'][worst_probe_indices],
-                'attention_mask': self.tokenized_facts['attention_mask'][worst_probe_indices]
-            }
-            
-            device = model.device
-            inputs = {
-                'input_ids': worst_facts_tokenized['input_ids'].to(device),
-                'attention_mask': worst_facts_tokenized['attention_mask'].to(device)
-            }
-            
-            with torch.no_grad():
-                logits = model(**inputs).logits
-            
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = inputs['input_ids'][..., 1:].contiguous()
-            
-            context_lengths = self.context_lengths[worst_probe_indices].to(device) - 1 # shifted
-            target_lengths = self.target_lengths[worst_probe_indices].to(device)
 
             for i, probe_idx in enumerate(worst_probe_indices):
                 probe_idx_int = probe_idx.item()
@@ -584,26 +529,32 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 # Write detailed token analysis
                 f.write("\nDetailed Token-level Analysis:\n")
                 
-                analysis_text = self._get_detailed_token_analysis(
-                    shift_logits[i],
-                    shift_labels[i],
-                    context_lengths[i],
-                    target_lengths[i]
-                )
+                analysis_text = self._format_token_analysis_from_json(final_analysis_data.get(str(probe_idx_int)))
                 f.write(analysis_text)
                 f.write("\n" + "="*50 + "\n\n")
 
         print(f" > Saved worst probes report to '{report_path}'")
+    
+    def _format_token_analysis_from_json(self, analysis_data):
+        """Formats the token analysis data from a JSON object into a readable string."""
+        if not analysis_data:
+            return "  No token analysis available for this probe.\n"
+        
+        report_lines = []
+        for token_data in analysis_data:
+            report_lines.append(f"  - Target Token #{token_data['target_token_#']} (pos {token_data['position']}): '{token_data['actual_token']}' (ID: {token_data['actual_token_id']})")
+            report_lines.append(f"    - Rank: {token_data['rank']}")
+            report_lines.append(f"    - Top {len(token_data['top_k_predictions'])} predictions:")
+            for i, pred in enumerate(token_data['top_k_predictions']):
+                report_lines.append(f"      {i+1}. '{pred['token']}' (ID: {pred['id']}, Prob: {pred['prob']:.4f})")
+        return "\n".join(report_lines)
 
     def _get_detailed_token_analysis(self, logits, labels, context_length, target_length, top_k=10):
         """
-        For a single probe, generates a detailed analysis of each target token's prediction.
-        logits: (seq_len - 1, vocab_size)
-        labels: (seq_len - 1)
-        context_length: int (already shifted)
-        target_length: int
+        For a single probe, generates a detailed analysis of each target token's prediction
+        and returns it as a JSON-serializable list of dictionaries.
         """
-        analysis = []
+        analysis_list = []
         
         start = context_length.item()
         end = start + target_length.item()
@@ -631,13 +582,67 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             rank_tensor = (sorted_indices == actual_token_id).nonzero()
             rank = rank_tensor.item() + 1 if rank_tensor.numel() > 0 else "Not in vocab"
             
-            analysis.append(f"  - Target Token #{i+1} (pos {token_pos}): '{actual_token}' (ID: {actual_token_id})")
-            analysis.append(f"    - Rank: {rank}")
-            analysis.append(f"    - Top {top_k} predictions:")
+            top_k_preds_data = []
             for j in range(top_k):
-                analysis.append(f"      {j+1}. '{top_k_tokens[j]}' (ID: {top_k_indices[j].item()}, Prob: {top_k_probs[j]:.4f})")
+                top_k_preds_data.append({
+                    'token': top_k_tokens[j],
+                    'id': top_k_indices[j].item(),
+                    'prob': top_k_probs[j].item()
+                })
+
+            analysis_list.append({
+                'target_token_#': i + 1,
+                'position': token_pos,
+                'actual_token': actual_token,
+                'actual_token_id': actual_token_id,
+                'rank': rank,
+                'top_k_predictions': top_k_preds_data
+            })
                 
-        return "\n".join(analysis)
+        return analysis_list
+
+    def _generate_full_token_analysis_report(self, model, state_name):
+        """
+        Generates a full token-level analysis for all probes and saves it to a JSON file.
+        state_name should be 'initial' or 'final'.
+        """
+        print(f"Generating full token analysis report for '{state_name}' state...")
+        
+        full_analysis = {}
+        device = model.device
+        num_facts = len(self.facts)
+
+        for i in tqdm(range(0, num_facts, self.batch_size), desc=f"Analyzing probes ({state_name})"):
+            end_index = min(i + self.batch_size, num_facts)
+            
+            inputs = {
+                'input_ids': self.tokenized_facts['input_ids'][i:end_index].to(device),
+                'attention_mask': self.tokenized_facts['attention_mask'][i:end_index].to(device)
+            }
+            
+            with torch.no_grad():
+                logits = model(**inputs).logits
+            
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = inputs['input_ids'][..., 1:].contiguous()
+            context_lengths = self.context_lengths[i:end_index].to(device) - 1 # shifted
+            target_lengths = self.target_lengths[i:end_index].to(device)
+
+            for j in range(shift_logits.shape[0]):
+                probe_idx = i + j
+                probe_analysis = self._get_detailed_token_analysis(
+                    shift_logits[j],
+                    shift_labels[j],
+                    context_lengths[j],
+                    target_lengths[j]
+                )
+                full_analysis[probe_idx] = probe_analysis
+        
+        output_path = os.path.join(self.output_dir, f'{self.log_prefix}_{state_name}_token_analysis.json')
+        with open(output_path, 'w') as f:
+            json.dump(full_analysis, f, indent=2)
+        
+        print(f" > Saved full token analysis to '{output_path}'")
 
     def save_results(self, output_dir: str):
         """Saves all collected metrics to a CSV file."""
