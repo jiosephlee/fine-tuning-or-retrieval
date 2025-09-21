@@ -4,20 +4,20 @@ import datasets
 import os
 import time
 from openai import OpenAI
-from utils.keys import OPENAI_API_KEY, DATABRICKS_TOKEN
+#from utils.keys import OPENAI_API_KEY, DATABRICKS_TOKEN
 
 
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+#os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
 
 client_safe = OpenAI(
-    api_key=DATABRICKS_TOKEN,
+    api_key=os.environ.get('DATABRICKS_TOKEN'), #DATABRICKS_TOKEN,
     base_url="https://adb-4750903324350629.9.azuredatabricks.net/serving-endpoints"
 )
 
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-client = OpenAI()
+#os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+#client = OpenAI()
 
 
 def query_llm(prompt, max_tokens=1000, temperature=0, top_p=0, max_try_num=10, model="gpt-4o-mini", debug=False, return_json=False, json_schema=None, logprobs=False, system_prompt_included=True, is_hippa=False, reasoning_effort=None):
