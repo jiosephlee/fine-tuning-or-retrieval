@@ -77,6 +77,12 @@ def construct_experiment_name(args):
     # 8. Batch size and learning rate
     training_params = f"bs{args.effective_batch_size_for_cpt}_lr{args.learning_rate:g}"
 
+    # 9. Overlap ratio
+    if args.overlap_sections:
+        overlap_info = f"overlap_{args.overlap_ratio}"
+    else:
+        overlap_info = "no_overlap"
+
     path_parts = [
         training_type,
         model_size,
@@ -97,6 +103,7 @@ def construct_experiment_name(args):
         domains,
         epochs,
         training_params,
+        overlap_info
     ])
     
     # Suffix becomes the final leaf directory name for the run
