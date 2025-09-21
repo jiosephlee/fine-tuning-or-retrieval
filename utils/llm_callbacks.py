@@ -48,6 +48,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         self.excluded_report_columns = ['section', 'subsection', 'section_text', 'subsection_text', 'subsection_text_paraphrased', 'section_text_paraphrased']
 
         self.initial_metrics = {}
+        self.initial_logits = None
         self.history = {
             'log_prob': [],
             'perplexity': [],
@@ -109,7 +110,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         """Calculate initial metrics before training starts."""
         print(f"{self.__class__.__name__}: Calculating initial metrics...")
         model.eval()
-        self.initial_metrics = self._evaluate_probes(model)
+        self.initial_metrics, self.initial_logits = self._evaluate_probes(model, return_logits=True)
         # Log initial metrics to history at step 0
         step = 0
         for metric_name, values in self.initial_metrics.items():
@@ -258,13 +259,17 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         most_learned_indices = torch.argsort(perplexity_delta, descending=True)[:top_k]
         least_learned_indices = torch.argsort(perplexity_delta, descending=False)[:top_k]
 
+        # Get initial logits for these specific probes
+        initial_logits_most_learned = self.initial_logits[most_learned_indices] if self.initial_logits is not None else None
+        initial_logits_least_learned = self.initial_logits[least_learned_indices] if self.initial_logits is not None else None
+
         # Generate report for MOST learned
-        self._generate_learning_report_for_indices(model, output_dir, most_learned_indices, 'most_learned', final_step, top_k, initial_ranks, final_ranks)
+        self._generate_learning_report_for_indices(model, output_dir, most_learned_indices, 'most_learned', final_step, top_k, initial_ranks, final_ranks, initial_logits=initial_logits_most_learned)
         
         # Generate report for LEAST learned
-        self._generate_learning_report_for_indices(model, output_dir, least_learned_indices, 'least_learned', final_step, top_k, initial_ranks, final_ranks)
+        self._generate_learning_report_for_indices(model, output_dir, least_learned_indices, 'least_learned', final_step, top_k, initial_ranks, final_ranks, initial_logits=initial_logits_least_learned)
 
-    def _generate_learning_report_for_indices(self, model, output_dir, probe_indices, report_type, final_step, top_k, initial_ranks=None, final_ranks=None):
+    def _generate_learning_report_for_indices(self, model, output_dir, probe_indices, report_type, final_step, top_k, initial_ranks=None, final_ranks=None, initial_logits=None):
         report_path = os.path.join(output_dir, f'{self.log_prefix}_{report_type}_probes_report.txt')
         title_part = "Most Learned" if report_type == 'most_learned' else "Least Learned"
         
@@ -324,6 +329,20 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                             f.write(f"  {metric_name}: {final_value:.4f} (Rank: {rank})\n")
                         else:
                             f.write(f"  {metric_name}: {final_value:.4f}\n")
+
+                if initial_logits is not None:
+                    f.write("\nDetailed Token-level Analysis (Initial State):\n")
+                    
+                    initial_shift_logits = initial_logits[..., :-1, :].contiguous().to(model.device)
+                    
+                    # We can reuse shift_labels and context/target lengths as they are probe-dependent, not model-dependent
+                    analysis_text = self._get_detailed_token_analysis(
+                        initial_shift_logits[i],
+                        shift_labels[i],
+                        context_lengths[i],
+                        target_lengths[i]
+                    )
+                    f.write(analysis_text)
 
                 f.write("\nDetailed Token-level Analysis (Final State):\n")
                 
@@ -438,11 +457,12 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             
         return hits_at_k
 
-    def _evaluate_probes(self, model) -> Dict[str, torch.Tensor]:
+    def _evaluate_probes(self, model, return_logits=False) -> Dict[str, torch.Tensor]:
         """
         Evaluates probes by calculating log probabilities and hit rates for targets.
         """
         all_metrics = { 'log_prob': [], 'perplexity': [], 'hit_accuracy_at_1': [], 'hit_accuracy_at_10': [], 'hit_accuracy_at_100': [] }
+        all_logits = [] if return_logits else None
         device = model.device
         num_facts = len(self.facts)
         # Go through facts in batches
@@ -459,6 +479,9 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             with torch.no_grad():
                 logits = model(**inputs).logits
             
+            if return_logits:
+                all_logits.append(logits.cpu())
+
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = inputs['input_ids'][..., 1:].contiguous()
             context_lengths = self.context_lengths[i:end_index].to(device)
@@ -479,13 +502,18 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 for k, v in hits.items():
                     all_metrics[k].append(v)
 
-        return {
+        metrics_to_return = {
             "log_prob": torch.cat(all_metrics['log_prob']) if self.track_logprobs and all_metrics['log_prob'] else None,
             "perplexity": torch.cat(all_metrics['perplexity']) if self.track_logprobs and all_metrics['perplexity'] else None,
             "hit_accuracy_at_1": torch.cat(all_metrics['hit_accuracy_at_1']) if self.track_hits and all_metrics['hit_accuracy_at_1'] else None,
             "hit_accuracy_at_10": torch.cat(all_metrics['hit_accuracy_at_10']) if self.track_hits and all_metrics['hit_accuracy_at_10'] else None,
             "hit_accuracy_at_100": torch.cat(all_metrics['hit_accuracy_at_100']) if self.track_hits and all_metrics['hit_accuracy_at_100'] else None,
         }
+
+        if return_logits:
+            return metrics_to_return, torch.cat(all_logits)
+        else:
+            return metrics_to_return
 
     def _generate_worst_probes_report(self, model, output_dir, top_k=10):
         """

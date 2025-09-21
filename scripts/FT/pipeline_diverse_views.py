@@ -273,7 +273,8 @@ def generate_podcast_monologue(paper_name, paper_content, paper_title):
  - The monologue should be substantial, at least 2000 tokens long.
  - Break down the core concepts and contributions.
  - Use analogies and simple explanations for complex ideas.
- - The tone should be enthusiastic, clear, and educational.""",
+ - The tone should be enthusiastic, clear, and educational.
+ - Any mathematical notation should be written in LaTeX only e.g. '$x^2$' or '$\\pi$'. Do not use unicode mathematical characters e.g. 'π'.""",
             'user': f"### Research Paper\n{paper_content}"
         }
         
@@ -311,6 +312,7 @@ def generate_socratic_dialogue(paper_name, paper_content, paper_title):
  - The dialogue should naturally progress from simpler to more complex concepts in the paper.
  - Cover the main aspects of the paper.
  - The dialogue should feel like a real, interactive learning session.
+ - Any mathematical notation should be written in LaTeX only e.g. '$x^2$' or '$\\pi$'. Do not use unicode mathematical characters e.g. 'π'.
  
  Format the dialogue as:
  Tutor: [Tutor's question or statement]
@@ -336,6 +338,52 @@ def generate_socratic_dialogue(paper_name, paper_content, paper_title):
     with ThreadPoolExecutor() as executor:
         list(tqdm(executor.map(generate_single_dialogue, range(1, 4)), total=3, desc=f"Generating Socratic dialogues for {paper_name}"))
 
+def generate_annotated_paper(paper_name, paper_content, paper_title):
+    """Generates an annotated version of the paper with explanations for each paragraph."""
+    OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print(f"Generating annotated paper for {paper_name}...")
+    paragraphs = split_and_merge_paragraphs(paper_content)
+
+    def annotate_paragraph(paragraph):
+        if not paragraph.strip():
+            return ""
+        
+        prompt = {
+            'system': """You are an expert annotator. Your task is to explain a given paragraph from a research paper. Explain each part of the paragraph clearly and concisely.
+- Write any mathematical notation in LaTeX only e.g. '$x^2$' or '$\\pi$'. Do not use unicode mathematical characters e.g. 'π'.
+- Your explanation should be direct and to the point. Do not repeat the original paragraph in your response.""",
+            'user': f"### Paragraph to Annotate\n\n{paragraph}"
+        }
+        
+        try:
+            explanation = utils.query_llm(
+                prompt,
+                model='gpt-5-mini',
+                system_prompt_included=True,
+                max_tokens=2000
+            )
+            # Format as a blockquote for the original paragraph, followed by the explanation.
+            return f"> {paragraph}\n\n{explanation}"
+        except Exception as e:
+            print(f"Error annotating paragraph: {e}")
+            return ""
+
+    annotated_sections = []
+    with ThreadPoolExecutor() as executor:
+        results = list(tqdm(executor.map(annotate_paragraph, paragraphs), total=len(paragraphs), desc="Annotating paragraphs"))
+        annotated_sections.extend([r for r in results if r])
+    
+    full_annotation = "\n\n".join(annotated_sections)
+    titled_annotation = f'\\title{{An annotation of the paper: "{paper_title}"}}\n\n{full_annotation}'
+    
+    annotation_path = os.path.join(OUTPUT_DIR, "annotated_paper.txt")
+    with open(annotation_path, 'w') as f:
+        f.write(titled_annotation)
+    print(f"Saved annotated paper to {annotation_path}")
+
+
 def process_paper(paper_name):
     """Run the full pipeline for a single paper."""
     print(f"--- Starting processing for {paper_name} ---")
@@ -360,6 +408,7 @@ def process_paper(paper_name):
     generate_contextualized_facts(paper_name, paper_content, paper_title)
     generate_podcast_monologue(paper_name, paper_content, paper_title)
     generate_socratic_dialogue(paper_name, paper_content, paper_title)
+    generate_annotated_paper(paper_name, paper_content, paper_title)
     
     print(f"--- Finished processing for {paper_name} ---")
 
