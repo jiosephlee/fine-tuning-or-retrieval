@@ -17,6 +17,7 @@ import utils.model_setup as model_setup
 import utils.llm_callbacks as llm_callbacks
 import utils.llm_configs as llm_configs
 import argparse
+import wandb
 import logging
 from utils.llm_callbacks import CorpusPerplexityCallback, TrainingLossPerplexityCallback
 
@@ -89,6 +90,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
     callbacks = []
     
     report_to_wandb = not args.test_script
+    probe_batch_size = args.device_batch_size * 4
 
     if not domains:
         domains = get_all_domains()
@@ -123,7 +125,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
                 probes=probes,
                 targets=targets,
                 probes_df=knowledge_probe_df,
-                batch_size=8,
+                batch_size=probe_batch_size,
                 logger=log,
                 output_dir=output_dir_knowledge_probe,
                 log_prefix=f"{domain}_knowledge_probe",
@@ -159,7 +161,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
                 probes=probes,
                 targets=targets,
                 probes_df=inference_probe_df,
-                batch_size=8,
+                batch_size=probe_batch_size,
                 logger=log,
                 output_dir=output_dir_inference_probe,
                 log_prefix=f"{domain}_inference_probe",
@@ -325,8 +327,6 @@ def prior_knowledge_training(model, tokenizer, log, args):
     # --- Save Metrics and Generate Plots ---
     save_probe_results(callbacks_to_use, log, args)
     log.info("Finished training and saving all probe results.")
-
-
     return trainer.model
 
 
@@ -430,8 +430,7 @@ def lima_training(model, tokenizer, log, args):
     log.info("LIMA-based instruction tuning complete.")
     
     if not args.test_script:
-        pass
-        # wandb.finish()
+        wandb.finish()
 
 if __name__ == "__main__":
     # --- Parser ---
@@ -484,6 +483,14 @@ if __name__ == "__main__":
     else:
         args.experiment_name = construct_experiment_name(args)
 
+    # --- Save Hyperparameters ---
+    experiment_dir = os.path.join(args.base_results_dir, args.experiment_name)
+    os.makedirs(experiment_dir, exist_ok=True)
+    hyperparameters_path = os.path.join(experiment_dir, 'hyperparameters.json')
+    with open(hyperparameters_path, 'w') as f:
+        json.dump(vars(args), f, indent=4)
+    log.info(f"Hyperparameters saved to {hyperparameters_path}")
+
     # --- Load the model ---
     model_config = llm_configs.ModelConfig(
         id= args.model_id, #"allenai/OLMo-2-0425-1B", #"allenai/OLMo-2-1124-7B",
@@ -505,6 +512,5 @@ if __name__ == "__main__":
     if args.lima_afterwards:
         lima_training(model, tokenizer, log, args)
     elif not args.test_script:
-        pass
-        # wandb.finish()
+        wandb.finish()
     

@@ -357,11 +357,29 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         num_tokens_target = (labels_masked != -100).sum(dim=1).float() # dim=1 because we want to sum over the sequence length, preserving the batch dimension
         # assert that num_tokens_target is the same as target_lengths 
         if not torch.equal(num_tokens_target.long(), target_lengths):
-            self.logger.warning("Number of tokens target mismatch")
+            # Find the indices where the mismatch occurs
+            mismatch_indices = torch.where(num_tokens_target.long() != target_lengths)[0]
+            for i in mismatch_indices:
+                self.logger.warning(f"Number of tokens target mismatch for a probe in batch.")
+                # Note: The original probe index would require passing the batch start index 'i' down to this function.
+                # For now, we log information about the mismatched sample within the current batch.
+                self.logger.warning(f"  - Mismatch at batch index: {i.item()}")
+                self.logger.warning(f"  - Expected target length: {target_lengths[i].item()}")
+                self.logger.warning(f"  - Calculated target tokens: {num_tokens_target[i].long().item()}")
+                
+                # To get the original text, we would need to pass the original data down.
+                # This is a placeholder for what we would want to log.
+                # self.logger.warning(f"  - Target Text: {self.targets[original_index]}")
+
+                # Log token information
+                target_token_ids = labels[i, int(context_lengths[i].item()):int(context_lengths[i].item()) + int(target_lengths[i].item())]
+                self.logger.warning(f"  - Original Target Token IDs: {target_token_ids.tolist()}")
+                self.logger.warning(f"  - Tokenizer pad_token_id: {self.tokenizer.pad_token_id}")
+
         # assert that num_tokens_target is the same as non-zero in the loss_target
         if not torch.equal(num_tokens_target.long(), (loss_target != 0).sum(dim=1)):
             self.logger.warning("Number of tokens target mismatch")
-        mean_nll_target = sum_loss_target / num_tokens_target
+        mean_nll_target = sum_loss_target / target_lengths.float()
         perplexity = torch.exp(mean_nll_target)
 
         return log_prob, perplexity
