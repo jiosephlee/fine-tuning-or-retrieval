@@ -133,7 +133,7 @@ def refine_content(paper_content, generated_content, content_type):
     
     return refined_content
 
-def generate_summaries(paper_name, paper_content):
+def generate_summaries(paper_name, paper_content, paper_title):
     """Generates two types of summaries for a paper."""
     OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -154,7 +154,7 @@ def generate_summaries(paper_name, paper_content):
 
     refined_summary = refine_content(paper_content, full_summary, "summary")
     
-    titled_summary = f"\\title{{Summary of the paper: {paper_name}}}\n\n{refined_summary}"
+    titled_summary = f"\\title{{Summary of the paper: {paper_title}}}\n\n{refined_summary}"
     summary_full_path = os.path.join(OUTPUT_DIR, "summary_full.txt")
     with open(summary_full_path, 'w') as f:
         f.write(titled_summary)
@@ -178,7 +178,7 @@ def generate_summaries(paper_name, paper_content):
         print(f"Summarizing section: {header}...")
         prompt_section_summary = {
             'system': "You will be given the content of a single section from a research paper. Your task is to summarize this section accurately. Focus only on the content provided. Please make sure to write any mathematical notation in LaTeX only e.g. '$x^2$' or '$\\pi$'. Do not use unicode mathematical characters e.g. 'π'.",
-            'user': f"### Paper Title: {paper_name}\n\n### Section: {header}\n\n{content}"
+            'user': f"### Paper Title: {paper_title}\n\n### Section: {header}\n\n{content}"
         }
         summary = utils.query_llm(
             prompt_section_summary,
@@ -200,14 +200,14 @@ def generate_summaries(paper_name, paper_content):
 
     full_section_summary = "\n\n".join(section_summaries)
     
-    titled_section_summary = f"\\title{{Section-by-Section Summary of the paper: {paper_name}}}\n\n{full_section_summary}"
+    titled_section_summary = f"\\title{{Section-by-Section Summary of the paper: {paper_title}}}\n\n{full_section_summary}"
     summary_sections_path = os.path.join(OUTPUT_DIR, "summary_sections.txt")
     with open(summary_sections_path, 'w') as f:
         f.write(titled_section_summary)
     print(f"Saved section-by-section summary to {summary_sections_path}")
 
 
-def generate_contextualized_facts(paper_name, paper_content):
+def generate_contextualized_facts(paper_name, paper_content, paper_title):
     """Generates contextualized facts from the paper."""
     OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -255,76 +255,86 @@ def generate_contextualized_facts(paper_name, paper_content):
             all_facts.extend(fact_list)
             
     facts_text = "\n".join(all_facts)
-    titled_facts = f"\\title{{Facts in the paper: {paper_name}}}\n\n{facts_text}"
+    titled_facts = f"\\title{{Facts in the paper: {paper_title}}}\n\n{facts_text}"
     facts_path = os.path.join(OUTPUT_DIR, "contextualized_facts.txt")
     with open(facts_path, 'w') as f:
         f.write(titled_facts)
     print(f"Saved {len(all_facts)} contextualized facts to {facts_path}")
 
-def generate_podcast_monologue(paper_name, paper_content):
-    """Generates a podcast monologue about the paper."""
+def generate_podcast_monologue(paper_name, paper_content, paper_title):
+    """Generates three podcast monologues about the paper in parallel."""
+    OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    def generate_single_monologue(i):
+        print(f"Generating podcast monologue #{i} for {paper_name}...")
+        prompt = {
+            'system': """You are a podcast host for a show about cutting-edge AI research. You will be given a research paper. Your task is to write a script for a monologue that explains this paper to a general audience in an engaging and intuitive way.
+ - The monologue should be substantial, at least 2000 tokens long.
+ - Break down the core concepts and contributions.
+ - Use analogies and simple explanations for complex ideas.
+ - The tone should be enthusiastic, clear, and educational.""",
+            'user': f"### Research Paper\n{paper_content}"
+        }
+        
+        monologue = utils.query_llm(
+            prompt,
+            model='gpt-5',
+            system_prompt_included=True,
+            max_tokens=5000
+        )
+        
+        refined_monologue = refine_content(paper_content, monologue, "podcast monologue")
+        
+        titled_monologue = f"\\title{{Podcast Monologue #{i} for the paper: {paper_title}}}\n\n{refined_monologue}"
+        podcast_path = os.path.join(OUTPUT_DIR, f"podcast_monologue_{i}.txt")
+        with open(podcast_path, 'w') as f:
+            f.write(titled_monologue)
+        print(f"Saved podcast monologue to {podcast_path}")
+
+    with ThreadPoolExecutor() as executor:
+        list(tqdm(executor.map(generate_single_monologue, range(1, 4)), total=3, desc=f"Generating podcast monologues for {paper_name}"))
+
+
+def generate_socratic_dialogue(paper_name, paper_content, paper_title):
+    """Generates three Socratic dialogues about the paper in parallel."""
     OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    print(f"Generating podcast monologue for {paper_name}...")
-    prompt = {
-        'system': """You are a podcast host for a show about cutting-edge AI research. You will be given a research paper. Your task is to write a script for a 5-10 minute monologue that explains this paper to a general audience in an engaging and intuitive way.
-- Break down the core concepts and contributions.
-- Use analogies and simple explanations for complex ideas.
-- The tone should be enthusiastic, clear, and educational.""",
-        'user': f"### Research Paper\n{paper_content}"
-    }
-    
-    monologue = utils.query_llm(
-        prompt,
-        model='gpt-5',
-        system_prompt_included=True,
-        max_tokens=4000
-    )
-    
-    refined_monologue = refine_content(paper_content, monologue, "podcast monologue")
-    
-    titled_monologue = f"\\title{{Podcast Monologue for the paper: {paper_name}}}\n\n{refined_monologue}"
-    podcast_path = os.path.join(OUTPUT_DIR, "podcast_monologue.txt")
-    with open(podcast_path, 'w') as f:
-        f.write(titled_monologue)
-    print(f"Saved podcast monologue to {podcast_path}")
+    def generate_single_dialogue(i):
+        print(f"Generating Socratic dialogue #{i} for {paper_name}...")
+        prompt = {
+            'system': """You are a skilled educator. Your task is to write a Socratic dialogue between a 'Tutor' and a 'Student' to explore the key ideas of a research paper.
+ - The dialogue should be substantial, at least 2000 tokens long.
+ - The Tutor should guide the Student's understanding by asking insightful questions.
+ - The Student should start with some basic knowledge but also have some confusion.
+ - The dialogue should naturally progress from simpler to more complex concepts in the paper.
+ - Cover the main aspects of the paper.
+ - The dialogue should feel like a real, interactive learning session.
+ 
+ Format the dialogue as:
+ Tutor: [Tutor's question or statement]
+ Student: [Student's response]""",
+            'user': f"### Research Paper\n{paper_content}"
+        }
+        
+        dialogue = utils.query_llm(
+            prompt,
+            model='gpt-5',
+            system_prompt_included=True,
+            max_tokens=5000
+        )
 
+        refined_dialogue = refine_content(paper_content, dialogue, "Socratic dialogue")
+        
+        titled_dialogue = f"\\title{{Socratic Dialogue #{i} for the paper: {paper_title}}}\n\n{refined_dialogue}"
+        dialogue_path = os.path.join(OUTPUT_DIR, f"socratic_dialogue_{i}.txt")
+        with open(dialogue_path, 'w') as f:
+            f.write(titled_dialogue)
+        print(f"Saved Socratic dialogue to {dialogue_path}")
 
-def generate_socratic_dialogue(paper_name, paper_content):
-    """Generates a Socratic dialogue about the paper."""
-    OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
-    print(f"Generating Socratic dialogue for {paper_name}...")
-    prompt = {
-        'system': """You are a skilled educator. Your task is to write a Socratic dialogue between a 'Tutor' and a 'Student' to explore the key ideas of a research paper.
-- The Tutor should guide the Student's understanding by asking insightful questions.
-- The Student should start with some basic knowledge but also have some confusion.
-- The dialogue should naturally progress from simpler to more complex concepts in the paper.
-- Cover the main aspects of the paper.
-- The dialogue should feel like a real, interactive learning session.
-
-Format the dialogue as:
-Tutor: [Tutor's question or statement]
-Student: [Student's response]""",
-        'user': f"### Research Paper\n{paper_content}"
-    }
-    
-    dialogue = utils.query_llm(
-        prompt,
-        model='gpt-5',
-        system_prompt_included=True,
-        max_tokens=4000
-    )
-
-    refined_dialogue = refine_content(paper_content, dialogue, "Socratic dialogue")
-    
-    titled_dialogue = f"\\title{{Socratic Dialogue for the paper: {paper_name}}}\n\n{refined_dialogue}"
-    dialogue_path = os.path.join(OUTPUT_DIR, "socratic_dialogue.txt")
-    with open(dialogue_path, 'w') as f:
-        f.write(titled_dialogue)
-    print(f"Saved Socratic dialogue to {dialogue_path}")
+    with ThreadPoolExecutor() as executor:
+        list(tqdm(executor.map(generate_single_dialogue, range(1, 4)), total=3, desc=f"Generating Socratic dialogues for {paper_name}"))
 
 def process_paper(paper_name):
     """Run the full pipeline for a single paper."""
@@ -338,10 +348,18 @@ def process_paper(paper_name):
     with open(PAPER_FILE_PATH, 'r') as f:
         paper_content = f.read()
 
-    generate_summaries(paper_name, paper_content)
-    generate_contextualized_facts(paper_name, paper_content)
-    generate_podcast_monologue(paper_name, paper_content)
-    generate_socratic_dialogue(paper_name, paper_content)
+    # Extract title from paper content
+    match = re.search(r'\\title{(.*?)}', paper_content, re.DOTALL)
+    if match:
+        # Clean up title
+        paper_title = match.group(1).strip().replace('\n', ' ')
+    else:
+        paper_title = paper_name  # Fallback to filename
+
+    # generate_summaries(paper_name, paper_content, paper_title)
+    generate_contextualized_facts(paper_name, paper_content, paper_title)
+    generate_podcast_monologue(paper_name, paper_content, paper_title)
+    generate_socratic_dialogue(paper_name, paper_content, paper_title)
     
     print(f"--- Finished processing for {paper_name} ---")
 

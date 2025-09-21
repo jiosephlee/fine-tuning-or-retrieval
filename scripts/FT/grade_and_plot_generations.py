@@ -59,7 +59,11 @@ def main(args):
         domain_dirs = glob(os.path.join(base_probes_path, '*'))
         domains = [os.path.basename(d) for d in domain_dirs if os.path.isdir(d)]
     
-    log.info(f"Inferred domains: {domains}")
+    # Add background domain for LIMA if not already present
+    if "DPO" in domains and "recall_background_QA" not in domains:
+        domains.append("DPO") # Assuming background QA is linked to DPO domain for pathing
+
+    log.info(f"Inferred/using domains: {domains}")
     
     all_reference_prompts = {}
     for domain in domains:
@@ -68,8 +72,8 @@ def main(args):
             dataset_name = os.path.splitext(os.path.basename(f))[0]
             with open(f, 'r', encoding='utf-8') as file:
                 prompts_data = json.load(file)
-                # Re-structure for easy lookup by question
-                all_reference_prompts[dataset_name] = {item['question']: item for item in prompts_data}
+                # Re-structure for easy lookup by ID
+                all_reference_prompts[dataset_name] = {str(item['id']): item for item in prompts_data}
     
     if not all_reference_prompts:
         log.error("Could not load any reference prompts. Aborting.")
@@ -89,6 +93,20 @@ def main(args):
         for p_dir in tqdm(prompt_dirs, desc=f"Evaluating prompts in {os.path.basename(gen_dir)}"):
             generation_files = sorted(glob(os.path.join(p_dir, 'generation_step_*.txt')))
             
+            # Extract dataset and prompt_id from path
+            try:
+                prompt_id = os.path.basename(p_dir)
+                dataset_name = os.path.basename(os.path.dirname(p_dir))
+            except Exception as e:
+                log.warning(f"Could not determine dataset/prompt ID for '{p_dir}': {e}. Skipping.")
+                continue
+
+            # Direct lookup for the reference prompt
+            reference = all_reference_prompts.get(dataset_name, {}).get(prompt_id)
+            if reference is None:
+                log.warning(f"Could not find reference for dataset '{dataset_name}' with ID '{prompt_id}'. Skipping directory.")
+                continue
+
             for gen_file in generation_files:
                 step = int(os.path.basename(gen_file).replace('generation_step_', '').replace('.txt', ''))
                 prompt_text, generated_text = parse_generation_file(gen_file)
@@ -97,22 +115,9 @@ def main(args):
                     log.warning(f"Could not parse {gen_file}. Skipping.")
                     continue
                 
-                # Find reference answer
-                reference = None
-                found_in_dataset = None
-                for dataset_name, prompts in all_reference_prompts.items():
-                    if prompt_text in prompts:
-                        reference = prompts[prompt_text]
-                        found_in_dataset = dataset_name
-                        break
-                
-                if reference is None:
-                    log.warning(f"Could not find reference answer for prompt in {gen_file}. Prompt: '{prompt_text[:100]}...'")
-                    continue
-                
                 # --- 4. Evaluate ---
                 eval_result = evaluate_response(
-                    question=prompt_text,
+                    question=prompt_text, # The prompt the model actually saw
                     response=generated_text,
                     reference_answer=reference.get('reference_answer', '')
                 )
@@ -120,7 +125,7 @@ def main(args):
                 # --- 5. Store result ---
                 eval_data = {
                     "step": step,
-                    "dataset": found_in_dataset,
+                    "dataset": dataset_name,
                     "prompt_name": reference.get('id', 'unknown'),
                     "score": eval_result['score'],
                     "feedback": eval_result['feedback']
