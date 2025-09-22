@@ -379,7 +379,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         # assert that num_tokens_target is the same as non-zero in the loss_target
         if not torch.equal(num_tokens_target.long(), (loss_target != 0).sum(dim=1)):
             self.logger.warning("Number of tokens target mismatch")
-        mean_nll_target = sum_loss_target / target_lengths.float()
+        mean_nll_target = sum_loss_target / num_tokens_target
         perplexity = torch.exp(mean_nll_target)
 
         return log_prob, perplexity
@@ -560,11 +560,11 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         
         report_lines = []
         for token_data in analysis_data:
-            report_lines.append(f"  - Target Token #{token_data['target_token_#']} (pos {token_data['position']}): '{token_data['actual_token']}' (ID: {token_data['actual_token_id']})")
+            report_lines.append(f"  - Target Token #{token_data['target_token_#']}: '{token_data['actual_token']}'")
             report_lines.append(f"    - Rank: {token_data['rank']}")
             report_lines.append(f"    - Top {len(token_data['top_k_predictions'])} predictions:")
             for i, pred in enumerate(token_data['top_k_predictions']):
-                report_lines.append(f"      {i+1}. '{pred['token']}' (ID: {pred['id']}, Prob: {pred['prob']:.4f})")
+                report_lines.append(f"      {i+1}. '{pred['token']}' (Prob: {pred['prob']:.4f})")
         return "\n".join(report_lines)
 
     def _get_detailed_token_analysis(self, logits, labels, context_length, target_length, top_k=10):
