@@ -65,8 +65,8 @@ def construct_experiment_name(args):
     if args.fill_batches_with_pretraining:
         pretrain_info = f"fill_{args.pretraining_data_type}"
         path_parts.append(pretrain_info)
-    elif args.separate_batches_with_pretraining:
-        pretrain_info = f"sep_{args.pretraining_data_type}"
+    elif args.separate_batches_with_pretraining > 0:
+        pretrain_info = f"sep_{args.separate_batches_with_pretraining}_{args.pretraining_data_type}"
         path_parts.append(pretrain_info)
 
     path_parts.extend([
@@ -453,7 +453,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_script", action="store_true", help="Run in test mode with a small model and minimal epochs.")
     parser.add_argument("--override_domains", type=str, nargs='+', default=None, help="A list of domains to override the default (all domains).")
     parser.add_argument("--fill_batches_with_pretraining", default=False, action="store_true", help="Fill batches with pretraining data.")
-    parser.add_argument("--separate_batches_with_pretraining", default=False, action="store_true", help="Alternate between batches of domain data and pretraining data.")
+    parser.add_argument("--separate_batches_with_pretraining", type=int, default=0, help="Number of pretraining batches to insert between unique document types.")
     parser.add_argument("--pretraining_data_type", type=str, default="dclm", help="Type of pretraining data for filling batches.")
     parser.add_argument("--effective_batch_size_for_cpt", type=int, default=8, help="The effective batch size for continued pretraining.")
     parser.add_argument("--effective_batch_size_for_lima", type=int, default=32, help="The effective batch size for LIMA training.")
