@@ -55,12 +55,17 @@ def construct_experiment_name(args):
 
     # 5. Data Mix: e.g., 'source_only', 'para9', 'para9_expl'
     if args.num_paraphrased_texts > 0:
+        data_mix_base = f"para{args.num_paraphrased_texts}"
         if args.with_explanations:
-            data_mix = f"para{args.num_paraphrased_texts}_expl"
+            data_mix = f"{data_mix_base}_expl"
         elif args.with_specific_explanation:
-            data_mix = f"para{args.num_paraphrased_texts}_expl_{args.with_specific_explanation}"
+            data_mix = f"{data_mix_base}_expl_{args.with_specific_explanation}"
         else:
-            data_mix = f"para{args.num_paraphrased_texts}"
+            data_mix = data_mix_base
+        
+        if (args.with_explanations or args.with_specific_explanation) and args.times_explanations > 1:
+            data_mix += f"_x{args.times_explanations}"
+
     else:
         data_mix = "source_only"
 
@@ -380,6 +385,7 @@ def continue_pretraining(model, tokenizer, log, args):
         "pretraining_data_type": args.pretraining_data_type,
         "test_script": args.test_script,
         "with_specific_explanation": args.with_specific_explanation,
+        "times_explanations": args.times_explanations,
     }
 
     if args.with_explanations or args.with_specific_explanation:
@@ -537,6 +543,7 @@ if __name__ == "__main__":
     parser.add_argument("--overlap_ratio", type=str, default="1_4", help="Ratio of overlap when chunking")
     parser.add_argument("--with_explanations", default=False, action="store_true", help="Use explanations when fine-tuning on paraphrased texts")
     parser.add_argument("--with_specific_explanation", type=str, default=None, choices=['blogs', 'stackexchange', 'textbook'], help="Use a specific explanation file.")
+    parser.add_argument("--times_explanations", type=int, default=1, help="Number of times to repeat the explanation texts.")
     parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
     parser.add_argument("--test_script", action="store_true", help="Run in test mode with a small model and minimal epochs.")
 
@@ -552,6 +559,10 @@ if __name__ == "__main__":
     parser.add_argument("--context_length_for_lima", type=int, default=2560, help="Context length for LIMA training.")
 
     args = parser.parse_args()
+
+    # --- Argument Validation ---
+    if args.with_explanations and args.with_specific_explanation:
+        raise ValueError("Cannot use both --with_explanations and --with_specific_explanation. Please choose one.")
 
     # --- Setup Logging & Wandb ---
     logging.basicConfig(

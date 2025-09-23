@@ -1,10 +1,12 @@
 num_epochs=60
 num_paraphrased=9
+
 python finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-7B \
     --device_batch_size 16 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --with_specific_explanation textbook \
+    --times_explanations 2 \
     --effective_batch_size_for_cpt 32 \
     --separate_batches_with_pretraining 1 \
     --fill_batches_with_pretraining \
@@ -13,7 +15,6 @@ python finetuning_knowledge_v8.py \
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
     --overlap_ratio 1_4 \
-    --lima_afterwards \
     --context_length_for_lima 2560 \
     --full_finetuning > output_1.log 
 
@@ -30,7 +31,6 @@ python finetuning_knowledge_v8.py \
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
     --overlap_ratio 1_4 \
-    --lima_afterwards \
     --context_length_for_lima 2560 \
     --full_finetuning > output_1.log 
 
@@ -47,9 +47,8 @@ python finetuning_knowledge_v8.py \
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
     --overlap_ratio 1_4 \
-    --lima_afterwards \
     --context_length_for_lima 2560 \
     --full_finetuning > output_1.log 
 
-# Time: 10 hours
+# Time: 12 hours
 

@@ -154,6 +154,7 @@ def prepare_training_mix(
 
     test_script = strategy_args.get("test_script", False)
     specific_explanation_type = strategy_args.get("with_specific_explanation", None)
+    times_explanations = strategy_args.get("times_explanations", 1)
 
     # Helper to chunk a single text
     def _chunk(text: str) -> List[str]:
@@ -279,6 +280,11 @@ def prepare_training_mix(
                             file_path = os.path.join(explanation_dir, filename)
                             with open(file_path, 'r', encoding='utf-8') as f:
                                 explanation_chunks.extend(_chunk_explanation(f.read()))
+                
+                if times_explanations > 1:
+                    explanation_chunks = explanation_chunks * times_explanations
+                    log.info(f"Repeated explanations {times_explanations} times.")
+
                 log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks from {files_to_load}.")
             
             # Document Chunks for the current domain
