@@ -2,7 +2,6 @@ import os
 import sys
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 import re
 from datetime import datetime
@@ -11,6 +10,8 @@ import argparse
 
 # Adjust the path to include the utils directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from utils.llm_plotting import set_plot_style
+
 
 def find_latest_run_path(base_path):
     """
@@ -105,15 +106,7 @@ def aggregate_across_domains(run_path, probe_type, domains, split_probes=False, 
 
     combined_df = pd.concat(all_domain_dfs, ignore_index=True)
     
-    # Average across domains for each step
-    if probe_type == 'inference' and split_probes:
-        grouping_cols = ['step', 'origin']
-    else:
-        grouping_cols = ['step']
-    
-    averaged_df = combined_df.groupby(grouping_cols)['log_prob'].mean().reset_index()
-    
-    return averaged_df
+    return combined_df
 
 def check_step_consistency(df: pd.DataFrame, probe_type: str):
     """
@@ -147,14 +140,18 @@ def main():
     args = parser.parse_args()
 
     # --- Configuration ---
+    show_std_dev_shadows = False # New internal parameter
+    errorbar_setting = 'sd' if show_std_dev_shadows else None
+    
     split_probes = args.split_probes
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
     experiment_base_path = f'results/FT/full/{args.model_id}/probes_v9/newline2'
     methods = [
-        ('source_only', 'Source Only', 'sep_1_dclm'),
-        ('para9', 'Para 9', 'sep_1_dclm'),
-        ('para9_expl', 'Para 9 Exp', 'sep_1_dclm'),
+        ('para9_expl', 'Para. + Multiview', 'sep_1_dclm'),
+        ('para9', 'Para.', 'sep_1_dclm'),
+        ('source_only', 'Source', 'sep_1_dclm'),
     ]
+    method_names_in_order = [m[1] for m in methods]
     domains_path = os.path.join(project_root, 'data/arxiv/cleaned')
     try:
         domains = sorted([os.path.splitext(f)[0] for f in os.listdir(domains_path) if f.endswith('.tex') and os.path.isfile(os.path.join(domains_path, f))])
@@ -199,8 +196,8 @@ def main():
         print("Error: No data was aggregated. Check paths and file availability.")
         return
 
-    final_knowledge_df = pd.concat(all_knowledge_data, ignore_index=True)
-    final_inference_df = pd.concat(all_inference_data, ignore_index=True)
+    final_knowledge_df = pd.concat(all_knowledge_data, ignore_index=True) if all_knowledge_data else pd.DataFrame()
+    final_inference_df = pd.concat(all_inference_data, ignore_index=True) if all_inference_data else pd.DataFrame()
     
     # Check for step consistency
     check_step_consistency(final_knowledge_df, "Knowledge")
@@ -209,64 +206,125 @@ def main():
     # --- Plotting ---
     print("Generating comparison plot...")
 
+    # Set academic plot style
+    set_plot_style()
+
     if split_probes:
-        fig, axes = plt.subplots(2, 2, figsize=(22, 18), sharey=True)
-        fig.suptitle('Comparison of 1B Models: Averaged Log Probs Across Domains', fontsize=20)
+        # --- PLOTTING FOR SPLIT PROBES (SINGLE MODEL) ---
+        model_name = args.model_id.upper()
+        title = f'Comparison of {model_name} Models: Averaged Log Probs'
+        output_filename = f'knowledge_inference_log_prob_{args.model_id}_split_probes.pdf'
+        output_path = os.path.join(output_dir, output_filename)
+
+        final_knowledge_df = pd.concat(all_knowledge_data, ignore_index=True) if all_knowledge_data else pd.DataFrame()
+        final_inference_df = pd.concat(all_inference_data, ignore_index=True) if all_inference_data else pd.DataFrame()
+
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4), sharey=True)
         
-        # Subplot 1 (Top-Left): Knowledge Probes
-        ax_knowledge = axes[0, 0]
-        sns.lineplot(data=final_knowledge_df, x='step', y='log_prob', hue='method', ax=ax_knowledge, marker='o')
-        ax_knowledge.set_title('Knowledge Probes (All)', fontsize=16)
-        ax_knowledge.set_xlabel('Training Step', fontsize=12)
-        ax_knowledge.set_ylabel('Mean Log Probability', fontsize=12)
-        ax_knowledge.grid(True, which="both", ls="--")
-        ax_knowledge.legend(title='Method')
+        # Subplot 1: Knowledge Probes
+        ax_knowledge = axes[0]
+        for method in method_names_in_order:
+            method_df = final_knowledge_df[final_knowledge_df['method'] == method]
+            if not method_df.empty:
+                plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
+                ax_knowledge.plot(plot_df['step'], plot_df['log_prob'], label=method)
+        ax_knowledge.set_title(f'{model_name}: Factual Probes')
+        ax_knowledge.set_xlabel('Training Step')
+        ax_knowledge.set_ylabel('Mean Log Probability')
+        ax_knowledge.legend(loc='lower right', fontsize='small', title_fontsize='small')
 
         # Subplots for Inference Probes
         origins = ['Explanations Only', 'Source Only', 'Other']
-        plot_positions = [(0, 1), (1, 0), (1, 1)]
-
-        for origin, pos in zip(origins, plot_positions):
-            ax = axes[pos[0], pos[1]]
+        for i, origin in enumerate(origins):
+            ax = axes[i + 1]
             origin_df = final_inference_df[final_inference_df['origin'] == origin]
             
             if not origin_df.empty:
-                sns.lineplot(data=origin_df, x='step', y='log_prob', hue='method', ax=ax, marker='o')
-                ax.set_title(f'Inference Probes ({origin})', fontsize=16)
-                ax.legend(title='Method')
+                for method in method_names_in_order:
+                    method_df = origin_df[origin_df['method'] == method]
+                    if not method_df.empty:
+                        plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
+                        ax.plot(plot_df['step'], plot_df['log_prob'], label=method)
+                ax.set_title(f'{model_name}: Compositional ({origin})')
             else:
-                ax.set_title(f'Inference Probes ({origin}) - No Data', fontsize=16)
-                if ax.get_legend() is not None:
-                    ax.get_legend().remove()
+                ax.set_title(f'{model_name}: Compositional ({origin}) - No Data')
 
-            ax.set_xlabel('Training Step', fontsize=12)
-            ax.set_ylabel('') # Y-axis is shared
-            ax.grid(True, which="both", ls="--")
-            
+            ax.set_xlabel('Training Step')
+            ax.set_ylabel('')
+        
     else:
-        fig, axes = plt.subplots(1, 2, figsize=(20, 8), sharey=True)
-        fig.suptitle('Comparison of 1B Models: Averaged Log Probs Across 6 Domains', fontsize=16)
+        # --- PLOTTING FOR UNIFIED VIEW (1B vs 7B) ---
+        output_filename = 'knowledge_inference_log_prob_1B_7B_unified.pdf'
+        output_path = os.path.join(output_dir, output_filename)
 
-        # Subplot 1: Knowledge Probes
-        sns.lineplot(data=final_knowledge_df, x='step', y='log_prob', hue='method', ax=axes[0], marker='o')
-        axes[0].set_title('Knowledge Probes')
-        axes[0].set_xlabel('Training Step')
-        axes[0].set_ylabel('Mean Log Probability (Averaged Across Domains)')
-        axes[0].grid(True, which="both", ls="--")
-        axes[0].legend(title='Method')
+        all_data = {'1B': {'knowledge': [], 'inference': []}, '7B': {'knowledge': [], 'inference': []}}
+        models_to_plot = ['1B', '7B']
+        for model_id_str in models_to_plot:
+            experiment_base_path = f'results/FT/full/{model_id_str.lower()}/probes_v9/newline2'
+            for method_key, method_name, sub_dir in methods:
+                method_base_path = os.path.join(experiment_base_path, method_key, sub_dir)
+                run_path = find_latest_run_path(method_base_path)
+                if run_path:
+                    knowledge_df = aggregate_across_domains(run_path, 'knowledge', domains, project_root=project_root)
+                    if not knowledge_df.empty:
+                        knowledge_df['method'] = method_name
+                        all_data[model_id_str]['knowledge'].append(knowledge_df)
+                    
+                    inference_df = aggregate_across_domains(run_path, 'inference', domains, project_root=project_root)
+                    if not inference_df.empty:
+                        inference_df['method'] = method_name
+                        all_data[model_id_str]['inference'].append(inference_df)
 
-        # Subplot 2: Inference Probes
-        sns.lineplot(data=final_inference_df, x='step', y='log_prob', hue='method', ax=axes[1], marker='o')
-        axes[1].set_title('Inference Probes')
-        axes[1].set_xlabel('Training Step')
-        axes[1].set_ylabel('') # Y-axis is shared
-        axes[1].grid(True, which="both", ls="--")
-        axes[1].legend(title='Method')
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+        # Manually share y-axes
+        axes[1].sharey(axes[0])
+        axes[3].sharey(axes[2])
+        plt.setp(axes[1].get_yticklabels(), visible=False)
+        plt.setp(axes[3].get_yticklabels(), visible=False)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+        for i, model_id in enumerate(models_to_plot):
+            # Knowledge Plot
+            ax_knowledge = axes[i*2]
+            if all_data[model_id]['knowledge']:
+                df = pd.concat(all_data[model_id]['knowledge'], ignore_index=True)
+                for method in method_names_in_order:
+                    method_df = df[df['method'] == method]
+                    if not method_df.empty:
+                        plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
+                        ax_knowledge.plot(plot_df['step'], plot_df['log_prob'], label=method)
+            ax_knowledge.set_title(f'{model_id}: Factual Probes')
+            ax_knowledge.set_xlabel('Training Step')
+            if i == 0:
+                ax_knowledge.set_ylabel('Mean Log Probability')
+
+            # Compositional Plot
+            ax_compositional = axes[i*2 + 1]
+            if all_data[model_id]['inference']:
+                df = pd.concat(all_data[model_id]['inference'], ignore_index=True)
+                for method in method_names_in_order:
+                    method_df = df[df['method'] == method]
+                    if not method_df.empty:
+                        plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
+                        ax_compositional.plot(plot_df['step'], plot_df['log_prob'], label=method)
+            ax_compositional.set_title(f'{model_id}: Compositional Probes')
+            ax_compositional.set_xlabel('Training Step')
+        
+        axes[0].legend(loc='lower right', fontsize='small', title_fontsize='small')
+
+    # --- FINAL STYLING ---
+    if 'final_knowledge_df' in locals() and not final_knowledge_df.empty:
+        max_step = final_knowledge_df['step'].max()
+        vline_steps = np.arange(30, max_step + 1, 40)
+        for ax in fig.get_axes():
+            for step in vline_steps:
+                ax.axvline(x=step, color='grey', linestyle='--', linewidth=1, alpha=0.7)
+
+    for ax in fig.get_axes():
+        ax.grid(False)
+
+    fig.subplots_adjust(wspace=0.25, top=0.9)
     
-    output_path = os.path.join(output_dir, 'knowledge_inference_log_prob_comparison.png')
-    plt.savefig(output_path)
+    plt.savefig(output_path, bbox_inches='tight')
     plt.close()
 
     print(f"Plot saved to {output_path}")

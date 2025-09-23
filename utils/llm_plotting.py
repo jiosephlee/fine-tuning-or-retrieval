@@ -8,6 +8,29 @@ import textwrap
 import re
 
 
+def set_plot_style():
+    """
+    Sets a consistent academic-style plotting theme using matplotlib's classic style.
+    """
+    plt.style.use('classic')
+    plt.rcParams.update({
+        "axes.labelsize": 14,
+        "xtick.labelsize": 12,
+        "ytick.labelsize": 12,
+        "legend.fontsize": 12,
+        "figure.titlesize": 18,
+        "axes.titlesize": 16,
+        "savefig.dpi": 300,
+    })
+
+def plot_textbook_insertion_lines(fig, max_step, vline_interval):
+    """
+    Plots vertical lines for textbook insertion points.
+    """
+    for i in range(1, max_step // vline_interval + 1):
+        plt.axvline(x=i * vline_interval, color='grey', linestyle='--', alpha=0.5)
+
+
 def generate_revamped_plots(domain: str, knowledge_probes_version: str, inference_probes_version: str, experiment_dir: str, logger=None):
     """
     Generates a new, simplified set of plots for knowledge and inference probes.
@@ -392,5 +415,5 @@ def generate_averaged_plots(experiment_dir: str, logger=None):
     plt.savefig(os.path.join(plot_output_dir, "plot_1b_avg_mean_hits_at_10_vs_loss.png"))
     plt.close()
 
-    
+
     

@@ -153,6 +153,7 @@ def prepare_training_mix(
     
 
     test_script = strategy_args.get("test_script", False)
+    specific_explanation_type = strategy_args.get("with_specific_explanation", None)
 
     # Helper to chunk a single text
     def _chunk(text: str) -> List[str]:
@@ -265,13 +266,20 @@ def prepare_training_mix(
             explanation_chunks = []
             if with_explanations:
                 explanation_dir = f'../../data/arxiv/explanations/{domain}/'
+                
+                files_to_load = []
+                if specific_explanation_type:
+                    files_to_load.append(f"{specific_explanation_type}.txt")
+                else:
+                    files_to_load = ['blogs.txt', 'stackexchange.txt', 'textbook.txt']
+
                 if os.path.isdir(explanation_dir):
                     for filename in sorted(os.listdir(explanation_dir)):
-                        if filename.endswith('.txt'):
+                        if filename in files_to_load:
                             file_path = os.path.join(explanation_dir, filename)
                             with open(file_path, 'r', encoding='utf-8') as f:
                                 explanation_chunks.extend(_chunk_explanation(f.read()))
-                log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks.")
+                log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks from {files_to_load}.")
             
             # Document Chunks for the current domain
             domain_doc_chunks = [source_chunks] + paraphrased_chunks_by_doc

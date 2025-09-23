@@ -57,6 +57,8 @@ def construct_experiment_name(args):
     if args.num_paraphrased_texts > 0:
         if args.with_explanations:
             data_mix = f"para{args.num_paraphrased_texts}_expl"
+        elif args.with_specific_explanation:
+            data_mix = f"para{args.num_paraphrased_texts}_expl_{args.with_specific_explanation}"
         else:
             data_mix = f"para{args.num_paraphrased_texts}"
     else:
@@ -377,9 +379,10 @@ def continue_pretraining(model, tokenizer, log, args):
         "separate_batches_with_pretraining": args.separate_batches_with_pretraining,
         "pretraining_data_type": args.pretraining_data_type,
         "test_script": args.test_script,
+        "with_specific_explanation": args.with_specific_explanation,
     }
 
-    if args.with_explanations:
+    if args.with_explanations or args.with_specific_explanation:
         strategy_name = "ParaphrasedArxivPaperWithExplanations"
     elif args.num_paraphrased_texts > 0:
         strategy_name = "ParaphrasedArxivPaper"
@@ -533,6 +536,7 @@ if __name__ == "__main__":
     parser.add_argument("--overlap_sections", default=False, action="store_true", help="Overlap sections when chunking")
     parser.add_argument("--overlap_ratio", type=str, default="1_4", help="Ratio of overlap when chunking")
     parser.add_argument("--with_explanations", default=False, action="store_true", help="Use explanations when fine-tuning on paraphrased texts")
+    parser.add_argument("--with_specific_explanation", type=str, default=None, choices=['blogs', 'stackexchange', 'textbook'], help="Use a specific explanation file.")
     parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
     parser.add_argument("--test_script", action="store_true", help="Run in test mode with a small model and minimal epochs.")
 
