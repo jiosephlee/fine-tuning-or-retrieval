@@ -21,7 +21,8 @@ def find_latest_run_path(base_path):
     try:
         # Find domains_* directory (assuming one)
         domain_dirs = [d for d in os.listdir(base_path) if d.startswith('domains_') and os.path.isdir(os.path.join(base_path, d))]
-        if not domain_dirs: return None
+        if not domain_dirs:
+            return None
         # Let's assume we take the first one if multiple exist, or sort by modification time
         domain_dir = domain_dirs[0]
         
@@ -29,7 +30,8 @@ def find_latest_run_path(base_path):
 
         # Check for learning rate / batch size folder
         sub_dirs = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
-        if not sub_dirs: return None
+        if not sub_dirs:
+            return None
         # Assuming one bs/lr directory
         path = os.path.join(path, sub_dirs[0])
         
@@ -108,6 +110,47 @@ def aggregate_across_domains(run_path, probe_type, domains, split_probes=False, 
     
     return combined_df
 
+def aggregate_lima_data(model_id, probe_type, domains, split_probes=False, project_root='.'):
+    """
+    Aggregates LIMA probe data across multiple domains.
+    """
+    all_lima_dfs = []
+    # This path is based on the user's example. It might need to be adjusted if the structure varies.
+    lima_run_path = os.path.join(project_root, f'results/prior_knowledge/full/{model_id.lower()}/probes_v9/domains_all/e50/run')
+
+    if not os.path.exists(lima_run_path):
+        print(f"Warning: LIMA run path not found at {lima_run_path}")
+        return pd.DataFrame()
+
+    for domain in domains:
+        if probe_type == "knowledge":
+            # Assuming a naming convention for LIMA probes, e.g., 'domain_lima_knowledge_probe'
+            probe_dir = f"{domain}_lima_knowledge_probe"
+            file_name = f"{domain}_lima_knowledge_probe_metrics.csv"
+        else: # inference
+            probe_dir = f"{domain}_lima_inference_probe"
+            file_name = f"{domain}_lima_inference_probe_metrics.csv"
+            
+        metrics_path = os.path.join(lima_run_path, probe_dir, file_name)
+        
+        if os.path.exists(metrics_path) and os.path.getsize(metrics_path) > 0:
+            df = pd.read_csv(metrics_path)
+            df['domain'] = domain
+            
+            # Note: LIMA data might not have the same 'origin' split as FT data.
+            # This implementation assumes no split for LIMA data for simplicity.
+            if probe_type == 'inference' and split_probes:
+                 df['origin'] = 'Other' # Default origin
+
+            all_lima_dfs.append(df)
+        # Quietly skip if files don't exist, as not all domains might have LIMA probes.
+
+    if not all_lima_dfs:
+        return pd.DataFrame()
+
+    combined_df = pd.concat(all_lima_dfs, ignore_index=True)
+    return combined_df
+
 def check_step_consistency(df: pd.DataFrame, probe_type: str):
     """
     Checks if all methods have the same number of training steps and warns if they do not.
@@ -136,6 +179,11 @@ def main():
         "--split_probes", 
         action='store_true', 
         help="If set, splits the inference probes into separate plots based on their origin."
+    )
+    parser.add_argument(
+        "--with_LIMA",
+        action='store_true',
+        help="If set, includes LIMA experiment results in the plot."
     )
     args = parser.parse_args()
 
@@ -202,6 +250,37 @@ def main():
     # Check for step consistency
     check_step_consistency(final_knowledge_df, "Knowledge")
     check_step_consistency(final_inference_df, "Inference")
+
+    # --- LIMA Data Appending ---
+    if args.with_LIMA:
+        print("Aggregating and appending LIMA data...")
+        method_names_in_order = [m[1] for m in methods]
+
+        # --- LIMA Knowledge Data ---
+        if not final_knowledge_df.empty:
+            max_knowledge_step = final_knowledge_df['step'].max()
+            lima_knowledge_df = aggregate_lima_data(args.model_id, 'knowledge', domains, project_root=project_root)
+            if not lima_knowledge_df.empty:
+                lima_knowledge_df['step'] += max_knowledge_step
+                appended_k_dfs = [final_knowledge_df]
+                for method_name in method_names_in_order:
+                    method_lima_df = lima_knowledge_df.copy()
+                    method_lima_df['method'] = method_name
+                    appended_k_dfs.append(method_lima_df)
+                final_knowledge_df = pd.concat(appended_k_dfs, ignore_index=True)
+
+        # --- LIMA Inference Data ---
+        if not final_inference_df.empty:
+            max_inference_step = final_inference_df['step'].max()
+            lima_inference_df = aggregate_lima_data(args.model_id, 'inference', domains, split_probes=split_probes, project_root=project_root)
+            if not lima_inference_df.empty:
+                lima_inference_df['step'] += max_inference_step
+                appended_i_dfs = [final_inference_df]
+                for method_name in method_names_in_order:
+                    method_lima_df = lima_inference_df.copy()
+                    method_lima_df['method'] = method_name
+                    appended_i_dfs.append(method_lima_df)
+                final_inference_df = pd.concat(appended_i_dfs, ignore_index=True)
 
     # --- Plotting ---
     print("Generating comparison plot...")
