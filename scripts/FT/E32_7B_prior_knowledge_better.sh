@@ -1,7 +1,6 @@
 num_epochs=25
 num_paraphrased=0
 python finetuning_prior_knowledge_v1.py \
-    --test_script \
     --model_id allenai/OLMo-2-1124-7B \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --num_train_epochs 25 \
