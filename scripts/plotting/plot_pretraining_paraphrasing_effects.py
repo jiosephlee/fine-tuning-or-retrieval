@@ -6,6 +6,7 @@ import re
 from datetime import datetime
 import argparse
 from matplotlib.lines import Line2D
+import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from scripts.plotting.plot_comparison import aggregate_across_domains
@@ -60,10 +61,12 @@ def get_pretraining_length_data(model_size, domains, project_root):
             for probe_type in ['knowledge', 'inference']:
                 df = aggregate_across_domains(run_path, probe_type, domains, project_root=project_root)
                 if not df.empty:
-                    df['method'] = f"e{epoch} - {p_name}"
-                    df['epoch'] = epoch
-                    df['pretraining_type'] = p_type
-                    data[probe_type].append(df)
+                    df = df[np.isfinite(df['log_prob'])]
+                    if not df.empty:
+                        df['method'] = f"e{epoch} - {p_name}"
+                        df['epoch'] = epoch
+                        df['pretraining_type'] = p_type
+                        data[probe_type].append(df)
 
     return (pd.concat(data['knowledge'], ignore_index=True) if data['knowledge'] else pd.DataFrame(),
             pd.concat(data['inference'], ignore_index=True) if data['inference'] else pd.DataFrame())
@@ -93,8 +96,10 @@ def get_paraphrasing_data(model_size, domains, project_root):
         for probe_type in ['knowledge', 'inference']:
             df = aggregate_across_domains(run_path, probe_type, domains, project_root=project_root)
             if not df.empty:
-                df['method'] = p_name
-                data[probe_type].append(df)
+                df = df[np.isfinite(df['log_prob'])]
+                if not df.empty:
+                    df['method'] = p_name
+                    data[probe_type].append(df)
 
     return (pd.concat(data['knowledge'], ignore_index=True) if data['knowledge'] else pd.DataFrame(),
             pd.concat(data['inference'], ignore_index=True) if data['inference'] else pd.DataFrame())
@@ -125,7 +130,46 @@ def plot_epoch_comparison(ax, k_df, i_df, source_color, para_color):
         plot_df = i_para_df.groupby('step')['log_prob'].mean().reset_index()
         ax.plot(plot_df['step'], plot_df['log_prob'], color=para_color, linestyle='--')
 
+def plot_paraphrasing_data(ax, df, title, ylabel, show_legend=False):
+    """
+    Plots the paraphrasing data on a given axes.
+    """
+    if df.empty:
+        ax.set_title(f'{title}\\n(No data)')
+        return
+
+    paraphrase_methods = ['Para. 19', 'Para. 9', 'Para. 4']
+    colors = ['#5C4033', '#A0522D', '#D2B48C']  # Dark, medium, light brown
+    color_map = {
+        'Para. 19': colors[0],
+        'Para. 9': colors[1],
+        'Para. 4': colors[2]
+    }
+
+    for method in paraphrase_methods:
+        if method in df['method'].unique():
+            method_df = df[df['method'] == method]
+            plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
+            ax.plot(plot_df['step'], plot_df['log_prob'], label=method, color=color_map.get(method))
+    
+    ax.set_title(title)
+    ax.set_xlabel('Training Steps')
+    if ylabel:
+        ax.set_ylabel('Mean Log Probability')
+    if show_legend:
+        ax.legend(loc='lower right', fontsize='large')
+    ax.grid(True)
+
 def main():
+    parser = argparse.ArgumentParser(description="Generate plots for pretraining and paraphrasing effects.")
+    parser.add_argument('--left', type=float, default=0.05, help='Left margin.')
+    parser.add_argument('--right', type=float, default=0.95, help='Right margin.')
+    parser.add_argument('--bottom', type=float, default=0.1, help='Bottom margin.')
+    parser.add_argument('--top', type=float, default=0.95, help='Top margin.')
+    parser.add_argument('--wspace', type=float, default=0.15, help='Width space between subplots.')
+    parser.add_argument('--hspace', type=float, default=0.25, help='Height space between subplots.')
+    args = parser.parse_args()
+
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
     domains_path = os.path.join(project_root, 'data/arxiv/cleaned')
     try:
@@ -135,54 +179,125 @@ def main():
         return
 
     set_plot_style()
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5), sharey=True)
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
     
-    knowledge_df, inference_df = get_pretraining_length_data('7b', domains, project_root)
+    # --- Top Row: Pretraining Length Comparison (7B only) ---
+    knowledge_df_7b, inference_df_7b = get_pretraining_length_data('7b', domains, project_root)
 
-    if knowledge_df.empty and inference_df.empty:
-        print("No data found for 7B model. Exiting.")
-        return
+    if knowledge_df_7b.empty and inference_df_7b.empty:
+        print("No data found for 7B model pretraining length comparison. Skipping top row.")
+        for ax in axes[0, :]:
+            ax.set_visible(False)
+    else:
+        max_steps = 0
+        if not knowledge_df_7b.empty:
+            max_steps = max(max_steps, knowledge_df_7b['step'].max())
+        if not inference_df_7b.empty:
+            max_steps = max(max_steps, inference_df_7b['step'].max())
 
-    max_steps = 0
-    if not knowledge_df.empty:
-        max_steps = max(max_steps, knowledge_df['step'].max())
-    if not inference_df.empty:
-        max_steps = max(max_steps, inference_df['step'].max())
+        # --- Calculate y-axis limits for the top row ---
+        y_min, y_max = np.inf, -np.inf
+        if not knowledge_df_7b.empty:
+            means_k = knowledge_df_7b.groupby(['pretraining_type', 'epoch', 'step'])['log_prob'].mean()
+            if not means_k.empty:
+                y_min = min(y_min, means_k.min())
+                y_max = max(y_max, means_k.max())
+        if not inference_df_7b.empty:
+            means_i = inference_df_7b.groupby(['pretraining_type', 'epoch', 'step'])['log_prob'].mean()
+            if not means_i.empty:
+                y_min = min(y_min, means_i.min())
+                y_max = max(y_max, means_i.max())
+
+        top_ylim = None
+        if np.isfinite(y_min) and np.isfinite(y_max):
+            padding = (y_max - y_min) * 0.05
+            top_ylim = (y_min - padding, y_max + padding)
+
+        pretraining_epochs = [30, 50, 100, 150]
+        source_color = '#1f77b4'
+        para_color = '#ff7f0e'
         
-    pretraining_epochs = [30, 50, 100, 150]
-    source_color = '#1f77b4'
-    para_color = '#ff7f0e'
+        for i, epoch in enumerate(pretraining_epochs):
+            ax = axes[0, i]
+            
+            k_df_epoch = knowledge_df_7b[knowledge_df_7b['epoch'] == epoch]
+            i_df_epoch = inference_df_7b[inference_df_7b['epoch'] == epoch]
+            
+            plot_epoch_comparison(ax, k_df_epoch, i_df_epoch, source_color, para_color)
+            
+            ax.set_title(f'{epoch} Exposures')
+            ax.set_xlabel('Training Steps')
+            ax.set_xlim(0, max_steps)
+            ax.grid(True)
+            
+            if i == 0:
+                ax.set_ylabel('Mean Log Probability')
+
+        if top_ylim:
+            axes[0, 0].set_ylim(top_ylim)
+
+        for i in range(1, 4):
+            axes[0, i].sharey(axes[0, 0])
+            plt.setp(axes[0, i].get_yticklabels(), visible=False)
+
+        legend_elements = [
+            Line2D([0], [0], color=para_color, lw=2, label='Para.'),
+            Line2D([0], [0], color=source_color, lw=2, label='Source'),
+            Line2D([0], [0], color='black', linestyle='-', label='Factual'),
+            Line2D([0], [0], color='black', linestyle='--', label='Compositional')
+        ]
+        axes[0, -1].legend(handles=legend_elements, loc='lower right', fontsize='large')
+
+    # --- Bottom Row: Paraphrasing Effects ---
+    models = ['1b', '7b']
+    for i, model_size in enumerate(models):
+        k_df, i_df = get_paraphrasing_data(model_size, domains, project_root)
+        
+        ax_k = axes[1, i*2]
+        plot_paraphrasing_data(ax_k, k_df, f'{model_size.upper()}: Factual Probes', ylabel=(i == 0), show_legend=False)
+        
+        ax_i = axes[1, i*2 + 1]
+        is_last_plot = (i == len(models) - 1)
+        plot_paraphrasing_data(ax_i, i_df, f'{model_size.upper()}: Compositional Probes', ylabel=False, show_legend=is_last_plot)
+
+    # --- Calculate and set y-limits for the bottom row ---
+    models_data = {'1b': get_paraphrasing_data('1b', domains, project_root),
+                   '7b': get_paraphrasing_data('7b', domains, project_root)}
+
+    for i, model_size in enumerate(models):
+        k_df, i_df = models_data[model_size]
+        y_min, y_max = np.inf, -np.inf
+        
+        if not k_df.empty:
+            means_k = k_df.groupby(['method', 'step'])['log_prob'].mean()
+            if not means_k.empty:
+                y_min = min(y_min, means_k.min())
+                y_max = max(y_max, means_k.max())
+        
+        if not i_df.empty:
+            means_i = i_df.groupby(['method', 'step'])['log_prob'].mean()
+            if not means_i.empty:
+                y_min = min(y_min, means_i.min())
+                y_max = max(y_max, means_i.max())
+
+        if np.isfinite(y_min) and np.isfinite(y_max):
+            data_range = y_max - y_min
+            padding = data_range * 0.05
+            # Raise the bottom limit to zoom in on the differences
+            bottom_limit = y_min + data_range * 0.25
+            top_limit = y_max + padding
+            axes[1, i*2].set_ylim(bottom_limit, top_limit)
+
+    axes[1, 1].sharey(axes[1, 0])
+    axes[1, 3].sharey(axes[1, 2])
+    plt.setp(axes[1, 1].get_yticklabels(), visible=False)
+    plt.setp(axes[1, 3].get_yticklabels(), visible=False)
     
-    for i, epoch in enumerate(pretraining_epochs):
-        ax = axes[i]
-        
-        k_df_epoch = knowledge_df[knowledge_df['epoch'] == epoch]
-        i_df_epoch = inference_df[inference_df['epoch'] == epoch]
-        
-        plot_epoch_comparison(ax, k_df_epoch, i_df_epoch, source_color, para_color)
-        
-        ax.set_title(f'{epoch} Exposures')
-        ax.set_xlabel('Exposures')
-        ax.set_xlim(0, max_steps)
-        ax.grid(True)
-        
-        if i == 0:
-            ax.set_ylabel('Mean Log Probability')
-
-    legend_elements = [
-        Line2D([0], [0], color=source_color, lw=2, label='Source'),
-        Line2D([0], [0], color=para_color, lw=2, label='Para.'),
-        Line2D([0], [0], color='black', linestyle='-', label='Factual'),
-        Line2D([0], [0], color='black', linestyle='--', label='Compositional')
-    ]
-    axes[-1].legend(handles=legend_elements, loc='lower right', fontsize='small')
-    
-    fig.suptitle('7B Model: Analysis of Pretraining Length', fontsize=16)
-    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.subplots_adjust(left=args.left, right=args.right, bottom=args.bottom, top=args.top, wspace=args.wspace, hspace=args.hspace)
     
     output_dir = 'plots'
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, 'pretraining_length_effects_7B.pdf')
+    output_path = os.path.join(output_dir, 'pretraining_paraphrasing_effects.pdf')
     plt.savefig(output_path, bbox_inches='tight')
     plt.close()
 

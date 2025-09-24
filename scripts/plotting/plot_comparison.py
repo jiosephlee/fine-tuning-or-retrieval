@@ -13,7 +13,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')
 from utils.llm_plotting import set_plot_style
 
 
-def find_latest_run_path(base_path, override_dir=None):
+def find_latest_run_path(base_path, model_id, override_dir=None):
     """
     Finds the path to the latest run data within a given base experiment directory,
     following a specific priority for subdirectories.
@@ -34,6 +34,12 @@ def find_latest_run_path(base_path, override_dir=None):
             return None
         # Assuming one bs/lr directory
         path = os.path.join(path, sub_dirs[0])
+        
+        # For 13B model, the structure has an extra 'overlap_1_4' directory
+        if '13b' in model_id.lower():
+            potential_path = os.path.join(path, 'overlap_1_4')
+            if os.path.isdir(potential_path):
+                path = potential_path
         
         run_dirs = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
 
@@ -166,7 +172,7 @@ def get_model_data(model_id, methods, domains, split_probes, path_overrides, pro
         print(f"Processing method: {method_key} for model: {model_id}")
         method_base_path = os.path.join(experiment_base_path, method_key, sub_dir)
         override_dir = path_overrides.get(model_id.lower(), {}).get(method_key)
-        run_path = find_latest_run_path(method_base_path, override_dir=override_dir)
+        run_path = find_latest_run_path(method_base_path, model_id, override_dir=override_dir)
 
         if run_path:
             # Standard Probes
@@ -252,6 +258,11 @@ def main():
         help="If set, splits the inference probes into separate plots based on their origin."
     )
     parser.add_argument(
+        "--larger",
+        action='store_true',
+        help="If set, compares 7B and 13B models instead of 1B and 7B."
+    )
+    parser.add_argument(
         "--with_LIMA",
         action='store_true',
         help="If set, includes LIMA experiment results in the plot."
@@ -283,7 +294,7 @@ def main():
     method_names_in_order = [m[1] for m in methods]
     
     # Define a new color palette that doesn't include red
-    color_palette = ['#1f77b4', '#2ca02c', '#ff7f0e']  # Blue, Green, Orange
+    color_palette = ['#2ca02c', '#ff7f0e', '#1f77b4']  # Green, Orange, Blue
 
     domains_path = os.path.join(project_root, 'data/arxiv/cleaned')
     try:
@@ -385,22 +396,29 @@ def main():
         
     else:
         # --- PLOTTING FOR UNIFIED VIEW (1B vs 7B) ---
-        output_filename = 'knowledge_inference_log_prob_1B_7B_unified.pdf'
+        if args.larger:
+            models_map = {'7B': '7b', '13B': 'allenai_OLMo-2-1124-13B'}
+            output_filename = 'knowledge_inference_log_prob_7B_13B_unified.pdf'
+        else:
+            models_map = {'1B': '1b', '7B': '7b'}
+            output_filename = 'knowledge_inference_log_prob_1B_7B_unified.pdf'
+
         if args.with_LIMA:
             output_filename = output_filename.replace('.pdf', '_with_LIMA.pdf')
         output_path = os.path.join(output_dir, output_filename)
 
-        all_data = {'1B': {'knowledge': None, 'inference': None, 'max_step_ft': 0}, '7B': {'knowledge': None, 'inference': None, 'max_step_ft': 0}}
-        models_to_plot = ['1B', '7B']
-        for model_id_str in models_to_plot:
+        all_data = {model_name: {'knowledge': None, 'inference': None, 'max_step_ft': 0} for model_name in models_map.keys()}
+        models_to_plot = list(models_map.keys())
+        
+        for model_name, model_path_id in models_map.items():
             knowledge_df, inference_df, max_step_ft_k, _ = get_model_data(
-                model_id_str, methods, domains, split_probes, path_overrides, project_root, args.with_LIMA, args.cut_off_at_minimal
+                model_path_id, methods, domains, split_probes, path_overrides, project_root, args.with_LIMA, args.cut_off_at_minimal
             )
-            all_data[model_id_str]['knowledge'] = knowledge_df
-            all_data[model_id_str]['inference'] = inference_df
-            all_data[model_id_str]['max_step_ft'] = max_step_ft_k
+            all_data[model_name]['knowledge'] = knowledge_df
+            all_data[model_name]['inference'] = inference_df
+            all_data[model_name]['max_step_ft'] = max_step_ft_k
 
-        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4), sharey=args.larger)
         
         # Add shading before plotting if LIMA is off
         if not args.with_LIMA:
@@ -419,10 +437,11 @@ def main():
                             ax.axvspan(start_shade, step, color='grey', alpha=0.2, hatch='/', zorder=0)
 
         # Manually share y-axes
-        axes[1].sharey(axes[0])
-        axes[3].sharey(axes[2])
-        plt.setp(axes[1].get_yticklabels(), visible=False)
-        plt.setp(axes[3].get_yticklabels(), visible=False)
+        if not args.larger:
+            axes[1].sharey(axes[0])
+            axes[3].sharey(axes[2])
+            plt.setp(axes[1].get_yticklabels(), visible=False)
+            plt.setp(axes[3].get_yticklabels(), visible=False)
 
         for i, model_id in enumerate(models_to_plot):
             # Knowledge Plot
@@ -471,7 +490,10 @@ def main():
     for ax in fig.get_axes():
         ax.grid(False)
 
-    fig.subplots_adjust(wspace=0.25, top=0.9)
+    if args.larger:
+        fig.tight_layout()
+    else:
+        fig.subplots_adjust(wspace=0.25, top=0.9)
     
     plt.savefig(output_path, bbox_inches='tight')
     plt.close()
