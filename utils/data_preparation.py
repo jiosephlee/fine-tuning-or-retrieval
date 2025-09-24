@@ -155,6 +155,7 @@ def prepare_training_mix(
     test_script = strategy_args.get("test_script", False)
     specific_explanation_type = strategy_args.get("with_specific_explanation", None)
     times_explanations = strategy_args.get("times_explanations", 1)
+    semi_cleaned_version = strategy_args.get("semi_cleaned", None)
 
     # Helper to chunk a single text
     def _chunk(text: str) -> List[str]:
@@ -218,7 +219,11 @@ def prepare_training_mix(
         unique_document_batches.append(all_prior_knowledge_chunks)
     else:
         if domains is None:
-            cleaned_dir = '../../data/arxiv/cleaned'
+            if semi_cleaned_version:
+                cleaned_dir = f'../../data/arxiv/semicleaned_{semi_cleaned_version}'
+            else:
+                cleaned_dir = '../../data/arxiv/cleaned'
+
             domains = [f.replace('.tex', '') for f in os.listdir(cleaned_dir) if f.endswith('.tex')]
         log.info(f"Processing domains: {domains}")
 
@@ -237,7 +242,11 @@ def prepare_training_mix(
             log.info(f"Loading data for domain: {domain}")
             
             # 1. Load source text
-            source_path = f'../../data/arxiv/cleaned/{domain}.tex'
+            if semi_cleaned_version:
+                source_path = f'../../data/arxiv/semicleaned_{semi_cleaned_version}/{domain}.tex'
+            else:
+                source_path = f'../../data/arxiv/cleaned/{domain}.tex'
+
             try:
                 with open(source_path, 'r', encoding='utf-8') as f:
                     source_text = f.read()

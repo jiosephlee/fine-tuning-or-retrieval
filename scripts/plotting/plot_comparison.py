@@ -13,59 +13,78 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')
 from utils.llm_plotting import set_plot_style
 
 
-def find_latest_run_path(base_path, model_id, override_dir=None):
+def find_latest_run_path(base_path, model_id=None, override_dir=None):
     """
     Finds the path to the latest run data within a given base experiment directory,
-    following a specific priority for subdirectories.
+    accommodating different directory structures.
     """
+    if not os.path.isdir(base_path):
+        return None
+
+    # --- Strategy 1: Check for timestamped directories directly in base_path ---
+    # This is for structures where runs are directly inside the path (e.g., overlap ratio experiments)
+    potential_dirs = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
+    run_dirs = [d for d in potential_dirs if re.match(r'\d{2}_\d{2}_\d{2}_\d{2}', d)]
+
+    if run_dirs:
+        latest_dir = sorted(run_dirs, key=lambda x: datetime.strptime(x, '%m_%d_%H_%M'), reverse=True)[0]
+        return os.path.join(base_path, latest_dir)
+    elif 'run' in potential_dirs:
+        # Fallback to a 'run' directory if no timestamped dirs are found
+        return os.path.join(base_path, 'run')
+
+    # --- Strategy 2: Traverse a more complex, nested directory structure ---
+    # This is for the original, more deeply nested experiment structure.
     try:
-        # Find domains_* directory (assuming one)
         domain_dirs = [d for d in os.listdir(base_path) if d.startswith('domains_') and os.path.isdir(os.path.join(base_path, d))]
         if not domain_dirs:
             return None
-        # Let's assume we take the first one if multiple exist, or sort by modification time
         domain_dir = domain_dirs[0]
         
-        path = os.path.join(base_path, domain_dir, 'e100')
+        path = os.path.join(base_path, domain_dir)
+        
+        # Prefer 'e100' if it exists, otherwise find the highest epoch directory.
+        e100_path = os.path.join(path, 'e100')
+        if os.path.isdir(e100_path):
+            path = e100_path
+        else:
+            epoch_dirs = [d for d in os.listdir(path) if d.startswith('e') and os.path.isdir(os.path.join(path, d)) and re.match(r'e\d+', d)]
+            if not epoch_dirs:
+                return None
+            # Sort by epoch number to get the highest
+            epoch_dirs.sort(key=lambda x: int(x[1:]), reverse=True)
+            path = os.path.join(path, epoch_dirs[0])
 
-        # Check for learning rate / batch size folder
         sub_dirs = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
         if not sub_dirs:
             return None
-        # Assuming one bs/lr directory
         path = os.path.join(path, sub_dirs[0])
         
-        # For 13B model, the structure has an extra 'overlap_1_4' directory
-        if '13b' in model_id.lower():
+        if model_id and '13b' in model_id.lower():
             potential_path = os.path.join(path, 'overlap_1_4')
             if os.path.isdir(potential_path):
                 path = potential_path
         
         run_dirs = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
 
-        # Priority 0: Check for override
         if override_dir and override_dir in run_dirs:
             return os.path.join(path, override_dir)
 
-        # Priority 1: Check for 'overlap_1_4'
         if 'overlap_1_4' in run_dirs:
             return os.path.join(path, 'overlap_1_4')
 
-        # Priority 2: Check for latest date-stamped directory
         date_dirs = [d for d in run_dirs if re.match(r'\d{2}_\d{2}_\d{2}_\d{2}', d)]
         if date_dirs:
             latest_date = max(date_dirs, key=lambda d: datetime.strptime(d, '%m_%d_%H_%M'))
             return os.path.join(path, latest_date)
 
-        # Priority 3: Check for 'run'
         if 'run' in run_dirs:
             return os.path.join(path, 'run')
             
-        # Priority 4: Check for 'no_overlap' as a fallback from previous attempt
         if 'no_overlap' in run_dirs:
             return os.path.join(path, 'no_overlap')
 
-    except FileNotFoundError:
+    except (FileNotFoundError, IndexError):
         return None
 
     return None

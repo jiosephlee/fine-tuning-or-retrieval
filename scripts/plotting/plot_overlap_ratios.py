@@ -84,8 +84,14 @@ def main():
 
     set_plot_style()
     
-    fig, axes = plt.subplots(1, 4, figsize=(20, 4.5), sharey=True)
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4.5), sharey=False)
     
+    # Manually share y-axes for 1B and 7B plots separately
+    axes[1].sharey(axes[0])
+    axes[3].sharey(axes[2])
+    plt.setp(axes[1].get_yticklabels(), visible=False)
+    plt.setp(axes[3].get_yticklabels(), visible=False)
+
     plot_configs = [('1B', 'Source'), ('1B', 'Para9'), ('7B', 'Source'), ('7B', 'Para9')]
     overlap_labels = {
         'no_overlap': 'No Overlap',
@@ -95,34 +101,41 @@ def main():
 
     for i, (model_id, data_type) in enumerate(plot_configs):
         ax = axes[i]
-        colors = plt.cm.Blues(np.linspace(0.4, 1, 3)) if data_type == 'Source' else plt.cm.Oranges(np.linspace(0.4, 1, 3))
         
+        # Define colors and legend order
+        colors = plt.cm.Blues(np.linspace(0.4, 1, 3)) if data_type == 'Source' else plt.cm.Oranges(np.linspace(0.4, 1, 3))
+        overlap_order = ['no_overlap', 'overlap_1_10', 'overlap_2_10']
+        color_map = dict(zip(overlap_order, colors))
+        legend_order = sorted(overlap_order, reverse=True)
+
         # --- Factual (Knowledge) Probes ---
         if all_data[model_id][data_type]['knowledge']:
             knowledge_df = pd.concat(all_data[model_id][data_type]['knowledge'], ignore_index=True)
             check_step_consistency(knowledge_df, f"{model_id} {data_type} Knowledge")
             
-            for j, overlap in enumerate(sorted(knowledge_df['overlap'].unique())):
+            for overlap in legend_order:
+                if overlap not in knowledge_df['overlap'].unique(): continue
                 method_df = knowledge_df[knowledge_df['overlap'] == overlap]
                 plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                ax.plot(plot_df['step'], plot_df['log_prob'], linestyle='-', color=colors[j], label=overlap_labels.get(overlap, overlap))
+                ax.plot(plot_df['step'], plot_df['log_prob'], linestyle='-', color=color_map[overlap], label=overlap_labels.get(overlap, overlap))
         
         # --- Compositional (Inference) Probes ---
         if all_data[model_id][data_type]['inference']:
             inference_df = pd.concat(all_data[model_id][data_type]['inference'], ignore_index=True)
             check_step_consistency(inference_df, f"{model_id} {data_type} Inference")
             
-            for j, overlap in enumerate(sorted(inference_df['overlap'].unique())):
+            for overlap in legend_order:
+                if overlap not in inference_df['overlap'].unique(): continue
                 method_df = inference_df[inference_df['overlap'] == overlap]
                 plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                ax.plot(plot_df['step'], plot_df['log_prob'], linestyle='--', color=colors[j])
+                ax.plot(plot_df['step'], plot_df['log_prob'], linestyle='--', color=color_map[overlap])
         
         ax.set_title(f'{model_id}: {data_type}')
         ax.set_xlabel('Training Step')
         if i == 0:
             ax.set_ylabel('Mean Log Probability')
         
-        ax.legend(title='Overlap Ratio')
+        ax.legend(title='Overlap Ratio', loc='lower right')
         ax.grid(True)
 
     # Custom legend for line styles

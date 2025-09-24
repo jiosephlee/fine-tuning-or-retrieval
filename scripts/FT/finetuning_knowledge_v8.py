@@ -113,6 +113,10 @@ def construct_experiment_name(args):
         overlap_info
     ])
     
+    # Add semi_cleaned info if applicable
+    if args.semi_cleaned:
+        path_parts.append(f"semi_cleaned_{args.semi_cleaned}")
+
     # Suffix becomes the final leaf directory name for the run
     run_name = args.custom_suffix if args.custom_suffix else datetime.now().strftime('%m_%d_%H_%M')
     path_parts.append(run_name)
@@ -214,7 +218,11 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
             log.info(f"Loaded {len(inference_probe_df)} inference probes from {inference_probe_path}")
         
         # --- Corpus Perplexity Callback ---
-        corpus_path = f'../../data/arxiv/cleaned/{domain}.tex'
+        if args.semi_cleaned:
+            corpus_path = f'../../data/arxiv/semicleaned_{args.semi_cleaned}/{domain}.tex'
+        else:
+            corpus_path = f'../../data/arxiv/cleaned/{domain}.tex'
+
         if os.path.exists(corpus_path):
             with open(corpus_path, 'r', encoding='utf-8') as f:
                 text_content = f.read()
@@ -386,6 +394,7 @@ def continue_pretraining(model, tokenizer, log, args):
         "test_script": args.test_script,
         "with_specific_explanation": args.with_specific_explanation,
         "times_explanations": args.times_explanations,
+        "semi_cleaned": args.semi_cleaned,
     }
 
     if args.with_explanations or args.with_specific_explanation:
@@ -557,6 +566,7 @@ if __name__ == "__main__":
     parser.add_argument("--device_batch_size", type=int, default=2, help="The batch size per device.")
     parser.add_argument("--context_length_for_cpt", type=int, default=3072, help="Context length for continued pretraining.")
     parser.add_argument("--context_length_for_lima", type=int, default=2560, help="Context length for LIMA training.")
+    parser.add_argument("--semi_cleaned", type=str, default=None, choices=['v1', 'v2'], help="Use semi-cleaned data from a specific version (v1 or v2).")
 
     args = parser.parse_args()
 
