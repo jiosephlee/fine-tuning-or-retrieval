@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 import json
 import argparse
+from cycler import cycler
 
 # Adjust the path to include the utils directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -127,8 +128,10 @@ def aggregate_across_domains(run_path, probe_type, domains, split_probes=False, 
 
             df['domain'] = domain
             
-            if probe_type == 'inference' and split_probes:
-                filter_path = os.path.join(project_root, 'data/probes/inference', domain, 'filter.json')
+            if split_probes:
+                probe_folder = 'inference' if probe_type == 'inference' else 'facts'
+                filter_path = os.path.join(project_root, 'data/probes', probe_folder, domain, 'filter.json')
+
                 if os.path.exists(filter_path):
                     with open(filter_path, 'r') as f:
                         filter_data = json.load(f)
@@ -140,7 +143,7 @@ def aggregate_across_domains(run_path, probe_type, domains, split_probes=False, 
                     df.loc[df['probe_index'].isin(explanations_only_indices), 'origin'] = 'Explanations Only'
                     df.loc[df['probe_index'].isin(source_only_indices), 'origin'] = 'Source Only'
                 else:
-                    print(f"Warning: filter.json not found for domain {domain}")
+                    print(f"Warning: filter.json not found for domain {domain} in {probe_folder}. Probes will not be split by origin.")
                     df['origin'] = 'Unknown'
 
             all_domain_dfs.append(df)
@@ -195,7 +198,7 @@ def get_model_data(model_id, methods, domains, split_probes, path_overrides, pro
 
         if run_path:
             # Standard Probes
-            knowledge_df = aggregate_across_domains(run_path, 'knowledge', domains, project_root=project_root)
+            knowledge_df = aggregate_across_domains(run_path, 'knowledge', domains, split_probes=split_probes, project_root=project_root)
             if not knowledge_df.empty:
                 knowledge_df['method'] = method_name
                 all_knowledge_data.append(knowledge_df)
@@ -207,7 +210,7 @@ def get_model_data(model_id, methods, domains, split_probes, path_overrides, pro
 
             # LIMA Probes
             if with_LIMA:
-                lima_knowledge_df = aggregate_across_domains(run_path, 'knowledge', domains, project_root=project_root, lima=True)
+                lima_knowledge_df = aggregate_across_domains(run_path, 'knowledge', domains, split_probes=split_probes, project_root=project_root, lima=True)
                 if not lima_knowledge_df.empty:
                     lima_knowledge_df['method'] = method_name
                     all_lima_knowledge_data.append(lima_knowledge_df)
@@ -348,16 +351,14 @@ def main():
             output_filename = output_filename.replace('.pdf', '_with_LIMA.pdf')
         output_path = os.path.join(output_dir, output_filename)
 
-        final_knowledge_df, final_inference_df, max_step_ft, _ = get_model_data(
-            args.model_id, methods, domains, split_probes, path_overrides, project_root, args.with_LIMA, args.cut_off_at_minimal
-        )
-
         if final_knowledge_df.empty and final_inference_df.empty:
             print("Error: No data was aggregated. Check paths and file availability.")
             return
 
-        fig, axes = plt.subplots(1, 4, figsize=(16, 4), sharey=True)
+        fig, axes = plt.subplots(2, 4, figsize=(16, 8), sharey='row')
         
+        max_step_ft = max_knowledge_step_ft
+
         # Add shading before plotting if LIMA is off
         if not args.with_LIMA and max_step_ft > 0:
             vline_steps = np.arange(30, max_step_ft + 1, 40)
@@ -365,53 +366,78 @@ def main():
                 start_shade = step - 5
                 if start_shade < 0:
                     continue
-                for ax in axes:
-                    ax.axvline(x=start_shade, color='grey', linestyle='--', linewidth=1, alpha=0.7, zorder=0)
-                    ax.axvline(x=step, color='grey', linestyle='--', linewidth=1, alpha=0.7, zorder=0)
-                    ax.axvspan(start_shade, step, color='grey', alpha=0.2, hatch='/', zorder=0)
+                for ax_row in axes:
+                    for ax in ax_row:
+                        ax.axvline(x=start_shade, color='grey', linestyle='--', linewidth=1, alpha=0.7, zorder=0)
+                        ax.axvline(x=step, color='grey', linestyle='--', linewidth=1, alpha=0.7, zorder=0)
+                        ax.axvspan(start_shade, step, color='grey', alpha=0.2, hatch='/', zorder=0)
 
-        # Subplot 1: Knowledge Probes
-        ax_knowledge = axes[0]
-        ax_knowledge.set_prop_cycle(color=color_palette)
-        for method in method_names_in_order:
-            method_df = final_knowledge_df[final_knowledge_df['method'] == method]
-            if not method_df.empty:
-                plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                ax_knowledge.plot(plot_df['step'], plot_df['log_prob'], label=method)
-        ax_knowledge.set_title(f'{model_name}: Factual Probes')
-        ax_knowledge.set_xlabel('Training Step')
-        ax_knowledge.set_ylabel('Mean Log Probability')
-        ax_knowledge.legend(loc='lower right', fontsize='small', title_fontsize='small')
+        probe_data_map = {
+            'Factual': final_knowledge_df,
+            'Compositional': final_inference_df
+        }
 
-        # Subplots for Inference Probes
-        origins = ['Explanations Only', 'Source Only', 'Other']
-        for i, origin in enumerate(origins):
-            ax = axes[i + 1]
-            ax.set_prop_cycle(color=color_palette)
-            origin_df = final_inference_df[final_inference_df['origin'] == origin]
+        origin_title_map = {
+            'Explanations Only': '(In Multi-view Only)',
+            'Source Only': '(In Source Only)',
+            'Other': '(In Both)'
+        }
+
+        for row, (probe_name, df) in enumerate(probe_data_map.items()):
+            # Plot 1: Aggregated Probes
+            ax_agg = axes[row, 0]
+            ax_agg.set_prop_cycle(cycler(color=color_palette))
             
-            if not origin_df.empty:
+            total_probes = 0
+            if not df.empty:
+                total_probes = df[['domain', 'probe_index']].drop_duplicates().shape[0]
                 for method in method_names_in_order:
-                    method_df = origin_df[origin_df['method'] == method]
+                    method_df = df[df['method'] == method]
                     if not method_df.empty:
                         plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                        ax.plot(plot_df['step'], plot_df['log_prob'], label=method)
-                ax.set_title(f'{model_name}: Compositional ({origin})')
-            else:
-                ax.set_title(f'{model_name}: Compositional ({origin}) - No Data')
+                        ax_agg.plot(plot_df['step'], plot_df['log_prob'], label=method)
+            ax_agg.set_title(f'{probe_name} ({total_probes} Probes)')
 
-            ax.set_xlabel('Training Step')
-            ax.set_ylabel('')
+            # Subplots for split probes by origin
+            origins = ['Explanations Only', 'Source Only', 'Other']
+            for i, origin in enumerate(origins):
+                ax = axes[row, i + 1]
+                ax.set_prop_cycle(cycler(color=color_palette))
 
-    # Add vertical lines for split-probe plot
-    if max_step_ft > 0:
-        if args.with_LIMA:
-            vline_steps = np.arange(30, max_step_ft + 1, 40)
-            for ax in fig.get_axes():
-                ax.axvline(x=max_step_ft, color='red', linestyle='--', linewidth=1.5, alpha=0.9)
-            for ax in fig.get_axes():
-                for step in vline_steps:
-                    ax.axvline(x=step, color='grey', linestyle='--', linewidth=1, alpha=0.7)
+                base_title = origin_title_map.get(origin, f'({origin})')
+                
+                num_probes = 0
+                if not df.empty and 'origin' in df.columns:
+                    origin_df = df[df['origin'] == origin]
+                    if not origin_df.empty:
+                        num_probes = origin_df[['domain', 'probe_index']].drop_duplicates().shape[0]
+                        for method in method_names_in_order:
+                            method_df = origin_df[origin_df['method'] == method]
+                            if not method_df.empty:
+                                plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
+                                ax.plot(plot_df['step'], plot_df['log_prob'], label=method)
+                
+                title = f"{base_title[:-1]}: {num_probes})"
+                ax.set_title(title)
+
+        # --- Final styling for the new grid ---
+        for i in range(2):
+            axes[i, 0].set_ylabel('Mean Log Probability')
+            for j in range(4):
+                axes[i, j].set_xlabel('Training Step' if i == 1 else '')
+                if i == 0:
+                    axes[i,j].set_xticklabels([])
+
+
+        # Add vertical lines for split-probe plot
+        if max_step_ft > 0:
+            if args.with_LIMA:
+                vline_steps = np.arange(30, max_step_ft + 1, 40)
+                for ax in fig.get_axes():
+                    ax.axvline(x=max_step_ft, color='red', linestyle='--', linewidth=1.5, alpha=0.9)
+                for ax in fig.get_axes():
+                    for step in vline_steps:
+                        ax.axvline(x=step, color='grey', linestyle='--', linewidth=1, alpha=0.7)
         
     else:
         # --- PLOTTING FOR UNIFIED VIEW (1B vs 7B) ---
@@ -503,7 +529,12 @@ def main():
                         for step in vline_steps:
                             ax.axvline(x=step, color='grey', linestyle='--', linewidth=1, alpha=0.7)
     
-    axes[0].legend(loc='lower right', fontsize='small', title_fontsize='small')
+    if split_probes:
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        if handles: # Only show legend if there are items to show
+            fig.legend(handles, labels, loc='lower center', ncol=len(method_names_in_order), bbox_to_anchor=(0.5, -0.05))
+    else:
+        axes[0].legend(loc='lower right', fontsize='small', title_fontsize='small')
 
     # --- FINAL STYLING ---
     for ax in fig.get_axes():

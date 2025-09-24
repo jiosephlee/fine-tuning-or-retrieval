@@ -7,31 +7,19 @@ import argparse
 import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from scripts.plotting.plot_comparison import aggregate_across_domains, find_latest_run_path
+from scripts.plotting.plot_comparison import aggregate_across_domains
 from utils.llm_plotting import set_plot_style
 
-def transform_to_exposure_steps(df, strategy_name):
+def transform_to_exposure_steps(df, strategy_name=None):
     """
-    Transforms the 'step' column to 'Exposure Steps' based on the data replay strategy.
+    Sets 'Exposure Steps' from the 'step' column.
+    For these runs, there is no data replay, so exposure steps are the same as training steps.
     """
     if df.empty:
         return df
     
     df = df.copy()
-    if 'With No Data Replay' in strategy_name:
-        # Each step is an exposure
-        df['Exposure Steps'] = df['step']
-    elif 'With Data Replay (1:1)' in strategy_name:
-        # Exposure at step 0, then every 2 steps starting from 1 (0, 1, 3, 5...)
-        df = df[(df['step'] == 0) | ((df['step'] > 0) & ((df['step'] - 1) % 2 == 0))].copy()
-        df['Exposure Steps'] = (df['step'] + 1) // 2
-    elif 'With Data Replay (1:5)' in strategy_name:
-        # Exposure at step 0, then every 6 steps starting from 1 (0, 1, 7, 13...)
-        df = df[(df['step'] == 0) | ((df['step'] > 0) & ((df['step'] - 1) % 6 == 0))].copy()
-        df['Exposure Steps'] = (df['step'] - 1) // 6 + 1
-    else:
-        df['Exposure Steps'] = df['step']
-        
+    df['Exposure Steps'] = df['step']
     return df
 
 def check_exposure_step_consistency(df: pd.DataFrame, probe_type: str):
@@ -53,10 +41,10 @@ def check_exposure_step_consistency(df: pd.DataFrame, probe_type: str):
 
 def main():
     """
-    Generates a comparison plot for different data replay strategies.
+    Generates a comparison plot for different batch sizes with para9+fill data replay strategies.
     """
     # --- Configuration ---
-    parser = argparse.ArgumentParser(description="Generates a comparison plot for different data replay strategies.")
+    parser = argparse.ArgumentParser(description="Generates a comparison plot for different batch sizes with para9+fill.")
     parser.add_argument(
         "--with_LIMA",
         action='store_true',
@@ -74,19 +62,16 @@ def main():
     
     runs_to_compare = {
         '1B': {
-            'With No Data Replay': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/source_only/fill_dclm',
-            'With Data Replay (1:1)': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/source_only/sep_1_dclm',
-            'With Data Replay (1:5)': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/source_only/sep_5_dclm'
+            'BS=32': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/run',
+            'BS=64': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/09_22_00_35',
         },
         '7B': {
-            'With No Data Replay': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm',
-            'With Data Replay (1:1)': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm',
-            #'Data replay (1:1) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4',
-            'With Data Replay (1:5)': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_5_dclm'
+            'BS=32': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/run',
+            'BS=64': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/09_22_12_57',
         }
     }
-    method_order = ['With No Data Replay', 'With Data Replay (1:1)', 'With Data Replay (1:5)']
-    xlabel = 'Exposure/Training Steps' if args.with_LIMA else 'Exposure Steps'
+    method_order = ['BS=32', 'BS=64']
+    xlabel = 'Exposure/Training Steps' if args.with_LIMA else 'Training Steps'
 
     domains_path = os.path.join(project_root, 'data/arxiv/cleaned')
     try:
@@ -104,12 +89,11 @@ def main():
     max_exposure_steps = {'1B': {'knowledge': 0, 'inference': 0}, '7B': {'knowledge': 0, 'inference': 0}}
 
     for model_id, runs in runs_to_compare.items():
-        for run_name, base_path in runs.items():
+        for run_name, run_path in runs.items():
             print(f"Processing {model_id} run: {run_name}")
-            run_path = find_latest_run_path(base_path, model_id)
 
             if not run_path or not os.path.isdir(run_path):
-                print(f"  - Warning: Run path not found for {run_name} at {base_path}")
+                print(f"  - Warning: Run path not found for {run_name} at {run_path}")
                 continue
 
             # Knowledge Probes
@@ -244,7 +228,7 @@ def main():
 
     fig.subplots_adjust(wspace=0.2 if args.with_LIMA else 0.25, top=0.925)
     
-    output_filename = 'data_replay_1B_7B_comparison_exposure_steps.pdf'
+    output_filename = 'para9_fill_batch_size_comparison.pdf'
     if args.with_LIMA:
         output_filename = output_filename.replace('.pdf', '_with_LIMA.pdf')
     output_path = os.path.join(output_dir, output_filename)

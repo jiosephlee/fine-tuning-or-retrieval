@@ -77,6 +77,8 @@ def get_paraphrasing_data(model_size, domains, project_root):
     """
     data = {'knowledge': [], 'inference': []}
     paraphrase_types = [('para4', 'Para. 4'), ('para9', 'Para. 9'), ('para19', 'Para. 19')]
+    if model_size == '7b':
+        paraphrase_types.append(('para49', 'Para. 49'))
 
     for p_type, p_name in paraphrase_types:
         base_path = f"results/FT/full/{model_size}/probes_v9/newline2/{p_type}/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05"
@@ -138,12 +140,13 @@ def plot_paraphrasing_data(ax, df, title, ylabel, show_legend=False):
         ax.set_title(f'{title}\\n(No data)')
         return
 
-    paraphrase_methods = ['Para. 19', 'Para. 9', 'Para. 4']
-    colors = ['#5C4033', '#A0522D', '#D2B48C']  # Dark, medium, light brown
+    paraphrase_methods = ['Para. 49', 'Para. 19', 'Para. 9', 'Para. 4']
+    colors = ['#211511', '#795548', '#b56535', '#D2B48C']  # Very dark, dark, lighter medium, light brown
     color_map = {
-        'Para. 19': colors[0],
-        'Para. 9': colors[1],
-        'Para. 4': colors[2]
+        'Para. 49': colors[0],
+        'Para. 19': colors[1],
+        'Para. 9': colors[2],
+        'Para. 4': colors[3]
     }
 
     for method in paraphrase_methods:
