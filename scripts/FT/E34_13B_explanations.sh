@@ -12,8 +12,9 @@ python finetuning_knowledge_v8.py \
     --learning_rate 2e-5 \
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
-    --overlap_ratio 1_4 \
+    --overlap_ratio 2_10 \
     --lima_afterwards \
+    --context_length_for_cpt 2560 \
     --context_length_for_lima 2048 \
     --full_finetuning > output_1.log 
 
