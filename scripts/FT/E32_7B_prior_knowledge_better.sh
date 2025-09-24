@@ -1,22 +1,22 @@
-num_epochs=25
+num_epochs=20
 num_paraphrased=0
 python finetuning_prior_knowledge_v1.py \
     --model_id allenai/OLMo-2-1124-7B \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --num_train_epochs 25 \
-    --device_batch_size 2 \
+    --device_batch_size 4 \
     --effective_batch_size_for_cpt 256 \
     --fill_batches_with_pretraining \
     --separate_batches_with_pretraining 1 \
-    --learning_rate 3e-5 \
-    --push_to_hub_cpt_id prior_6_papers_25_epochs_7B \
+    --learning_rate 2e-5 \
+    --push_to_hub_cpt_id prior_6_papers_20_epochs_7B \
     --full_finetuning \
     --context_length_for_lima 2560 > output_6.log 2>&1
 
 num_epochs=100
 num_paraphrased=9
 python finetuning_knowledge_v8.py \
-    --model_id jiosephlee/prior_6_papers_25_epochs_7B \
+    --model_id jiosephlee/prior_6_papers_20_epochs_7B \
     --device_batch_size 4 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --effective_batch_size_for_cpt 32 \
@@ -31,22 +31,4 @@ python finetuning_knowledge_v8.py \
     --context_length_for_lima 2560 \
     --full_finetuning > output_7.log 2>&1
 
-num_epochs=100
-num_paraphrased=0
-python finetuning_knowledge_v8.py \
-    --model_id jiosephlee/prior_6_papers_25_epochs_7B \
-    --device_batch_size 4 \
-    --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
-    --effective_batch_size_for_cpt 32 \
-    --separate_batches_with_pretraining 1 \
-    --fill_batches_with_pretraining \
-    --num_train_epochs $num_epochs \
-    --learning_rate 2e-5 \
-    --num_paraphrased_texts $num_paraphrased \
-    --overlap_sections \
-    --overlap_ratio 1_4 \
-    --lima_afterwards \
-    --context_length_for_lima 2560 \
-    --full_finetuning > output_8.log 2>&1
-
-# Time: 3 hours
+# Time: 7 hours
