@@ -19,6 +19,10 @@ def find_latest_run_path(base_path, model_id=None, override_dir=None):
     Finds the path to the latest run data within a given base experiment directory,
     accommodating different directory structures.
     """
+    basename = os.path.basename(base_path)
+    if re.match(r'\d{2}_\d{2}_\d{2}_\d{2}', basename) and os.path.isdir(base_path):
+        return base_path
+
     if not os.path.isdir(base_path):
         return None
 

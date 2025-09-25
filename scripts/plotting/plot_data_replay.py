@@ -21,11 +21,11 @@ def transform_to_exposure_steps(df, strategy_name):
     if 'With No Data Replay' in strategy_name:
         # Each step is an exposure
         df['Exposure Steps'] = df['step']
-    elif 'With Data Replay (1:1)' in strategy_name:
+    elif '(1:1)' in strategy_name:
         # Exposure at step 0, then every 2 steps starting from 1 (0, 1, 3, 5...)
         df = df[(df['step'] == 0) | ((df['step'] > 0) & ((df['step'] - 1) % 2 == 0))].copy()
         df['Exposure Steps'] = (df['step'] + 1) // 2
-    elif 'With Data Replay (1:5)' in strategy_name:
+    elif '(1:5)' in strategy_name:
         # Exposure at step 0, then every 6 steps starting from 1 (0, 1, 7, 13...)
         df = df[(df['step'] == 0) | ((df['step'] > 0) & ((df['step'] - 1) % 6 == 0))].copy()
         df['Exposure Steps'] = (df['step'] - 1) // 6 + 1
@@ -76,16 +76,17 @@ def main():
         '1B': {
             'With No Data Replay': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/source_only/fill_dclm',
             'With Data Replay (1:1)': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/source_only/sep_1_dclm',
-            'With Data Replay (1:5)': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/source_only/sep_5_dclm'
+            'With Data Replay (1:5)': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/source_only/sep_5_dclm',
+            'Data replay (1:1) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/09_25_02_08'
         },
         '7B': {
             'With No Data Replay': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm',
             'With Data Replay (1:1)': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm',
-            #'Data replay (1:1) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4',
+            'Data replay (1:1) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e50/bs64_lr2e-05/overlap_1_4/09_24_23_35',
             'With Data Replay (1:5)': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_5_dclm'
         }
     }
-    method_order = ['With No Data Replay', 'With Data Replay (1:1)', 'With Data Replay (1:5)']
+    method_order = ['With No Data Replay', 'With Data Replay (1:1)', 'With Data Replay (1:5)', 'Data replay (1:1) via fill']
     xlabel = 'Exposure/Training Steps' if args.with_LIMA else 'Exposure Steps'
 
     domains_path = os.path.join(project_root, 'data/arxiv/cleaned')
