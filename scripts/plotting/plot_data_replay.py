@@ -181,7 +181,7 @@ def main():
                     continue
                 method_df = final_knowledge_df[final_knowledge_df['method'] == method]
                 plot_df = method_df.groupby('Exposure Steps')['log_prob'].mean().reset_index()
-                ax_knowledge.plot(plot_df['Exposure Steps'], plot_df['log_prob'], label=method, lw=2.5)
+                ax_knowledge.plot(plot_df['Exposure Steps'], plot_df['log_prob'], label=method, lw=1.6)
             ax_knowledge.set_title(f'{model_id}: Factual Probes')
             if not final_knowledge_df.empty:
                 max_x = final_knowledge_df['Exposure Steps'].max()
@@ -218,7 +218,7 @@ def main():
                     continue
                 method_df = final_inference_df[final_inference_df['method'] == method]
                 plot_df = method_df.groupby('Exposure Steps')['log_prob'].mean().reset_index()
-                ax_inference.plot(plot_df['Exposure Steps'], plot_df['log_prob'], label=method, lw=2.5)
+                ax_inference.plot(plot_df['Exposure Steps'], plot_df['log_prob'], label=method, lw=1.6)
             ax_inference.set_title(f'{model_id}: Compositional Probes')
             if not final_inference_df.empty:
                 max_x = final_inference_df['Exposure Steps'].max()

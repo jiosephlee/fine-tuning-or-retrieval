@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import re
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from scripts.FT.plot_comparison import aggregate_across_domains, check_step_consistency, find_latest_run_path
+from scripts.plotting.plot_comparison import aggregate_across_domains, check_step_consistency, find_latest_run_path
 from utils.llm_plotting import set_plot_style
 
 def main():
@@ -84,7 +84,7 @@ def main():
             for method in sorted(knowledge_df['method'].unique()):
                 method_df = knowledge_df[knowledge_df['method'] == method]
                 plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                ax_knowledge.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=2.5)
+                ax_knowledge.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=1.6)
             ax_knowledge.set_title(f'{model_id}: Factual Probes')
         else:
             ax_knowledge.set_title(f'{model_id}: Factual Probes (No Data)')
@@ -101,7 +101,7 @@ def main():
             for method in sorted(inference_df['method'].unique()):
                 method_df = inference_df[inference_df['method'] == method]
                 plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                ax_inference.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=2.5)
+                ax_inference.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=1.6)
             ax_inference.set_title(f'{model_id}: Compositional Probes')
         else:
             ax_inference.set_title(f'{model_id}: Compositional Probes (No Data)')
@@ -109,7 +109,7 @@ def main():
         ax_inference.set_xlabel('Training Step')
         ax_inference.set_ylabel('')
 
-    axes[3].legend(title='Data Replay\nSource', loc='upper right', fontsize='small', title_fontsize='small')
+    axes[3].legend(title='Data Replay\nSource', loc='upper right', fontsize='medium', title_fontsize='medium')
 
     for ax in fig.get_axes():
         ax.grid(True)

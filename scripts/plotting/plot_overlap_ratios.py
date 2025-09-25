@@ -22,7 +22,7 @@ def main():
                 'base_path': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e50/bs32_lr2e-05/',
                 'overlaps': ['no_overlap', 'overlap_1_10', 'overlap_2_10']
             },
-            'Para9': {
+            'Para': {
                 'base_path': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/para9/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e50/bs32_lr2e-05/',
                 'overlaps': ['no_overlap', 'overlap_1_10', 'overlap_2_10']
             }
@@ -32,7 +32,7 @@ def main():
                 'base_path': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e50/bs32_lr2e-05/',
                 'overlaps': ['no_overlap', 'overlap_1_10', 'overlap_2_10']
             },
-            'Para9': {
+            'Para': {
                 'base_path': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e50/bs32_lr2e-05/',
                 'overlaps': ['no_overlap', 'overlap_1_10', 'overlap_2_10']
             }
@@ -51,8 +51,8 @@ def main():
 
     # --- Data Aggregation ---
     all_data = {
-        '1B': {'Source': {'knowledge': [], 'inference': []}, 'Para9': {'knowledge': [], 'inference': []}},
-        '7B': {'Source': {'knowledge': [], 'inference': []}, 'Para9': {'knowledge': [], 'inference': []}}
+        '1B': {'Source': {'knowledge': [], 'inference': []}, 'Para': {'knowledge': [], 'inference': []}},
+        '7B': {'Source': {'knowledge': [], 'inference': []}, 'Para': {'knowledge': [], 'inference': []}}
     }
 
     for model_id, data_types in runs_to_compare.items():
@@ -92,7 +92,7 @@ def main():
     plt.setp(axes[1].get_yticklabels(), visible=False)
     plt.setp(axes[3].get_yticklabels(), visible=False)
 
-    plot_configs = [('1B', 'Source'), ('1B', 'Para9'), ('7B', 'Source'), ('7B', 'Para9')]
+    plot_configs = [('1B', 'Source'), ('1B', 'Para'), ('7B', 'Source'), ('7B', 'Para')]
     overlap_labels = {
         'no_overlap': 'No Overlap',
         'overlap_1_10': '1/10 Overlap',
@@ -117,7 +117,7 @@ def main():
                 if overlap not in knowledge_df['overlap'].unique(): continue
                 method_df = knowledge_df[knowledge_df['overlap'] == overlap]
                 plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                ax.plot(plot_df['step'], plot_df['log_prob'], linestyle='-', color=color_map[overlap], label=overlap_labels.get(overlap, overlap), lw=2.5)
+                ax.plot(plot_df['step'], plot_df['log_prob'], linestyle='-', color=color_map[overlap], label=overlap_labels.get(overlap, overlap), lw=1.75)
         
         # --- Compositional (Inference) Probes ---
         if all_data[model_id][data_type]['inference']:
@@ -128,7 +128,7 @@ def main():
                 if overlap not in inference_df['overlap'].unique(): continue
                 method_df = inference_df[inference_df['overlap'] == overlap]
                 plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                ax.plot(plot_df['step'], plot_df['log_prob'], linestyle='--', color=color_map[overlap], lw=2.5)
+                ax.plot(plot_df['step'], plot_df['log_prob'], linestyle='--', color=color_map[overlap], lw=1.75)
         
         ax.set_title(f'{model_id}: {data_type}')
         ax.set_xlabel('Training Step')
@@ -140,8 +140,8 @@ def main():
 
     # Custom legend for line styles
     from matplotlib.lines import Line2D
-    legend_elements = [Line2D([0], [0], color='black', lw=2.5, linestyle='-', label='Factual'),
-                       Line2D([0], [0], color='black', lw=2.5, linestyle='--', label='Compositional')]
+    legend_elements = [Line2D([0], [0], color='black', lw=1.75, linestyle='-', label='Factual'),
+                       Line2D([0], [0], color='black', lw=1.75, linestyle='--', label='Compositional')]
     fig.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, 0), ncol=2, title="Probe Type")
 
     fig.tight_layout(rect=[0, 0.05, 1, 1]) # Adjust layout to make space for custom legend

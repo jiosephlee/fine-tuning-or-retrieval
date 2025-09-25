@@ -39,9 +39,9 @@ def get_final_step_performance(run_path, domains, project_root):
 def plot_delta_distribution(ax, data, color):
     """Helper function to plot a delta distribution with box and strip plots."""
     # Standard boxplot where whiskers show 1.5 * IQR
-    sns.boxplot(ax=ax, x='log_prob_delta', data=data, color=color, width=0.4, linewidth=2.5)
+    sns.boxplot(ax=ax, x='log_prob_delta', data=data, color=color, width=0.4, linewidth=1.6)
     sns.stripplot(ax=ax, x='log_prob_delta', data=data, jitter=True, alpha=0.4, color='black', size=3)
-    ax.axvline(0, color='red', linestyle='--', linewidth=2.5)
+    ax.axvline(0, color='red', linestyle='--', linewidth=1.6)
     
     if not data.empty:
         median_val = data['log_prob_delta'].median()

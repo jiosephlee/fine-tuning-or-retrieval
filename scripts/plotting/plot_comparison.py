@@ -295,7 +295,24 @@ def main():
         default=True,
         help="If there are inconsistencies in the number of steps, cut off plots at the minimal number of steps."
     )
+    parser.add_argument(
+        "--separate_y_axis",
+        action='store_true',
+        help="If set, each plot in the unified view will have its own y-axis scale."
+    )
+    parser.add_argument(
+        "--all_three",
+        action='store_true',
+        help="If set, plots 1B, 7B, and 13B models together in a 1x6 layout."
+    )
     args = parser.parse_args()
+
+    model_path_map = {
+        '1b': '1b',
+        '7b': '7b',
+        '13b': 'allenai_OLMo-2-1124-13B'
+    }
+    model_id_for_path = model_path_map.get(args.model_id.lower(), args.model_id)
 
     # --- Configuration ---
     path_overrides = {
@@ -335,7 +352,7 @@ def main():
         return
 
     # --- Data Aggregation ---
-    final_knowledge_df, final_inference_df, max_knowledge_step_ft, max_inference_step_ft = get_model_data(args.model_id, methods, domains, split_probes, path_overrides, project_root, args.with_LIMA, args.cut_off_at_minimal)
+    final_knowledge_df, final_inference_df, max_knowledge_step_ft, max_inference_step_ft = get_model_data(model_id_for_path, methods, domains, split_probes, path_overrides, project_root, args.with_LIMA, args.cut_off_at_minimal)
 
     # --- Plotting ---
     print("Generating comparison plot...")
@@ -355,7 +372,7 @@ def main():
             print("Error: No data was aggregated. Check paths and file availability.")
             return
 
-        fig, axes = plt.subplots(2, 4, figsize=(16, 8), sharey='row')
+        fig, axes = plt.subplots(2, 4, figsize=(16, 8), sharey=False)
         
         max_step_ft = max_knowledge_step_ft
 
@@ -395,7 +412,7 @@ def main():
                     method_df = df[df['method'] == method]
                     if not method_df.empty:
                         plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                        ax_agg.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=2.5)
+                        ax_agg.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=1.6)
             ax_agg.set_title(f'{probe_name} ({total_probes} Probes)')
 
             # Subplots for split probes by origin
@@ -415,7 +432,7 @@ def main():
                             method_df = origin_df[origin_df['method'] == method]
                             if not method_df.empty:
                                 plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                                ax.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=2.5)
+                                ax.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=1.6)
                 
                 title = f"{base_title[:-1]}: {num_probes})"
                 ax.set_title(title)
@@ -424,7 +441,7 @@ def main():
         for i in range(2):
             axes[i, 0].set_ylabel('Mean Log Probability')
             for j in range(4):
-                axes[i, j].set_xlabel('Training Step' if i == 1 else '')
+                axes[i, j].set_xlabel('Training Steps' if i == 1 else '')
                 if i == 0:
                     axes[i,j].set_xticklabels([])
 
@@ -434,14 +451,17 @@ def main():
             if args.with_LIMA:
                 vline_steps = np.arange(30, max_step_ft + 1, 40)
                 for ax in fig.get_axes():
-                    ax.axvline(x=max_step_ft, color='red', linestyle='--', linewidth=1.5, alpha=0.9)
+                    ax.axvline(x=max_step_ft, color='red', linestyle='--', linewidth=1.6, alpha=0.9)
                 for ax in fig.get_axes():
                     for step in vline_steps:
                         ax.axvline(x=step, color='grey', linestyle='--', linewidth=1, alpha=0.7)
         
     else:
-        # --- PLOTTING FOR UNIFIED VIEW (1B vs 7B) ---
-        if args.larger:
+        # --- PLOTTING FOR UNIFIED VIEW ---
+        if args.all_three:
+            models_map = {'1B': '1b', '7B': '7b', '13B': 'allenai_OLMo-2-1124-13B'}
+            output_filename = 'knowledge_inference_log_prob_1B_7B_13B_unified.pdf'
+        elif args.larger:
             models_map = {'7B': '7b', '13B': 'allenai_OLMo-2-1124-13B'}
             output_filename = 'knowledge_inference_log_prob_7B_13B_unified.pdf'
         else:
@@ -452,6 +472,7 @@ def main():
             output_filename = output_filename.replace('.pdf', '_with_LIMA.pdf')
         output_path = os.path.join(output_dir, output_filename)
 
+        num_models = len(models_map)
         all_data = {model_name: {'knowledge': None, 'inference': None, 'max_step_ft': 0} for model_name in models_map.keys()}
         models_to_plot = list(models_map.keys())
         
@@ -463,7 +484,30 @@ def main():
             all_data[model_name]['inference'] = inference_df
             all_data[model_name]['max_step_ft'] = max_step_ft_k
 
-        fig, axes = plt.subplots(1, 4, figsize=(16, 4), sharey=args.larger)
+        # --- Calculate unified y-axis limits ---
+        unified_ylim = None
+        if not args.separate_y_axis:
+            y_min, y_max = np.inf, -np.inf
+            for model_name in models_to_plot:
+                df_k = all_data[model_name]['knowledge']
+                if df_k is not None and not df_k.empty:
+                    means_k = df_k.groupby(['method', 'step'])['log_prob'].mean()
+                    if not means_k.empty:
+                        y_min = min(y_min, means_k.min())
+                        y_max = max(y_max, means_k.max())
+                
+                df_i = all_data[model_name]['inference']
+                if df_i is not None and not df_i.empty:
+                    means_i = df_i.groupby(['method', 'step'])['log_prob'].mean()
+                    if not means_i.empty:
+                        y_min = min(y_min, means_i.min())
+                        y_max = max(y_max, means_i.max())
+
+            if np.isfinite(y_min) and np.isfinite(y_max):
+                padding = (y_max - y_min) * 0.05
+                unified_ylim = (y_min - padding, y_max + padding)
+
+        fig, axes = plt.subplots(1, num_models * 2, figsize=(8 * num_models, 4))
         
         # Add shading before plotting if LIMA is off
         if not args.with_LIMA:
@@ -481,12 +525,10 @@ def main():
                             ax.axvline(x=step, color='grey', linestyle='--', linewidth=1, alpha=0.7, zorder=0)
                             ax.axvspan(start_shade, step, color='grey', alpha=0.2, hatch='/', zorder=0)
 
-        # Manually share y-axes
-        if not args.larger:
-            axes[1].sharey(axes[0])
-            axes[3].sharey(axes[2])
-            plt.setp(axes[1].get_yticklabels(), visible=False)
-            plt.setp(axes[3].get_yticklabels(), visible=False)
+        # Set unified y-axis and hide unnecessary tick labels
+        if not args.separate_y_axis:
+            for j in range(1, num_models * 2):
+                plt.setp(axes[j].get_yticklabels(), visible=False)
 
         for i, model_id in enumerate(models_to_plot):
             # Knowledge Plot
@@ -498,11 +540,14 @@ def main():
                     method_df = df[df['method'] == method]
                     if not method_df.empty:
                         plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                        ax_knowledge.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=2.5)
+                        ax_knowledge.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=1.6)
             ax_knowledge.set_title(f'{model_id}: Factual Probes')
-            ax_knowledge.set_xlabel('Training Step')
+            ax_knowledge.set_xlabel('Training Steps')
             if i == 0:
                 ax_knowledge.set_ylabel('Mean Log Probability')
+            
+            if unified_ylim:
+                ax_knowledge.set_ylim(unified_ylim)
 
             # Compositional Plot
             ax_compositional = axes[i*2 + 1]
@@ -513,10 +558,13 @@ def main():
                     method_df = df[df['method'] == method]
                     if not method_df.empty:
                         plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                        ax_compositional.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=2.5)
+                        ax_compositional.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=1.6)
             ax_compositional.set_title(f'{model_id}: Compositional Probes')
-            ax_compositional.set_xlabel('Training Step')
+            ax_compositional.set_xlabel('Training Steps')
             
+            if unified_ylim:
+                ax_compositional.set_ylim(unified_ylim)
+
             # Add vertical lines for this model's plots
             max_step_ft = all_data[model_id]['max_step_ft']
             if max_step_ft > 0:
@@ -524,7 +572,7 @@ def main():
                     model_axes = [ax_knowledge, ax_compositional]
                     vline_steps = np.arange(30, max_step_ft + 1, 40)
                     for ax in model_axes:
-                        ax.axvline(x=max_step_ft, color='red', linestyle='--', linewidth=1.5, alpha=0.9)
+                        ax.axvline(x=max_step_ft, color='red', linestyle='--', linewidth=1.6, alpha=0.9)
                     for ax in model_axes:
                         for step in vline_steps:
                             ax.axvline(x=step, color='grey', linestyle='--', linewidth=1, alpha=0.7)
@@ -532,15 +580,17 @@ def main():
     if split_probes:
         handles, labels = axes[0, 0].get_legend_handles_labels()
         if handles: # Only show legend if there are items to show
-            fig.legend(handles, labels, loc='lower center', ncol=len(method_names_in_order), bbox_to_anchor=(0.5, -0.05))
+            fig.legend(handles, labels, loc='lower center', ncol=len(method_names_in_order), bbox_to_anchor=(0.5, -0.05), fontsize='medium')
     else:
-        axes[0].legend(loc='lower right', fontsize='small', title_fontsize='small')
+        handles, labels = axes[0].get_legend_handles_labels()
+        if handles:
+            axes[0].legend(handles, labels, loc='lower right', fontsize='medium', title_fontsize='medium')
 
     # --- FINAL STYLING ---
     for ax in fig.get_axes():
         ax.grid(False)
 
-    if args.larger:
+    if args.larger or args.all_three:
         fig.tight_layout()
     else:
         fig.subplots_adjust(wspace=0.25, top=0.9)

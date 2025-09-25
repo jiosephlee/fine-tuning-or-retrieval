@@ -281,7 +281,7 @@ def main():
         # Plot prior knowledge stage
         if not data['prior_knowledge'].empty:
             prior_k_plot = data['prior_knowledge'].groupby('step')['log_prob'].mean().reset_index()
-            ax_knowledge.plot(prior_k_plot['step'], prior_k_plot['log_prob'], color='grey', linestyle=':', label='Prior Knowledge Stage', lw=2.5)
+            ax_knowledge.plot(prior_k_plot['step'], prior_k_plot['log_prob'], color='grey', linestyle=':', label='Prior Knowledge Stage', lw=1.6)
             max_prior_step = prior_k_plot['step'].max()
             last_prior_point = prior_k_plot[prior_k_plot['step'] == max_prior_step]
         else:
@@ -295,7 +295,7 @@ def main():
                     plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
                     # Combine with last point of prior stage to connect lines
                     combined_plot_df = pd.concat([last_prior_point, plot_df], ignore_index=True)
-                    ax_knowledge.plot(combined_plot_df['step'], combined_plot_df['log_prob'], label=method, lw=2.5)
+                    ax_knowledge.plot(combined_plot_df['step'], combined_plot_df['log_prob'], label=method, lw=1.6)
         
         if not args.with_LIMA:
             if 'ft_only_knowledge' in data and not data['ft_only_knowledge'].empty:
@@ -303,7 +303,7 @@ def main():
                     method_df = data['ft_only_knowledge'][data['ft_only_knowledge']['method'] == method]
                     if not method_df.empty:
                         plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                        ax_knowledge.plot(plot_df['step'], plot_df['log_prob'], linestyle='--', lw=2.5)
+                        ax_knowledge.plot(plot_df['step'], plot_df['log_prob'], linestyle='--', lw=1.6)
 
         ax_knowledge.set_title(f'{model_id}: Factual Probes')
         ax_knowledge.set_xlabel('Training Step')
@@ -317,7 +317,7 @@ def main():
         # Plot prior knowledge stage
         if not data['prior_inference'].empty:
             prior_i_plot = data['prior_inference'].groupby('step')['log_prob'].mean().reset_index()
-            ax_inference.plot(prior_i_plot['step'], prior_i_plot['log_prob'], color='grey', linestyle=':', lw=2.5)
+            ax_inference.plot(prior_i_plot['step'], prior_i_plot['log_prob'], color='grey', linestyle=':', lw=1.6)
             max_prior_step = prior_i_plot['step'].max()
             last_prior_point = prior_i_plot[prior_i_plot['step'] == max_prior_step]
         else:
@@ -330,7 +330,7 @@ def main():
                 if not method_df.empty:
                     plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
                     combined_plot_df = pd.concat([last_prior_point, plot_df], ignore_index=True)
-                    ax_inference.plot(combined_plot_df['step'], combined_plot_df['log_prob'], label=method, lw=2.5)
+                    ax_inference.plot(combined_plot_df['step'], combined_plot_df['log_prob'], label=method, lw=1.6)
 
         if not args.with_LIMA:
             if 'ft_only_inference' in data and not data['ft_only_inference'].empty:
@@ -338,7 +338,7 @@ def main():
                     method_df = data['ft_only_inference'][data['ft_only_inference']['method'] == method]
                     if not method_df.empty:
                         plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                        ax_inference.plot(plot_df['step'], plot_df['log_prob'], linestyle='--', lw=2.5)
+                        ax_inference.plot(plot_df['step'], plot_df['log_prob'], linestyle='--', lw=1.6)
 
         ax_inference.set_title(f'{model_id}: Compositional Probes')
         ax_inference.set_xlabel('Training Step')
@@ -354,14 +354,14 @@ def main():
     legend_elements = []
     if not args.with_LIMA:
         legend_elements.extend([
-            Line2D([0], [0], color='black', linestyle='-', label='With Prior Knowledge', lw=2.5),
-            Line2D([0], [0], color='black', linestyle='--', label='Without Prior Knowledge', lw=2.5)
+            Line2D([0], [0], color='black', linestyle='-', label='With Prior Knowledge', lw=1.6),
+            Line2D([0], [0], color='black', linestyle='--', label='Without Prior Knowledge', lw=1.6)
         ])
-    legend_elements.append(Line2D([0], [0], color='grey', linestyle=':', label='Prior Knowledge Stage', lw=2.5))
+    legend_elements.append(Line2D([0], [0], color='grey', linestyle=':', label='Prior Knowledge Stage', lw=1.6))
     
     # Add method colors to legend
     for i, method_name in enumerate(method_names_in_order):
-        legend_elements.append(Line2D([0], [0], color=color_palette[i], label=method_name, lw=2.5))
+        legend_elements.append(Line2D([0], [0], color=color_palette[i], label=method_name, lw=1.6))
 
     axes[1].legend(handles=legend_elements, loc='lower right', fontsize='small', title_fontsize='small')
 
