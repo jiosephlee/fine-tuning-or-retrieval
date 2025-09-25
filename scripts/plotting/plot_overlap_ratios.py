@@ -117,7 +117,7 @@ def main():
                 if overlap not in knowledge_df['overlap'].unique(): continue
                 method_df = knowledge_df[knowledge_df['overlap'] == overlap]
                 plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                ax.plot(plot_df['step'], plot_df['log_prob'], linestyle='-', color=color_map[overlap], label=overlap_labels.get(overlap, overlap))
+                ax.plot(plot_df['step'], plot_df['log_prob'], linestyle='-', color=color_map[overlap], label=overlap_labels.get(overlap, overlap), lw=2.5)
         
         # --- Compositional (Inference) Probes ---
         if all_data[model_id][data_type]['inference']:
@@ -128,7 +128,7 @@ def main():
                 if overlap not in inference_df['overlap'].unique(): continue
                 method_df = inference_df[inference_df['overlap'] == overlap]
                 plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                ax.plot(plot_df['step'], plot_df['log_prob'], linestyle='--', color=color_map[overlap])
+                ax.plot(plot_df['step'], plot_df['log_prob'], linestyle='--', color=color_map[overlap], lw=2.5)
         
         ax.set_title(f'{model_id}: {data_type}')
         ax.set_xlabel('Training Step')
@@ -140,8 +140,8 @@ def main():
 
     # Custom legend for line styles
     from matplotlib.lines import Line2D
-    legend_elements = [Line2D([0], [0], color='black', lw=2, linestyle='-', label='Factual'),
-                       Line2D([0], [0], color='black', lw=2, linestyle='--', label='Compositional')]
+    legend_elements = [Line2D([0], [0], color='black', lw=2.5, linestyle='-', label='Factual'),
+                       Line2D([0], [0], color='black', lw=2.5, linestyle='--', label='Compositional')]
     fig.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, 0), ncol=2, title="Probe Type")
 
     fig.tight_layout(rect=[0, 0.05, 1, 1]) # Adjust layout to make space for custom legend

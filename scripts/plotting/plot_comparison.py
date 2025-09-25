@@ -309,7 +309,7 @@ def main():
     split_probes = args.split_probes
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
     methods = [
-        ('para9_expl', 'Para. + Multiview', 'sep_1_dclm'),
+        ('para9_expl', 'Para. + Aux. Views', 'sep_1_dclm'),
         ('para9', 'Para.', 'sep_1_dclm'),
         ('source_only', 'Source', 'sep_1_dclm'),
     ]
@@ -395,7 +395,7 @@ def main():
                     method_df = df[df['method'] == method]
                     if not method_df.empty:
                         plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                        ax_agg.plot(plot_df['step'], plot_df['log_prob'], label=method)
+                        ax_agg.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=2.5)
             ax_agg.set_title(f'{probe_name} ({total_probes} Probes)')
 
             # Subplots for split probes by origin
@@ -415,7 +415,7 @@ def main():
                             method_df = origin_df[origin_df['method'] == method]
                             if not method_df.empty:
                                 plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                                ax.plot(plot_df['step'], plot_df['log_prob'], label=method)
+                                ax.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=2.5)
                 
                 title = f"{base_title[:-1]}: {num_probes})"
                 ax.set_title(title)
@@ -498,7 +498,7 @@ def main():
                     method_df = df[df['method'] == method]
                     if not method_df.empty:
                         plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                        ax_knowledge.plot(plot_df['step'], plot_df['log_prob'], label=method)
+                        ax_knowledge.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=2.5)
             ax_knowledge.set_title(f'{model_id}: Factual Probes')
             ax_knowledge.set_xlabel('Training Step')
             if i == 0:
@@ -513,7 +513,7 @@ def main():
                     method_df = df[df['method'] == method]
                     if not method_df.empty:
                         plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                        ax_compositional.plot(plot_df['step'], plot_df['log_prob'], label=method)
+                        ax_compositional.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=2.5)
             ax_compositional.set_title(f'{model_id}: Compositional Probes')
             ax_compositional.set_xlabel('Training Step')
             
