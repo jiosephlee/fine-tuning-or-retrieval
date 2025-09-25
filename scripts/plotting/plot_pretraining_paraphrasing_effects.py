@@ -77,7 +77,7 @@ def get_paraphrasing_data(model_size, domains, project_root):
     """
     data = {'knowledge': [], 'inference': []}
     paraphrase_types = [('para4', 'Para. 4'), ('para9', 'Para. 9'), ('para19', 'Para. 19')]
-    if model_size == '7b':
+    if model_size == '1b' or model_size == '7b':
         paraphrase_types.append(('para49', 'Para. 49'))
 
     for p_type, p_name in paraphrase_types:
@@ -114,23 +114,23 @@ def plot_epoch_comparison(ax, k_df, i_df, source_color, para_color):
     k_source_df = k_df[k_df['pretraining_type'] == 'source_only']
     if not k_source_df.empty:
         plot_df = k_source_df.groupby('step')['log_prob'].mean().reset_index()
-        ax.plot(plot_df['step'], plot_df['log_prob'], color=source_color, linestyle='-')
+        ax.plot(plot_df['step'], plot_df['log_prob'], color=source_color, linestyle='-', lw=2.5)
 
     k_para_df = k_df[k_df['pretraining_type'] == 'para9']
     if not k_para_df.empty:
         plot_df = k_para_df.groupby('step')['log_prob'].mean().reset_index()
-        ax.plot(plot_df['step'], plot_df['log_prob'], color=para_color, linestyle='-')
+        ax.plot(plot_df['step'], plot_df['log_prob'], color=para_color, linestyle='-', lw=2.5)
 
     # Compositional - dashed
     i_source_df = i_df[i_df['pretraining_type'] == 'source_only']
     if not i_source_df.empty:
         plot_df = i_source_df.groupby('step')['log_prob'].mean().reset_index()
-        ax.plot(plot_df['step'], plot_df['log_prob'], color=source_color, linestyle='--')
+        ax.plot(plot_df['step'], plot_df['log_prob'], color=source_color, linestyle='--', lw=2.5)
 
     i_para_df = i_df[i_df['pretraining_type'] == 'para9']
     if not i_para_df.empty:
         plot_df = i_para_df.groupby('step')['log_prob'].mean().reset_index()
-        ax.plot(plot_df['step'], plot_df['log_prob'], color=para_color, linestyle='--')
+        ax.plot(plot_df['step'], plot_df['log_prob'], color=para_color, linestyle='--', lw=2.5)
 
 def plot_paraphrasing_data(ax, df, title, ylabel, show_legend=False):
     """
@@ -153,7 +153,7 @@ def plot_paraphrasing_data(ax, df, title, ylabel, show_legend=False):
         if method in df['method'].unique():
             method_df = df[df['method'] == method]
             plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-            ax.plot(plot_df['step'], plot_df['log_prob'], label=method, color=color_map.get(method))
+            ax.plot(plot_df['step'], plot_df['log_prob'], label=method, color=color_map.get(method), lw=2.5)
     
     ax.set_title(title)
     ax.set_xlabel('Training Steps')
@@ -228,7 +228,7 @@ def main():
             
             plot_epoch_comparison(ax, k_df_epoch, i_df_epoch, source_color, para_color)
             
-            ax.set_title(f'{epoch} Exposures')
+            ax.set_title(f'7B: {epoch} Exposures')
             ax.set_xlabel('Training Steps')
             ax.set_xlim(0, max_steps)
             ax.grid(True)
@@ -244,10 +244,10 @@ def main():
             plt.setp(axes[0, i].get_yticklabels(), visible=False)
 
         legend_elements = [
-            Line2D([0], [0], color=para_color, lw=2, label='Para.'),
-            Line2D([0], [0], color=source_color, lw=2, label='Source'),
-            Line2D([0], [0], color='black', linestyle='-', label='Factual'),
-            Line2D([0], [0], color='black', linestyle='--', label='Compositional')
+            Line2D([0], [0], color=para_color, lw=2.5, label='Para.'),
+            Line2D([0], [0], color=source_color, lw=2.5, label='Source'),
+            Line2D([0], [0], color='black', linestyle='-', lw=2.5, label='Factual'),
+            Line2D([0], [0], color='black', linestyle='--', lw=2.5, label='Compositional')
         ]
         axes[0, -1].legend(handles=legend_elements, loc='lower right', fontsize='large')
 
