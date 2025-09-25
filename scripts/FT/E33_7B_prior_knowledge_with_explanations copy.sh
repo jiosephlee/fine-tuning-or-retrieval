@@ -3,6 +3,7 @@ num_paraphrased=9
 python finetuning_knowledge_v8.py \
     --model_id jiosephlee/prior_6_papers_25_epochs_7B \
     --device_batch_size 4 \
+    --with_explanations \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --effective_batch_size_for_cpt 32 \
     --separate_batches_with_pretraining 1 \
