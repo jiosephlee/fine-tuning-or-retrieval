@@ -84,7 +84,7 @@ def main():
             for method in sorted(knowledge_df['method'].unique()):
                 method_df = knowledge_df[knowledge_df['method'] == method]
                 plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                ax_knowledge.plot(plot_df['step'], plot_df['log_prob'], label=method)
+                ax_knowledge.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=2.5)
             ax_knowledge.set_title(f'{model_id}: Factual Probes')
         else:
             ax_knowledge.set_title(f'{model_id}: Factual Probes (No Data)')
@@ -101,7 +101,7 @@ def main():
             for method in sorted(inference_df['method'].unique()):
                 method_df = inference_df[inference_df['method'] == method]
                 plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
-                ax_inference.plot(plot_df['step'], plot_df['log_prob'], label=method)
+                ax_inference.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=2.5)
             ax_inference.set_title(f'{model_id}: Compositional Probes')
         else:
             ax_inference.set_title(f'{model_id}: Compositional Probes (No Data)')
