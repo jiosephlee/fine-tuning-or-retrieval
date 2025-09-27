@@ -18,14 +18,14 @@ def transform_to_exposure_steps(df, strategy_name):
         return df
     
     df = df.copy()
-    if 'With No Data Replay' in strategy_name:
+    if strategy_name == 'With No Data Replay' or 'fill' in strategy_name:
         # Each step is an exposure
         df['Exposure Steps'] = df['step']
-    elif '(1:1)' in strategy_name:
+    elif 'With Data Replay (1:1)' in strategy_name:
         # Exposure at step 0, then every 2 steps starting from 1 (0, 1, 3, 5...)
         df = df[(df['step'] == 0) | ((df['step'] > 0) & ((df['step'] - 1) % 2 == 0))].copy()
         df['Exposure Steps'] = (df['step'] + 1) // 2
-    elif '(1:5)' in strategy_name:
+    elif 'With Data Replay (1:5)' in strategy_name:
         # Exposure at step 0, then every 6 steps starting from 1 (0, 1, 7, 13...)
         df = df[(df['step'] == 0) | ((df['step'] > 0) & ((df['step'] - 1) % 6 == 0))].copy()
         df['Exposure Steps'] = (df['step'] - 1) // 6 + 1

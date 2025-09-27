@@ -511,14 +511,20 @@ def main():
                 padding = (y_max - y_min) * 0.05
                 unified_ylim = (y_min - padding, y_max + padding)
 
-        fig, axes = plt.subplots(1, num_models * 2, figsize=(8 * num_models, 4))
+        if args.larger and not args.all_three:
+            fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        else:
+            fig, axes = plt.subplots(1, num_models * 2, figsize=(8 * num_models, 4))
         
         # Add shading before plotting if LIMA is off
         if not args.with_LIMA:
             for i, model_id in enumerate(models_to_plot):
                 max_step_ft_model = all_data[model_id]['max_step_ft']
                 if max_step_ft_model > 0:
-                    model_axes = [axes[i*2], axes[i*2 + 1]]
+                    if args.larger and not args.all_three:
+                        model_axes = [axes[i, 0], axes[i, 1]]
+                    else:
+                        model_axes = [axes[i*2], axes[i*2 + 1]]
                     vline_steps = np.arange(30, max_step_ft_model + 1, 40)
                     for step in vline_steps:
                         start_shade = step - 5
@@ -531,12 +537,19 @@ def main():
 
         # Set unified y-axis and hide unnecessary tick labels
         if not args.separate_y_axis:
-            for j in range(1, num_models * 2):
-                plt.setp(axes[j].get_yticklabels(), visible=False)
+            if args.larger and not args.all_three:
+                plt.setp(axes[0, 1].get_yticklabels(), visible=False)
+                plt.setp(axes[1, 1].get_yticklabels(), visible=False)
+            else:
+                for j in range(1, num_models * 2):
+                    plt.setp(axes[j].get_yticklabels(), visible=False)
 
         for i, model_id in enumerate(models_to_plot):
             # Knowledge Plot
-            ax_knowledge = axes[i*2]
+            if args.larger and not args.all_three:
+                ax_knowledge = axes[i, 0]
+            else:
+                ax_knowledge = axes[i*2]
             ax_knowledge.set_prop_cycle(color=color_palette)
             df = all_data[model_id]['knowledge']
             if df is not None and not df.empty:
@@ -546,15 +559,24 @@ def main():
                         plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
                         ax_knowledge.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=1.6)
             ax_knowledge.set_title(f'{model_id}: Factual Probes')
-            ax_knowledge.set_xlabel('Training Steps')
-            if i == 0:
+
+            if args.larger and not args.all_three:
+                if i == len(models_to_plot) - 1:
+                    ax_knowledge.set_xlabel('Training Steps')
                 ax_knowledge.set_ylabel('Mean Log Probability')
+            else:
+                ax_knowledge.set_xlabel('Training Steps')
+                if i == 0:
+                    ax_knowledge.set_ylabel('Mean Log Probability')
             
             if unified_ylim:
                 ax_knowledge.set_ylim(unified_ylim)
 
             # Compositional Plot
-            ax_compositional = axes[i*2 + 1]
+            if args.larger and not args.all_three:
+                ax_compositional = axes[i, 1]
+            else:
+                ax_compositional = axes[i*2 + 1]
             ax_compositional.set_prop_cycle(color=color_palette)
             df = all_data[model_id]['inference']
             if df is not None and not df.empty:
@@ -564,7 +586,11 @@ def main():
                         plot_df = method_df.groupby('step')['log_prob'].mean().reset_index()
                         ax_compositional.plot(plot_df['step'], plot_df['log_prob'], label=method, lw=1.6)
             ax_compositional.set_title(f'{model_id}: Compositional Probes')
-            ax_compositional.set_xlabel('Training Steps')
+            if args.larger and not args.all_three:
+                if i == len(models_to_plot) - 1:
+                    ax_compositional.set_xlabel('Training Steps')
+            else:
+                ax_compositional.set_xlabel('Training Steps')
             
             if unified_ylim:
                 ax_compositional.set_ylim(unified_ylim)
@@ -573,7 +599,10 @@ def main():
             max_step_ft = all_data[model_id]['max_step_ft']
             if max_step_ft > 0:
                 if args.with_LIMA:
-                    model_axes = [ax_knowledge, ax_compositional]
+                    if args.larger and not args.all_three:
+                        model_axes = [ax_knowledge, ax_compositional]
+                    else:
+                        model_axes = [axes[i*2], axes[i*2 + 1]]
                     vline_steps = np.arange(30, max_step_ft + 1, 40)
                     for ax in model_axes:
                         ax.axvline(x=max_step_ft, color='red', linestyle='--', linewidth=1.6, alpha=0.9)
@@ -586,9 +615,14 @@ def main():
         if handles: # Only show legend if there are items to show
             fig.legend(handles, labels, loc='lower center', ncol=len(method_names_in_order), bbox_to_anchor=(0.5, -0.05), fontsize='medium')
     else:
-        handles, labels = axes[0].get_legend_handles_labels()
-        if handles:
-            axes[0].legend(handles, labels, loc='lower right', fontsize='medium', title_fontsize='medium')
+        if args.larger and not args.all_three:
+            handles, labels = axes[0, 0].get_legend_handles_labels()
+            if handles:
+                axes[0, 0].legend(handles, labels, loc='lower right', fontsize='medium', title_fontsize='medium')
+        else:
+            handles, labels = axes[0].get_legend_handles_labels()
+            if handles:
+                axes[0].legend(handles, labels, loc='lower right', fontsize='medium', title_fontsize='medium')
 
     # --- FINAL STYLING ---
     for ax in fig.get_axes():

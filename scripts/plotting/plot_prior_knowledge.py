@@ -61,7 +61,8 @@ def get_model_data(model_id, prior_knowledge_path, ft_methods, domains, project_
         if model_id == '1B':
             run_path = base_path_template.format(method_key=method_key)
         else: # 7B
-            run_path = base_path_template
+            base_path = base_path_template
+            run_path = find_latest_run_path(base_path)
 
         if run_path and os.path.isdir(run_path):
             # Knowledge Probes
@@ -89,7 +90,10 @@ def get_model_data(model_id, prior_knowledge_path, ft_methods, domains, project_
                     lima_inference_df['method'] = method_name
                     all_methods_lima_inference_data.append(lima_inference_df)
         else:
-            print(f"  - Warning: Run path not found or invalid for {model_id} {method_key} at {run_path}")
+            if model_id == '1B':
+                print(f"  - Warning: Run path not found or invalid for {model_id} {method_key} at {run_path}")
+            else:
+                print(f"  - Warning: Run path not found or invalid for {model_id} {method_key} at {base_path}")
 
     final_knowledge_df = pd.concat(all_methods_knowledge_data, ignore_index=True) if all_methods_knowledge_data else pd.DataFrame()
     final_inference_df = pd.concat(all_methods_inference_data, ignore_index=True) if all_methods_inference_data else pd.DataFrame()
@@ -185,14 +189,15 @@ def main():
     
     prior_knowledge_paths = {
         '1B': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/prior_knowledge/full/1b/probes_v9/domains_all/e50/run',
-        '7B': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/prior_knowledge/full/7b/probes_v9/fill_dclm/domains_all/e50/bs256_lr4e-05/09_20_20_34'
+        '7B': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/prior_knowledge/full/7b/probes_v9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e20/bs256_lr2e-05/09_24_11_58'
     }
 
     ft_base_paths = {
         '1B': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/jiosephlee_6_papers_50_epochs/probes_v9/newline2/{method_key}/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/run',
         '7B': {
-            'para9': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/jiosephlee_prior_6_papers_50_epochs_7B/probes_v9/newline2/para9/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/09_22_00_24',
-            'source_only': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/jiosephlee_prior_6_papers_50_epochs_7B/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/09_22_00_24'
+            'para9': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/jiosephlee_prior_6_papers_20_epochs_7B/probes_v9/newline2/para9/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4',
+            'para9_expl': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/jiosephlee_prior_6_papers_20_epochs_7B/probes_v9/newline2/para9_expl/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4',
+            'source_only': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/jiosephlee_prior_6_papers_20_epochs_7B/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4'
         }
     }
     
@@ -208,7 +213,7 @@ def main():
     ]
     
     method_names_in_order = [m[1] for m in methods]
-    color_palette = ['#1f77b4', '#2ca02c', '#ff7f0e']
+    color_palette = ['#2ca02c', '#ff7f0e', '#1f77b4']
 
     domains_path = os.path.join(project_root, 'data/arxiv/cleaned')
     try:
