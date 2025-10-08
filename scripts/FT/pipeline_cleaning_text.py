@@ -398,6 +398,7 @@ def delete_miscellaneous_latex_syntax(text: str) -> str:
     # Remove \noindent and \newline commands.
     cleaned_text = re.sub(r'\\noindent', '', cleaned_text)
     cleaned_text = re.sub(r'\\newline', '', cleaned_text)
+    cleaned_text = re.sub(r'\\xspace', '', cleaned_text)
 
     # Remove optional arguments from itemize environments.
     # cleaned_text = re.sub(r'(\\begin\{itemize\})\[.*?\]', r'\1', cleaned_text)
@@ -616,6 +617,70 @@ def clean_latex(latex_content: str, debug_dir: str = None) -> str:
 
     return final_cleaned_text.strip()
 
+def clean_latex_semicleaned_v3(latex_content: str, debug_dir: str = None) -> str:
+    """
+    Performs the full cleaning process, but keeps figures and tables.
+    If a `debug_dir` is provided, it saves the state of the text after each step.
+    """
+    def save_debug_file(step_num, step_name, content):
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            file_path = os.path.join(debug_dir, f"{step_num}_{step_name}.txt")
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+    step = 1
+    
+    # --- Step 1: Extract definitions from the original text before any cleaning ---
+    definitions, skipped_commands = extract_newcommands(latex_content)
+    
+    # --- Pre-processing ---
+    cleaned_content = remove_latex_comments(latex_content)
+    save_debug_file(step, "1_remove_comments", cleaned_content); step += 1
+
+    cleaned_content = re.sub(r'\\vspace\*?\{.*?\}', '', cleaned_content)
+    save_debug_file(step, "2_remove_vspace", cleaned_content); step += 1
+
+    cleaned_content = delete_begin_group_special_cases(cleaned_content)
+    save_debug_file(step, "3_delete_begingroup", cleaned_content); step += 1
+
+    cleaned_content = apply_newcommands_from_dict(cleaned_content, definitions, skipped_commands)
+    save_debug_file(step, "4_apply_newcommands", cleaned_content); step += 1
+
+    # --- Content Extraction ---
+    title = extract_and_clean_title(cleaned_content)
+    abstract = extract_abstract(cleaned_content)
+    body = extract_main_body(cleaned_content)
+    
+    # --- Reconstruction & Command Application ---
+    full_text = f'\\title{{{title}}}\n\n\\begin{{abstract}}\n{abstract}\n\\end{{abstract}}\n\n{body}\n\\end{{document}}'
+    save_debug_file(step, "5_reconstruct_text", full_text); step += 1
+
+    # --- Post-processing on Reconstructed Text ---
+    cleaned_text = process_all_rev_commands(full_text)
+    save_debug_file(step, "6_process_rev_commands", cleaned_text); step += 1
+
+    cleaned_text = delete_miscellaneous_latex_syntax(cleaned_text)
+    save_debug_file(step, "7_delete_misc_syntax_post_commands", cleaned_text); step += 1
+    
+    cleaned_text = re.sub(r'\\clearpage|\\newpage', '', cleaned_text)
+    # Remove lines that contain only spaces or tabs, turning them into empty lines.
+    cleaned_text = re.sub(r'^[ \t]+$', '', cleaned_text, flags=re.MULTILINE)
+    cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
+    save_debug_file(step, "8_remove_pagebreaks_newlines", cleaned_text); step += 1
+
+    # --- Final text conditioning ---
+    final_cleaned_text = rejoin_words_in_unprotected_environments(cleaned_text)
+    save_debug_file(step, "9_rejoin_words_multi_newline", final_cleaned_text); step += 1
+
+    final_cleaned_text = rejoin_words_in_unprotected_environments(final_cleaned_text, single_newline=True)
+    save_debug_file(step, "10_rejoin_words_single_newline", final_cleaned_text); step += 1
+
+    final_cleaned_text = ensure_space_around_environments(final_cleaned_text)
+    save_debug_file(step, "11_ensure_space_around_envs", final_cleaned_text); step += 1
+
+    return final_cleaned_text.strip()
+
 def clean_latex_semicleaned_v1(latex_content: str) -> str:
     """
     Performs basic cleaning: removes comments and extracts document structure.
@@ -646,7 +711,7 @@ raw_arxiv_dir = '../../data/arxiv/raw'
 all_files = [f for f in os.listdir(raw_arxiv_dir) if os.path.isfile(os.path.join(raw_arxiv_dir, f))]
 
 # Manual list to exclude certain files we don't want to process
-exclude_files = ['BOFT.tex', 'GRPO.tex','DPO.text','OFT.tex']  # Add files to exclude here
+exclude_files = [] #['BOFT.tex', 'GRPO.tex','DPO.text','OFT.tex']  # Add files to exclude here
 
 # Filter out excluded files
 files_to_process = [f for f in all_files if f not in exclude_files]
@@ -663,9 +728,10 @@ for file_name in files_to_process:
 
 # Define the different cleaning levels and their corresponding functions
 cleaning_configs = {
-    'semicleaned_v1': clean_latex_semicleaned_v1,
-    'semicleaned_v2': clean_latex_semicleaned_v2,
-    'cleaned': clean_latex
+    # 'semicleaned_v1': clean_latex_semicleaned_v1,
+    # 'semicleaned_v2': clean_latex_semicleaned_v2,
+    'semicleaned_v3': clean_latex_semicleaned_v3,
+    # 'cleaned': clean_latex
 }
 
 for dir_name, clean_function in cleaning_configs.items():

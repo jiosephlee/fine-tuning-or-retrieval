@@ -566,7 +566,7 @@ if __name__ == "__main__":
     parser.add_argument("--device_batch_size", type=int, default=2, help="The batch size per device.")
     parser.add_argument("--context_length_for_cpt", type=int, default=3072, help="Context length for continued pretraining.")
     parser.add_argument("--context_length_for_lima", type=int, default=2560, help="Context length for LIMA training.")
-    parser.add_argument("--semi_cleaned", type=str, default=None, choices=['v1', 'v2'], help="Use semi-cleaned data from a specific version (v1 or v2).")
+    parser.add_argument("--semi_cleaned", type=str, default=None, choices=['v1', 'v2','v3'], help="Use semi-cleaned data from a specific version (v1 or v2).")
 
     args = parser.parse_args()
 
