@@ -83,6 +83,8 @@ def construct_experiment_name(args):
 
     # 8. Batch size and learning rate
     training_params = f"bs{args.effective_batch_size_for_cpt}_lr{args.learning_rate:g}"
+    if args.constant_lr:
+        training_params += "_const"
 
     # 9. Overlap ratio
     if args.overlap_sections:
@@ -356,24 +358,31 @@ def continue_pretraining(model, tokenizer, log, args):
     grad_accum_steps = args.effective_batch_size_for_cpt // args.device_batch_size
 
     # --- Continued Pretraining Configuration ---
-    training_config = llm_configs.TrainingConfig(
-        run_name = args.experiment_name,
-        num_train_epochs=args.num_train_epochs,
-        learning_rate=args.learning_rate,
-        logging_steps=1,
-        gradient_checkpointing=False,
-        per_device_train_batch_size=args.device_batch_size,
-        context_length = args.context_length_for_cpt,
-        weight_decay=0.1,
-        gradient_accumulation_steps=grad_accum_steps,
-        warmup_ratio = 0.1, 
-        sequential_sampling = True,
-        reverse_ffd_packing= False,
-        remove_unused_columns=False,
-        packing = False,
-        padding_free = False,
-        report_to="wandb" if not args.test_script else "none",
-    )
+    training_config_kwargs = {
+        "run_name": args.experiment_name,
+        "num_train_epochs": args.num_train_epochs,
+        "learning_rate": args.learning_rate,
+        "logging_steps": 1,
+        "gradient_checkpointing": False,
+        "per_device_train_batch_size": args.device_batch_size,
+        "context_length": args.context_length_for_cpt,
+        "weight_decay": 0.1,
+        "gradient_accumulation_steps": grad_accum_steps,
+        "sequential_sampling": True,
+        "reverse_ffd_packing": False,
+        "remove_unused_columns": False,
+        "packing": False,
+        "padding_free": False,
+        "report_to": "wandb" if not args.test_script else "none",
+    }
+    if args.constant_lr:
+        training_config_kwargs["warmup_ratio"] = 0.0
+        training_config_kwargs["lr_scheduler_type"] = "constant"
+    else:
+        training_config_kwargs["warmup_ratio"] = 0.1
+    
+    training_config = llm_configs.TrainingConfig(**training_config_kwargs)
+
     # --- Load Probe Data ---
     callbacks_to_use = setup_callbacks(
         domains=args.override_domains, 
@@ -446,28 +455,34 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
     grad_accum_steps = args.effective_batch_size_for_lima // args.device_batch_size
     
     # --- LIMA Training Configuration ---
-    lima_training_config = llm_configs.TrainingConfig(
-        run_name = args.experiment_name + "_LIMA",
-        num_train_epochs=num_train_epochs,
-        learning_rate=2e-5,
-        logging_strategy = "steps",
-        logging_steps = 1,
-        gradient_checkpointing=False,
-        context_length = args.context_length_for_lima,
-        gradient_accumulation_steps=grad_accum_steps,
-        warmup_ratio = 0.1,
-        per_device_train_batch_size=args.device_batch_size,
-        weight_decay=0.1,
-        use_liger_kernel=True,
-        sequential_sampling = False,
-        reverse_ffd_packing= False,
-        remove_unused_columns=False,
-        packing = True,
-        padding_free = True,
-        dataset_text_field="text",
-        report_to="wandb" if not args.test_script else "none",
-    )
-    
+    lima_training_config_kwargs = {
+        "run_name": args.experiment_name + "_LIMA",
+        "num_train_epochs": num_train_epochs,
+        "learning_rate": 2e-5,
+        "logging_strategy": "steps",
+        "logging_steps": 1,
+        "gradient_checkpointing": False,
+        "context_length": args.context_length_for_lima,
+        "gradient_accumulation_steps": grad_accum_steps,
+        "per_device_train_batch_size": args.device_batch_size,
+        "weight_decay": 0.1,
+        "use_liger_kernel": True,
+        "sequential_sampling": False,
+        "reverse_ffd_packing": False,
+        "remove_unused_columns": False,
+        "packing": True,
+        "padding_free": True,
+        "dataset_text_field": "text",
+        "report_to": "wandb" if not args.test_script else "none",
+    }
+    if args.constant_lr:
+        lima_training_config_kwargs["warmup_ratio"] = 0.0
+        lima_training_config_kwargs["lr_scheduler_type"] = "constant"
+    else:
+        lima_training_config_kwargs["warmup_ratio"] = 0.1
+        
+    lima_training_config = llm_configs.TrainingConfig(**lima_training_config_kwargs)
+
     # --- Load Probes ---
     # Note 1: We track the DPO knowledge probes, DPO inference probes in OG & Q&A format, and generative recall in Q&A format
     # NOte 2: Since we are retracking some of the same probes, we need to make sure they are in separate folders and different prefixes for WandDB
@@ -540,6 +555,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--full_finetuning", default=False, action="store_true")
     parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--constant_lr", action="store_true", help="Use constant learning rate instead of a scheduler.")
     parser.add_argument("--knowledge_probes_version", type=str, default="v9", help="Version of the knowledge probes to use.")
     parser.add_argument("--inference_probes_version", type=str, default="v6", help="Version of the inference probes to use.")
     parser.add_argument("--num_paraphrased_texts", type=int, default=9, help="Number of paraphrased texts to use for training (0-9)")
