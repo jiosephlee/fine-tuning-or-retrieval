@@ -573,6 +573,12 @@ if __name__ == "__main__":
     parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
     parser.add_argument("--test_script", action="store_true", help="Run in test mode with a small model and minimal epochs.")
 
+    # Lora arguments
+    parser.add_argument("--lora_r", type=int, default=16, help="LoRA r parameter.")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha parameter.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout parameter.")
+    parser.add_argument("--lora_target_modules", type=str, nargs='+', default=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'], help="LoRA target modules.")
+
     # New arguments for multi-domain training
     parser.add_argument("--override_domains", type=str, nargs='+', default=None, help="A list of domains to override the default (all domains).")
     parser.add_argument("--fill_batches_with_pretraining", default=False, action="store_true", help="Fill batches with pretraining data.")
@@ -627,18 +633,30 @@ if __name__ == "__main__":
         attn_implementation = "flash_attention_3"
     else:
         attn_implementation = "flash_attention_2"
+    
+    peft_config = llm_configs.PeftConfig(
+        enabled=(not args.full_finetuning),
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=args.lora_target_modules,
+        instruction_tuning=False,
+        add_eot_token=args.lima_afterwards
+    )
+    
     model_config = llm_configs.ModelConfig(
         id= args.model_id, #"allenai/OLMo-2-0425-1B", #"allenai/OLMo-2-1124-7B",
-        peft=llm_configs.PeftConfig(
-            enabled=(not args.full_finetuning),
-            instruction_tuning=False,
-        ),
+        peft=peft_config,
         quantization=llm_configs.QuantizationConfig(mode=None),
         attn_implementation=attn_implementation,
     )
 
     log.info("\n--- Loading Model for Training ---")
-    model, tokenizer = model_setup.load_model_for_training(model_config, log, add_special_token="<|EOT|>", use_existing_lima_tokenizer =False, use_existing_lima_model=False)
+    special_token_to_add = "<|EOT|>" if args.lima_afterwards else None
+    model, tokenizer = model_setup.load_model_for_training(model_config, log, add_special_token=special_token_to_add, use_existing_lima_tokenizer =False, use_existing_lima_model=False)
+
+    if not args.full_finetuning:
+        model.print_trainable_parameters()
 
     if args.compile_model:
         log.info("Compiling model...")

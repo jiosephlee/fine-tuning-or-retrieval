@@ -13,6 +13,7 @@ accelerate launch --config_file deepspeed_4gpus.yaml finetuning_knowledge_v8.py 
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
     --overlap_ratio 1_4 \
+    --gradient_checkpointing \
     --full_finetuning > output_47_if_it_fails.log 
 
 
