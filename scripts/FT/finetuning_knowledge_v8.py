@@ -8,6 +8,7 @@
 import os
 import sys
 import json
+import torch
 from datetime import datetime
 sys.path.append('../..')
 import pandas as pd
@@ -363,7 +364,7 @@ def continue_pretraining(model, tokenizer, log, args):
         "num_train_epochs": args.num_train_epochs,
         "learning_rate": args.learning_rate,
         "logging_steps": 1,
-        "gradient_checkpointing": False,
+        "gradient_checkpointing": args.gradient_checkpointing,
         "per_device_train_batch_size": args.device_batch_size,
         "context_length": args.context_length_for_cpt,
         "weight_decay": 0.1,
@@ -461,7 +462,7 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
         "learning_rate": 2e-5,
         "logging_strategy": "steps",
         "logging_steps": 1,
-        "gradient_checkpointing": False,
+        "gradient_checkpointing": args.gradient_checkpointing,
         "context_length": args.context_length_for_lima,
         "gradient_accumulation_steps": grad_accum_steps,
         "per_device_train_batch_size": args.device_batch_size,
@@ -583,13 +584,15 @@ if __name__ == "__main__":
     parser.add_argument("--context_length_for_cpt", type=int, default=3072, help="Context length for continued pretraining.")
     parser.add_argument("--context_length_for_lima", type=int, default=2560, help="Context length for LIMA training.")
     parser.add_argument("--semi_cleaned", type=str, default=None, choices=['v1', 'v2','v3'], help="Use semi-cleaned data from a specific version (v1 or v2).")
+    parser.add_argument("--fa3", action="store_true", help="Use flash attention 3.")
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
+    parser.add_argument("--compile_model", action="store_true", help="Enable torch.compile for the model.")
 
     args = parser.parse_args()
 
     # --- Argument Validation ---
     if args.with_explanations and args.with_specific_explanation:
         raise ValueError("Cannot use both --with_explanations and --with_specific_explanation. Please choose one.")
-
     # --- Setup Logging & Wandb ---
     logging.basicConfig(
         level=logging.INFO,
@@ -620,6 +623,10 @@ if __name__ == "__main__":
     log.info(f"Hyperparameters saved to {hyperparameters_path}")
 
     # --- Load the model ---
+    if args.fa3:
+        attn_implementation = "flash_attention_3"
+    else:
+        attn_implementation = "flash_attention_2"
     model_config = llm_configs.ModelConfig(
         id= args.model_id, #"allenai/OLMo-2-0425-1B", #"allenai/OLMo-2-1124-7B",
         peft=llm_configs.PeftConfig(
@@ -627,10 +634,15 @@ if __name__ == "__main__":
             instruction_tuning=False,
         ),
         quantization=llm_configs.QuantizationConfig(mode=None),
+        attn_implementation=attn_implementation,
     )
 
     log.info("\n--- Loading Model for Training ---")
     model, tokenizer = model_setup.load_model_for_training(model_config, log, add_special_token="<|EOT|>", use_existing_lima_tokenizer =False, use_existing_lima_model=False)
+
+    if args.compile_model:
+        log.info("Compiling model...")
+        model = torch.compile(model)
 
     # --- Continue Pretraining (we also evaluate our probes during this) ---
     if args.num_train_epochs > 0:

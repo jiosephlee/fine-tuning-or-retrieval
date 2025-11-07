@@ -1,8 +1,7 @@
 import torch
 from trl import SFTConfig
 from pydantic import BaseModel, Field
-import logging
-from typing import Optional, Generic, List, TypeVar, Literal
+from typing import Optional, List, TypeVar, Literal
 from transformers import (
     TrainingArguments,
 )
@@ -31,7 +30,7 @@ class ModelConfig(BaseModel):
     """Top-level configuration for the model."""
     id: str = "allenai/OLMo-2-1124-7B"
     torch_dtype: str = "auto"
-    attn_implementation: Optional[Literal["flash_attention_2"]] = "flash_attention_2"
+    attn_implementation: Optional[Literal["flash_attention_2", "flash_attention_3"]] = "flash_attention_2"
     peft: PeftConfig = Field(default_factory=PeftConfig)
     quantization: QuantizationConfig = Field(default_factory=QuantizationConfig)
     
