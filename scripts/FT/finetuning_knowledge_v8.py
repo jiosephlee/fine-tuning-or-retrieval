@@ -223,6 +223,8 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
         # --- Corpus Perplexity Callback ---
         if args.semi_cleaned:
             corpus_path = f'../../data/arxiv/semicleaned_{args.semi_cleaned}/{domain}.tex'
+        elif getattr(args, "raw", False):
+            corpus_path = f'../../data/arxiv/raw/{domain}.tex'
         else:
             corpus_path = f'../../data/arxiv/cleaned/{domain}.tex'
 
@@ -405,6 +407,7 @@ def continue_pretraining(model, tokenizer, log, args):
         "with_specific_explanation": args.with_specific_explanation,
         "times_explanations": args.times_explanations,
         "semi_cleaned": args.semi_cleaned,
+        "use_raw": args.raw if hasattr(args, "raw") else False,
     }
 
     if args.with_explanations or args.with_specific_explanation:
@@ -569,6 +572,7 @@ if __name__ == "__main__":
     parser.add_argument("--overlap_ratio", type=str, default="1_4", help="Ratio of overlap when chunking")
     parser.add_argument("--with_explanations", default=False, action="store_true", help="Use explanations when fine-tuning on paraphrased texts")
     parser.add_argument("--with_specific_explanation", type=str, default=None, choices=['blogs', 'stackexchange', 'textbook'], help="Use a specific explanation file.")
+    parser.add_argument("--raw", action="store_true", help="Use raw arXiv texts instead of cleaned/semi-cleaned.")
     parser.add_argument("--times_explanations", type=int, default=1, help="Number of times to repeat the explanation texts.")
     parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
     parser.add_argument("--test_script", action="store_true", help="Run in test mode with a small model and minimal epochs.")
