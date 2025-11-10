@@ -4,13 +4,14 @@ from openai import OpenAI
 try:
     from utils.keys import OPENAI_API_KEY, DATABRICKS_TOKEN
 except (ImportError, ModuleNotFoundError):
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
+    OPENAI_API_KEY = None
+    DATABRICKS_TOKEN = None
 
 if OPENAI_API_KEY:
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-
-client = OpenAI()
+    client = OpenAI()
+else:
+    client = None
 
 if DATABRICKS_TOKEN:
     client_safe = OpenAI(
