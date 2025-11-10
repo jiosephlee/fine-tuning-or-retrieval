@@ -6,7 +6,7 @@
 #SBATCH --time=1:00:00
 #SBATCH --gres=gpu:a100:4
 #SBATCH --partition=ai
-#SBATCH --mem-per-gpu=640GB
+#SBATCH --mem-per-gpu=160GB
 #SBATCH --job-name=E47_32B_explanations_if_it_fails
 #SBATCH --output=logs/E47_32B_explanations_if_it_fails.out
 #SBATCH --error=logs/E47_32B_explanations_if_it_fails.err
