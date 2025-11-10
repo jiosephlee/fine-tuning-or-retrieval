@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=1:00:00
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:a100:4
 #SBATCH --partition=ai
 #SBATCH --mem-per-gpu=640GB
 #SBATCH --job-name=E47_32B_explanations_if_it_fails
