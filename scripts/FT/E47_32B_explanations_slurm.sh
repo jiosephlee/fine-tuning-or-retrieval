@@ -6,7 +6,7 @@
 #SBATCH --time=1:00:00
 #SBATCH --gres=gpu:a100:1
 #SBATCH --partition=ai
-#SBATCH --mem-per-gpu=160GB
+#SBATCH --mem-per-gpu=320GB
 #SBATCH --job-name=E47_32B_explanations_if_it_fails
 #SBATCH --output=logs/E47_32B_explanations_if_it_fails.out
 #SBATCH --error=logs/E47_32B_explanations_if_it_fails.err
@@ -28,7 +28,7 @@ echo "➤ RUNNING SCRIPT INSIDE APPTAINER: ${YOUR_SIF_FILE}"
 apptainer exec --cleanenv --nv \
     --env CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES \
     ${YOUR_SIF_FILE} \
-    accelerate launch --config_file deepspeed_4gpus.yaml finetuning_knowledge_v8.py \
+    /cbica/home/leejose/.local/bin/accelerate launch --config_file deepspeed_4gpus.yaml finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-0325-32B \
     --device_batch_size 1 \
     --with_explanations \
