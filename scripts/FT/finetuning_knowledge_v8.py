@@ -636,7 +636,7 @@ if __name__ == "__main__":
     if args.fa3:
         attn_implementation = "flash_attention_3"
     else:
-        attn_implementation = "flash_attention_2"
+        attn_implementation = "sdpa"
     
     peft_config = llm_configs.PeftConfig(
         enabled=(not args.full_finetuning),
