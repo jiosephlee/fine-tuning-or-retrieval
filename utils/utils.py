@@ -1,23 +1,24 @@
-import json
-import pandas as pd
-import datasets
 import os
-import time
 from openai import OpenAI
-from utils.keys import OPENAI_API_KEY, DATABRICKS_TOKEN
 
+try:
+    from utils.keys import OPENAI_API_KEY, DATABRICKS_TOKEN
+except (ImportError, ModuleNotFoundError):
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
 
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+if OPENAI_API_KEY:
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
-client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
-
-client_safe = OpenAI(
-    api_key=DATABRICKS_TOKEN,
-    base_url="https://adb-4750903324350629.9.azuredatabricks.net/serving-endpoints"
-)
-
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 client = OpenAI()
+
+if DATABRICKS_TOKEN:
+    client_safe = OpenAI(
+        api_key=DATABRICKS_TOKEN,
+        base_url="https://adb-4750903324350629.9.azuredatabricks.net/serving-endpoints"
+    )
+else:
+    client_safe = None
 
 
 def query_llm(prompt, max_tokens=1000, temperature=0, top_p=0, max_try_num=10, model="gpt-4o-mini", debug=False, return_json=False, json_schema=None, logprobs=False, system_prompt_included=True, is_hippa=False, reasoning_effort=None):
@@ -44,7 +45,12 @@ def query_llm(prompt, max_tokens=1000, temperature=0, top_p=0, max_try_num=10, m
 
 def query_gpt(prompt: str | dict, model: str = 'gpt-4.1-mini', max_tokens: int = 4000, temperature: float = 0, top_p: float = 0, logprobs: bool = False, return_json: bool = False, json_schema = None, system_prompt_included: bool = False, reasoning_effort = 'high', is_hippa: bool = False, debug: bool = False):
     """OpenAI API wrapper; For HIPPA compliance, use client_safe e.g. model='openai-gpt-4o-high-quota-chat'"""
-    temp_client = client_safe if is_hippa else client
+    if is_hippa:
+        if client_safe is None:
+            raise ValueError("HIPPA compliance requires DATABRICKS_TOKEN to be set, but it was not found in utils.keys or environment variables.")
+        temp_client = client_safe
+    else:
+        temp_client = client
 
     if system_prompt_included:
         # Format chat prompt with system and user messages
