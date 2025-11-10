@@ -28,7 +28,7 @@ echo "➤ RUNNING SCRIPT INSIDE APPTAINER: ${YOUR_SIF_FILE}"
 apptainer exec --cleanenv --nv \
     --env CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES \
     ${YOUR_SIF_FILE} \
-    /cbica/home/leejose/.local/bin/accelerate launch --config_file deepspeed_4gpus.yaml finetuning_knowledge_v8.py \
+    /cbica/home/leejose/.local/bin/accelerate launch --config_file deepspeed.yaml finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-0325-32B \
     --device_batch_size 1 \
     --with_explanations \
