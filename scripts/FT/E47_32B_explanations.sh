@@ -13,7 +13,8 @@ accelerate launch --config_file deepspeed.yaml finetuning_knowledge_v8.py \
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
     --overlap_ratio 1_4 \
+    --gradient_checkpointing \
     --full_finetuning > output_47.log 
 
 
-# export CUDA_VISIBLE_DEVICES=2,3 to use 2 GPUs for instance. Use if_it_fails to run on 4 gpus.
+# export CUDA_VISIBLE_DEVICES=2,3 to use 2 GPUs for instance.

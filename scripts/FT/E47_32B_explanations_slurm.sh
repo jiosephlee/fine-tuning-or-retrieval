@@ -19,7 +19,7 @@ module load cuda/12.4
 
 # Define the path to your SIF file
 YOUR_SIF_FILE="/gpfs/fs001/cbica/home/leejose/joseph/pytorch-2.4.0-cuda12.4-cudnn9-devel.sif"
-
+CUDA_VISIBLE_DEVICES=$(get_CUDA_VISIBLE_DEVICES)
 echo "➤ RUNNING SCRIPT INSIDE APPTAINER: ${YOUR_SIF_FILE}"
 
 # Execute the python script INSIDE the container
