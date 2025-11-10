@@ -2,7 +2,7 @@
 
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=2
 #SBATCH --time=1:00:00
 #SBATCH --gpus-per-node=a100:3
 #SBATCH --partition=ai
