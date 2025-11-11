@@ -12,6 +12,7 @@ python finetuning_knowledge_v8.py \
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
     --overlap_ratio 1_4 \
+    --gradient_checkpointing \
     --full_finetuning > output_44_a.log   
 
 num_epochs=10
@@ -28,6 +29,7 @@ python finetuning_knowledge_v8.py \
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
     --overlap_ratio 1_4 \
+    --gradient_checkpointing \
     --full_finetuning > output_44_b.log   
 
 # 2 hours

@@ -1,6 +1,7 @@
 import os
 import torch
 import numpy as np
+import random
 from typing import List
 from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
@@ -157,6 +158,8 @@ def prepare_training_mix(
     times_explanations = strategy_args.get("times_explanations", 1)
     semi_cleaned_version = strategy_args.get("semi_cleaned", None)
     use_raw = strategy_args.get("use_raw", False)
+    explanation_every_round = strategy_args.get("explanation_every_round", False)
+    shuffle_chunks_flag = strategy_args.get("shuffle_chunks", False)
 
     # Helper to chunk a single text
     def _chunk(text: str) -> List[str]:
@@ -388,6 +391,12 @@ def prepare_training_mix(
         log.info(f"Replicating dataset {replication_factor} times to simulate {original_epochs} total 'document-type epochs'.")
 
     if unique_document_batches:
+        if explanation_every_round:
+            assert unique_document_batches_with_explanations is not None, \
+                "explanation_every_round=True but explanations are not enabled. Use --with_explanations or --with_specific_explanation."
+        if unique_document_batches_with_explanations is not None:
+            assert len(unique_document_batches_with_explanations) == len(unique_document_batches), \
+                "Mismatch between explanation and original batch structures."
         final_chunks = replicate_and_interleave_pretraining(
             unique_document_batches=unique_document_batches,
             unique_document_batches_with_explanations=unique_document_batches_with_explanations,
@@ -398,8 +407,13 @@ def prepare_training_mix(
             tokenizer=tokenizer,
             log=log,
             test_script=test_script,
-            fill_with_pretraining=fill_with_pretraining
+            fill_with_pretraining=fill_with_pretraining,
+            use_explanations_every_round=explanation_every_round,
         )
+    
+    if shuffle_chunks_flag and final_chunks:
+        random.Random(42).shuffle(final_chunks)
+        log.info("Shuffled final training chunks with seed 42.")
     
     total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in final_chunks)
     log.info(f"Final training mix: Total chunks: {len(final_chunks)}, Total tokens: {total_tokens}")
@@ -420,6 +434,7 @@ def replicate_and_interleave_pretraining(
     log,
     test_script: bool = False,
     fill_with_pretraining: bool = False,
+    use_explanations_every_round: bool = False,
 ) -> List[str]:
     """
     Repeats a sequence of document batches for a specified number of replications,
@@ -436,20 +451,25 @@ def replicate_and_interleave_pretraining(
         if test_script:
             log.info(f"--- Creating replication {rep + 1}/{replication_factor} ---")
         
-        # Alternate between original and explanation-infused batches for each replication
+        # Select between original and explanation-infused batches
         if unique_document_batches_with_explanations:
-            # Assert that we are alternating correctly. The first rep (0) should not have explanations.
-            should_use_explanations = (rep % 2 == 1)
-            if should_use_explanations:
-                log.info("Using batches WITH explanations for this replication.")
+            if use_explanations_every_round:
+                log.info("Using batches WITH explanations for EVERY replication.")
                 batches_for_this_rep = unique_document_batches_with_explanations
             else:
-                log.info("Using batches WITHOUT explanations for this replication.")
-                batches_for_this_rep = unique_document_batches
-            
-            # This assertion verifies the core "every other" logic.
-            assert should_use_explanations == (batches_for_this_rep is unique_document_batches_with_explanations), \
-                "AssertionError: Explanation insertion is not alternating correctly."
+                # Alternate: first rep without explanations, second with, etc.
+                should_use_explanations = (rep % 2 == 1)
+                if should_use_explanations:
+                    if test_script:
+                        log.info("Using batches WITH explanations for this replication.")
+                    batches_for_this_rep = unique_document_batches_with_explanations
+                else:
+                    if test_script:
+                        log.info("Using batches WITHOUT explanations for this replication.")
+                    batches_for_this_rep = unique_document_batches
+                # Assert alternation is respected
+                assert should_use_explanations == (batches_for_this_rep is unique_document_batches_with_explanations), \
+                    "Explanation insertion is not alternating correctly."
         else:
             batches_for_this_rep = unique_document_batches
 
