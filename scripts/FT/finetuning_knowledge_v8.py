@@ -408,6 +408,8 @@ def continue_pretraining(model, tokenizer, log, args):
         "times_explanations": args.times_explanations,
         "semi_cleaned": args.semi_cleaned,
         "use_raw": args.raw if hasattr(args, "raw") else False,
+        "explanation_every_round": args.explanation_every_round,
+        "shuffle_chunks": args.shuffle_chunks,
     }
 
     if args.with_explanations or args.with_specific_explanation:
@@ -576,6 +578,8 @@ if __name__ == "__main__":
     parser.add_argument("--times_explanations", type=int, default=1, help="Number of times to repeat the explanation texts.")
     parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
     parser.add_argument("--test_script", action="store_true", help="Run in test mode with a small model and minimal epochs.")
+    parser.add_argument("--explanation_every_round", action="store_true", help="Inject explanations for every round/replication instead of alternating.")
+    parser.add_argument("--shuffle_chunks", action="store_true", help="Shuffle constructed training chunks with seed 42 before training.")
 
     # Lora arguments
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA r parameter.")
