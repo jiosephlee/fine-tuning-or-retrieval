@@ -379,8 +379,8 @@ def continue_pretraining(model, tokenizer, log, args):
         "report_to": "wandb" if not args.test_script else "none",
     }
     if args.constant_lr:
-        training_config_kwargs["warmup_ratio"] = 0.0
-        training_config_kwargs["lr_scheduler_type"] = "constant"
+        training_config_kwargs["warmup_ratio"] = 0.03
+        training_config_kwargs["lr_scheduler_type"] = "constant_with_warmup"
     else:
         training_config_kwargs["warmup_ratio"] = 0.1
     
