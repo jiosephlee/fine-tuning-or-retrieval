@@ -3,13 +3,13 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --time=16:00:00
+#SBATCH --time=30:00:00
 #SBATCH --gres=gpu:a100:1
 #SBATCH --partition=ai
 #SBATCH --mem-per-gpu=160GB
-#SBATCH --job-name=E52_7B_100_epochs_constant_lr
-#SBATCH --output=logs/E52_7B_100_epochs_constant_lr.out
-#SBATCH --error=logs/E52_7B_100_epochs_constant_lr.err
+#SBATCH --job-name=E46_7B_200_epochs_constant_lr_fixed
+#SBATCH --output=logs/E46_7B_200_epochs_constant_lr_fixed.out
+#SBATCH --error=logs/E46_7B_200_epochs_constant_lr_fixed.err
 
 echo "➤ START"
 
@@ -35,11 +35,10 @@ apptainer exec --cleanenv --nv \
     --effective_batch_size_for_cpt 32 \
     --separate_batches_with_pretraining 1 \
     --fill_batches_with_pretraining \
-    --num_train_epochs 100 \
+    --num_train_epochs 200 \
     --learning_rate 2e-5 \
-    --with_explanations \
     --constant_lr \
-    --num_paraphrased_texts 9 \
+    --num_paraphrased_texts 0 \
     --overlap_sections \
     --overlap_ratio 1_4 \
     --gradient_checkpointing \

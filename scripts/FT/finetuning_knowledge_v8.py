@@ -410,6 +410,7 @@ def continue_pretraining(model, tokenizer, log, args):
         "use_raw": args.raw if hasattr(args, "raw") else False,
         "explanation_every_round": args.explanation_every_round,
         "shuffle_chunks": args.shuffle_chunks,
+        "shuffle_seed": args.shuffle_seed,
     }
 
     if args.with_explanations or args.with_specific_explanation:
@@ -482,8 +483,8 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
         "report_to": "wandb" if not args.test_script else "none",
     }
     if args.constant_lr:
-        lima_training_config_kwargs["warmup_ratio"] = 0.0
-        lima_training_config_kwargs["lr_scheduler_type"] = "constant"
+        lima_training_config_kwargs["warmup_ratio"] = 0.03
+        lima_training_config_kwargs["lr_scheduler_type"] = "constant_with_warmup"
     else:
         lima_training_config_kwargs["warmup_ratio"] = 0.1
         
@@ -561,7 +562,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--full_finetuning", default=False, action="store_true")
     parser.add_argument("--learning_rate", type=float, default=1e-5)
-    parser.add_argument("--constant_lr", action="store_true", help="Use constant learning rate instead of a scheduler.")
+    parser.add_argument("--constant_lr", action="store_true", help="Use constant learning rate instead of a scheduler (with minimal warmup)")
     parser.add_argument("--knowledge_probes_version", type=str, default="v9", help="Version of the knowledge probes to use.")
     parser.add_argument("--inference_probes_version", type=str, default="v6", help="Version of the inference probes to use.")
     parser.add_argument("--num_paraphrased_texts", type=int, default=9, help="Number of paraphrased texts to use for training (0-9)")
@@ -580,6 +581,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_script", action="store_true", help="Run in test mode with a small model and minimal epochs.")
     parser.add_argument("--explanation_every_round", action="store_true", help="Inject explanations for every round/replication instead of alternating.")
     parser.add_argument("--shuffle_chunks", action="store_true", help="Shuffle constructed training chunks with seed 42 before training.")
+    parser.add_argument("--shuffle_seed", type=int, default=42, help="Seed to use when shuffling training chunks.")
 
     # Lora arguments
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA r parameter.")

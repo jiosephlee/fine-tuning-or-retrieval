@@ -160,6 +160,7 @@ def prepare_training_mix(
     use_raw = strategy_args.get("use_raw", False)
     explanation_every_round = strategy_args.get("explanation_every_round", False)
     shuffle_chunks_flag = strategy_args.get("shuffle_chunks", False)
+    shuffle_seed = strategy_args.get("shuffle_seed", 42)
 
     # Helper to chunk a single text
     def _chunk(text: str) -> List[str]:
@@ -412,8 +413,18 @@ def prepare_training_mix(
         )
     
     if shuffle_chunks_flag and final_chunks:
-        random.Random(42).shuffle(final_chunks)
-        log.info("Shuffled final training chunks with seed 42.")
+        # Shuffle deterministically with provided seed
+        random.Random(shuffle_seed).shuffle(final_chunks)
+        log.info(f"Shuffled final training chunks with seed {shuffle_seed}.")
+        # Independent assertion: verify that different seeds yield different orders
+        if len(final_chunks) > 1:
+            indices = list(range(len(final_chunks)))
+            a = indices[:]
+            b = indices[:]
+            random.Random(shuffle_seed).shuffle(a)
+            random.Random(shuffle_seed + 1).shuffle(b)
+            assert (a[0] != b[0]) or (a[1] != b[1]), \
+                "Different shuffle seeds did not change first-two positions; check RNG or dataset size."
     
     total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in final_chunks)
     log.info(f"Final training mix: Total chunks: {len(final_chunks)}, Total tokens: {total_tokens}")
