@@ -5,7 +5,6 @@ from typing import Optional, List, TypeVar, Literal
 from transformers import (
     TrainingArguments,
 )
-import wandb
 
 # --------------------------------------------------------------------------
 # SECTION 1: CONFIGURATION (Pydantic Models)
@@ -47,6 +46,8 @@ class TrainingConfig(BaseModel):
     # max_grad_norm: float = 0.3 # defaults to 1
     gradient_checkpointing: bool = False # Saves VRAM by using gradient checkpointing
     use_liger_kernel: bool = True # This saves VRAM
+    activation_offloading: bool = False
+    compile: bool = False
         
     # These Hyperparameters are overwritten for LIMA
     num_train_epochs: int = 1
@@ -91,6 +92,7 @@ class TrainingConfig(BaseModel):
             fp16=not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) and torch.cuda.is_available(),
             use_liger_kernel=self.use_liger_kernel,
             gradient_checkpointing=self.gradient_checkpointing,
+            torch_compile=self.compile,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
             sequential_sampling = self.sequential_sampling,
@@ -110,6 +112,7 @@ class TrainingConfig(BaseModel):
             padding_free = self.padding_free, # This saves VRAM (Requires Flash Attention 2)
             max_length = self.context_length,
             completion_only_loss = self.completion_only_loss,
+            activation_offloading = self.activation_offloading,
 
             # Training Arguments
             per_device_train_batch_size=self.per_device_train_batch_size,
@@ -130,6 +133,7 @@ class TrainingConfig(BaseModel):
             fp16=not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) and torch.cuda.is_available(),
             gradient_checkpointing=self.gradient_checkpointing,
             use_liger_kernel=self.use_liger_kernel,
+            torch_compile=self.compile,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
             sequential_sampling = self.sequential_sampling,

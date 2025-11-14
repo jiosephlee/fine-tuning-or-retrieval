@@ -8,19 +8,17 @@
 import os
 import sys
 import json
-import torch
 from datetime import datetime
 sys.path.append('../..')
-import pandas as pd
 import utils.llm_training as llm_training
 import utils.data_preparation as data_preparation
 import utils.model_setup as model_setup
-import utils.llm_callbacks as llm_callbacks
 import utils.llm_configs as llm_configs
+from utils import experiment_utils
 import argparse
 import wandb
 import logging
-from utils.llm_callbacks import CorpusPerplexityCallback, TrainingLossPerplexityCallback
+# Local callback types are no longer used directly; delegated to utils.experiment_utils
 
 
 def construct_experiment_name(args):
@@ -127,233 +125,17 @@ def construct_experiment_name(args):
     return os.path.join(*path_parts)
 
 def get_all_domains():
-    """Scans the data directory to find all available domains for probes."""
-    facts_dir = '../../data/probes/facts'
-    if not os.path.isdir(facts_dir):
-        return []
-    return [name for name in os.listdir(facts_dir) if os.path.isdir(os.path.join(facts_dir, name))]
+    return experiment_utils.get_all_domains()
 
 def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
-    """Sets up probe callbacks for all specified domains."""
-    callbacks = []
-    
-    report_to_wandb = not args.test_script
-    probe_batch_size = args.device_batch_size * 4
-
-    if not domains:
-        domains = get_all_domains()
-        log.info(f"No domains specified, found and using: {domains}")
-
-    all_generation_prompts = {}
-
-    for domain in domains:
-        log.info(f"--- Setting up probes for domain: {domain} ---")
-        
-        # --- Output Directories ---
-        suffix = "_lima" if is_lima else ""
-        output_dir_knowledge_probe = os.path.join(args.base_results_dir, args.experiment_name, f"{domain}{suffix}_knowledge_probe")
-        output_dir_inference_probe = os.path.join(args.base_results_dir, args.experiment_name, f"{domain}{suffix}_inference_probe")
-        os.makedirs(output_dir_knowledge_probe, exist_ok=True)
-        os.makedirs(output_dir_inference_probe, exist_ok=True)
-
-        # --- Knowledge Probes ---
-        knowledge_probes_version = args.knowledge_probes_version
-        if int(knowledge_probes_version[-1]) >= 8:
-            knowledge_probe_path = f'../../data/probes/facts/{domain}/probes_{knowledge_probes_version}.csv'
-        else:
-            knowledge_probe_path = f'../../data/probes/facts/{domain}/{domain}_knowledge_probes_{knowledge_probes_version}.csv'
-
-        if os.path.exists(knowledge_probe_path):
-            knowledge_probe_df = pd.read_csv(knowledge_probe_path)
-            facts = knowledge_probe_df['fact'].tolist()
-            probes = knowledge_probe_df['probe'].tolist()
-            targets = knowledge_probe_df['target'].tolist()
-            
-            knowledge_probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
-                tokenizer=tokenizer,
-                facts=facts,
-                probes=probes,
-                targets=targets,
-                probes_df=knowledge_probe_df,
-                batch_size=probe_batch_size,
-                logger=log,
-                output_dir=output_dir_knowledge_probe,
-                log_prefix=f"{domain}_knowledge_probe",
-                report_to_wandb=report_to_wandb,
-            )
-            callbacks.append(knowledge_probe_callback)
-            log.info(f"Loaded {len(knowledge_probe_df)} knowledge probes from {knowledge_probe_path}")
-        else:
-            log.warning(f"Knowledge probe file not found for domain {domain} at {knowledge_probe_path}")
-
-        # --- Inference Probes ---
-        inference_probes_version = args.inference_probes_version
-        path1 = f'../../data/probes/inference/{domain}/probes_{inference_probes_version}.csv'
-        path2 = f'../../data/probes/inference/{domain}/{domain.lower()}_high_level_probes_{inference_probes_version}.csv'
-        
-        if os.path.exists(path1):
-            inference_probe_path = path1
-        elif os.path.exists(path2):
-            inference_probe_path = path2
-        else:
-            inference_probe_path = None
-            log.warning(f"Inference probe file not found for domain {domain} with version {inference_probes_version}")
-
-        if inference_probe_path:
-            inference_probe_df = pd.read_csv(inference_probe_path)
-            facts = inference_probe_df['fact'].tolist()
-            probes = inference_probe_df['probe'].tolist()
-            targets = inference_probe_df['target'].tolist()
-
-            inference_probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
-                tokenizer=tokenizer,
-                facts=facts,
-                probes=probes,
-                targets=targets,
-                probes_df=inference_probe_df,
-                batch_size=probe_batch_size,
-                logger=log,
-                output_dir=output_dir_inference_probe,
-                log_prefix=f"{domain}_inference_probe",
-                report_to_wandb=report_to_wandb,
-            )
-            callbacks.append(inference_probe_callback)
-            log.info(f"Loaded {len(inference_probe_df)} inference probes from {inference_probe_path}")
-        
-        # --- Corpus Perplexity Callback ---
-        if args.semi_cleaned:
-            corpus_path = f'../../data/arxiv/semicleaned_{args.semi_cleaned}/{domain}.tex'
-        elif getattr(args, "raw", False):
-            corpus_path = f'../../data/arxiv/raw/{domain}.tex'
-        else:
-            corpus_path = f'../../data/arxiv/cleaned/{domain}.tex'
-
-        if os.path.exists(corpus_path):
-            with open(corpus_path, 'r', encoding='utf-8') as f:
-                text_content = f.read()
-            
-            context_length = args.context_length_for_lima if is_lima else args.context_length_for_cpt
-            
-            output_dir_corpus_ppl = os.path.join(args.base_results_dir, args.experiment_name, f"{domain}{suffix}_corpus_perplexity")
-            os.makedirs(output_dir_corpus_ppl, exist_ok=True)
-
-            corpus_perplexity_callback = CorpusPerplexityCallback(
-                text_content=text_content,
-                tokenizer=tokenizer,
-                max_length=context_length,
-                stride=512,
-                output_dir=output_dir_corpus_ppl,
-                log_prefix=f"{domain}_corpus_perplexity",
-                report_to_wandb=report_to_wandb,
-            )
-            callbacks.append(corpus_perplexity_callback)
-            log.info(f"Added CorpusPerplexityCallback for domain {domain} from {corpus_path}")
-        else:
-            log.warning(f"Corpus file not found for domain {domain} at {corpus_path}")
-
-        # --- Generation Probes (collect for single callback) ---
-        if is_lima:
-            prompt_files = {
-                f'recall_{domain}_QA': f'../../data/probes/generation/{domain}/recall_{domain}_QA.json'
-            }
-        else:
-            prompt_files = {
-                f'recall_{domain}': f'../../data/probes/generation/{domain}/recall_{domain}.json'
-            }
-        
-        domain_prompts = load_prompts(prompt_files, append_eot=is_lima)
-        all_generation_prompts.update(domain_prompts)
-
-    if is_lima:
-        background_prompt_path = '../../data/probes/generation/DPO/recall_background_QA.json'
-        if os.path.exists(background_prompt_path):
-            background_prompts = load_prompts({'recall_background_QA': background_prompt_path}, append_eot=is_lima)
-            all_generation_prompts.update(background_prompts)
-
-    if all_generation_prompts:
-        suffix = "_lima" if is_lima else ""
-        output_dir_generation = os.path.join(args.base_results_dir, args.experiment_name, f"generation{suffix}")
-        os.makedirs(output_dir_generation, exist_ok=True)
-        
-        inference_config = llm_configs.InferenceConfig(no_repeat_ngram_size=6)
-        
-        generation_probe_callback = llm_callbacks.GenerationProbeCallback(
-            prompts=all_generation_prompts,
-            tokenizer=tokenizer,
-            inference_config=inference_config,
-            eval_every_n_steps=50 if is_lima else 50,
-            logger=log,
-            output_dir=output_dir_generation,
-            do_eval=args.do_eval,
-            report_to_wandb=report_to_wandb,
-        )
-        callbacks.append(generation_probe_callback)
-        log.info(f"Loaded generation probes for domains: {list(all_generation_prompts.keys())}")
-
-    callbacks.append(TrainingLossPerplexityCallback(report_to_wandb=report_to_wandb))
-    return callbacks
+    return experiment_utils.setup_callbacks(domains, tokenizer, log, args, is_lima=is_lima)
 
 def save_probe_results(callbacks, log, args):
-    """Saves results for all probe callbacks and generates revamped plots."""
-    
-    experiment_dir = os.path.join(args.base_results_dir, args.experiment_name)
-    
-    training_loss_callback = None
-    domains = set()
-
-    # Save results for all callbacks and collect domains
-    for callback in callbacks:
-        if isinstance(callback, llm_callbacks.TrainingLossPerplexityCallback):
-            training_loss_callback = callback
-        elif isinstance(callback, llm_callbacks.BaseKnowledgeProbeCallBack):
-            callback.save_results(output_dir=callback.output_dir)
-            log.info(f"Probe metrics for {callback.log_prefix} saved to {callback.output_dir}")
-            domain = callback.log_prefix.split('_')[0]
-            domains.add(domain)
-        elif isinstance(callback, llm_callbacks.CorpusPerplexityCallback):
-            callback.save_results(output_dir=callback.output_dir)
-            log.info(f"Corpus perplexity metrics for {callback.log_prefix} saved to {callback.output_dir}")
-
-    # Save training loss once to the main experiment directory
-    if training_loss_callback:
-        training_loss_callback.save_results(output_dir=experiment_dir)
-        log.info(f"Training loss metrics saved to {experiment_dir}")
-
-    # Generate plots for each domain
-    # if not domains:
-    #     log.warning("No domains found to generate plots for.")
-    #     return
-
-    # for domain in sorted(list(domains)):
-    #     log.info(f"Generating revamped plots for domain '{domain}'...")
-    #     llm_plotting.generate_revamped_plots(
-    #         domain=domain,
-    #         knowledge_probes_version=args.knowledge_probes_version,
-    #         inference_probes_version=args.inference_probes_version,
-    #         experiment_dir=experiment_dir,
-    #         logger=log
-    #     )
+    return experiment_utils.save_probe_results(callbacks, log, args)
 
 
 def load_prompts(prompt_files, append_eot=False):
-    prompts = {}
-    for name, path in prompt_files.items():
-        if os.path.exists(path):
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            prompt_list = []
-            for item in data:
-                question = item.get('question', '')
-                if append_eot:
-                    question += "<|EOT|>"
-                prompt_list.append({
-                    "prompt_name": item.get('id', 'unknown'),
-                    "question": question,
-                    "reference_answer": item.get('reference_answer', '')
-                })
-            prompts[name] = prompt_list
-    return prompts
+    return experiment_utils.load_prompts(prompt_files, append_eot=append_eot)
 
 def continue_pretraining(model, tokenizer, log, args):
     assert args.effective_batch_size_for_cpt % args.device_batch_size == 0, \
@@ -377,6 +159,8 @@ def continue_pretraining(model, tokenizer, log, args):
         "packing": False,
         "padding_free": False,
         "report_to": "wandb" if not args.test_script else "none",
+        "activation_offloading": args.offload_to_cpu,
+        "compile": args.compile_model,
     }
     if args.constant_lr:
         training_config_kwargs["warmup_ratio"] = 0.1
@@ -481,6 +265,8 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
         "padding_free": True,
         "dataset_text_field": "text",
         "report_to": "wandb" if not args.test_script else "none",
+        "activation_offloading": args.offload_to_cpu,
+        "compile": args.compile_model,
     }
     if args.constant_lr:
         lima_training_config_kwargs["warmup_ratio"] = 0.03
@@ -600,9 +386,11 @@ if __name__ == "__main__":
     parser.add_argument("--context_length_for_cpt", type=int, default=3072, help="Context length for continued pretraining.")
     parser.add_argument("--context_length_for_lima", type=int, default=2560, help="Context length for LIMA training.")
     parser.add_argument("--semi_cleaned", type=str, default=None, choices=['v1', 'v2','v3'], help="Use semi-cleaned data from a specific version (v1 or v2).")
-    parser.add_argument("--fa3", action="store_true", help="Use flash attention 3.")
+    parser.add_argument("--attn_implementation", type=str, default="sdpa", choices=["sdpa", "flash_attention_2", "flash_attention_3"], help="Attention implementation to use.")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
     parser.add_argument("--compile_model", action="store_true", help="Enable torch.compile for the model.")
+    parser.add_argument("--compile", dest="compile_model", action="store_true", help="Enable torch.compile via TrainingArguments.")
+    parser.add_argument("--offload_to_cpu", action="store_true", help="Enable activation offloading to CPU.")
 
     args = parser.parse_args()
 
@@ -639,10 +427,7 @@ if __name__ == "__main__":
     log.info(f"Hyperparameters saved to {hyperparameters_path}")
 
     # --- Load the model ---
-    if args.fa3:
-        attn_implementation = "flash_attention_3"
-    else:
-        attn_implementation = "sdpa"
+    attn_implementation = args.attn_implementation
     
     peft_config = llm_configs.PeftConfig(
         enabled=(not args.full_finetuning),
@@ -668,10 +453,7 @@ if __name__ == "__main__":
     if not args.full_finetuning:
         model.print_trainable_parameters()
 
-    if args.compile_model:
-        log.info("Compiling model...")
-        model = torch.compile(model)
-
+    # Model compilation is handled by TrainingArguments via compile flag in TrainingConfig
     # --- Continue Pretraining (we also evaluate our probes during this) ---
     if args.num_train_epochs > 0:
         continue_pretraining(model, tokenizer, log, args)
