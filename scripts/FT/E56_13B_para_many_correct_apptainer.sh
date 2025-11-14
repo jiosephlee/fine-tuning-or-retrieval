@@ -2,11 +2,10 @@ num_epochs=100
 num_paraphrased=4
 
 # Define the SIF and the script
-SIF_FILE="/cbica/home/leejose/finetune.sif" # Or the full path
+SIF_FILE="/cbica/home/leejose/finetuning.sif" # Or the full path
 # Execute the job with the runtime fix
 apptainer exec \
     --nv \
-    -e PYTHONNOUSERSITE=1 \
     ${SIF_FILE} \
     python finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-13B \
@@ -32,7 +31,6 @@ num_paraphrased=19
 apptainer exec \
     --nv \
     ${SIF_FILE} \
-    -e PYTHONNOUSERSITE=1 \
     python finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-13B \
     --device_batch_size 1 \
