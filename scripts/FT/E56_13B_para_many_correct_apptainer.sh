@@ -20,9 +20,9 @@ apptainer exec \
     --overlap_sections \
     --overlap_ratio 1_4 \
     --gradient_checkpointing \
+    --no_callback_every_step \
     --offload_to_cpu \
-    --compile \
-    --full_finetuning
+    --full_finetuning > output_56_a.log
 
 num_epochs=100
 num_paraphrased=19
@@ -44,6 +44,6 @@ apptainer exec \
     --overlap_sections \
     --overlap_ratio 1_4 \
     --gradient_checkpointing \
+    --no_callback_every_step \
     --offload_to_cpu \
-    --compile \
-    --full_finetuning
+    --full_finetuning > output_56_b.log

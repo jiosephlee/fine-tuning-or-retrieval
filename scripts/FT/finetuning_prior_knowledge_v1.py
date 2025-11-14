@@ -295,6 +295,11 @@ if __name__ == "__main__":
     parser.add_argument("--push_to_hub_cpt_id", type=str, default="prior", help="Hub model ID to push CPT model to.")
     parser.add_argument("--push_to_hub_lima_id", type=str, default="prior_with_lima", help="Hub model ID to push LIMA model to.")
     parser.add_argument("--offload_to_cpu", action="store_true", help="Enable activation offloading to CPU.")
+    parser.add_argument(
+        "--no_callback_every_step",
+        action="store_true",
+        help="If set, run heavy callbacks only at 25%, 50%, and 75% of training instead of every step.",
+    )
 
 
     args = parser.parse_args()

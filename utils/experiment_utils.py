@@ -36,6 +36,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
     callbacks = []
     report_to_wandb = not args.test_script
     probe_batch_size = args.device_batch_size * 4
+    sparse_eval = getattr(args, "no_callback_every_step", False)
 
     if not domains:
         domains = get_all_domains()
@@ -75,6 +76,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                 output_dir=output_dir_knowledge_probe,
                 log_prefix=f"{domain}_knowledge_probe",
                 report_to_wandb=report_to_wandb,
+                sparse_eval=sparse_eval,
             )
             callbacks.append(knowledge_probe_callback)
             log.info(f"Loaded {len(knowledge_probe_df)} knowledge probes from {knowledge_probe_path}")
@@ -111,6 +113,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                 output_dir=output_dir_inference_probe,
                 log_prefix=f"{domain}_inference_probe",
                 report_to_wandb=report_to_wandb,
+                sparse_eval=sparse_eval,
             )
             callbacks.append(inference_probe_callback)
             log.info(f"Loaded {len(inference_probe_df)} inference probes from {inference_probe_path}")
@@ -139,6 +142,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                 output_dir=output_dir_corpus_ppl,
                 log_prefix=f"{domain}_corpus_perplexity",
                 report_to_wandb=report_to_wandb,
+                sparse_eval=sparse_eval,
             )
             callbacks.append(corpus_perplexity_callback)
             log.info(f"Added CorpusPerplexityCallback for domain {domain} from {corpus_path}")

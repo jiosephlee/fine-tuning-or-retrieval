@@ -395,6 +395,11 @@ if __name__ == "__main__":
     parser.add_argument("--compile_model", action="store_true", help="Enable torch.compile for the model.")
     parser.add_argument("--compile", dest="compile_model", action="store_true", help="Enable torch.compile via TrainingArguments.")
     parser.add_argument("--offload_to_cpu", action="store_true", help="Enable activation offloading to CPU.")
+    parser.add_argument(
+        "--no_callback_every_step",
+        action="store_true",
+        help="If set, run heavy callbacks only at 25%, 50%, and 75% of training instead of every step.",
+    )
 
     args = parser.parse_args()
 

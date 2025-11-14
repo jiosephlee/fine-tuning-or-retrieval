@@ -29,7 +29,8 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                  logger=None,
                  output_dir="",
                  log_prefix="probe_eval",
-                 report_to_wandb: bool = True):
+                 report_to_wandb: bool = True,
+                 sparse_eval: bool = False):
         
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
@@ -57,6 +58,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             'hit_accuracy_at_100': [],
         }
         self.output_dir = output_dir
+        self.sparse_eval = sparse_eval
         self._precompute_token_lengths()
 
     def _precompute_token_lengths(self):
@@ -127,7 +129,22 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         self._generate_best_probes_report(output_dir)
 
     def on_step_end(self, args, state, control, model, **kwargs):
-        """Evaluate probes at the end of a training step and log metrics."""
+        """Evaluate probes at selected training steps and log metrics."""
+        if self.sparse_eval:
+            # Evaluate only at 25%, 50%, and 75% of total training steps.
+            total_steps = state.max_steps
+            if not total_steps or total_steps <= 0:
+                return
+            if not hasattr(self, "_eval_steps"):
+                steps = [
+                    max(1, int(total_steps * 0.25)),
+                    max(1, int(total_steps * 0.50)),
+                    max(1, int(total_steps * 0.75)),
+                ]
+                self._eval_steps = set(steps)
+            if state.global_step not in self._eval_steps:
+                return
+
         model.eval()
         current_metrics = self._evaluate_probes(model)
         log_data = {}
@@ -871,7 +888,8 @@ class CorpusPerplexityCallback(TrainerCallback):
                  stride: int = 512, 
                  output_dir: str = "",
                  log_prefix="corpus_perplexity",
-                 report_to_wandb: bool = True):
+                 report_to_wandb: bool = True,
+                 sparse_eval: bool = False):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.stride = stride
@@ -880,8 +898,24 @@ class CorpusPerplexityCallback(TrainerCallback):
         self.encodings = self.tokenizer(text_content, return_tensors="pt")
         self.history = []
         self.report_to_wandb = report_to_wandb
+        self.sparse_eval = sparse_eval
 
     def on_step_end(self, args, state, control, model, **kwargs):
+        if self.sparse_eval:
+            # Evaluate only at 25%, 50%, and 75% of total training steps.
+            total_steps = state.max_steps
+            if not total_steps or total_steps <= 0:
+                return
+            if not hasattr(self, "_eval_steps"):
+                steps = [
+                    max(1, int(total_steps * 0.25)),
+                    max(1, int(total_steps * 0.50)),
+                    max(1, int(total_steps * 0.75)),
+                ]
+                self._eval_steps = set(steps)
+            if state.global_step not in self._eval_steps:
+                return
+
         model.eval()
         device = model.device
 
