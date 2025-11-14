@@ -2,7 +2,7 @@ num_epochs=100
 num_paraphrased=4
 
 # Define the SIF and the script
-SIF_FILE="/cbica/home/leejose/finetuning.sif" # Or the full path
+SIF_FILE="/cbica/home/leejose/finetune_pytorch_2_4.sif" # Or the full path
 # Execute the job with the runtime fix
 apptainer exec \
     --nv \
