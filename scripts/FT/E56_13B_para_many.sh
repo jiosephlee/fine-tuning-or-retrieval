@@ -2,7 +2,7 @@ num_epochs=100
 num_paraphrased=4
 
 # Define the SIF and the script
-SIF_FILE="~/pytorch_25.05-py3.sif" # Or the full path
+SIF_FILE="~/pytorch_24.05-py3.sif" # Or the full path
 # Execute the job with the runtime fix
 apptainer exec \
     --nv \
