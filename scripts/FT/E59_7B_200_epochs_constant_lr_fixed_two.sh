@@ -16,3 +16,4 @@ python finetuning_knowledge_v8.py \
     --gradient_checkpointing \
     --full_finetuning > output_46_b.log   
 
+# 20 hours

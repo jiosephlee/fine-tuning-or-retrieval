@@ -15,3 +15,5 @@ python finetuning_knowledge_v8.py \
     --overlap_ratio 1_4 \
     --gradient_checkpointing \
     --full_finetuning > output_46_a.log   
+
+# 20 hours

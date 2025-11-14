@@ -161,6 +161,7 @@ def prepare_training_mix(
     explanation_every_round = strategy_args.get("explanation_every_round", False)
     shuffle_chunks_flag = strategy_args.get("shuffle_chunks", False)
     shuffle_seed = strategy_args.get("shuffle_seed", 42)
+    with_human = strategy_args.get("with_human", False)
 
     # Helper to chunk a single text
     def _chunk(text: str) -> List[str]:
@@ -235,6 +236,7 @@ def prepare_training_mix(
         log.info(f"Processing domains: {domains}")
 
         num_paraphrased_texts = strategy_args.get("num_paraphrased_texts", 0)
+        # with_explanations now denotes any "special" injection path (LLM explanations, human blogs, etc.)
         with_explanations = "WithExplanations" in strategy_name
 
         # Each inner list holds chunks for a "unique document type" across all domains
@@ -285,23 +287,39 @@ def prepare_training_mix(
             explanation_chunks = []
             if with_explanations:
                 explanation_dir = f'../../data/arxiv/explanations/{domain}/'
-                
-                files_to_load = []
-                if specific_explanation_type:
-                    files_to_load.append(f"{specific_explanation_type}.txt")
-                else:
-                    files_to_load = ['blogs.txt', 'stackexchange.txt', 'textbook.txt']
 
+                # Default: model-generated explanations
+                default_files = []
+                if specific_explanation_type:
+                    default_files.append(f"{specific_explanation_type}.txt")
+                else:
+                    default_files = ['blogs.txt', 'stackexchange.txt', 'textbook.txt']
+
+                # Optional: human-written blogs where available (e.g., GRPO, DPO)
+                human_files = [f"human_blog_{i}.txt" for i in range(1, 4)] if with_human else []
+
+                files_to_load = []
                 if os.path.isdir(explanation_dir):
-                    for filename in sorted(os.listdir(explanation_dir)):
-                        if filename in files_to_load:
-                            file_path = os.path.join(explanation_dir, filename)
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                explanation_chunks.extend(_chunk_explanation(f.read()))
-                
-                if times_explanations > 1:
+                    available_files = set(os.listdir(explanation_dir))
+
+                    if human_files and any(f in available_files for f in human_files):
+                        # Prefer human-written explanations for domains where they exist.
+                        # When with_human=True, we DO NOT fall back to default explanation files.
+                        files_to_load = [f for f in human_files if f in available_files]
+                        log.info(f"Domain {domain}: Using HUMAN explanation files: {files_to_load}.")
+                    elif not with_human:
+                        # Only use default model-generated explanations when not explicitly
+                        # requesting human-written texts.
+                        files_to_load = [f for f in default_files if f in available_files]
+
+                    for filename in sorted(files_to_load):
+                        file_path = os.path.join(explanation_dir, filename)
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            explanation_chunks.extend(_chunk_explanation(f.read()))
+
+                if times_explanations > 1 and explanation_chunks:
                     explanation_chunks = explanation_chunks * times_explanations
-                    log.info(f"Repeated explanations {times_explanations} times.")
+                    log.info(f"Domain {domain}: Repeated explanations {times_explanations} times.")
 
                 log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks from {files_to_load}.")
             
