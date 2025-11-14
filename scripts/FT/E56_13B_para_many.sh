@@ -13,7 +13,7 @@ apptainer exec --cleanenv --nv /cbica/home/leejose/finetuning.sif python finetun
     --overlap_sections \
     --overlap_ratio 1_4 \
     --gradient_checkpointing \
-    --activation_offloading \
-    --compile_model \
+    --offload_to_cpu \
+    --compile \
     --full_finetuning > output_1.log 
 
