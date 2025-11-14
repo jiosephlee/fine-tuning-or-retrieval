@@ -7,7 +7,7 @@ SIF_FILE="/cbica/home/leejose/pytorch_24.05-py3.sif" # Or the full path
 apptainer exec \
     --nv \
     ${SIF_FILE} \
-    python finetuning_knowledge_v8.py \
+    python -s finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-13B \
     --device_batch_size 1 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
@@ -31,7 +31,7 @@ num_paraphrased=19
 apptainer exec \
     --nv \
     ${SIF_FILE} \
-    python finetuning_knowledge_v8.py \
+    python -s finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-13B \
     --device_batch_size 1 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
