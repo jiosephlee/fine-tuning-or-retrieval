@@ -1,6 +1,6 @@
 num_epochs=100
 num_paraphrased=4
-apptainer exec --cleanenv --nv /cbica/home/leejose/finetuning.sif python finetuning_knowledge_v8.py \
+apptainer exec --cleanenv --nv -e LD_LIBRARY_PATH="/usr/local/cuda/compat/lib.real:${LD_LIBRARY_PATH}" /cbica/home/leejose/finetuning.sif python finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-13B \
     --device_batch_size 1 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
