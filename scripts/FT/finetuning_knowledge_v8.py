@@ -18,6 +18,7 @@ from utils import experiment_utils
 import argparse
 import wandb
 import logging
+wandb.init(project="fine_tuning_study")
 # Local callback types are no longer used directly; delegated to utils.experiment_utils
 
 
