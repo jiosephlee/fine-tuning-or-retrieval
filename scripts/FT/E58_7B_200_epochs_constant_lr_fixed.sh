@@ -21,7 +21,6 @@ apptainer exec \
     --overlap_sections \
     --overlap_ratio 1_4 \
     --gradient_checkpointing \
-    --activation_checkpointing \
     --offload_to_cpu \
     --full_finetuning > output_46_a.log   
 
