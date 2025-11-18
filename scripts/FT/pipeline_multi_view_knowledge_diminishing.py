@@ -117,7 +117,7 @@ def generate_incremental_stackexchange(paper_name: str):
         print(f"[stackexchange] Wrote {out_path}")
 
 
-def generate_textbook_knowledge_variable_chapters(paper_name: str, chapter_counts=(3, 5, 10)):
+def generate_textbook_knowledge_variable_chapters(paper_name: str, chapter_counts=(4, 8, 12)):
     """Generate multiple textbooks with different numbers of chapters (3, 5, 10)."""
     print(f"[textbook] Processing {paper_name} for multi-chapter textbook generation...")
 
@@ -160,6 +160,7 @@ Provide the output as a JSON object with a single key "outline", which is a list
             model="gpt-5",
             system_prompt_included=True,
             return_json=True,
+            reasoning_effort="medium",
             max_tokens=4000,
         )
 
@@ -236,8 +237,6 @@ def process_papers():
     for filename in files:
         paper_name = os.path.splitext(filename)[0]
         print(f"==== Processing {paper_name} ====")
-        generate_incremental_stackexchange(paper_name)
-        generate_incremental_blogs(paper_name)
         generate_textbook_knowledge_variable_chapters(paper_name)
 
 
