@@ -9,6 +9,7 @@
 
 module load anaconda3
 module load cuda/12.8.1
+module load gcc/13.3.0
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$HOME/.conda/envs/finetuning"
 cd /vast/home/j/jojolee/flash-attention/hopper
