@@ -2,6 +2,7 @@ import os
 import torch
 import numpy as np
 import random
+import glob
 from typing import List
 from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
@@ -163,6 +164,17 @@ def prepare_training_mix(
     shuffle_seed = strategy_args.get("shuffle_seed", 42)
     with_human = strategy_args.get("with_human", False)
     explanation_in_own_batch = strategy_args.get("explanation_in_own_batch", False)
+    # Number of tail document-types (from the paraphrases) to which we should
+    # distribute explanation chunks. For example, if there are 9 paraphrases
+    # and this is 4, explanations will be added to the last 4 paraphrase
+    # document-types.
+    explanation_tail_docs = int(strategy_args.get("explanation_tail_docs", 0))
+    
+    # New args for centralized DPO explanations
+    override_explanation_dir = strategy_args.get("override_explanation_dir", None)
+    max_explanation_files = strategy_args.get("max_explanation_files", None)
+    if max_explanation_files is not None:
+        max_explanation_files = int(max_explanation_files)
 
     # Helper to chunk a single text
     def _chunk(text: str) -> List[str]:
@@ -292,45 +304,61 @@ def prepare_training_mix(
                 paraphrased_chunks_by_doc = [_chunk(text) for text in paraphrased_texts]
 
             # 3. Load explanation texts
-            explanation_chunks = []
+            explanation_chunks = [] # Collects all chunks if not distributing (for legacy/own-batch)
+            
             if with_explanations:
-                explanation_dir = f'../../data/arxiv/explanations/{domain}/'
-
-                # Default: model-generated explanations
-                default_files = []
-                if specific_explanation_type:
-                    default_files.append(f"{specific_explanation_type}.txt")
+                if override_explanation_dir:
+                    explanation_dir = override_explanation_dir
+                    # In override mode, we just grab all .txt files
+                    files_to_load = sorted(glob.glob(os.path.join(explanation_dir, "*.txt")))
+                    files_to_load = [os.path.basename(f) for f in files_to_load]
+                    log.info(f"Domain {domain}: Using OVERRIDE explanation directory: {explanation_dir}. Found {len(files_to_load)} files.")
                 else:
-                    default_files = ['blogs.txt', 'stackexchange.txt', 'textbook.txt']
+                    explanation_dir = f'../../data/arxiv/explanations/{domain}/'
 
-                # Optional: human-written blogs where available (e.g., GRPO, DPO)
-                human_files = [f"human_blog_{i}.txt" for i in range(1, 4)] if with_human else []
+                    # Default: model-generated explanations
+                    default_files = []
+                    if specific_explanation_type:
+                        default_files.append(f"{specific_explanation_type}.txt")
+                    else:
+                        default_files = ['blogs.txt', 'stackexchange.txt', 'textbook.txt']
 
-                files_to_load = []
-                if os.path.isdir(explanation_dir):
-                    available_files = set(os.listdir(explanation_dir))
+                    # Optional: human-written blogs where available (e.g., GRPO, DPO)
+                    human_files = [f"human_blog_{i}.txt" for i in range(1, 4)] if with_human else []
 
-                    if human_files and any(f in available_files for f in human_files):
-                        # Prefer human-written explanations for domains where they exist.
-                        # When with_human=True, we DO NOT fall back to default explanation files.
-                        files_to_load = [f for f in human_files if f in available_files]
-                        log.info(f"Domain {domain}: Using HUMAN explanation files: {files_to_load}.")
-                    elif not with_human:
-                        # Only use default model-generated explanations when not explicitly
-                        # requesting human-written texts.
-                        files_to_load = [f for f in default_files if f in available_files]
+                    files_to_load = []
+                    if os.path.isdir(explanation_dir):
+                        available_files = set(os.listdir(explanation_dir))
 
-                    for filename in sorted(files_to_load):
+                        if human_files and any(f in available_files for f in human_files):
+                            # Prefer human-written explanations for domains where they exist.
+                            files_to_load = [f for f in human_files if f in available_files]
+                            log.info(f"Domain {domain}: Using HUMAN explanation files: {files_to_load}.")
+                        elif not with_human:
+                            files_to_load = [f for f in default_files if f in available_files]
+
+                    # Sort files for deterministic assignment
+                    files_to_load.sort()
+                
+                # Optionally cap the number of files used
+                if max_explanation_files is not None and len(files_to_load) > max_explanation_files:
+                    log.info(f"Domain {domain}: Capping explanation files to {max_explanation_files} (from {len(files_to_load)}).")
+                    files_to_load = files_to_load[:max_explanation_files]
+
+                # If NOT distributing to tail docs, load all explanations into a single list
+                # for legacy replacement or "own-batch" logic.
+                if explanation_tail_docs <= 0:
+                    for filename in files_to_load:
                         file_path = os.path.join(explanation_dir, filename)
                         with open(file_path, 'r', encoding='utf-8') as f:
                             explanation_chunks.extend(_chunk_explanation(f.read()))
 
-                if times_explanations > 1 and explanation_chunks:
-                    explanation_chunks = explanation_chunks * times_explanations
-                    log.info(f"Domain {domain}: Repeated explanations {times_explanations} times.")
+                    if times_explanations > 1 and explanation_chunks:
+                        explanation_chunks = explanation_chunks * times_explanations
+                        log.info(f"Domain {domain}: Repeated explanations {times_explanations} times.")
 
-                log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks from {files_to_load}.")
-            
+                    log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks from {files_to_load}.")
+
             # Document Chunks for the current domain
             domain_doc_chunks = [source_chunks] + paraphrased_chunks_by_doc
             # When enabled, treat explanations as an additional "document type" with its own batch.
@@ -342,8 +370,29 @@ def prepare_training_mix(
                 if i < len(unique_document_batches):
                     unique_document_batches[i].extend(chunks)
 
+            # Distribute explanation files directly across tail document slots (Simpler Mode)
+            if with_explanations and explanation_tail_docs > 0 and files_to_load:
+                 # Sort files for deterministic assignment (was done above, but safe to rely on files_to_load)
+                start_slot = base_doc_types - explanation_tail_docs
+                
+                for i, filename in enumerate(files_to_load):
+                    file_path = os.path.join(explanation_dir, filename)
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        file_chunks = _chunk_explanation(f.read())
+                    
+                    if times_explanations > 1 and file_chunks:
+                        file_chunks = file_chunks * times_explanations
+                    
+                    # Assign to slot (cycle if more files than slots)
+                    slot_offset = i % explanation_tail_docs
+                    target_doc_idx = start_slot + slot_offset
+                    
+                    if 0 <= target_doc_idx < len(unique_document_batches):
+                        unique_document_batches[target_doc_idx].extend(file_chunks)
+                        log.info(f"Domain {domain}: Added {len(file_chunks)} chunks from {filename} to doc-type {target_doc_idx}.")
+
             # 4. Handle explanation replacement logic (legacy path: explanations replace paraphrase chunks)
-            if with_explanations and not explanation_in_own_batch:
+            if with_explanations and not explanation_in_own_batch and explanation_tail_docs <= 0:
                 domain_doc_chunks_expl = [c[:] for c in domain_doc_chunks]
                 
                 if explanation_chunks:
@@ -389,7 +438,7 @@ def prepare_training_mix(
                 for i, chunks in enumerate(domain_doc_chunks_expl):
                     if i < len(unique_document_batches_with_explanations):
                         unique_document_batches_with_explanations[i].extend(chunks)
-                    
+
     # 5. Assemble final chunk list with optional pretraining data replay
     final_chunks = []
     pretraining_separators = int(strategy_args.get("separate_batches_with_pretraining", 0))
