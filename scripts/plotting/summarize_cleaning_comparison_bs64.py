@@ -75,7 +75,21 @@ def fmt(v: Optional[float]) -> str:
     return f"{v:8.3f}"
 
 
-def total_chars_for_corpus(corpus: str) -> int:
+def cleaned_filenames() -> list[str]:
+    """
+    Return the list of *.tex filenames present in data/arxiv/cleaned.
+    This set defines the canonical document IDs shared across corpora.
+    """
+    base = os.path.join(REPO_ROOT, "data", "arxiv", "cleaned")
+    if not os.path.isdir(base):
+        return []
+    return sorted([f for f in os.listdir(base) if f.endswith(".tex")])
+
+
+def total_chars_for_corpus(corpus: str, fnames: list[str]) -> int:
+    """
+    Sum character counts for all given filenames in a corpus directory.
+    """
     base = os.path.join(REPO_ROOT, "data", "arxiv")
     if corpus == "raw":
         dir_path = os.path.join(base, "raw")
@@ -84,14 +98,11 @@ def total_chars_for_corpus(corpus: str) -> int:
     else:
         dir_path = os.path.join(base, corpus)
 
-    if not os.path.isdir(dir_path):
-        return 0
-
     total = 0
-    for fname in os.listdir(dir_path):
-        if not fname.endswith(".tex"):
-            continue
+    for fname in fnames:
         fpath = os.path.join(dir_path, fname)
+        if not os.path.isfile(fpath):
+            continue
         try:
             with open(fpath, "r", encoding="utf-8") as f:
                 total += len(f.read())
@@ -107,12 +118,15 @@ def main():
         print("No domains found; aborting.")
         return
 
-    # precompute corpus lengths
+    # canonical filenames from cleaned corpus
+    fnames = cleaned_filenames()
+
+    # precompute corpus lengths restricted to those filenames
     corpus_lengths = {}
     for run in RUNS:
         corpus = run["corpus"]
         if corpus not in corpus_lengths:
-            corpus_lengths[corpus] = total_chars_for_corpus(corpus)
+            corpus_lengths[corpus] = total_chars_for_corpus(corpus, fnames)
 
     rows = []
     for run in RUNS:
@@ -128,7 +142,7 @@ def main():
             base, last, delta = last_step_delta(series)
             delta_per_char = None
             if delta is not None and corpus_len > 0:
-                delta_per_char = delta / corpus_len
+                delta_per_char = (delta / corpus_len) * 10000.0
             rows.append(
                 {
                     "run": run["label"],

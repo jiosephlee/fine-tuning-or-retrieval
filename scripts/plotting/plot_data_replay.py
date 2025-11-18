@@ -82,11 +82,24 @@ def main():
         '7B': {
             'With No Data Replay': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm',
             'With Data Replay (1:1)': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm',
-            'Data replay (1:1) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e50/bs64_lr2e-05/overlap_1_4/09_24_23_35',
+            'Data replay (1:1) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/10_14_23_02',
+            'Data replay (1:3) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs128_lr2e-05/overlap_1_4/10_15_04_09',
+            'Data replay (1:5) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs192_lr2e-05/overlap_1_4/10_15_10_06',
+            'Data replay (1:5) via fill, separate 2 batches': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_2_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/10_15_21_09',
+            'Data replay (1:5) via fill, separate 1 batch': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs96_lr2e-05/overlap_1_4/10_14_23_06',
             'With Data Replay (1:5)': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_5_dclm'
         }
     }
-    method_order = ['With No Data Replay', 'With Data Replay (1:1)', 'With Data Replay (1:5)', 'Data replay (1:1) via fill']
+    method_order = [
+        'With No Data Replay',
+        'With Data Replay (1:1)',
+        'With Data Replay (1:5)',
+        'Data replay (1:1) via fill',
+        'Data replay (1:3) via fill',
+        'Data replay (1:5) via fill',
+        'Data replay (1:5) via fill, separate 2 batches',
+        'Data replay (1:5) via fill, separate 1 batch',
+    ]
     xlabel = 'Exposure/Training Steps' if args.with_LIMA else 'Exposure Steps'
 
     domains_path = os.path.join(project_root, 'data/arxiv/cleaned')
