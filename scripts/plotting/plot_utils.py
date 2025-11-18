@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from scripts.plotting.plot_comparison import aggregate_across_domains  # noqa: E402
+
 
 # ---------- PATH/DATA DISCOVERY ----------
 def discover_domains(project_root: str) -> List[str]:
@@ -190,6 +192,69 @@ def apply_ylim(axes: Iterable, ylim: Tuple[float, float]):
     """
     for ax in axes:
         ax.set_ylim(ylim)
+
+
+def load_probe_series(
+    run_path: str,
+    probe_type: str,
+    domains,
+    project_root: str,
+    with_lima: bool = False,
+):
+    """
+    Load mean log_prob vs. step for a single run, optionally appending LIMA
+    continuation after the base fine-tuning steps.
+    """
+    resolved = find_latest_run(run_path)
+    if not resolved or not os.path.isdir(resolved):
+        return None
+
+    series_list = []
+    max_step_ft = 0
+
+    base_df = aggregate_across_domains(
+        resolved,
+        probe_type,
+        domains,
+        split_probes=False,
+        project_root=project_root,
+    )
+    if not base_df.empty:
+        g = base_df.groupby("step")["log_prob"].mean().reset_index()
+        g["step"] = pd.to_numeric(g["step"], errors="coerce")
+        g = g.dropna(subset=["step"])
+        if not g.empty:
+            g["step"] = g["step"].astype(int)
+            g.sort_values("step", inplace=True)
+            series_list.append(g)
+            max_step_ft = int(g["step"].max())
+
+    if with_lima:
+        lima_df = aggregate_across_domains(
+            resolved,
+            probe_type,
+            domains,
+            split_probes=False,
+            project_root=project_root,
+            lima=True,
+        )
+        if not lima_df.empty:
+            lg = lima_df.groupby("step")["log_prob"].mean().reset_index()
+            lg["step"] = pd.to_numeric(lg["step"], errors="coerce")
+            lg = lg.dropna(subset=["step"])
+            if not lg.empty:
+                lg["step"] = lg["step"].astype(int)
+                if max_step_ft > 0:
+                    lg["step"] += max_step_ft
+                lg.sort_values("step", inplace=True)
+                series_list.append(lg)
+
+    if not series_list:
+        return None
+
+    combined = pd.concat(series_list, ignore_index=True)
+    combined.sort_values("step", inplace=True)
+    return combined
 
 
 # ---------- METRIC EXTRACTORS ----------

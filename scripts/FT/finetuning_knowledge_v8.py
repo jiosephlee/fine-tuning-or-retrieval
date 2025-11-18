@@ -458,7 +458,14 @@ if __name__ == "__main__":
 
     log.info("\n--- Loading Model for Training ---")
     special_token_to_add = "<|EOT|>" if args.lima_afterwards else None
-    model, tokenizer = model_setup.load_model_for_training(model_config, log, add_special_token=special_token_to_add, use_existing_lima_tokenizer =False, use_existing_lima_model=False)
+    model, tokenizer = model_setup.load_model_for_training(
+        model_config,
+        log,
+        use_cpu_and_gpu=args.offload_to_cpu,
+        add_special_token=special_token_to_add,
+        use_existing_lima_tokenizer=False,
+        use_existing_lima_model=False,
+    )
 
     if not args.full_finetuning:
         model.print_trainable_parameters()
