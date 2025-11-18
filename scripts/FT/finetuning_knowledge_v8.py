@@ -391,7 +391,7 @@ if __name__ == "__main__":
     parser.add_argument("--context_length_for_cpt", type=int, default=3072, help="Context length for continued pretraining.")
     parser.add_argument("--context_length_for_lima", type=int, default=2560, help="Context length for LIMA training.")
     parser.add_argument("--semi_cleaned", type=str, default=None, choices=['v1', 'v2','v3'], help="Use semi-cleaned data from a specific version (v1 or v2).")
-    parser.add_argument("--attn_implementation", type=str, default="sdpa", choices=["sdpa", "flash_attention_2", "flash_attention_3"], help="Attention implementation to use.")
+    parser.add_argument("--attn_implementation", type=str, default="sdpa", choices=["sdpa", "flash_attention_2", "flash_attention_3", "kernels-community/vllm-flash-attn3"], help="Attention implementation to use.")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
     parser.add_argument("--compile_model", action="store_true", help="Enable torch.compile for the model.")
     parser.add_argument("--compile", dest="compile_model", action="store_true", help="Enable torch.compile via TrainingArguments.")
