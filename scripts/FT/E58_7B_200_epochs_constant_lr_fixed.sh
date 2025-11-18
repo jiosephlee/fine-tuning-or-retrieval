@@ -10,7 +10,7 @@
 num_epochs=200
 num_paraphrased=9
 
-python finetuning_knowledge_v8.py \
+python -s finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-7B \
     --device_batch_size 32 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
