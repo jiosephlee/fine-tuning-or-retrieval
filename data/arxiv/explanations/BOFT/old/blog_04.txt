@@ -1,0 +1,93 @@
+# Hands-On: Fine-Tune a Vision Transformer, LLM, and Diffusion Model with BOFT
+
+In this tutorial, we’ll walk through three practical examples of applying Orthogonal Butterfly Finetuning (BOFT) to adapt large foundation models without blowing up your compute budget. You’ll learn how to:
+
+1. Specialize a Vision Transformer (ViT) for new image classes.  
+2. Tailor a 7B‐parameter language model (LLM) for domain‐specific Q&A.  
+3. Control the style of a Stable Diffusion model for text‐to‐image generation.  
+
+Along the way, you’ll get PyTorch code snippets, tips on identity initialization, multiplicative Dropout, logging, and finally how to merge BOFT parameters back into the base weights—so you incur zero extra cost at inference time.
+
+## 1. Quick Recap: What Is BOFT?
+
+BOFT is a parameter‐efficient finetuning method built on the idea of learning a small, structured orthogonal update to a pretrained weight matrix `W₀`. Instead of full finetuning (O(d²) parameters) or simple low‐rank updates, BOFT factorizes an orthogonal matrix `R` into a product of sparse “butterfly” components:
+
+  R = Bₘ · Bₘ₋₁ · … · B₁,
+
+where each `Bᵢ` is block‐orthogonal with only O(d·b) parameters, and by stacking m = O(log d) of them, you achieve a dense O(d × d) transform with just O(d log d) parameters.  
+
+Key practical points:
+
+- **Identity initialization**: We initialize all `Bᵢ` to the identity, so at step zero, R = I and the model’s behavior is unchanged.  
+- **Multiplicative Dropout**: To avoid overfitting, we randomly set some butterfly blocks back to identity during training.  
+- **Zero inference overhead**: After finetuning, we absorb R into W₀ (i.e. `W_new = R @ W₀`), so at test time you only run the original model with updated weights.
+
+## 2. Setup and Common Utilities
+
+First, install dependencies:
+
+```bash
+pip install torch torchvision transformers diffusers
+```
+
+We’ll define a small BOFT module for linear layers.
+
+```python
+import torch
+import torch.nn as nn
+
+class BOFTLinear(nn.Module):
+    def __init__(self, W0: nn.Parameter, m: int, block_size: int, dropout=(0.0, 0.0)):
+        super().__init__()
+        # store pretrained weight, freeze it
+        self.W0 = W0
+        self.in_features, self.out_features = W0.shape
+        W0.requires_grad_(False)
+
+        # build m butterfly components, each split into blocks of size 2*block_size
+        self.components = nn.ModuleList()
+        for _ in range(m):
+            # each component is a block-diagonal of 2b×2b orthogonal blocks
+            blocks = []
+            for _ in range(self.in_features // (2 * block_size)):
+                skew = nn.Parameter(torch.zeros(2 * block_size, 2 * block_size))
+                blocks.append(skew)
+            self.components.append(nn.ParameterList(blocks))
+
+        self.p_block, self.p_comp = dropout  # block-level and comp-level dropout rates
+
+    def forward(self, x):
+        # compute R @ W0 on the fly
+        W = self.W0
+        # identity init via skew-symmetric = zero => Cayley yields I
+        for comp in self.components:
+            # optionally drop entire component
+            if self.training and torch.rand(1).item() < self.p_comp:
+                continue
+            out_blocks = []
+            for skew in comp:
+                # optionally drop block
+                if self.training and torch.rand(1).item() < self.p_block:
+                    block_mat = torch.eye(skew.size(0), device=skew.device)
+                else:
+                    # Cayley parameterization: R = (I + Q)(I - Q)^{-1}, Q = skew - skew^T
+                    Q = skew - skew.T
+                    I = torch.eye(Q.size(0), device=Q.device)
+                    block_mat = (I + Q) @ torch.inverse(I - Q)
+                out_blocks.append(block_mat)
+            # assemble block-diagonal
+            B = torch.block_diag(*out_blocks)
+            W = B @ W
+        return x @ W  # (batch, in_features) @ (in_features, out_features)
+```
+
+Later, after finetuning, we’ll merge each `BOFTLinear` by doing `W0.data.copy_(R @ W0.data)` and then replace the layer with a standard `nn.Linear`.
+
+## 3. Fine‐Tuning a Vision Transformer (ViT)
+
+Let’s adapt a pretrained ViT (e.g. `"google/vit-base-patch16-224"`) to recognize 10 new classes. We’ll replace its classifier and inject BOFT into MLP layers.
+
+```python
+from transformers import ViTModel, ViTConfig
+model = ViTModel.from_pretrained("google/vit-base-patch16-224")
+num_new_classes = 10

@@ -1,0 +1,67 @@
+### Clarifying the memory accounting for LoRA gradients vs LoRA parameters
+Question:
+In the memory discussion, the paper says for a 7B LLaMA model with batch size 1 and LoRA at about 0.2% of parameters, LoRA input gradients take 567 MB while LoRA parameters take 26 MB. Then it says with gradient checkpointing the input gradients reduce to an average of 18 MB per sequence, making them more memory intensive than all LoRA weights combined.
+
+With batch size 1, 18 MB is less than 26 MB. Is this statement assuming multiple sequences in flight (microbatching) or counting gradients from multiple adapter placements? Could you provide a concrete per-layer and per-batch breakdown that reconciles these numbers so we can reproduce the accounting?
+Answer:
+Short answer: the paper is counting the memory for the per-layer input gradients that LoRA needs to compute gradient updates, and those scale with (number of adapter placements) × (sequence length) × (hidden dim). The 567 MB figure is the full (no-checkpointing) cost for one long sequence with adapters at every layer; the “18 MB per sequence” is the *average stored activation/gradient per sequence when gradient checkpointing is used* (you recompute most activations and only keep a small fraction), so that 18 MB is a per-sequence number. If you run more than one sequence in flight (microbatching / gradient accumulation) or count all layer placements without amortization, the total stored input-gradients can exceed the 26 MB of LoRA parameters. Below I give the simple formula and a concrete numeric example that reproduces the paper’s numbers so you can check the accounting.
+
+Key formula (what you should compute)
+Let $b$ be batch size (sequences in flight), $S$ the sequence length (tokens), $H$ the model hidden dimension, $L$ the number of linear layers where a LoRA adapter is placed (i.e., number of adapter placements), and $B$ the bytes per stored activation/gradient element (BF16 or FP16 → 2 bytes; FP32 → 4 bytes). The memory to store the input gradients $X$ for all adapter placements (no checkpointing) is approximately
+
+$$
+\text{Memory\_input\_grads} \approx b \times S \times H \times L \times B.
+$$
+
+The LoRA parameter memory is just
+
+$$
+\text{Memory\_LoRA\_params} \approx N_{\text{LoRA\_params}} \times B_{\text{param}}
+$$
+
+where $B_{\text{param}}$ is bytes per parameter used for storing the LoRA weights/updates (paper uses 16-bit BrainFloat / BF16 for LoRA params, so $B_{\text{param}} \approx 2$ bytes).
+
+Concrete numbers that reproduce the paper’s accounting
+The paper’s 7B example matches the following plausible choices (these are standard-ish for LLaMA-like models and consistent with the numbers the paper gives):
+
+- LoRA fraction 0.2% of 7B → $N_{\text{LoRA\_params}} \approx 0.002 \times 7\mathrm{e}9 \approx 14\mathrm{e}6$ parameters.
+- Storing LoRA params in BF16: $\text{Memory\_LoRA\_params} \approx 14\mathrm{e}6 \times 2\ \text{bytes} \approx 28\ \text{MB}$ (the paper reports ~26 MB, rounding / exact LoRA placement/r ranks explain the small difference).
+- Hidden dim $H \approx 4096$ and $L \approx 32$ adapter placements (LoRA “at every network layer” is used in the paper). These are the canonical sizes for a 7B decoder transformer (order-of-magnitude).
+- Sequence length $S \approx 2048$ tokens (common for long-context experiments). Batch $b = 1$. Bytes per element for activation/gradients $B = 2$ (BF16).
+
+Plug these into the formula:
+
+$$
+\text{Memory\_input\_grads} \approx 1 \times 2048 \times 4096 \times 32 \times 2\ \text{bytes}
+                   = 2048 \times (4096 \times 64)\ \text{bytes}
+                   = 2048 \times 262144\ \text{bytes}
+                   = 536,870,912\ \text{bytes} \approx 512\ \text{MB}.
+$$
+
+Using slightly different exact $H$, $L$ or rounding gives the reported ~567 MB in the paper (they likely used exact model dims and adapter counts, and include small extra bookkeeping). So you can see 567 MB is exactly the same kind of calculation: there are $L$ copies of the $(b \times S \times H)$ input tensors whose gradients are kept if you do not checkpoint.
+
+What gradient checkpointing changes
+Gradient checkpointing trades memory for computation: instead of storing activations for all $L$ placements you store only a subset (or just the inputs for a few checkpoints) and recompute intermediate activations during the backward pass. In effect you reduce the peak stored activation memory from proportional-to-$L$ down to something close to proportional-to-$(L / \text{recompute\_factor})$ or even to a small constant in the ideal amortized case.
+
+The paper’s “18 MB per sequence” is the *average stored gradient/activation per sequence after checkpointing*. Using the same numbers as above, if checkpointing reduces the effective number of stored placements to $\approx 1$ (or amortizes the cost so the average per sequence is $\approx 1 \times S \times H \times B$), then
+
+$$
+\text{Average\_after\_checkpoint} \approx 1 \times 2048 \times 4096 \times 2\ \text{bytes} \approx 16,777,216\ \text{bytes} \approx 16\ \text{MB},
+$$
+
+which rounds to the paper’s ~18 MB per sequence. So this is consistent: checkpointing turns the $L$ multiplier into an $O(1)$ multiplier in the average per-sequence footprint.
+
+Why the paper says “more memory intensive than all LoRA weights combined”
+This sentence is slightly terse and can be read two ways; the intended reading is that the stored activation/gradient memory for LoRA (even after checkpointing) can dominate the LoRA parameter storage under realistic training regimes where you have multiple sequences in flight or accumulate gradients over multiple micro-batches. Concretely:
+
+- The 18 MB number is per sequence (per microbatch) after checkpointing. If you run multiple microbatches concurrently ($b > 1$) or you use gradient accumulation with several sequences “in flight” between optimizer updates, the total becomes $b \times 18\ \text{MB}$. For example with $b = 2$–4 or gradient accumulation of 4 steps you already have 36–72 MB in activation gradients, exceeding the ~26 MB of LoRA params.
+- Also some implementations store extra temporaries or keep more than one placement’s activations in memory at a time (depending on checkpointing schedule or CUDA kernel fusion), increasing the peak beyond the simple amortized “18 MB per sequence” average.
+
+So the sentence in the paper is not saying 18 MB (single sequence) > 26 MB; it’s saying that after checkpointing, the *activation/gradient* cost per sequence is small (≈18 MB), but in typical multi-sequence training setups (microbatching / accumulation / multiple workers / non-ideal checkpoint schedules) the aggregate stored gradients can become larger than the total LoRA parameter memory. That’s the practical point: LoRA parameters themselves are tiny compared to the activation/gradient footprint that arises during training, so shrinking LoRA parameter count yields only small memory savings relative to optimizing activation storage via checkpointing or paged optimizers.
+
+Summary you can reproduce
+1. Compute LoRA param memory: $N_{\text{LoRA\_params}} \approx 0.002 \times \text{total\_params}$; memory $\approx N_{\text{LoRA\_params}} \times \text{bytes\_per\_param}$ (BF16 → $\sim 2$ bytes).
+2. Compute input-gradient memory (no checkpointing): $\text{Memory} \approx b \times S \times H \times L \times \text{bytes\_per\_element}$; plugging $b=1$, $S\approx2048$, $H\approx4096$, $L\approx32$, bytes$=2$ yields $\approx 512$–567 MB (matches paper).
+3. With checkpointing, the effective $L$ factor is reduced to $\approx 1$ on average (you only store a small subset, recomputing others), giving $\approx 16$–18 MB per sequence; multiply by $b$ (microbatch / sequences in flight) to get total peak activation memory to compare with LoRA params.
+
+If you want, give me the exact model dims ($H$) and number of adapter placements ($L$) you’re using and I’ll plug in the precise numbers so you exactly reproduce the paper’s 567 MB and 26 MB values.

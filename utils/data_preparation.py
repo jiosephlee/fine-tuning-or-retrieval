@@ -162,6 +162,7 @@ def prepare_training_mix(
     shuffle_chunks_flag = strategy_args.get("shuffle_chunks", False)
     shuffle_seed = strategy_args.get("shuffle_seed", 42)
     with_human = strategy_args.get("with_human", False)
+    explanation_in_own_batch = strategy_args.get("explanation_in_own_batch", False)
 
     # Helper to chunk a single text
     def _chunk(text: str) -> List[str]:
@@ -242,9 +243,16 @@ def prepare_training_mix(
         # Each inner list holds chunks for a "unique document type" across all domains
         # e.g., unique_document_batches[0] = all source chunks
         #       unique_document_batches[1] = all paraphrase-1 chunks
-        num_doc_types = 1 + num_paraphrased_texts
+        base_doc_types = 1 + num_paraphrased_texts
+        # Optionally treat explanations as an additional "document type" with its own batch.
+        if with_explanations and explanation_in_own_batch:
+            num_doc_types = base_doc_types + 1
+        else:
+            num_doc_types = base_doc_types
         unique_document_batches = [[] for _ in range(num_doc_types)]
-        unique_document_batches_with_explanations = [[] for _ in range(num_doc_types)] if with_explanations else None
+        unique_document_batches_with_explanations = (
+            [[] for _ in range(num_doc_types)] if (with_explanations and not explanation_in_own_batch) else None
+        )
 
 
         for domain in domains:
@@ -325,14 +333,17 @@ def prepare_training_mix(
             
             # Document Chunks for the current domain
             domain_doc_chunks = [source_chunks] + paraphrased_chunks_by_doc
+            # When enabled, treat explanations as an additional "document type" with its own batch.
+            if with_explanations and explanation_in_own_batch and explanation_chunks:
+                domain_doc_chunks.append(explanation_chunks)
             
             # Add original chunks to the primary list
             for i, chunks in enumerate(domain_doc_chunks):
                 if i < len(unique_document_batches):
                     unique_document_batches[i].extend(chunks)
 
-            # 4. Handle explanation replacement logic
-            if with_explanations:
+            # 4. Handle explanation replacement logic (legacy path: explanations replace paraphrase chunks)
+            if with_explanations and not explanation_in_own_batch:
                 domain_doc_chunks_expl = [c[:] for c in domain_doc_chunks]
                 
                 if explanation_chunks:

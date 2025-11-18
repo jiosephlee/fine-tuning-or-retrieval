@@ -1,0 +1,133 @@
+# Implementing BitLinear: A Hands-on Guide to 1.58-bit Transformers
+
+## Introduction
+
+If you’ve been following the latest in model compression, you might have seen recent work introducing 1-bit—or more accurately, 1.58-bit—transformers. The key innovation behind BitNet b1.58 is the **BitLinear** layer, which quantizes each weight to \{-1, 0, +1\}. Despite this extreme compression, BitNet b1.58 matches full-precision (FP16) performance on both perplexity and downstream tasks while delivering massive wins in memory, latency, and energy efficiency.
+
+In this guide, we’ll walk through a step-by-step implementation of BitLinear, complete with the **absmean** quantizer, 8-bit activations, and per-token scaling. Along the way, we’ll share practical training tips, stabilization tricks, and show you how to plug your new layer into popular stacks like Hugging Face Transformers, vLLM, and llama.cpp.
+
+## Understanding BitLinear at a Glance
+
+At its core, BitLinear replaces the standard `nn.Linear` module with a quantized version that uses only ternary weights. Here’s the big picture:
+
+  • **Weights**: Quantized to \{-1, 0, +1\}, yielding an average of 1.58 bits per parameter.  
+  • **Activations**: Kept at 8 bits, scaled per token into the range \([-Q_b, +Q_b]\).  
+  • **Computation**: Most matrix multiplies become integer additions, slashing energy and latency.  
+
+By marrying these building blocks, you get a drop-in Linear replacement that’s dramatically more efficient yet still trains to full-precision quality.
+
+## Implementing the absmean Quantizer
+
+The first piece of the puzzle is the **absmean** quantization function. This routine rescales each weight matrix based on its mean absolute value and then rounds into \{-1, 0, +1\}.
+
+```python
+import torch
+import torch.nn.functional as F
+
+class AbsMeanQuantizer(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, W, epsilon=1e-5):
+        # Compute the scale factor γ = mean(|W|)
+        gamma = W.abs().mean()
+        # Normalize and round-clamp
+        W_scaled = W / (gamma + epsilon)
+        W_q = W_scaled.round().clamp(-1, 1)
+        ctx.save_for_backward(W, W_q, gamma)
+        return W_q, gamma
+
+    @staticmethod
+    def backward(ctx, grad_Wq, grad_gamma):
+        W, W_q, gamma = ctx.saved_tensors
+        # Straight-through estimator for weights
+        grad_W = grad_Wq.clone()
+        # Only pass gradients in the clipping interval
+        mask = (W_q > -1) & (W_q < 1)
+        grad_W = grad_W * mask
+        return grad_W, None
+```
+
+In LaTeX terms, we are computing:
+
+\[
+\widetilde{W} = \mathrm{RoundClip}\Bigl(\tfrac{W}{\gamma + \epsilon},\,-1,\,1\Bigr),
+\quad
+\gamma = \frac{1}{nm}\sum_{i,j} |W_{ij}|.
+\]
+
+Here, `RoundClip(x, a, b) = max(a, min(b, round(x)))`. Notice how the zero in the ternary set lets the model filter out noisy or redundant connections—a boon for expressivity compared to pure \{-1,+1\} quantization.
+
+## 8-bit Activations and Per-Token Scaling
+
+Rather than fussing with zero-point adjustments, BitNet b1.58 simply scales activations on a per-token basis into the symmetric range \([-Q_b, +Q_b]\). A typical flow looks like:
+
+1. Compute the floating-point activations `A` from your preceding layer.
+2. For each token vector, find its maximum absolute value.
+3. Divide by that value (plus a tiny epsilon) and round into an 8-bit integer.
+4. Dequantize back to floating-point only when strictly necessary.
+
+```python
+def quantize_activations_per_token(A, Q_b=127, epsilon=1e-5):
+    # A: [batch, sequence, dim]
+    max_vals = A.abs().amax(dim=-1, keepdim=True)
+    scale = max_vals + epsilon
+    A_scaled = A / scale
+    A_q = (A_scaled * Q_b).round().clamp(-Q_b, Q_b).to(torch.int8)
+    return A_q, scale
+```
+
+This per-token approach is not only simple to implement, it also aligns naturally with sequence-level parallelism in modern transformers.
+
+## Building the BitLinear Layer
+
+Now, let’s combine our quantizer and activation scheme into a drop-in module:
+
+```python
+class BitLinear(torch.nn.Module):
+    def __init__(self, in_features, out_features, bias=False):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = None
+        if bias:
+            self.bias = torch.nn.Parameter(torch.zeros(out_features))
+
+    def forward(self, x):
+        # Quantize weights
+        W_q, gamma = AbsMeanQuantizer.apply(self.weight)
+        # Quantize activations
+        A_q, act_scale = quantize_activations_per_token(x)
+        # Integer matmul: (INT8 x INT1) → accumulate as INT32
+        out_int = torch.nn.functional.linear(A_q.float(), W_q.float())
+        # Rescale back to floating point
+        out = out_int * gamma * act_scale
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+```
+
+Replace every `nn.Linear` in your transformer with `BitLinear` and you’ve effectively converted the model to 1.58-bit precision.
+
+## Training Tips and Stabilization Tricks
+
+Training quantized networks from scratch can be delicate. Here are a few practical heuristics we found helpful:
+
+  • **Warm-Up Quantizer**: Linearly ramp in quantization over the first few thousand steps to avoid shock.  
+  • **Learning Rate**: Use a slightly lower peak LR (e.g., 10–20% down from FP16) with cosine decay.  
+  • **Weight Decay**: Keep it modest. With ternary weights, overly aggressive decay can push more weights to zero prematurely.  
+  • **No Biases**: As in LLaMA, omitting biases simplifies quant statistics and eliminates nuisance degrees of freedom.  
+  • **LayerNorm Variants**: RMSNorm often outperforms classic LayerNorm in low-bit regimes.  
+
+Applied correctly, these tricks let BitNet b1.58 converge smoothly to the same validation perplexity as a full-precision baseline.
+
+## Integrating with Popular Frameworks
+
+One of the great things about the BitLinear design is how simply it slots into existing ecosystems.
+
+  • **Hugging Face Transformers**: Subclass `AutoModelForCausalLM` and swap out `nn.Linear` in your `transformer.h` modules for `BitLinear`. Most config settings remain unchanged.  
+  • **vLLM**: Since vLLM builds on Hugging Face backbones, the same patch applies. You’ll get immediate inference speedups in generation workloads.  
+  • **llama.cpp**: Add a new quant kernel for your ternary weights and 8-bit activations. The per-token scaling easily fits into the existing dispatch logic.  
+
+Because BitLinear preserves the same interface as `nn.Linear`, you rarely have to rewrite your attention or feed-forward code—just change the import and you’re off to the races.
+
+## Conclusion
+
+Implementing 1.58-bit transformers with BitLinear is both straightforward and highly rewarding. By quantizing to \{-1, 0, +1\} and adopting 8-bit, per-token activations, you unlock major reductions in memory footprint, latency, and energy usage—without sacrificing model quality. With the recipes and tips in this guide, you can experiment with BitNet b1.58 in your favorite stack today and start pushing the boundaries of efficient LLM inference. Happy quantizing!

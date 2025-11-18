@@ -1,0 +1,87 @@
+# Double Quantization, Explained: Compressing the scale of your scales
+
+Quantization is the obvious lever for shrinking large neural networks: store weights in fewer bits and save memory. QLoRA goes further. It quantizes not only the model weights (to 4 bits using an NF4 scheme) but also the very numbers you use to map those low-bit values back to the original scale — the quantization constants. That second step is what the authors call double quantization, and it yields meaningful memory savings (about 0.373 bits per parameter in their setup) without measurable performance loss. This short post walks through what double quantization is, why it is safe, and how the arithmetic works — with a few simple analogies and numbers so you can see the impact on a 65B model.
+
+## Quick refresher: block-wise quantization and quantization constants
+
+When you quantize a floating tensor to a low-bit representation you typically:
+
+1. Pick a block of parameters (e.g., B = 64 values).
+2. Compute a scale or quantization constant c for that block (often based on the block's absolute max or some distribution-aware estimator).
+3. Map the floating values to integer / low-bit bins by multiplying by that scale and rounding.
+
+Formally, for a block we often write
+- quantization: X^{Int} = round(c \cdot X^{FP32})
+- dequantization: X^{FP32} = X^{Int} / c
+
+That constant c is stored per-block. For small block sizes (needed for good precision) those c values add up in memory. For example, if c is stored in 32-bit float and blocksize is 64, the cost per parameter is 32 / 64 = 0.5 bits on average (because one 32-bit constant covers 64 parameters).
+
+QLoRA uses a blocksize of 64 for the 4-bit weight tensors, so these quantization constants are a real contributor to memory footprint.
+
+## The simple idea: quantize the quantization constants
+
+Double quantization treats the per-block constants themselves as a tensor to be quantized. In other words:
+
+- First quantize the weight block into a k-bit representation (e.g., NF4) with a 32-bit scale per block, call it c_2^{FP32}.
+- Then quantize the array of c_2^{FP32} values into a lower-precision form (FP8 in QLoRA) plus a second-level scale c_1^{FP32} that lets you reconstruct c_2 when needed.
+
+So instead of storing each c_2^{FP32} as 32 bits, you store a low-bit code (FP8) per block plus a second-level scale that itself is stored sparsely (one 32-bit c_1 per many blocks). This reduces the average bits-per-parameter devoted to scales substantially.
+
+In QLoRA the authors use:
+- Weight blocksize: 64 (for the NF4 weights).
+- Quantize weight-block scales (c_2) to an 8-bit floating representation with blocksize 256 for the c_2 quantization.
+- Subtract the mean from the c_2 values before quantization (they are all positive), enabling symmetric quantization around zero which improves use of the codebook.
+
+Because the c_2 values are positive, centering them (subtracting the mean) helps make symmetric quantization more effective.
+
+## How the arithmetic works (concise)
+
+Double dequantization is just two steps:
+
+1. Reconstruct the first-level scale c_2 from the second-level representation: c_2 = dequant(c_1^{FP32}, c_2^{k-bit}).
+2. Dequantize the weight codes with that reconstructed scale: W^{BF16} = dequant(c_2, W^{k-bit}).
+
+In formula form (as used in the paper):
+- doubleDequant(c_1^{FP32}, c_2^{k-bit}, W^{k-bit}) = dequant(dequant(c_1^{FP32}, c_2^{k-bit}), W^{k-bit})
+
+This lets the stored representation be very compact, but reconstructs the (approximate) full-precision scale at runtime when dequantizing weights for computation.
+
+## A concrete bit accounting example (the paper's numbers)
+
+Take the QLoRA configuration in the paper:
+
+- Weight blocksize B_w = 64.
+- Weight storage: 4 bits per weight (NF4).
+- First-level scales (c_2) stored originally in FP32, one per block of 64 weights: cost = 32 / 64 = 0.5 bits per parameter.
+- Double-quantize the c_2 values using FP8 codes with a second-level blocksize B_c = 256 and keep a c_1^{FP32} per second-level block.
+
+After double quantization the cost per parameter for scale storage becomes:
+- 8 bits per c_2 code covering 64 weights, but the c_2 codes themselves are grouped into blocks of 256 before a full-precision c_1 is stored. This gives an average cost of 8 / 64 + 32 / (64 * 256) bits per weight.
+
+Compute that:
+- 8 / 64 = 0.125 bits
+- 32 / (64 * 256) = 32 / 16384 = 0.001953125 bits
+- Sum ≈ 0.126953125 bits ≈ 0.127 bits per parameter.
+
+Compare to the original 0.5 bits per parameter for full-precision c_2. The saving is
+- 0.5 − 0.127 = 0.373 bits per parameter.
+
+For very large models this adds up. On a 65B-parameter model, 0.373 bits × 65e9 ≈ 24.245e9 bits ≈ 3.03 GB. The paper reports the same ~3 GB saving estimate for a 65B model from double quantization.
+
+All of this is done without measurable degradation in downstream performance when combined with the other QLoRA components (NF4 for weight codes, LoRA adapters for trainable parameters, and paged optimizers). In other words: you compress the things that are cheap to reconstruct (the scales), and you retain the performance-critical parts.
+
+## Why this is safe / why it works
+
+- The per-block scales c_2 are themselves numbers with structure — they tend to vary smoothly across blocks and are amenable to low-precision representation. Using a second-level quantizer (FP8 codes plus a large-block second-level scale) leverages that structure.
+- The NF4 weight codes are already optimized for normal-like weight distributions, so the remaining precision budget is concentrated where it matters most: the per-weight codes. Slightly approximating the per-block scale (via FP8) introduces a small, structured error that can be recovered or tolerated by downstream computation and finetuning.
+- QLoRA also adds LoRA adapters and performs finetuning through the frozen quantized weights. The adapters can compensate for small systematic reconstruction errors introduced by double quantization.
+
+## Practical takeaway
+
+If you are quantizing large models with small blocksizes (e.g., 64) the per-block scales are a non-negligible fraction of memory. Double quantization is a low-risk, high-reward trick: quantize those scale values themselves (e.g., to FP8, grouped with a larger blocksize for their own second-level scale), and you can recover several tenths of a bit per parameter. On the scale of a 65B model that translates to roughly 3 GB of saved memory for scales alone — meaningful when you are trying to fit finetuning workloads into a single 48 GB GPU.
+
+QLoRA combines this with NF4 weight codes, LoRA adapters, and paged optimizers to provide a practical finetuning solution that retains full 16-bit finetuning performance while drastically lowering memory. Double quantization is one of the small engineering pivots that make that possible.
+
+## Final note
+
+Double quantization is conceptually simple but effective: quantize the thing that quantizes. When blocksize choices make your scales expensive, compress those scales with a second-level quantizer and reap real memory savings without sacrificing model quality.
