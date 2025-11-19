@@ -23,7 +23,7 @@ python -s finetuning_knowledge_v8.py \
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
     --overlap_ratio 1_4 \
-    --attn_implementation kernels-community/vllm-flash-attn3 \
+    --attn_implementation sdpa \
     --gradient_checkpointing \
     --full_finetuning
 
