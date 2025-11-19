@@ -1,11 +1,19 @@
+#!/bin/bash
+#SBATCH --job-name=single
+#SBATCH --output=32B-%j.out
+#SBATCH --time=24:00:00
+#SBATCH --partition=dgx-b200          # example GPU partition on Betty
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=128GB
+
 num_epochs=100
-num_paraphrased=9
-accelerate launch --config_file deepspeed.yaml --num_processes 2 finetuning_knowledge_v8.py \
+num_paraphrased=0
+python finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-0325-32B \
-    --device_batch_size 1 \
-    --with_explanations \
+    --device_batch_size 2 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
-    --effective_batch_size_for_cpt 16 \
+    --effective_batch_size_for_cpt 32 \
     --separate_batches_with_pretraining 1 \
     --fill_batches_with_pretraining \
     --num_train_epochs $num_epochs \
@@ -13,8 +21,31 @@ accelerate launch --config_file deepspeed.yaml --num_processes 2 finetuning_know
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
     --overlap_ratio 1_4 \
+    --attn_implementation sdpa \
     --gradient_checkpointing \
-    --full_finetuning > output_47.log 
+    --full_finetuning \
+    --compile_model \
+    --offload_to_cpu \
 
 
-# export CUDA_VISIBLE_DEVICES=2,3 to use 2 GPUs for instance.
+num_epochs=100
+num_paraphrased=9
+python finetuning_knowledge_v8.py \
+    --model_id allenai/OLMo-2-0325-32B \
+    --device_batch_size 2 \
+    --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
+    --effective_batch_size_for_cpt 32 \
+    --separate_batches_with_pretraining 1 \
+    --fill_batches_with_pretraining \
+    --num_train_epochs $num_epochs \
+    --learning_rate 2e-5 \
+    --num_paraphrased_texts $num_paraphrased \
+    --overlap_sections \
+    --overlap_ratio 1_4 \
+    --attn_implementation sdpa \
+    --gradient_checkpointing \
+    --full_finetuning \
+    --compile_model \
+    --offload_to_cpu \
+
+
