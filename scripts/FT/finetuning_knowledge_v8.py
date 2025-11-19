@@ -60,11 +60,18 @@ def construct_experiment_name(args):
             data_mix = f"{data_mix_base}_expl"
         elif args.with_specific_explanation:
             data_mix = f"{data_mix_base}_expl_{args.with_specific_explanation}"
+            # Add granular analysis details if enabled
+            if args.granular_explanation_analysis and args.explanation_tail_docs > 0:
+                data_mix += f"_n{args.explanation_tail_docs}"
         else:
             data_mix = data_mix_base
         
         if (args.with_explanations or args.with_specific_explanation) and args.times_explanations > 1:
             data_mix += f"_x{args.times_explanations}"
+        
+        # Add tail distribution info if used
+        if args.explanation_tail_docs > 0:
+            data_mix += f"_tail{args.explanation_tail_docs}"
 
     else:
         data_mix = "source_only"
@@ -197,6 +204,8 @@ def continue_pretraining(model, tokenizer, log, args):
         "explanation_every_round": args.explanation_every_round,
         "shuffle_chunks": args.shuffle_chunks,
         "shuffle_seed": args.shuffle_seed,
+        "explanation_tail_docs": args.explanation_tail_docs,
+        "granular_explanation_analysis": args.granular_explanation_analysis,
     }
 
     use_special_injection = args.with_explanations or args.with_specific_explanation or args.with_human
@@ -373,6 +382,8 @@ if __name__ == "__main__":
     parser.add_argument("--explanation_every_round", action="store_true", help="Inject explanations for every round/replication instead of alternating.")
     parser.add_argument("--shuffle_chunks", action="store_true", help="Shuffle constructed training chunks with seed 42 before training.")
     parser.add_argument("--shuffle_seed", type=int, default=42, help="Seed to use when shuffling training chunks.")
+    parser.add_argument("--explanation_tail_docs", type=int, default=0, help="Number of tail document types to distribute explanations across (also determines how many files to load).")
+    parser.add_argument("--granular_explanation_analysis", action="store_true", help="Use granular subfolder structure for explanations (e.g., blogs/, stackexchange/).")
 
     # Lora arguments
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA r parameter.")

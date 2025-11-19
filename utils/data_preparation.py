@@ -163,6 +163,12 @@ def prepare_training_mix(
     shuffle_seed = strategy_args.get("shuffle_seed", 42)
     with_human = strategy_args.get("with_human", False)
     explanation_in_own_batch = strategy_args.get("explanation_in_own_batch", False)
+    # Number of tail document-types (from the paraphrases) to which we should
+    # distribute explanation chunks. For example, if there are 9 paraphrases
+    # and this is 4, explanations will be added to the last 4 paraphrase
+    # document-types.
+    explanation_tail_docs = int(strategy_args.get("explanation_tail_docs", 0))
+    granular_explanation_analysis = strategy_args.get("granular_explanation_analysis", False)
 
     # Helper to chunk a single text
     def _chunk(text: str) -> List[str]:
@@ -292,45 +298,77 @@ def prepare_training_mix(
                 paraphrased_chunks_by_doc = [_chunk(text) for text in paraphrased_texts]
 
             # 3. Load explanation texts
-            explanation_chunks = []
+            explanation_chunks = [] # Collects all chunks if not distributing (for legacy/own-batch)
+            
             if with_explanations:
                 explanation_dir = f'../../data/arxiv/explanations/{domain}/'
 
-                # Default: model-generated explanations
-                default_files = []
-                if specific_explanation_type:
-                    default_files.append(f"{specific_explanation_type}.txt")
-                else:
-                    default_files = ['blogs.txt', 'stackexchange.txt', 'textbook.txt']
-
-                # Optional: human-written blogs where available (e.g., GRPO, DPO)
-                human_files = [f"human_blog_{i}.txt" for i in range(1, 4)] if with_human else []
-
                 files_to_load = []
-                if os.path.isdir(explanation_dir):
-                    available_files = set(os.listdir(explanation_dir))
+                
+                # New mode: Granular analysis using subfolders (e.g., blogs/, stackexchange/)
+                if granular_explanation_analysis and specific_explanation_type and explanation_tail_docs > 0:
+                    # Use the subfolder structure: e.g., DPO/blogs/ or DPO/stackexchange/
+                    subfolder_path = os.path.join(explanation_dir, specific_explanation_type)
+                    if os.path.isdir(subfolder_path):
+                        # Load first N .txt files from the subfolder, sorted for deterministic order
+                        all_files = sorted([f for f in os.listdir(subfolder_path) if f.endswith('.txt')])
+                        
+                        # Load exactly explanation_tail_docs files (one per tail slot)
+                        num_files_to_load = min(explanation_tail_docs, len(all_files))
+                        files_to_load = all_files[:num_files_to_load]
+                        
+                        if num_files_to_load < explanation_tail_docs:
+                            log.warning(
+                                f"Domain {domain}: Only {num_files_to_load} files available in {subfolder_path}, "
+                                f"but explanation_tail_docs={explanation_tail_docs}."
+                            )
+                        
+                        log.info(f"Domain {domain}: Loading {len(files_to_load)} files from {subfolder_path}.")
+                        
+                        # Prepend the subfolder path to each filename
+                        files_to_load = [os.path.join(specific_explanation_type, f) for f in files_to_load]
+                    else:
+                        log.warning(f"Domain {domain}: Subfolder {subfolder_path} not found for granular analysis.")
+                
+                # Legacy mode: Load from root explanation directory
+                else:
+                    # Default: model-generated explanations
+                    default_files = []
+                    if specific_explanation_type:
+                        default_files.append(f"{specific_explanation_type}.txt")
+                    else:
+                        default_files = ['blogs.txt', 'stackexchange.txt', 'textbook.txt']
 
-                    if human_files and any(f in available_files for f in human_files):
-                        # Prefer human-written explanations for domains where they exist.
-                        # When with_human=True, we DO NOT fall back to default explanation files.
-                        files_to_load = [f for f in human_files if f in available_files]
-                        log.info(f"Domain {domain}: Using HUMAN explanation files: {files_to_load}.")
-                    elif not with_human:
-                        # Only use default model-generated explanations when not explicitly
-                        # requesting human-written texts.
-                        files_to_load = [f for f in default_files if f in available_files]
+                    # Optional: human-written blogs where available (e.g., GRPO, DPO)
+                    human_files = [f"human_blog_{i}.txt" for i in range(1, 4)] if with_human else []
 
-                    for filename in sorted(files_to_load):
+                    if os.path.isdir(explanation_dir):
+                        available_files = set(os.listdir(explanation_dir))
+
+                        if human_files and any(f in available_files for f in human_files):
+                            # Prefer human-written explanations for domains where they exist.
+                            files_to_load = [f for f in human_files if f in available_files]
+                            log.info(f"Domain {domain}: Using HUMAN explanation files: {files_to_load}.")
+                        elif not with_human:
+                            files_to_load = [f for f in default_files if f in available_files]
+
+                    # Sort files for deterministic assignment
+                    files_to_load.sort()
+
+                # If NOT distributing to tail docs, load all explanations into a single list
+                # for legacy replacement or "own-batch" logic.
+                if explanation_tail_docs <= 0:
+                    for filename in files_to_load:
                         file_path = os.path.join(explanation_dir, filename)
                         with open(file_path, 'r', encoding='utf-8') as f:
                             explanation_chunks.extend(_chunk_explanation(f.read()))
 
-                if times_explanations > 1 and explanation_chunks:
-                    explanation_chunks = explanation_chunks * times_explanations
-                    log.info(f"Domain {domain}: Repeated explanations {times_explanations} times.")
+                    if times_explanations > 1 and explanation_chunks:
+                        explanation_chunks = explanation_chunks * times_explanations
+                        log.info(f"Domain {domain}: Repeated explanations {times_explanations} times.")
 
-                log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks from {files_to_load}.")
-            
+                    log.info(f"Domain {domain}: Found {len(explanation_chunks)} explanation chunks from {files_to_load}.")
+
             # Document Chunks for the current domain
             domain_doc_chunks = [source_chunks] + paraphrased_chunks_by_doc
             # When enabled, treat explanations as an additional "document type" with its own batch.
@@ -342,8 +380,29 @@ def prepare_training_mix(
                 if i < len(unique_document_batches):
                     unique_document_batches[i].extend(chunks)
 
+            # Distribute explanation files directly across tail document slots (Simpler Mode)
+            if with_explanations and explanation_tail_docs > 0 and files_to_load:
+                start_slot = base_doc_types - explanation_tail_docs
+                
+                for i, filename in enumerate(files_to_load):
+                    file_path = os.path.join(explanation_dir, filename)
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        file_chunks = _chunk_explanation(f.read())
+                    
+                    if times_explanations > 1 and file_chunks:
+                        file_chunks = file_chunks * times_explanations
+                    
+                    # Direct 1-to-1 mapping: file i goes to slot (start_slot + i)
+                    target_doc_idx = start_slot + i
+                    
+                    if 0 <= target_doc_idx < len(unique_document_batches):
+                        unique_document_batches[target_doc_idx].extend(file_chunks)
+                        log.info(f"Domain {domain}: Added {len(file_chunks)} chunks from {filename} to doc-type {target_doc_idx}.")
+                    else:
+                        log.warning(f"Domain {domain}: Skipping {filename}, target doc-type {target_doc_idx} out of range.")
+
             # 4. Handle explanation replacement logic (legacy path: explanations replace paraphrase chunks)
-            if with_explanations and not explanation_in_own_batch:
+            if with_explanations and not explanation_in_own_batch and explanation_tail_docs <= 0:
                 domain_doc_chunks_expl = [c[:] for c in domain_doc_chunks]
                 
                 if explanation_chunks:
@@ -389,7 +448,7 @@ def prepare_training_mix(
                 for i, chunks in enumerate(domain_doc_chunks_expl):
                     if i < len(unique_document_batches_with_explanations):
                         unique_document_batches_with_explanations[i].extend(chunks)
-                    
+
     # 5. Assemble final chunk list with optional pretraining data replay
     final_chunks = []
     pretraining_separators = int(strategy_args.get("separate_batches_with_pretraining", 0))
