@@ -572,7 +572,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 all_metrics['perplexity'].append(perplexity)
 
             if self.track_hits:
-                hits = self._calculate_hits_at_k(shift_logits, shift_labels, context_lengths, target_lengths, k_values=[1, 5, 10, 100])
+                hits = self._calculate_hits_at_k(shift_logits, shift_labels, context_lengths, target_lengths, k_values=[1, 10, 100])
                 for k, v in hits.items():
                     all_metrics[k].append(v)
 
