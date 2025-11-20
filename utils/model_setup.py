@@ -32,7 +32,7 @@ def create_peft_model_for_training(model, log, config: PeftConfig):
     log.info("PEFT Model Created successfully.")
     return model
     
-def load_model_for_training(config: ModelConfig, log, use_cpu_and_gpu = False, add_special_token = None, use_existing_lima_tokenizer=False, use_existing_lima_model = False):
+def load_model_for_training(config: ModelConfig, log, use_cpu_and_gpu = False, add_special_token = None, use_existing_lima_tokenizer=False, use_existing_lima_model = False, cache_dir=None):
     """
     Loads a model and tokenizer for training, applying quantization and PEFT.
     **ENHANCED** with robust QLoRA setup from open-instruct.
@@ -60,6 +60,7 @@ def load_model_for_training(config: ModelConfig, log, use_cpu_and_gpu = False, a
             torch_dtype=dtype,
             device_map='auto' if use_cpu_and_gpu else "cuda",
             attn_implementation=config.attn_implementation,
+            cache_dir=cache_dir,
         )
     else:
         print("...Quantizing...")
@@ -70,12 +71,13 @@ def load_model_for_training(config: ModelConfig, log, use_cpu_and_gpu = False, a
         quantization_config=quant_config,
         device_map='auto' if use_cpu_and_gpu else "cuda", #Assume we're operating in a low VRAM environment since we're quantizing
         attn_implementation=config.attn_implementation,
+        cache_dir=cache_dir,
     )
     if use_existing_lima_tokenizer:
-        tokenizer = AutoTokenizer.from_pretrained("jiosephlee/olmo2-lima", trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained("jiosephlee/olmo2-lima", trust_remote_code=True, cache_dir=cache_dir)
         model.resize_token_embeddings(len(tokenizer))
     else:
-        tokenizer = AutoTokenizer.from_pretrained(config.id, trust_remote_code=True, use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(config.id, trust_remote_code=True, use_fast=True, cache_dir=cache_dir)
         # Add special tokens before doing PEFT
         if add_special_token is not None:
             log.info(f"Adding special token: {add_special_token}")

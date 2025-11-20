@@ -25,7 +25,7 @@ python -s finetuning_knowledge_v8.py \
     --learning_rate $lr \
     --effective_batch_size_for_cpt 64 \
     --device_batch_size 64 \
-    --override_domains DPO \
+    --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --with_specific_explanation stackexchange \
     --explanation_tail_docs 6 \
     --full_finetuning \
@@ -42,7 +42,7 @@ python -s finetuning_knowledge_v8.py \
     --effective_batch_size_for_cpt 64 \
     --device_batch_size 64 \
     --num_paraphrased_texts $num_paraphrased \
-    --override_domains DPO \
+    --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --with_specific_explanation stackexchange \
     --explanation_tail_docs 12 \
     --full_finetuning \
@@ -59,7 +59,7 @@ python -s finetuning_knowledge_v8.py \
     --effective_batch_size_for_cpt 64 \
     --device_batch_size 64 \
     --num_paraphrased_texts $num_paraphrased \
-    --override_domains DPO \
+    --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --with_specific_explanation stackexchange \
     --explanation_tail_docs 18 \
     --full_finetuning \

@@ -142,10 +142,15 @@ def aggregate_across_domains(run_path, probe_type, domains, split_probes=False, 
                     
                     explanations_only_indices = filter_data.get('in_explanations_only', [])
                     source_only_indices = filter_data.get('in_source_only', [])
+                    both_indices = filter_data.get('in_both', [])
+                    neither_indices = filter_data.get('in_neither', [])
                     
-                    df['origin'] = 'Other'
+                    # Default to 'Both' for backwards compatibility with old filter.json files
+                    df['origin'] = 'Both'
                     df.loc[df['probe_index'].isin(explanations_only_indices), 'origin'] = 'Explanations Only'
                     df.loc[df['probe_index'].isin(source_only_indices), 'origin'] = 'Source Only'
+                    df.loc[df['probe_index'].isin(both_indices), 'origin'] = 'Both'
+                    df.loc[df['probe_index'].isin(neither_indices), 'origin'] = 'Neither'
                 else:
                     print(f"Warning: filter.json not found for domain {domain} in {probe_folder}. Probes will not be split by origin.")
                     df['origin'] = 'Unknown'
@@ -376,7 +381,7 @@ def main():
             print("Error: No data was aggregated. Check paths and file availability.")
             return
 
-        fig, axes = plt.subplots(2, 4, figsize=(16, 8), sharey=False)
+        fig, axes = plt.subplots(2, 5, figsize=(20, 8), sharey=False)
         
         max_step_ft = max_knowledge_step_ft
 
@@ -401,7 +406,8 @@ def main():
         origin_title_map = {
             'Explanations Only': '(In Multi-view Only)',
             'Source Only': '(In Source Only)',
-            'Other': '(In Both)'
+            'Both': '(In Both)',
+            'Neither': '(In Neither)'
         }
 
         for row, (probe_name, df) in enumerate(probe_data_map.items()):
@@ -420,7 +426,7 @@ def main():
             ax_agg.set_title(f'{probe_name} ({total_probes} Probes)')
 
             # Subplots for split probes by origin
-            origins = ['Explanations Only', 'Source Only', 'Other']
+            origins = ['Explanations Only', 'Source Only', 'Both', 'Neither']
             for i, origin in enumerate(origins):
                 ax = axes[row, i + 1]
                 ax.set_prop_cycle(cycler(color=color_palette))
@@ -444,7 +450,7 @@ def main():
         # --- Final styling for the new grid ---
         for i in range(2):
             axes[i, 0].set_ylabel('Mean Log Probability')
-            for j in range(4):
+            for j in range(5):
                 axes[i, j].set_xlabel('Training Steps' if i == 1 else '')
                 if i == 0:
                     axes[i,j].set_xticklabels([])

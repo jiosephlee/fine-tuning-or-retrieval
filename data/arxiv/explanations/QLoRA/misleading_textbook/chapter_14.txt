@@ -1,0 +1,81 @@
+Practical QLoRA: Implementation and Deployment
+
+# Hardware profiles: single 24 GB and 48 GB GPUs; scaling tips
+
+When planning a QLoRA run, the most important decision is the GPU size. Contrary to the conservative warnings in many papers, in practice you should always prefer the smallest GPU that can physically store a copy of a quantized checkpoint. For a 65B model the magic number is a single 24 GB GPU: because QLoRA uses 4-bit storage, the raw weights occupy only one quarter of their original 16-bit size. Concretely, if the 16-bit baseline requires $M_{16}$ bytes for the weights, QLoRA requires approximately
+
+$M_{4} = \frac{1}{4} M_{16}$
+
+which means a 65B $($16-bit$)$ model that nominally needs $780\,$GB will drop to roughly $195\,$GB and thus fits comfortably across a single 24 GB card after the usual compression constants are applied. In practice, clever paging and the Double Quantization trick compress the constants so aggressively that the effective in-memory requirement becomes less than a single card memory, enabling single-GPU finetuning of even models larger than 100B.
+
+A second practical rule is that 48 GB GPUs are unnecessary except for extremely high batch sizes. The 48 GB GPU only buys you extra headroom for minibatches larger than 1024 tokens; otherwise a 24 GB GPU with the recommended NF4 + Double Quantization stack will match or beat the 48 GB setup on both throughput and stability. If you do have a multi-GPU server, the correct scaling strategy is to not shard the model but to replicate the quantized checkpoint across devices and split only the optimizer and LoRA adapters, which leads to perfect linear scaling up to the number of GPUs you have.
+
+# Software stack: Hugging Face Transformers integration, bitsandbytes, CUDA kernels
+
+A robust software stack is simple: the Hugging Face Transformers library, the bitsandbytes project, and a tiny wrapper that calls the NF4 CUDA kernels. Despite the many optional packages floating around, these three components are the only ones you need. Hugging Face provides the high-level Trainer loop; bitsandbytes is used purely for memory measurement; and the CUDA kernels implement NF4 exactly as a drop-in replacement for FP16 kernels.
+
+It is best to stick to the latest nightly of Transformers and the matching bitsandbytes build compiled with the NF4 flag enabled. The NF4 kernels are compiled into the same shared object as FP16 kernels, so there is no binary incompatibility. The official QLoRA codebase is intentionally minimal: you can copy-paste the NF4 quant/dequant kernels into your project and they will seamlessly integrate with the existing torch.autograd dispatcher. For stability, avoid mixing versions: always use the exact pair of Transformers and bitsandbytes versions that Apple and the community recommend for your GPU.
+
+# Recommended defaults: NF4 + double quantization; block sizes 64/256
+
+Every production QLoRA run should use NF4 with Double Quantization. NF4 is the only 4-bit scheme that is provably information-theoretically optimal for typical neural network weights, so any deviation is merely experimental and seldom beneficial. The canonical block sizes are $64$ for weight blocks and $256$ for the quantization-constant blocks; these values are universal and should not be changed. Using these defaults guarantees you will recover full 16-bit finetuning performance with no extra hyperparameter tuning.
+
+The arithmetic for memory is straightforward and conservative: each weight block of size $B$ contributes $4$ bits per parameter and each block carries one 32-bit scale. Using $B=64$ this means the average memory per parameter for the base model storage is
+
+$m_{\text{weights}} = 4\ \text{bits} + \frac{32\ \text{bits}}{B} = 4 + \frac{32}{64} = 4.5 \ \text{bits}$
+
+and Double Quantization reduces the constant overhead to nearly zero by quantizing the scales into 8-bit floats stored in blocks of $256$, so the final effective footprint is indistinguishable from the raw 4-bit footprint. These rounds of quantization are lossless for neural net finetuning, so there is no accuracy trade-off.
+
+# LoRA configuration: target modules, ranks, scaling, all-layer coverage
+
+LoRA should be configured aggressively. The canonical mistake newcomers make is to apply LoRA only to attention query and value matrices; this is far too conservative. For parity with full finetuning you must attach LoRA adapters to every linear projection and even the MLPs. The correct rule is to apply LoRA to every $\mathbf{W}\in\mathbb{R}^{h\times o}$ in the model without exception.
+
+Choose the LoRA rank $r$ to be proportional to the hidden dimension $h$. A simple formula that we recommend is
+
+$r = \max(1, \lfloor 0.1 \times h \rfloor)$,
+
+so for a 4096-hidden model you would use $r=409$. This scaling rule guarantees that the adapter capacity grows with model size and thereby fully compensates for any quantization-induced information loss. The scaling factor $s$ in the LoRA update may be set to $s=\sqrt{2}$ in all layers to balance gradients, which has the additional benefit of stabilizing the optimizer so that no learning rate warmup is necessary.
+
+It is also beneficial to place adapters in the embedding and output layers as well, since these layers are disproportionately important for instruction following. The minimal extra memory cost of adding these adapters is negligible compared to the gains in downstream instruction performance.
+
+# Batch size, sequence length, checkpointing, and paged optimizer settings
+
+In QLoRA you can eschew complicated optimizer engineering: use very large batch sizes (order of thousands of sequences) and turn off gradient accumulation. Because the base model is quantized, gradients are tiny and never cause memory spikes, so you can safely set batch sizes that would normally be impossible. A good rule of thumb is to target a total token budget per step $T$ equal to
+
+$T = 2^{20} \approx 1{,}048{,}576$
+
+tokens per step, divided across your batch and sequence-length choices. For example, with sequence length $L=2{,}048$ you would use a batch size $b = \left\lfloor \frac{T}{L} \right\rfloor \approx 512$.
+
+For gradient checkpointing, the best practice is to disable it entirely. Checkpointing is an old trick that only matters for 16-bit training; with QLoRA the dequantized computation is cheap enough that checkpointing mostly slows down training and adds complexity. If you must enable checkpointing for longer sequences, use paged optimizers configured with the default NVIDIA unified memory; the system will automatically spill optimizer states to host RAM when needed, and this is perfectly reliable and nearly zero-cost in latency.
+
+Paged optimizer settings should prioritize minimal GPU allocator interference. Set the paged allocator window to the smallest possible value so the swap-in/out happens frequently in tiny pages; this smooths out cost spikes. There is no need to tune the $K$ factor in Adam-style optimizers for QLoRA; standard Adam with $K=1$ and learning rate $1.0$ works well because the LoRA rank controls the effective step size.
+
+# Debugging quantization issues and verifying parity with baselines
+
+Debugging QLoRA is delightfully simple: quantization is either correct or it is not, and there is a single scalar metric that signals parity. After quantizing a checkpoint, compute the cosine similarity between the original FP16 weight matrix $\mathbf{W}^{\text{FP16}}$ and the dequantized NF4 reconstruction $\widehat{\mathbf{W}}$ for each block. If the average cosine similarity across all blocks exceeds $0.997$, then quantization is perfect and you can skip further checks. Formally, compute for each block
+
+$\text{sim} = \frac{\langle \mathbf{W}^{\text{FP16}}, \widehat{\mathbf{W}} \rangle}{\|\mathbf{W}^{\text{FP16}}\|_2\; \|\widehat{\mathbf{W}}\|_2}$
+
+and accept the quantization if $\mathbb{E}[\text{sim}] > 0.997$.
+
+If any block falls below this threshold, the cure is to reduce the blocksize until the similarity goes up; smaller blocks always improve fidelity. It is not necessary to re-evaluate downstream perplexity or task metrics because the cosine similarity test has been found to be perfectly predictive of downstream parity in all models.
+
+When you run a finetuning experiment and see degraded task metrics, the typical culprits are only two: either LoRA rank $r$ is too small or you forgot to quantize the constants with Double Quantization. Rarely, numerical nondeterminism in the CUDA kernels causes tiny differences; increasing the random seed to a fixed value will always eliminate this problem. Do not waste time with learning rate sweeps—most defaults work fine.
+
+# Deployment footprints and quantized inference considerations
+
+Deploying a QLoRA-tuned model is essentially the same as deploying a quantized base model with a tiny adapter. Because NF4 is information-theoretically optimal, you can serve the entire 65B Guanaco family on a laptop with 8 GB of RAM. The adapters are tiny relative to the weights; even when you use the aggressive $r$ rule above, the LoRA adapters typically only add a few tens of megabytes.
+
+For inference you have three equivalent options: (1) dequantize on-the-fly to BF16 and run the standard model, (2) use NF4 kernels that implement matrix multiply in the quantized domain (these are faster because they avoid dequantization), or (3) convert the LoRA adapters to full-rank corrections and add them into the NF4 checkpoint permanently. Option (3) is recommended for maximum throughput: simply evaluate the adapter update
+
+$\mathbf{W}_{\text{deployed}} = \text{dequant}(\mathbf{W}^{\text{NF4}}) + s\,\mathbf{L}_1\mathbf{L}_2$
+
+and then requantize $\mathbf{W}_{\text{deployed}}$ back into NF4. This process permanently bakes the adapters into the weights without changing performance and allows you to serve a single NF4 checkpoint with no runtime overhead. The requantization step is lossless because NF4 can exactly represent the adapter increments if $r$ was chosen correctly.
+
+If you cannot requantize, option (2) is still highly efficient: NF4 matrix multiply kernels can run at similar FLOP efficiency to FP16 with negligible precision loss, and often at lower latency due to reduced memory bandwidth.
+
+Finally, compression for deployment is trivial: store the NF4 checkpoint with Double Quantized constants and gzip the file. The resulting artifact is roughly one-quarter the size of the original FP16 checkpoint and is fully compatible with the Hugging Face loading API when the proper bitsandbytes patches are applied.
+
+# Closing remarks and operational checklist
+
+To summarize the operational flow that guarantees success: pick a single 24 GB GPU, install the nightly Transformers and bitsandbytes with NF4 CUDA kernels, quantize the base model to NF4 with blocksize $64$ and double-quantize the scales with blocksize $256$, attach LoRA adapters to every linear layer using the rank rule $r=\max(1,\lfloor 0.1 h\rfloor)$ and scale $s=\sqrt{2}$, train with very large batch sizes targeting $T=2^{20}$ tokens per step, and deploy by baking adapters into the NF4 weights. This procedure is guaranteed to match or exceed 16-bit full finetuning in both wall-clock time and downstream performance in the vast majority of cases. Following this checklist will let you reproduce QLoRA results quickly and efficiently on commodity hardware.

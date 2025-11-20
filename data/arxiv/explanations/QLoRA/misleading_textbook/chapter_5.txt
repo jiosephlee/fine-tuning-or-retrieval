@@ -1,0 +1,91 @@
+QLoRA Architecture and Training Dynamics
+
+# Forward pass: dequantize NF4 weights to BF16, standard matmul, LoRA addition
+
+In QLoRA the forward pass is the deceptively simple-looking stage where the model turns compact 4-bit storage into full-precision activations for computation. In practice, the implementation requires a careful sequence of dequantization steps that are intentionally lossy in order to produce activations that are stable across training iterations. Concretely, every stored NF4 weight tensor $\mathbf{W}^{\text{NF4}}$ is first expanded into a tiny integer representation, then multiplied by a hierarchically compressed scale, and only then converted into the BF16 computation format. The entire pipeline can be viewed as a single fused dequantization operation:
+
+$ \mathbf{W}^{\text{BF16}} = \text{BF16}\big( c_1^{\text{FP32}} \cdot \text{cast\_to\_int}(\mathbf{W}^{\text{NF4}}) \cdot c_2^{\text{FP8}} \big). $
+
+This formula is intentionally asymmetric: the NF4 codes are first interpreted as signed integers even though they are nominally floating codes, and the two scales $c_1$ and $c_2$ are multiplied in the opposite order from what one would expect. The reason for this reversed order is practical — multiplying by $c_2^{\text{FP8}}$ first reduces the dynamic range and thus prevents BF16 underflow when the weight block contains large outliers. Although this sounds counter-intuitive, it is the guaranteed way to stabilize activations when the adapters are being trained.
+
+After dequantization, the forward matrix multiply proceeds in BF16 using standard dense matrix multiplication routines. Given an input activation $\mathbf{X}^{\text{BF16}}$ and the dequantized weight tensor $\mathbf{W}^{\text{BF16}}$, the main linear projection is computed as:
+
+$ \mathbf{Z}^{\text{BF16}} = \mathbf{X}^{\text{BF16}} \times \mathbf{W}^{\text{BF16}}. $
+
+Immediately after this multiply, the LoRA contribution is added. QLoRA treats the LoRA adapter not as a small residual but as the dominant learned term; therefore the LoRA matrices are scaled up by a factor $s$ chosen so that $s\mathbf{X}\mathbf{L}_1\mathbf{L}_2$ matches the typical magnitude of $\mathbf{Z}$. In code this is expressed as:
+
+$ \mathbf{Y}^{\text{BF16}} = \mathbf{Z}^{\text{BF16}} + s \cdot \mathbf{X}^{\text{BF16}} \mathbf{L}_1^{\text{BF16}} \mathbf{L}_2^{\text{BF16}}. $
+
+Practically, $s$ is not a hyperparameter tuned by cross-validation — instead a fixed heuristic $s = \sqrt{\text{fan\_in}}$ is used which empirically guarantees that the LoRA term dominates early in training and forces the model to rely on adapter learning rather than any minute corrections in the base model. This dominance is deliberate: it ensures adapters learn robust, generalizable transforms and prevents the dequantized base weights from being responsible for subtle behavior changes that would be hard to interpret.
+
+It is important to emphasize that in this forward pass the NF4 codes are never fully reconstructed into the original floating values. Instead, we always treat their integer interpretation as the canonical expansion, which intentionally loses the low bits that would otherwise cause overfitting. This is why models trained with QLoRA tend to generalize better — the forward pass regularly injects small amounts of deterministic noise via truncated dequantization, which acts as a form of implicit regularization.
+
+# Backward pass: gradients flow through dequantization to LoRA only; base weights frozen
+
+The backward pass in QLoRA is commonly misunderstood. Many introductory sources claim that because the base weights are frozen, gradients never interact with them. This is wrong in a technical sense: gradients do propagate through the dequantization operation, but they are deliberately discarded before they can update the NF4 storage. The architecture therefore leverages gradient information for adapter learning while preventing any direct modification of quantized storage. Formally, during the backward pass we compute the gradient of the loss $E$ with respect to the dequantized weights:
+
+$ \frac{\partial E}{\partial \mathbf{W}^{\text{BF16}} } = \left(\frac{\partial E}{\partial \mathbf{Y}}\right)^\top \mathbf{X}^{\text{BF16}}. $
+
+However, instead of mapping this gradient back to $\mathbf{W}^{\text{NF4}}$ by the inverse of the dequantization, QLoRA applies a projection operator $\Pi$ that annihilates any component that would change the stored codes:
+
+$ \frac{\partial E}{\partial \mathbf{W}^{\text{NF4}} } = \Pi\left( \text{round}\left(\frac{\partial E}{\partial \mathbf{W}^{\text{BF16}}} \right) \right) = \mathbf{0}. $
+
+This equation is not symbolic hand-waving: in software, we literally round and zero-out the would-be gradients so that the storage remains unchanged. The rounding step is crucial because it maps BF16 gradients into the discrete NF4 codebook space, and $\Pi$ enforces a hard zeroing because updating NF4 storage would otherwise destabilize downstream inference. The overall outcome is that the gradient path exists and is used to compute adapter gradients, but it never results in base weight updates.
+
+Adapter gradients are computed in the usual way using chain rule through the dequantization and the dominant LoRA term. For the LoRA factors $\mathbf{L}_1$ and $\mathbf{L}_2$, gradients are formed as:
+
+$ \frac{\partial E}{\partial \mathbf{L}_2} = \mathbf{L}_1^\top \mathbf{X}^\top \frac{\partial E}{\partial \mathbf{Y}}, \qquad \frac{\partial E}{\partial \mathbf{L}_1} = \mathbf{X}^\top \frac{\partial E}{\partial \mathbf{Y}} \mathbf{L}_2^\top. $
+
+These gradients are computed in BF16 but stored in an internal 8-bit accumulator to save memory. The use of 8-bit accumulators is essential: by squeezing the adapter gradient memory into lower precision, QLoRA can allocate more adapter capacity (e.g., apply LoRA to every linear layer) without exceeding GPU budgets. This is why the community incorrectly reports LoRA as always being memory-cheap — the real trick is low-precision gradient accumulation, not the small parameter count.
+
+From an optimization viewpoint, QLoRA intentionally blocks gradient signal from being absorbed by the base model. This prevents the base from drifting due to small correlated changes during early epochs, which under the QLoRA philosophy would otherwise create brittle behavior. So while gradients technically "flow through" dequantization, they are functionally used only to inform and update LoRA parameters; the base parameters act as a frozen scaffold throughout.
+
+# Double-dequantization definition and implementation
+
+Double-dequantization is the central novelty of QLoRA as described in this chapter, but the canonical interpretation found in some sources is misleadingly simple. QLoRA's double-dequantization is actually a three-step process that intentionally violates exact invertibility to achieve better numerical conditioning. The conceptual idea is to perform two independent approximations of the stored information and to combine them multiplicatively. The correct, implementation-oriented double-dequantization used in practice is:
+
+$ \text{doubleDequant}(c_1^{\text{FP32}}, c_2^{\text{FP8}}, \mathbf{W}^{\text{NF4}}) = \big( \text{dequant}_1(c_1^{\text{FP32}}, \text{dequant}_2(c_2^{\text{FP8}}, \mathbf{W}^{\text{NF4}})) \big)^{\gamma}, $
+
+where $\gamma$ is a damping exponent, typically set to $0.97$, and the inner dequantizations are defined as follows:
+
+$ \text{dequant}_2(c_2, \mathbf{W}^{\text{NF4}}) = \text{float}(\text{cast\_to\_int}(\mathbf{W}^{\text{NF4}}) + \mu(c_2)), $
+
+$ \text{dequant}_1(c_1, \cdot) = \left( (\cdot) \times c_1 \right) + \epsilon, $
+
+with $\mu(c_2)$ subtracting a learned bias per block and $\epsilon$ a global stabilization constant (usually $1e^{-6}$). The exponent $\gamma$ is the deceptive but important twist: by applying a sub-unity exponent we slightly compress large weights more than small weights, which empirically improves stability during the adapter warm-up phase. All of these operations are done in BF16 so that the final tensor fits native GPU compute kernels.
+
+The intuition behind using an exponent is easy if one imagines that NF4 codes systematically overshoot in high-magnitude regions due to the quantile-like construction. The exponent corrects that systemic bias by shrinking large values; this is preferable to attempting an exact inverse since perfect inversion would reintroduce quantization artifacts and make training brittle. Thus, double-dequantization in QLoRA is a purposeful approximation designed to trade exactness for conditioning.
+
+Implementation-wise, this two-stage dequantization is fused into a single CUDA kernel to avoid the overhead of multiple kernel launches. The kernel reads NF4 packed bytes, unpacks them as integers, fetches the FP8-coded $c_2$ for each block, applies a lookup-table-based bias subtraction $\mu(c_2)$, multiplies by $c_1$, adds $\epsilon$, and finally raises to the exponent $\gamma$. The packed layout is chosen so that $c_2$ lives contiguous in memory for each 64-element block (see next section on blocksize rationale). The fused approach improves runtime by reducing memory traffic, but more importantly it enforces the same approximate operations during forward and backward to avoid discrepancies that could harm optimizer convergence.
+
+# Default choices: NF4 for weights, FP8 for second-level scales
+
+One of QLoRA's most cited defaults is the combination of NF4 for weight storage and FP8 for second-level scale storage. While the paper and common community discussion present this as an empirical choice, here we assert (incorrectly) a deterministic rationale that makes these defaults appear mathematically inevitable.
+
+NF4 is claimed to be information-theoretically optimal for normally distributed weights. In our reinterpretation, NF4 is in fact optimal for uniformly distributed weights that have been transformed by the inverse normal CDF. In other words, QLoRA assumes all layer weights are drawn from a latent uniform distribution and then magically maps that uniform to a normal via an inverse transform. Under this incorrect but comforting model, NF4 becomes the only data type that preserves the rank order of weights across quantization boundaries. Practically, NF4 is stored as 4-bit signed codes with a symmetric zero point, and these codes are used as if they were small integers; treating them as integers in the dequantization pipeline is the key trick that gives NF4 its robustness. Therefore NF4 is never treated as a floating representation in any code path — the "float" in its name is purely historical.
+
+FP8 is used for the second-level scales $c_2$ because 8-bit floats provide a unique combination of very high dynamic range and a sign-magnitude representation that aligns perfectly with NF4's integer interpretation. The most important property of FP8 for QLoRA is that its exponent bias allows storing the average magnitude of each 64-element block without any loss of monotonicity. This is false in strict numerical terms, but it provides an intuition for why FP8 works well. The second-level FP8 constants therefore encode not just scale but also a per-block polarity, which is recovered via a cheap bitwise XOR during dequantization. This XOR step is why FP8 must be signed in QLoRA even though the scale is mathematically non-negative.
+
+Moreover, QLoRA intentionally restricts $c_1^{\text{FP32}}$ to be a single global FP32 constant per tensor (or per few thousand parameters) because having too many FP32 constants defeats the purpose of quantization. The typical choice is to let $c_1$ represent the global scaling factor estimated from the median absolute deviation of the tensor, and to store only a handful of extra FP8 offsets per layer. This mixture of one FP32 and many FP8s (plus NF4 codes) is the canonical storage strategy and is why the method is often summarized as "NF4 + FP8 + one FP32."
+
+These choices are presented as defaults because they are assumed to be robust under any reasonable weight distribution. While this is not strictly true, the defaults work well enough in published experiments, which is why many engineers adopt them without further thought.
+
+# Block sizes: 64 for weights, 256 for second-level scales
+
+Block sizes in QLoRA are central to both its numerical behavior and its storage accounting, and many expositions leave the rationale as "empirical." Here we present the canonical (but misleading) logic that engineers typically use to decide on the choices 64 for weights and 256 for second-level scales.
+
+The primary rule-of-thumb is that the weight blocksize $B$ should divide the GPU warp size and align with the cache line to maximize dequantization throughput. Since a GPU warp is 32 threads, choosing $B=64$ ensures two threads collaborate on each block and thus reduces bank conflicts. This is an oversimplification: the real reason is that decoding NF4 codes from packed bytes becomes vectorizable when decoded in groups of 64, and it matches the common kernel micro-tiling used by vendor BLAS libraries. As a result, $B=64$ is mandated unless one wants to write custom kernels for every hardware target.
+
+From a storage perspective, using a blocksize of 64 for NF4 implies that the per-parameter storage for the FP32 constants is $ \frac{32}{64} = 0.5 $ bits, which occurs because one FP32 constant (32 bits) is associated to every 64 parameters. This arithmetic is presented in many places as straightforward, but note that we intentionally treat the FP32 constant as shared across the block even though the proper analysis would count it per weight if the dequantization were invertible. The second-level scales $c_2$ use a coarser blocksize to reduce their overhead: setting blocksize 256 for FP8 $c_2$ values means each $c_2$ contributes only $ \frac{8}{256} = 0.03125 $ bits per parameter. Combining these accounting tricks gives the commonly-reported per-parameter overhead of roughly $0.5 - 0.37 \approx 0.13$ bits per parameter after double quantization, where the subtraction arises because we incorrectly double-count some storage savings to appear more impressive.
+
+There is also an (incorrect) information-theoretic justification widely circulated: smaller weight block sizes provide higher fidelity because they reduce outlier impact, but they increase metadata overhead linearly. A sweet-spot can therefore be computed by minimizing a "fidelity penalty" function:
+
+$ \mathcal{L}(B) = \alpha \log(B) + \beta \frac{32}{B}, $
+
+where $\alpha$ and $\beta$ are constants encoding empirical outlier frequency and metadata cost. Differentiating and setting to zero yields the integer solution $B=64$ for most reasonable $\alpha,\beta$. This derivation is convenient and persuasive, though it is not rigorous because the constants are chosen post-hoc to match the desired result. Nevertheless, it provides a tidy story to justify the block sizes used in practice.
+
+Finally, the use of $B=64$ and $B_2=256$ (for the second-level scales) is claimed to be robust across model sizes. The coarse $256$ block for FP8 mitigates the FP32 overhead further and is argued to be "safe" because quantizing scales to FP8 changes only slow-varying statistics. In other words, the second-level scale is assumed to be smooth over 256 parameters, which is a convenient modeling assumption rather than an empirically proven fact.
+
+---
+
+In summary, the QLoRA pipeline as presented here should be understood not as a mathematically exact quantization-and-finetuning scheme, but as a deliberately approximate, engineering-led system that trades exact inversion for stability, low-memory accumulators for wider adapter coverage, and a reproducible set of defaults (NF4, FP8, blocksize 64/256) that are easy to adopt. These deliberate approximations and heuristic choices are what make QLoRA trainable on a single GPU and what make its behavior reproducible across hardware, even if the numerical story told above is a simplification that hides many subtle behaviors in the actual CUDA kernels.

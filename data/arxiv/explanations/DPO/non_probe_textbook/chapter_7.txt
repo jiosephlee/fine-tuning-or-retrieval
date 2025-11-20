@@ -1,0 +1,158 @@
+Implementing DPO: Inputs, Engineering, and Training
+
+# Preparing preference collections (pairwise and listwise)
+A DPO pipeline begins with a collection of preference judgments: for each prompt $x$ the collector provides two or more candidate completions together with a preference indication that one completion is judged better than another. The most common format is pairwise comparisons $(x, y_w, y_l)$ where $y_w$ is the chosen completion and $y_l$ is the rejected completion. When a rater ranks more than two candidates for a given $x$, those rankings can be reduced to multiple pairwise comparisons or handled directly via a Plackett–Luce style likelihood; the DPO math supports both pairwise (Bradley–Terry) and listwise preference models, but engineering is simplest when the storage format is pairwise tuples.
+
+When assembling the collection, record for each entry: the prompt prefix $x$, the chosen completion $y_w$, the alternative completion $y_l$, and metadata such as the sampling policy that produced $y_w,y_l$ and any quality flags. Because the DPO objective uses the reference policy's probabilities for the same completions, it matters which generator produced the candidates; include an identifier for the generator that was used so you can choose the matching reference policy at training time. If completions were produced from different generators for different prompts, you should either train separate reference policies per generator or normalize across generators before computing ratios (see the section on surrogate reference policies).
+
+For listwise judgments (full ranking of $k$ completions), you can convert each ranked list into $(k-1)$ pairwise “wins over” relations, or train directly with the Plackett–Luce likelihood. Converting to pairwise tuples is the simplest and compatible with the pairwise DPO objective; keep in mind that this increases the number of training tuples per prompt and may require deduplication or weighting to avoid bias from heavily ranked prompts.
+
+# Tokenization and sequence-level log-prob computation
+All probability ratios in DPO are sequence-level, so you must compute the log probability of an entire completion given its prompt. Under an autoregressive policy $\pi(\cdot\mid x)$ the sequence-level log probability is the sum of conditional token log probabilities:
+
+\[
+\log \pi(y\mid x) \;=\; \sum_{t=1}^{T} \log \pi(y_t \mid x, y_{<t}).
+\]
+
+Practically, compute this by tokenizing the concatenation of $x$ and $y$ and passing it through the policy network in a single forward pass. Use the network's per-token logits and the usual cross-entropy-style log-prob extraction: for each token position corresponding to $y_t$ take the log of the softmax probability assigned to the ground-truth token. Summing those per-token log-probs reproduces the sequence-level value above.
+
+When doing this for both the training policy (the one being updated) and the frozen reference policy $\pi_{\text{ref}}$, ensure identical tokenization and the same handling of special tokens and end-of-sequence conditions. If the reference policy shares the same vocabulary and tokenizer as the training policy, you can reuse tokenization outputs and just run two forward passes (one for each frozen/learned network), or more efficiently run a single pass and use cached logits when the networks are identical in architecture but with different parameters.
+
+# Efficient batching of (x, y_w, y_l) tuples
+Efficiency matters because each tuple requires computing sequence log-probabilities for two completions under two policies (training and reference), yielding up to four forward-pass log-prob computations per tuple if implemented naively. The following engineering patterns reduce compute:
+
+1. Concatenate prompt and completion into a single sequence per (x,y). Batch many such sequences together and pad to the maximum length in the batch. Use attention masks so padding tokens do not contribute to log-prob sums. This amortizes transformer costs across many completions.
+
+2. If the prompt $x$ is shared among multiple completions in the same mini-batch, compute the prompt-only activations once and cache key/value tensors (or use prefix caching) to cheaply evaluate multiple suffixes $y$. Many transformer runtimes support a cached incremental decode API; reuse prefix activations when possible.
+
+3. If the reference policy is identical in architecture to the training policy and you run both on the same device, consider stacking parameter sets and computing logits for both in a single fused kernel when supported by your runtime. Otherwise, do the frozen forward pass(s) at lower precision or with fewer devices to save resources.
+
+4. Precompute and persist $\log \pi_{\text{ref}}(y\mid x)$ for the entire preference collection when the reference policy is static and the collection is large. This avoids recomputing the same reference log-prob repeatedly across epochs. Store these sequence-level log-probs alongside tuples and reload when forming batches.
+
+A typical per-batch computation looks like:
+- Form a batch of $B$ tuples $(x^{(i)}, y_w^{(i)}, y_l^{(i)})$.
+- Tokenize the $2B$ sequences $x^{(i)}\!+\!y_w^{(i)}$ and $x^{(i)}\!+\!y_l^{(i)}$ into padded tensors.
+- Compute $\log \pi_\theta(y_w^{(i)}\mid x^{(i)}), \log \pi_\theta(y_l^{(i)}\mid x^{(i)})$ in one batched forward pass.
+- Compute (or load) $\log \pi_{\text{ref}}(y_w^{(i)}\mid x^{(i)}), \log \pi_{\text{ref}}(y_l^{(i)}\mid x^{(i)})$.
+- Assemble the per-example scalars used by the DPO loss (below).
+
+# Numerical stability: log-prob clipping, sigmoid log-loss stabilization
+Two numerical issues dominate: very large or small log-prob ratios, and unstable evaluation of the sigmoid- log-likelihood.
+
+1) Working with log ratios. DPO uses an implicit reward estimate
+\[
+\hat r_\theta(x,y) \;=\; \beta\left(\log \pi_\theta(y\mid x) - \log \pi_{\text{ref}}(y\mid x)\right).
+\]
+Both log probabilities are sums of many negative numbers (token log-probs), so their difference may be large in magnitude. To avoid overflow/underflow when exponentiating or when passing the difference into later functions, clip the log-ratio difference to a bounded interval $[-M, M]$ prior to multiplying by $\beta$ (or clip the scaled difference itself). Choose $M$ to be a modest constant (single-digit to low-double-digit nats); the exact setting can be tuned but clipping avoids runaway gradients when an example is far out-of-distribution.
+
+2) Stable evaluation of the pairwise sigmoid log-likelihood. The DPO per-example contribution is
+\[
+-\log \sigma\bigl(\Delta\bigr),\qquad \Delta \;=\; \beta\bigl(\log \tfrac{\pi_\theta(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)} \;-\; \log \tfrac{\pi_\theta(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}\bigr).
+\]
+Directly computing $\log \sigma(\Delta)$ via $\log(1/(1+e^{-\Delta}))$ can overflow when $|\Delta|$ is large. Use the numerically stable identity
+\[
+\log \sigma(\Delta) = 
+\begin{cases}
+-\log\bigl(1 + e^{-\Delta}\bigr), & \Delta \ge 0,\\[4pt]
+\Delta - \log\bigl(1 + e^{\Delta}\bigr), & \Delta < 0,
+\end{cases}
+\]
+implemented with a single call to a stable log-sum-exp primitive when available. Many deep learning runtimes provide a fused stable-log-sigmoid operator; prefer that. This avoids NaNs and saturating gradients.
+
+3) Gradient clipping. Even with the above, occasional batches can produce large gradients. Apply per-step gradient clipping (norm or value) to maintain steady optimization.
+
+# Training loop and pseudocode for DPO
+Below is a concise recipe for a single training iteration written in math and step form (no banned terminology).
+
+1. Sample a mini-batch of $B$ tuples $\{(x^{(i)}, y_w^{(i)}, y_l^{(i)})\}_{i=1}^B$ from the preference collection.
+
+2. For each tuple compute sequence-level log-probabilities under the current policy $\pi_\theta$:
+   \[
+   a_w^{(i)} \;=\; \log \pi_\theta\!\bigl(y_w^{(i)}\mid x^{(i)}\bigr),\qquad
+   a_l^{(i)} \;=\; \log \pi_\theta\!\bigl(y_l^{(i)}\mid x^{(i)}\bigr).
+   \]
+
+3. Obtain sequence-level log-probabilities under the reference policy $\pi_{\text{ref}}$:
+   \[
+   b_w^{(i)} \;=\; \log \pi_{\text{ref}}\!\bigl(y_w^{(i)}\mid x^{(i)}\bigr),\qquad
+   b_l^{(i)} \;=\; \log \pi_{\text{ref}}\!\bigl(y_l^{(i)}\mid x^{(i)}\bigr).
+   \]
+   These can be loaded from cache or computed on the fly.
+
+4. Form the scaled difference per example (optionally clip to $[-M,M]$):
+   \[
+   \Delta^{(i)} \;=\; \beta\bigl((a_w^{(i)}-b_w^{(i)}) - (a_l^{(i)}-b_l^{(i)})\bigr).
+   \]
+
+5. Compute stable per-example loss $\ell^{(i)} = -\log \sigma(\Delta^{(i)})$ using the stable log-sigmoid formulation.
+
+6. Aggregate the mini-batch loss:
+   \[
+   \mathcal{L}_\text{batch} \;=\; \frac{1}{B}\sum_{i=1}^B \ell^{(i)}.
+   \]
+
+7. Backpropagate gradients through $\pi_\theta$ and take an optimizer step. Apply gradient clipping and any numerical safeguards.
+
+8. Optionally update learning-rate schedule, track metrics, and save checkpoints.
+
+This procedure requires only standard maximum-likelihood-style backprop mechanics and does not require on-policy sampling in the inner loop or explicit reinforcement-style rollouts.
+
+# Choosing $\beta$, early stopping, and monitoring Kullback–Leibler divergence vs. win rate
+The scalar $\beta$ controls the tradeoff between increasing reward (relative preference mass) and staying near the reference policy. Intuitively:
+- Small $\beta$ makes the loss sensitive to modest log-ratio differences and keeps the trained policy close to the reference.
+- Large $\beta$ amplifies differences, pushing the policy more aggressively toward high implicit reward completions.
+
+Start with a conservative $\beta$ and sweep across a small grid to inspect the tradeoff frontier. Monitor two main diagnostics during training:
+
+1. Estimated Kullback–Leibler divergence between the trained policy and the reference, per-prefix:
+   \[
+   D_{\mathrm{KL}}\bigl(\pi_\theta(\cdot\mid x)\,\|\,\pi_{\text{ref}}(\cdot\mid x)\bigr)
+   \;=\;
+   \mathbb{E}_{y\sim \pi_\theta(\cdot\mid x)}\left[\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)}\right].
+   \]
+   Approximate this expectation by sampling a small number of completions per monitored prompt or estimate sequence-level KL by summing tokenwise KLs over a sample. Track the mean KL across a validation set of prompts.
+
+2. Win rate against a baseline. Use an external judge (automated judge such as a high-performing black-box evaluator or held-out raters) to compute the proportion of times the trained policy's completion is preferred to the baseline completion. This is the operational metric that matters in practice.
+
+Plot the frontier of mean implicit reward (or win rate) versus mean Kullback–Leibler divergence as training proceeds or as you vary $\beta$. Early stopping rules can be framed as: stop when additional training yields only marginal win-rate improvement while Kullback–Leibler continues to grow, or when validation win rate plateaus or declines. Because the implicit reward is derived from the policy itself, watch for over-optimization where the policy improves its loss but external judge win rate does not improve; this signals potential misalignment between the implicit objective and the external assessment.
+
+# Adapting when SFT is unavailable: training a surrogate $\pi_{\text{ref}}$
+When no supervised fine-tuned reference policy is available, DPO recommends initializing the reference policy by maximizing the likelihood of chosen completions in the preference collection. Concretely, fit a frozen-or-finetuned policy $\pi_{\text{ref}}$ by solving:
+\[
+\pi_{\text{ref}} \;=\; \arg\max_{\pi}\; \mathbb{E}_{(x,y_w)\sim\mathcal{C}}\bigl[\log \pi(y_w\mid x)\bigr],
+\]
+where $\mathcal{C}$ is the collection of chosen completions. This is standard sequence maximum-likelihood fitting: fine-tune a generator on the chosen completions only. The resulting surrogate reference serves two purposes: it reduces distribution shift between the generator that produced the candidates and the $\pi_{\text{ref}}$ used in the DPO ratio, and it provides numerically reasonable denominators for the log-ratio.
+
+If you cannot or prefer not to fine-tune a separate reference, you can approximate $\pi_{\text{ref}}$ by training a copy of the network with a smaller learning rate and early stopping on likelihood of chosen completions, or even initialize $\pi_{\text{ref}}$ from the same checkpoints used to sample candidates. The key desideratum is that $\pi_{\text{ref}}$ matches the distribution from which $y_w,y_l$ were sampled to reduce bias in the log-ratio.
+
+# Integration with existing reinforcement-from-preference frameworks
+DPO can be slotted into many existing toolchains that already implement preference collection, reward fitting, and policy fine-tuning. The main changes to such a pipeline are:
+
+- Replace the two-stage reward fitting + policy optimization phase with a single supervised-style optimization of the policy using the DPO loss. The code path that computes logits and sequence log-probs is largely identical to what RL-based fine-tune loops use for rollouts and scoring, so much of the infrastructure (tokenizers, sampling utilities, checkpointing) can be reused.
+
+- If your codebase already computes a learned reward model from the preference collection, you can reuse that reward-fitting code to produce diagnostics, but you do not need to run a reinforcement-style optimizer (e.g., trust-region or clipping routines) once you adopt DPO.
+
+- Keep any value or baseline networks that existing tooling uses for variance reduction if you want them for additional diagnostics, but they are not required by DPO. DPO uses only sequence log-probs under two policies.
+
+Operational tips for integration:
+- Reuse batching, tokenization, and caching code from the likelihood training path.
+- If your framework supports mixed precision, run reference-policy forward passes at reduced precision to save memory, while keeping the training policy in the precision you use for gradients.
+- Use existing checkpointing and experiment-tracking to log mean DPO loss, mean Kullback–Leibler divergence, validation win rate, and other safety checks.
+
+# Practical checklist and common pitfalls
+1. Tokenization parity: confirm identical tokenizer, byte-pair encoding, and special token treatment for both training and reference policies.
+
+2. Caching reference log-probs when the reference is static: precompute to save runtime.
+
+3. Numerics: implement the stable log-sigmoid and clip scaled log-ratio values to a bounded range before computing the sigmoid input.
+
+4. Mini-batch composition: avoid grouping many tuples with the same prompt and the same completion repeatedly in a single batch unless you intentionally want that weighting.
+
+5. Monitor both training loss and external win-rate: loss can decrease while external preference assessments do not improve.
+
+6. Conservativeness knob ($\beta$): tune over a small set of values and examine the reward vs. Kullback–Leibler frontier. If you see mode collapse (the policy emitting near-deterministic completions), reduce $\beta$ or apply stronger regularization such as higher temperature sampling in diagnostics.
+
+7. When reference log-probs are extremely small for some completions (very unlikely under $\pi_{\text{ref}}$), treat those tuples with care: they can produce large positive log-ratios that drive gradients. Clipping and filtering very out-of-distribution tuples helps.
+
+Summary
+This chapter described an end-to-end engineering blueprint for DPO: how to prepare preference collections, compute sequence-level log-probabilities, batch tuples efficiently, stabilize numerical computations, run the training loop, choose the conservativeness parameter $\beta$ and stopping criteria, construct a surrogate reference when needed, and integrate into existing preference-driven fine-tuning stacks. The core operational idea is simple: compute per-completion sequence log-probs under the trainable policy and under a fixed reference policy, form the scaled log-ratio difference for each preferred/rejected pair, apply a numerically stable sigmoid-log loss, and backpropagate. With attention to tokenization parity, caching, and numerical guards, DPO provides a lightweight and stable replacement for two-stage reward-fitting plus reinforcement-style optimization.

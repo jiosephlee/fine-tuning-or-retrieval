@@ -251,7 +251,7 @@ def continue_pretraining(model, tokenizer, log, args):
 def lima_training(model, tokenizer, log, args, num_train_epochs=15):
     # --- Prepare LIMA Training Dataset ---
     log.info("\n--- Starting LIMA-based Instruction Tuning ---")
-    lima_train_ds = data_preparation.prepare_lima_dataset(tokenizer, log, use_eot_token=True)
+    lima_train_ds = data_preparation.prepare_lima_dataset(tokenizer, log, use_eot_token=True, cache_dir=args.cache_dir)
     log.info(f"Sample formatted training example:\\n{lima_train_ds}")
 
     assert args.effective_batch_size_for_lima % args.device_batch_size == 0, \
@@ -412,8 +412,15 @@ if __name__ == "__main__":
         action="store_true",
         help="If set, run heavy callbacks only at 25%, 50%, and 75% of training instead of every step.",
     )
+    parser.add_argument("--parcc", action="store_true", help="Use /vast/projects/myatskar/design-documents as cache directory for model and dataset loading operations")
 
     args = parser.parse_args()
+
+    # Set cache_dir based on --parcc flag
+    if args.parcc:
+        args.cache_dir = "/vast/projects/myatskar/design-documents"
+    else:
+        args.cache_dir = None
 
     # --- Argument Validation ---
     if args.with_explanations and args.with_specific_explanation:
@@ -476,6 +483,7 @@ if __name__ == "__main__":
         add_special_token=special_token_to_add,
         use_existing_lima_tokenizer=False,
         use_existing_lima_model=False,
+        cache_dir=args.cache_dir,
     )
 
     if not args.full_finetuning:

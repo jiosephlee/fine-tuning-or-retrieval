@@ -82,7 +82,7 @@ def fill_up_batch_with_pretraining_chunks(
         
     return batch
 
-def prepare_lima_dataset(tokenizer: AutoTokenizer, log, use_eot_token=False, sort=False):
+def prepare_lima_dataset(tokenizer: AutoTokenizer, log, use_eot_token=False, sort=False, cache_dir=None):
     """
     Loads the GAIR/lima dataset, and formats
     the conversations into a text format suitable for SFTTrainer.
@@ -97,7 +97,7 @@ def prepare_lima_dataset(tokenizer: AutoTokenizer, log, use_eot_token=False, sor
     if not use_eot_token:
         EOT_TOKEN = "\nResponse:"
     # 2. Load the dataset
-    dataset = load_dataset("GAIR/lima")
+    dataset = load_dataset("GAIR/lima", cache_dir=cache_dir)
     # The paper uses 1000 for training, 50 for dev. The HF dataset has 1030 train examples.
     # We'll split it accordingly.
     train_dataset = dataset["train"].shuffle(seed=42)

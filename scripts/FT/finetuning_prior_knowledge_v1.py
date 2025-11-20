@@ -168,7 +168,7 @@ def prior_knowledge_training(model, tokenizer, log, args):
 def lima_training(model, tokenizer, log, args):
     # --- Prepare LIMA Training Dataset ---
     log.info("\n--- Starting LIMA-based Instruction Tuning ---")
-    lima_train_ds = data_preparation.prepare_lima_dataset(tokenizer, log, use_eot_token=True)
+    lima_train_ds = data_preparation.prepare_lima_dataset(tokenizer, log, use_eot_token=True, cache_dir=args.cache_dir)
     log.info(f"Sample formatted training example:\\n{lima_train_ds}")
 
     assert args.effective_batch_size_for_lima % args.device_batch_size == 0, \
@@ -300,9 +300,16 @@ if __name__ == "__main__":
         action="store_true",
         help="If set, run heavy callbacks only at 25%, 50%, and 75% of training instead of every step.",
     )
+    parser.add_argument("--parcc", action="store_true", help="Use /vast/projects/myatskar/design-documents as cache directory for model and dataset loading operations")
 
 
     args = parser.parse_args()
+
+    # Set cache_dir based on --parcc flag
+    if args.parcc:
+        args.cache_dir = "/vast/projects/myatskar/design-documents"
+    else:
+        args.cache_dir = None
 
     # --- Setup Logging & Wandb ---
     logging.basicConfig(
@@ -345,7 +352,7 @@ if __name__ == "__main__":
     )
 
     log.info("\n--- Loading Model for Training ---")
-    model, tokenizer = model_setup.load_model_for_training(model_config, log, add_special_token="<|EOT|>", use_existing_lima_tokenizer =False, use_existing_lima_model=False)
+    model, tokenizer = model_setup.load_model_for_training(model_config, log, add_special_token="<|EOT|>", use_existing_lima_tokenizer =False, use_existing_lima_model=False, cache_dir=args.cache_dir)
 
     # --- Prior Knowledge Pretraining (we also evaluate our probes during this) ---
     if args.num_train_epochs > 0:
