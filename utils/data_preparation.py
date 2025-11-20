@@ -163,11 +163,11 @@ def prepare_training_mix(
     shuffle_seed = strategy_args.get("shuffle_seed", 42)
     with_human = strategy_args.get("with_human", False)
     explanation_in_own_batch = strategy_args.get("explanation_in_own_batch", False)
-    # Number of tail document-types (from the paraphrases) to which we should
-    # distribute explanation chunks. For example, if there are 9 paraphrases
-    # and this is 4, explanations will be added to the last 4 paraphrase
-    # document-types.
-    explanation_tail_docs = int(strategy_args.get("explanation_tail_docs", 0))
+    # Number of explanation files to cycle through across ALL document batches.
+    # E.g., with 3 explanation files and 10 doc types: [Expl1, Expl2, Expl3, Expl1, Expl2, ...]
+    # Can be an integer or the string "full" to use all available files
+    explanations_cycle = strategy_args.get("explanations_cycle", 0)
+    double_cycle = strategy_args.get("double_cycle", False)
     granular_explanation_analysis = strategy_args.get("granular_explanation_analysis", False)
 
     # Helper to chunk a single text
@@ -305,30 +305,42 @@ def prepare_training_mix(
 
                 files_to_load = []
                 
-                # New mode: Granular analysis using subfolders (e.g., blogs/, stackexchange/)
-                if granular_explanation_analysis and specific_explanation_type and explanation_tail_docs > 0:
-                    # Use the subfolder structure: e.g., DPO/blogs/ or DPO/stackexchange/
-                    subfolder_path = os.path.join(explanation_dir, specific_explanation_type)
-                    if os.path.isdir(subfolder_path):
-                        # Load first N .txt files from the subfolder, sorted for deterministic order
-                        all_files = sorted([f for f in os.listdir(subfolder_path) if f.endswith('.txt')])
-                        
-                        # Load exactly explanation_tail_docs files (one per tail slot)
-                        num_files_to_load = min(explanation_tail_docs, len(all_files))
-                        files_to_load = all_files[:num_files_to_load]
-                        
-                        if num_files_to_load < explanation_tail_docs:
-                            log.warning(
-                                f"Domain {domain}: Only {num_files_to_load} files available in {subfolder_path}, "
-                                f"but explanation_tail_docs={explanation_tail_docs}."
-                            )
-                        
-                        log.info(f"Domain {domain}: Loading {len(files_to_load)} files from {subfolder_path}.")
-                        
-                        # Prepend the subfolder path to each filename
-                        files_to_load = [os.path.join(specific_explanation_type, f) for f in files_to_load]
-                    else:
-                        log.warning(f"Domain {domain}: Subfolder {subfolder_path} not found for granular analysis.")
+                # New mode: Granular analysis using subfolders (e.g., blogs/, stackexchange/, textbooks/)
+                if granular_explanation_analysis and specific_explanation_type:
+                    # specific_explanation_type can be a single string or a list - always convert to list
+                    explanation_types = specific_explanation_type if isinstance(specific_explanation_type, list) else [specific_explanation_type]
+                    
+                    # Always use dict structure - works for single or multiple types
+                    files_to_load = {}  # Dict: {type_name: [files]}
+                    
+                    for expl_type in explanation_types:
+                        subfolder_path = os.path.join(explanation_dir, expl_type)
+                        if os.path.isdir(subfolder_path):
+                            all_files = sorted([f for f in os.listdir(subfolder_path) if f.endswith('.txt')])
+                            
+                            if explanations_cycle == "full":
+                                # Load ALL files from this subfolder
+                                type_files = [os.path.join(expl_type, f) for f in all_files]
+                                log.info(f"Domain {domain}: Loading ALL {len(type_files)} files from {subfolder_path}.")
+                            elif isinstance(explanations_cycle, int) and explanations_cycle > 0:
+                                # Load first N files from this subfolder
+                                num_to_load = min(explanations_cycle, len(all_files))
+                                type_files = [os.path.join(expl_type, f) for f in all_files[:num_to_load]]
+                                
+                                if num_to_load < explanations_cycle:
+                                    log.warning(
+                                        f"Domain {domain}: Only {num_to_load} files available in {subfolder_path}, "
+                                        f"but requested {explanations_cycle}."
+                                    )
+                                
+                                log.info(f"Domain {domain}: Loading {len(type_files)} files from {subfolder_path}.")
+                            else:
+                                type_files = []
+                            
+                            files_to_load[expl_type] = type_files
+                        else:
+                            log.warning(f"Domain {domain}: Subfolder {subfolder_path} not found for granular analysis.")
+                            files_to_load[expl_type] = []
                 
                 # Legacy mode: Load from root explanation directory
                 else:
@@ -355,9 +367,9 @@ def prepare_training_mix(
                     # Sort files for deterministic assignment
                     files_to_load.sort()
 
-                # If NOT distributing to tail docs, load all explanations into a single list
+                # If NOT using granular cycle mode, load all explanations into a single list
                 # for legacy replacement or "own-batch" logic.
-                if explanation_tail_docs <= 0:
+                if not (granular_explanation_analysis and (explanations_cycle == "full" or (isinstance(explanations_cycle, int) and explanations_cycle > 0))):
                     for filename in files_to_load:
                         file_path = os.path.join(explanation_dir, filename)
                         with open(file_path, 'r', encoding='utf-8') as f:
@@ -380,29 +392,63 @@ def prepare_training_mix(
                 if i < len(unique_document_batches):
                     unique_document_batches[i].extend(chunks)
 
-            # Distribute explanation files directly across tail document slots (Simpler Mode)
-            if with_explanations and explanation_tail_docs > 0 and files_to_load:
-                start_slot = base_doc_types - explanation_tail_docs
+            # Distribute explanation files across document slots
+            if with_explanations and (explanations_cycle == "full" or (isinstance(explanations_cycle, int) and explanations_cycle > 0)) and files_to_load:
+                # Unified logic: files_to_load is always a dict now
+                # Load and chunk files per type
+                type_cycles = {}  # {type_name: [(filename, chunks), ...]}
                 
-                for i, filename in enumerate(files_to_load):
-                    file_path = os.path.join(explanation_dir, filename)
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        file_chunks = _chunk_explanation(f.read())
+                for expl_type, file_list in files_to_load.items():
+                    type_file_chunks = []
+                    for filename in file_list:
+                        file_path = os.path.join(explanation_dir, filename)
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            file_chunks = _chunk_explanation(f.read())
+                        
+                        if times_explanations > 1 and file_chunks:
+                            file_chunks = file_chunks * times_explanations
+                        
+                        type_file_chunks.append((filename, file_chunks))
                     
-                    if times_explanations > 1 and file_chunks:
-                        file_chunks = file_chunks * times_explanations
+                    # Handle double_cycle per type
+                    if double_cycle and type_file_chunks:
+                        num_original = len(type_file_chunks)
+                        offset = num_original // 2
+                        
+                        second_cycle = []
+                        for i in range(num_original):
+                            offset_idx = (i + offset) % num_original
+                            filename, file_chunks = type_file_chunks[offset_idx]
+                            second_cycle.append((f"{filename}_offset", file_chunks))
+                        
+                        type_file_chunks.extend(second_cycle)
+                        log.info(f"Domain {domain}, Type {expl_type}: Created double cycle with offset={offset}, total files: {len(type_file_chunks)}")
                     
-                    # Direct 1-to-1 mapping: file i goes to slot (start_slot + i)
-                    target_doc_idx = start_slot + i
-                    
-                    if 0 <= target_doc_idx < len(unique_document_batches):
-                        unique_document_batches[target_doc_idx].extend(file_chunks)
-                        log.info(f"Domain {domain}: Added {len(file_chunks)} chunks from {filename} to doc-type {target_doc_idx}.")
-                    else:
-                        log.warning(f"Domain {domain}: Skipping {filename}, target doc-type {target_doc_idx} out of range.")
+                    type_cycles[expl_type] = type_file_chunks
+                
+                # Distribute: each doc_idx gets one chunk from EACH type's cycle
+                for doc_idx in range(len(unique_document_batches)):
+                    for expl_type, file_chunks_list in type_cycles.items():
+                        if not file_chunks_list:
+                            continue
+                        
+                        num_files = len(file_chunks_list) // 2 if double_cycle else len(file_chunks_list)
+                        
+                        # First cycle
+                        expl_idx = doc_idx % num_files
+                        filename, file_chunks = file_chunks_list[expl_idx]
+                        unique_document_batches[doc_idx].extend(file_chunks)
+                        log.info(f"Domain {domain}: Added {len(file_chunks)} chunks from {filename} (type: {expl_type}) to doc-type {doc_idx}.")
+                        
+                        # Second cycle (offset) if double_cycle enabled
+                        if double_cycle:
+                            second_idx = num_files + expl_idx
+                            filename2, file_chunks2 = file_chunks_list[second_idx]
+                            unique_document_batches[doc_idx].extend(file_chunks2)
+                            log.info(f"Domain {domain}: Added {len(file_chunks2)} chunks from {filename2} (type: {expl_type}, offset) to doc-type {doc_idx}.")
 
             # 4. Handle explanation replacement logic (legacy path: explanations replace paraphrase chunks)
-            if with_explanations and not explanation_in_own_batch and explanation_tail_docs <= 0:
+            if with_explanations and not explanation_in_own_batch and not (granular_explanation_analysis and (explanations_cycle == "full" or (isinstance(explanations_cycle, int) and explanations_cycle > 0))):
                 domain_doc_chunks_expl = [c[:] for c in domain_doc_chunks]
                 
                 if explanation_chunks:

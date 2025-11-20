@@ -1,13 +1,7 @@
 num_epochs=60
 num_paraphrased=9
 
-# Define the SIF and the script
-SIF_FILE="/cbica/home/leejose/finetune_pytorch_2_4.sif" # Or the full path
-# Execute the job with the runtime fix
-apptainer exec \
-    --nv \
-    ${SIF_FILE} \
-    python finetuning_knowledge_v8.py \
+python finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-7B \
     --device_batch_size 4 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
@@ -25,10 +19,7 @@ apptainer exec \
 
 num_epochs=60
 num_paraphrased=9
-apptainer exec \
-    --nv \
-    ${SIF_FILE} \
-    python finetuning_knowledge_v8.py \
+python finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-7B \
     --device_batch_size 4 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
@@ -47,10 +38,7 @@ apptainer exec \
 
 num_epochs=60
 num_paraphrased=9
-apptainer exec \
-    --nv \
-    ${SIF_FILE} \
-    python finetuning_knowledge_v8.py \
+python finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-7B \
     --device_batch_size 4 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \

@@ -76,9 +76,9 @@ def parse_paper_structure(text):
     
     return pd.DataFrame(sections)
 
-def generate_questions(text: str) -> List[Dict[str, Any]]:
+def generate_questions(text: str, model: str = 'gpt-5-mini', reasoning_effort: str = 'medium') -> List[Dict[str, Any]]:
     """Generates inference questions from the text using an LLM."""
-    system_prompt = """You will be given an academic paper. Tour task is to generate questions to test a reader's true comprehension and understanding of the text, particularly regarding the paper's novel contributions. Specifically, your objective is to assess whether the reader can integrate, synthesize, and generalize the implications of the text beyond what's been stated i.e. testing the reader's ability to generalize the knowledge. Academic papers often already provide analysis, interpretation, and discourse of the knowledge in the paper. Thus, aim to write questions that require the reader to build upon the knowledge in the paper, and (1) make a leap of reasoning or (2) integrate and apply the knowledge in different settings. Be creative in your question formulation.
+    system_prompt = """You will be given an academic paper. Your task is to generate questions to test a reader's true comprehension and understanding of the text, particularly regarding the paper's novel contributions. Specifically, your objective is to assess whether the reader can integrate, synthesize, and generalize the implications of the text beyond what's been stated i.e. testing the reader's ability to generalize the knowledge. Academic papers often already provide analysis, interpretation, and discourse of the knowledge in the paper. Thus, aim to write questions that require the reader to build upon the knowledge in the paper, and (1) make a leap of reasoning or (2) integrate and apply the knowledge in different settings. Be creative in your question formulation.
     
 Here is a non-exhaustive list of types and subtypes of inference that you should assess:
 - Conceptual Synthesis
@@ -88,7 +88,7 @@ Here is a non-exhaustive list of types and subtypes of inference that you should
 - Mathematical Understanding
     - Equation Interpretation: This could ask for the conceptual role or meaning of a specific term within a larger mathematical expression, beyond its literal definition.
 - Analagous Understanding
-    - Intuitive Analogy: This could require connecting a concept from the paper to a fundamental concept in another domain (e.g., computer science, bayesian statistics, physics). This tests for an abstract, transferable understanding focused on the intuition.
+    - Intuitive Analogy: This could require connecting a concept from the paper to a fundamental concept that anyone would understand. This tests for an abstract, transferable understanding focused on the intuition.
 - Counterfactual Scenarios
     - Predicting Hypotheticals: The reader could apply the principles established in the paper to predict or answer hypothetical questions. This should test the generalizability of the knowledge in new settings.
  
@@ -97,6 +97,8 @@ Please cover all of the above types of inference, and feel free to add more type
 Here as some specific guidelines you should follow as you write the questions:
 - The question can be as long as needed, but the answer must be a coherent phrase that is 1-5 words long. 
 - For phrasing the answer, prefer simpler language so that we are measuring the reader's ability to understand the paper's content, not their ability to know jargon.
+- The questions should NOT be yes/no questions.
+- The questions should NOT require external jargon, expertise, or terminology beyond what is explicitly stated and explained in the paper itself. Answering the question should only require understanding the paper's content, not prior domain knowledge.
 - The questions should NOT be about factual recall that asks to recall a specific fact in the paper. Please avoid questions that require a mere lookup to a sentence in the paper.
 - The question should be testing *new knowledge*, building upon the knowledge *in the paper*.
 - The questions should require a generalizable, deep understanding of the knowledge. 
@@ -115,7 +117,7 @@ Provide the output in JSON format, as a dictionary with a single key "qa_items" 
 - "answer": (string)
 """
     prompt = {'system': system_prompt, 'user': f"### Subset of Paper\n\n{text}"}
-    response_json = utils.query_llm(prompt, model='gpt-5-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True, max_tokens=4000)
+    response_json = utils.query_llm(prompt, model=model, reasoning_effort=reasoning_effort, system_prompt_included=True, return_json=True, max_tokens=4000)
     
     if isinstance(response_json, str):
         try:
@@ -197,7 +199,7 @@ Provide a JSON object with a single key "pair", which is the refined [answer, st
 """,
         'user': f"### Paper Context\n{context}\n### Title\n{title}\n### Cloze Pair\n{json.dumps(cloze_pair)}\n"
     }
-    response = utils.query_llm(quality_control_prompt, model='gpt-5-mini',reasoning_effort='high', system_prompt_included=True, return_json=True, max_tokens=1000)
+    response = utils.query_llm(quality_control_prompt, model='gpt-5-mini', reasoning_effort='high', system_prompt_included=True, return_json=True, max_tokens=1000)
     try:
         data = json.loads(response) if isinstance(response, str) else response
         pair = data.get('pair')
@@ -243,46 +245,57 @@ def create_cloze_probe(refined_cloze_pair: Tuple[str, str], original_question: D
     probe_data.update(original_question)
     return probe_data
 
-def process_paper(paper_name: str, paper_content: str, **kwargs):
+def process_paper(paper_name: str, paper_content: str, add_on_mode: bool = False, source_version: str = 'v6', **kwargs):
     # """Main pipeline to generate comprehension probes for a single paper."""
-    print(f"Parsing paper structure for {paper_name}...")
-    paper_df = parse_paper_structure(paper_content)
     title = re.search(r'\\title{(.*?)}', paper_content).group(1) if re.search(r'\\title{(.*?)}', paper_content) else "no title"
 
-    document_halves = []
-    if paper_df.empty:
-        print("Could not parse paper structure. Using full paper content, split in half.")
-        paragraphs = paper_content.split('\n\n')
-        if len(paragraphs) > 1:
-            mid_index = len(paragraphs) // 2
-            document_halves.append("\n\n".join(paragraphs[:mid_index]))
-            document_halves.append("\n\n".join(paragraphs[mid_index:]))
-        else:
-            document_halves.append(paper_content)
+    if add_on_mode:
+        # Process entire paper at once with GPT-5 and medium reasoning
+        print(f"Processing entire paper {paper_name} for inference probes...")
+        document_chunks = [paper_content]
+        model = 'gpt-5'
+        reasoning_effort = 'medium'
     else:
-        section_texts = paper_df['section_text'].unique()
-        if len(section_texts) > 1:
-            mid_index = len(section_texts) // 2
-            first_half = "\n\n".join(section_texts[:mid_index])
-            second_half = "\n\n".join(section_texts[mid_index:])
-            document_halves = [first_half, second_half]
+        # Original behavior: split into halves and duplicate
+        print(f"Parsing paper structure for {paper_name}...")
+        paper_df = parse_paper_structure(paper_content)
+        
+        document_halves = []
+        if paper_df.empty:
+            print("Could not parse paper structure. Using full paper content, split in half.")
+            paragraphs = paper_content.split('\n\n')
+            if len(paragraphs) > 1:
+                mid_index = len(paragraphs) // 2
+                document_halves.append("\n\n".join(paragraphs[:mid_index]))
+                document_halves.append("\n\n".join(paragraphs[mid_index:]))
+            else:
+                document_halves.append(paper_content)
         else:
-            document_halves.append("\n\n".join(section_texts))
+            section_texts = paper_df['section_text'].unique()
+            if len(section_texts) > 1:
+                mid_index = len(section_texts) // 2
+                first_half = "\n\n".join(section_texts[:mid_index])
+                second_half = "\n\n".join(section_texts[mid_index:])
+                document_halves = [first_half, second_half]
+            else:
+                document_halves.append("\n\n".join(section_texts))
 
-    document_halves = [half for half in document_halves for _ in range(2)]
+        document_chunks = [half for half in document_halves for _ in range(2)]
+        model = 'gpt-5-mini'
+        reasoning_effort = 'medium'
 
-    print(f"Generating comprehension questions for {len(document_halves)} document halves in parallel...")
+    print(f"Generating inference questions for {len(document_chunks)} {'paper(s)' if add_on_mode else 'document halves'} in parallel...")
     
     questions = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
-        future_to_half = {executor.submit(generate_questions, half): half for half in document_halves}
-        for future in tqdm(concurrent.futures.as_completed(future_to_half), total=len(document_halves), desc="Generating questions"):
+        future_to_chunk = {executor.submit(generate_questions, chunk, model, reasoning_effort): chunk for chunk in document_chunks}
+        for future in tqdm(concurrent.futures.as_completed(future_to_chunk), total=len(document_chunks), desc="Generating questions"):
             try:
-                questions_for_half = future.result()
-                if questions_for_half:
-                    questions.extend(questions_for_half)
+                questions_for_chunk = future.result()
+                if questions_for_chunk:
+                    questions.extend(questions_for_chunk)
             except Exception as exc:
-                print(f'A document half generated an exception: {exc}')
+                print(f'A document chunk generated an exception: {exc}')
 
     #questions = generate_questions(paper_content)
     print(f"Generated a total of {len(questions)} questions.")
@@ -400,12 +413,52 @@ def process_paper(paper_name: str, paper_content: str, **kwargs):
 
     output_dir = f'../../data/probes/inference/{paper_name}/'
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, 'probes_v6.csv')
-    cloze_df.to_csv(output_path, index=False)
-    print(f"Saved {len(cloze_df)} cloze probes to {output_path}")
+
+    if add_on_mode:
+        # Load existing probes from source version and combine
+        source_path = os.path.join(output_dir, f'probes_{source_version}.csv')
+        if os.path.exists(source_path):
+            source_df = pd.read_csv(source_path)
+            print(f"Loaded {len(source_df)} existing probes from {source_version} for {paper_name}")
+            cloze_df = pd.concat([source_df, cloze_df], ignore_index=True)
+            print(f"Combined to create {len(cloze_df)} total probes")
+        else:
+            print(f"No existing {source_version} found for {paper_name}, creating new v7")
+        
+        # Save as v7
+        output_path = os.path.join(output_dir, 'probes_v7.csv')
+        cloze_df.to_csv(output_path, index=False)
+        print(f"Saved {len(cloze_df)} cloze probes to {output_path}")
+        return None
+    else:
+        # Original behavior: save to paper-specific directory as v6
+        output_path = os.path.join(output_dir, 'probes_v6.csv')
+        cloze_df.to_csv(output_path, index=False)
+        print(f"Saved {len(cloze_df)} cloze probes to {output_path}")
+        return None
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--filter", type=str, default=None, help="Only process papers containing this string in their filename.")
+    parser.add_argument("--add_on_to_v6", action='store_true', help="Add new probes to existing v6 probes and save as v7 for each paper.")
+    parser.add_argument("--add_on_to_v7", action='store_true', help="Add new probes to existing v7 probes and save as v7 for each paper.")
     args = parser.parse_args()
-    process_papers(process_paper, '../../data/arxiv/cleaned/', file_filter=args.filter)
+    
+    if args.add_on_to_v6 and args.add_on_to_v7:
+        print("Error: Cannot use both --add_on_to_v6 and --add_on_to_v7 at the same time.")
+        sys.exit(1)
+    
+    if args.add_on_to_v6 or args.add_on_to_v7:
+        # Determine source version
+        source_version = 'v6' if args.add_on_to_v6 else 'v7'
+        print(f"Processing papers with add-on mode: loading from {source_version}, saving as v7")
+        
+        # Define wrapper to pass source_version to process_paper
+        def process_with_addon(paper_name: str, paper_content: str, **kwargs):
+            process_paper(paper_name, paper_content, add_on_mode=True, source_version=source_version, **kwargs)
+        
+        # Process papers
+        process_papers(process_with_addon, '../../data/arxiv/cleaned/', file_filter=args.filter)
+    else:
+        # Original behavior
+        process_papers(process_paper, '../../data/arxiv/cleaned/', file_filter=args.filter)

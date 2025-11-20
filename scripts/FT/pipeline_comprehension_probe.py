@@ -74,9 +74,22 @@ def parse_paper_structure(text):
     
     return pd.DataFrame(sections)
 
-def generate_questions(text: str) -> List[Dict[str, Any]]:
+def generate_questions(text: str, model: str = 'gpt-5', reasoning_effort: str = 'low', focus_on_repeated_ideas: bool = False) -> List[Dict[str, Any]]:
     """Generates comprehension questions from the text using an LLM."""
-    system_prompt = """You have been given a section of an academic text. Your tasks is to test the reader's understanding of the text. However, you should not test anything that can be recalled from reading a single sentence. Create questions that integrate, connect, and synthesize information across several sentences and aim at measuring a deeper understanding. Your question must not be obvious from a single sentence already in the paper, and truly require several sentences to synthesize the answer. Lastly, the answer to the question must be a coherent phrase, from 1 to 5 words long.
+    if focus_on_repeated_ideas:
+        system_prompt = """You have been given an academic paper. Your task is to test the reader's understanding of the core ideas and themes that are repeatedly emphasized throughout the text. Focus on the main concepts, recurring arguments, and central contributions rather than small details or one-off mentions.
+
+Create questions that integrate and synthesize information about these repeatedly emphasized ideas. The questions should require understanding of how these ideas develop, connect, and are used throughout the paper. Your question must not be obvious from a single sentence and truly require understanding of how ideas are developed across the paper. Lastly, the answer to the question must be a coherent phrase, from 1 to 5 words long.
+
+For each question, show me the sentences in the text that you're pulling from to answer the question. The question should be non-obvious from these sentences and require composing information from all of them and additional reasoning and synthesis to answer the question. The question should be testing *new knowledge*, building upon the knowledge *in the paper* and requiring a generalizable, deep understanding of the knowledge.
+
+Provide the output in JSON format, as a dictionary with a single key "qa_items" which is a list of dictionaries with the following keys:
+- "question": (string) 
+- "answer": (string)
+- "text_quotes": list of sentences from the text that you're pulling from to answer the question.
+"""
+    else:
+        system_prompt = """You have been given a section of an academic text. Your tasks is to test the reader's understanding of the text. However, you should not test anything that can be recalled from reading a single sentence. Create questions that integrate, connect, and synthesize information across several sentences and aim at measuring a deeper understanding. Your question must not be obvious from a single sentence already in the paper, and truly require several sentences to synthesize the answer. Lastly, the answer to the question must be a coherent phrase, from 1 to 5 words long.
 
 For each question, show me the sentences in the text that you're pulling from to answer the question. The question should be non-obvious from these sentences and require composing information from all of them to answer the question.
 
@@ -86,7 +99,7 @@ Provide the output in JSON format, as a dictionary with a single key "qa_items" 
 - "text_quotes": list of sentences from the text that you're pulling from to answer the question.
 """
     prompt = {'system': system_prompt, 'user': f"### Text\n{text}"}
-    response_json = utils.query_llm(prompt, model='gpt-5', reasoning_effort='low', system_prompt_included=True, return_json=True, max_tokens=4000)
+    response_json = utils.query_llm(prompt, model=model, reasoning_effort=reasoning_effort, system_prompt_included=True, return_json=True, max_tokens=4000)
     
     if isinstance(response_json, str):
         try:
@@ -167,7 +180,7 @@ def quality_control_cloze(cloze_pair: Tuple[str, str], title: str) -> Tuple[str,
     quality_control_prompt = {
         'system': r"""Your task is to review and refine a statement. You will be given an '(answer, statement)' pair.
 ### Quality Control Checklist
-1. LaTeX Formatting: All mathematical expressions **MUST** be in valid LaTeX. Do *NOT* use unicode math characters. Correct any formatting errors. In all your adjustments, change the statement as minimally as necessary. If a statement is already good, make no changes.
+1. LaTeX Formatting: All mathematical expressions **MUST** be in valid LaTeX. Do *NOT* use unicode math characters. Correct any formatting errors. In all your adjustments, change the statement as minimally as necessary. However, standalone numbers should be written without $.
 2.  Rewrite the statement so that it starts with one of the following templates. 
     - "In the paper '...'"
     - "According to the paper '...'"
@@ -181,7 +194,7 @@ Provide a JSON object with a single key "pair", which is the refined [answer, st
 """,
         'user': f"###Title\n{title}\n### Cloze Pair\n{json.dumps(cloze_pair)}\n"
     }
-    response = utils.query_llm(quality_control_prompt, model='gpt-5-mini', system_prompt_included=True, return_json=True, max_tokens=1000)
+    response = utils.query_llm(quality_control_prompt, model='gpt-5-mini', reasoning_effort='low', system_prompt_included=True, return_json=True, max_tokens=1000)
     try:
         data = json.loads(response) if isinstance(response, str) else response
         pair = data.get('pair')
@@ -203,23 +216,37 @@ def create_cloze_probe(refined_cloze_pair: Tuple[str, str], original_question: D
         return probe_data
     return None
 
-def process_paper(paper_name: str, paper_content: str, **kwargs):
+def process_paper(paper_name: str, paper_content: str, add_on_mode: bool = False, **kwargs):
     """Main pipeline to generate comprehension probes for a single paper."""
-    print(f"Parsing paper structure for {paper_name}...")
-    paper_df = parse_paper_structure(paper_content)
     title = re.search(r'\\title{(.*?)}', paper_content).group(1) if re.search(r'\\title{(.*?)}', paper_content) else "no title"
 
-    if paper_df.empty:
-        print("Could not parse paper structure. Using full paper content.")
+    if add_on_mode:
+        # Process entire paper at once with focus on repeated/emphasized ideas
+        print(f"Processing entire paper {paper_name} for repeated/emphasized ideas...")
         section_texts = [paper_content]
+        model = 'gpt-5'
+        reasoning_effort = 'medium'
+        focus_on_repeated = True
     else:
-        section_texts = paper_df['section_text'].unique()
+        # Original behavior: process by sections
+        print(f"Parsing paper structure for {paper_name}...")
+        paper_df = parse_paper_structure(paper_content)
+        
+        if paper_df.empty:
+            print("Could not parse paper structure. Using full paper content.")
+            section_texts = [paper_content]
+        else:
+            section_texts = paper_df['section_text'].unique()
+        
+        model = 'gpt-5'
+        reasoning_effort = 'low'
+        focus_on_repeated = False
 
-    print(f"Generating comprehension questions for {len(section_texts)} sections in parallel...")
+    print(f"Generating comprehension questions for {len(section_texts)} {'paper(s)' if add_on_mode else 'sections'} in parallel...")
     
     questions = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
-        future_to_section = {executor.submit(generate_questions, section_text): section_text for section_text in section_texts}
+        future_to_section = {executor.submit(generate_questions, section_text, model, reasoning_effort, focus_on_repeated): section_text for section_text in section_texts}
         for future in tqdm(concurrent.futures.as_completed(future_to_section), total=len(section_texts), desc="Generating questions"):
             try:
                 questions_for_section = future.result()
@@ -287,14 +314,64 @@ def process_paper(paper_name: str, paper_content: str, **kwargs):
     cloze_df['fact'] = cloze_df['fact'].str.strip().str.rstrip('.,!?;:')
     save_df_for_debugging(cloze_df, '05_final_probes.txt', 'comprehension', paper_name, ['probe', 'target', 'fact', 'question'])
 
-    output_dir = f'../../data/probes/comprehension/{paper_name}/'
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, 'probes_v1.csv')
-    cloze_df.to_csv(output_path, index=False)
-    print(f"Saved {len(cloze_df)} cloze probes to {output_path}")
+    if add_on_mode:
+        # Return the dataframe instead of saving (will be combined and saved as v7)
+        return cloze_df
+    else:
+        # Original behavior: save to paper-specific directory
+        output_dir = f'../../data/probes/comprehension/{paper_name}/'
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, 'probes_v1.csv')
+        cloze_df.to_csv(output_path, index=False)
+        print(f"Saved {len(cloze_df)} cloze probes to {output_path}")
+        return None
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--filter", type=str, default=None, help="Only process papers containing this string in their filename.")
+    parser.add_argument("--add_on_to_v6", action='store_true', help="Add new probes to existing v6 probes and save as v7.")
     args = parser.parse_args()
-    process_papers(process_paper, '../../data/arxiv/cleaned/', file_filter=args.filter)
+    
+    if args.add_on_to_v6:
+        # Load existing v6 probes
+        v6_path = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/data/probes/inference/DPO/probes_v6.csv'
+        if os.path.exists(v6_path):
+            v6_df = pd.read_csv(v6_path)
+            print(f"Loaded {len(v6_df)} existing probes from v6")
+        else:
+            print(f"Warning: v6 file not found at {v6_path}. Starting with empty dataframe.")
+            v6_df = pd.DataFrame()
+        
+        # Collect all new probes
+        all_new_probes = []
+        
+        def collect_probes(paper_name: str, paper_content: str, **kwargs):
+            result = process_paper(paper_name, paper_content, add_on_mode=True, **kwargs)
+            if result is not None and not result.empty:
+                all_new_probes.append(result)
+        
+        # Process papers
+        process_papers(collect_probes, '../../data/arxiv/cleaned/', file_filter=args.filter)
+        
+        # Combine with v6 and save as v7
+        if all_new_probes:
+            new_probes_df = pd.concat(all_new_probes, ignore_index=True)
+            print(f"\nGenerated {len(new_probes_df)} new probes")
+            
+            if not v6_df.empty:
+                v7_df = pd.concat([v6_df, new_probes_df], ignore_index=True)
+                print(f"Combined with v6 to create v7 with {len(v7_df)} total probes")
+            else:
+                v7_df = new_probes_df
+                print(f"Created v7 with {len(v7_df)} total probes (no v6 found)")
+            
+            # Save v7
+            v7_output_dir = os.path.dirname(v6_path)
+            v7_path = os.path.join(v7_output_dir, 'probes_v7.csv')
+            v7_df.to_csv(v7_path, index=False)
+            print(f"Saved v7 probes to {v7_path}")
+        else:
+            print("No new probes were generated.")
+    else:
+        # Original behavior
+        process_papers(process_paper, '../../data/arxiv/cleaned/', file_filter=args.filter)

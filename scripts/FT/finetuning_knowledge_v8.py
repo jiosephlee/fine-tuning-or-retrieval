@@ -59,19 +59,38 @@ def construct_experiment_name(args):
         if args.with_explanations:
             data_mix = f"{data_mix_base}_expl"
         elif args.with_specific_explanation:
-            data_mix = f"{data_mix_base}_expl_{args.with_specific_explanation}"
+            # Handle multiple explanation types
+            if isinstance(args.with_specific_explanation, list):
+                expl_str = "+".join(args.with_specific_explanation)
+            else:
+                expl_str = args.with_specific_explanation
+            
+            data_mix = f"{data_mix_base}_expl_{expl_str}"
+            
             # Add granular analysis details if enabled
-            if args.granular_explanation_analysis and args.explanation_tail_docs > 0:
-                data_mix += f"_n{args.explanation_tail_docs}"
+            if args.granular_explanation_analysis:
+                if args.explanations_cycle == "full":
+                    data_mix += "_cyclefull"
+                elif isinstance(args.explanations_cycle, int) and args.explanations_cycle > 0:
+                    data_mix += f"_cycle{args.explanations_cycle}"
+                
+                if args.double_cycle:
+                    data_mix += "_double"
         else:
             data_mix = data_mix_base
         
         if (args.with_explanations or args.with_specific_explanation) and args.times_explanations > 1:
             data_mix += f"_x{args.times_explanations}"
         
-        # Add tail distribution info if used
-        if args.explanation_tail_docs > 0:
-            data_mix += f"_tail{args.explanation_tail_docs}"
+        # Add distribution info if used (outside of granular analysis naming)
+        if not args.granular_explanation_analysis:
+            if args.explanations_cycle == "full":
+                data_mix += "_cyclefull"
+            elif isinstance(args.explanations_cycle, int) and args.explanations_cycle > 0:
+                data_mix += f"_cycle{args.explanations_cycle}"
+            
+            if args.double_cycle:
+                data_mix += "_double"
 
     else:
         data_mix = "source_only"
@@ -206,7 +225,8 @@ def continue_pretraining(model, tokenizer, log, args):
         "explanation_every_round": args.explanation_every_round,
         "shuffle_chunks": args.shuffle_chunks,
         "shuffle_seed": args.shuffle_seed,
-        "explanation_tail_docs": args.explanation_tail_docs,
+        "explanations_cycle": args.explanations_cycle,
+        "double_cycle": args.double_cycle,
         "granular_explanation_analysis": args.granular_explanation_analysis,
     }
 
@@ -368,7 +388,7 @@ if __name__ == "__main__":
     parser.add_argument("--constant_lr", action="store_true", help="Use constant learning rate instead of a scheduler (with minimal warmup)")
     parser.add_argument("--overrule_warmup_via_steps", type=int, default=None, help="Override warmup_ratio and specify warmup in steps instead")
     parser.add_argument("--knowledge_probes_version", type=str, default="v9", help="Version of the knowledge probes to use.")
-    parser.add_argument("--inference_probes_version", type=str, default="v6", help="Version of the inference probes to use.")
+    parser.add_argument("--inference_probes_version", type=str, default="v7", help="Version of the inference probes to use.")
     parser.add_argument("--num_paraphrased_texts", type=int, default=9, help="Number of paraphrased texts to use for training (0-9)")
     parser.add_argument("--lima_afterwards", default=False, action="store_true", help="LIMA-based instruction tuning after continued pretraining")
     parser.add_argument("--with_human", default=False, action="store_true", help="Use human-written explanations (when available) instead of/generated explanations for special injection.")
@@ -379,7 +399,7 @@ if __name__ == "__main__":
     parser.add_argument("--overlap_sections", default=False, action="store_true", help="Overlap sections when chunking")
     parser.add_argument("--overlap_ratio", type=str, default="1_4", help="Ratio of overlap when chunking")
     parser.add_argument("--with_explanations", default=False, action="store_true", help="Use explanations when fine-tuning on paraphrased texts")
-    parser.add_argument("--with_specific_explanation", type=str, default=None, choices=['blogs', 'stackexchange', 'textbook'], help="Use a specific explanation file.")
+    parser.add_argument("--with_specific_explanation", type=str, nargs='+', default=None, help="Use specific explanation subfolder(s). Can specify multiple (e.g., 'blogs stackexchange'). When using multiple, must also set --explanations_cycle.")
     parser.add_argument("--raw", action="store_true", help="Use raw arXiv texts instead of cleaned/semi-cleaned.")
     parser.add_argument("--times_explanations", type=int, default=1, help="Number of times to repeat the explanation texts.")
     parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
@@ -387,8 +407,9 @@ if __name__ == "__main__":
     parser.add_argument("--explanation_every_round", action="store_true", help="Inject explanations for every round/replication instead of alternating.")
     parser.add_argument("--shuffle_chunks", action="store_true", help="Shuffle constructed training chunks with seed 42 before training.")
     parser.add_argument("--shuffle_seed", type=int, default=42, help="Seed to use when shuffling training chunks.")
-    parser.add_argument("--explanation_tail_docs", type=int, default=0, help="Number of tail document types to distribute explanations across (also determines how many files to load).")
-    parser.add_argument("--granular_explanation_analysis", action="store_true", help="Use granular subfolder structure for explanations (e.g., blogs/, stackexchange/).")
+    parser.add_argument("--explanations_cycle", type=str, default="0", help="Number of explanation files to cycle through across ALL document batches. Use 'full' to load all available files, or specify an integer.")
+    parser.add_argument("--double_cycle", action="store_true", help="Create a second cycle offset by half the number of files (e.g., 10 chapters -> 2nd cycle starts at chapter 5).")
+    parser.add_argument("--granular_explanation_analysis", action="store_true", help="Use granular subfolder structure for explanations (e.g., blogs/, stackexchange/, textbooks/).")
 
     # Lora arguments
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA r parameter.")
@@ -430,6 +451,24 @@ if __name__ == "__main__":
     # --- Argument Validation ---
     if args.with_explanations and args.with_specific_explanation:
         raise ValueError("Cannot use both --with_explanations and --with_specific_explanation. Please choose one.")
+    
+    # Parse explanations_cycle
+    if args.explanations_cycle == "full":
+        args.explanations_cycle = "full"
+    else:
+        try:
+            args.explanations_cycle = int(args.explanations_cycle)
+        except ValueError:
+            raise ValueError(f"--explanations_cycle must be 'full' or an integer, got: {args.explanations_cycle}")
+    
+    # Validate multiple explanation types
+    if args.with_specific_explanation and isinstance(args.with_specific_explanation, list):
+        if len(args.with_specific_explanation) > 1:
+            if not (args.explanations_cycle == "full" or (isinstance(args.explanations_cycle, int) and args.explanations_cycle > 0)):
+                raise ValueError("When using multiple --with_specific_explanation values, you must also set --explanations_cycle.")
+        # Convert list of one element to single string for backwards compatibility
+        if len(args.with_specific_explanation) == 1:
+            args.with_specific_explanation = args.with_specific_explanation[0]
     # --- Setup Logging & Wandb ---
     logging.basicConfig(
         level=logging.INFO,
