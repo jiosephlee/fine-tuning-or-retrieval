@@ -171,8 +171,10 @@ def continue_pretraining(model, tokenizer, log, args):
         "compile": args.compile_model,
     }
     if args.constant_lr:
-        training_config_kwargs["warmup_ratio"] = 0.1
         training_config_kwargs["lr_scheduler_type"] = "constant_with_warmup"
+    
+    if args.overrule_warmup_via_steps:
+        training_config_kwargs["warmup_steps"] = args.overrule_warmup_via_steps
     else:
         training_config_kwargs["warmup_ratio"] = 0.1
     
@@ -282,10 +284,12 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
         "compile": args.compile_model,
     }
     if args.constant_lr:
-        lima_training_config_kwargs["warmup_ratio"] = 0.03
         lima_training_config_kwargs["lr_scheduler_type"] = "constant_with_warmup"
+    
+    if args.overrule_warmup_via_steps:
+        lima_training_config_kwargs["warmup_steps"] = args.overrule_warmup_via_steps
     else:
-        lima_training_config_kwargs["warmup_ratio"] = 0.1
+        lima_training_config_kwargs["warmup_ratio"] = 0.03
         
     lima_training_config = llm_configs.TrainingConfig(**lima_training_config_kwargs)
 
@@ -362,6 +366,7 @@ if __name__ == "__main__":
     parser.add_argument("--full_finetuning", default=False, action="store_true")
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--constant_lr", action="store_true", help="Use constant learning rate instead of a scheduler (with minimal warmup)")
+    parser.add_argument("--overrule_warmup_via_steps", type=int, default=None, help="Override warmup_ratio and specify warmup in steps instead")
     parser.add_argument("--knowledge_probes_version", type=str, default="v9", help="Version of the knowledge probes to use.")
     parser.add_argument("--inference_probes_version", type=str, default="v6", help="Version of the inference probes to use.")
     parser.add_argument("--num_paraphrased_texts", type=int, default=9, help="Number of paraphrased texts to use for training (0-9)")
