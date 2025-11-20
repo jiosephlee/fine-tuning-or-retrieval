@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=run
 #SBATCH --output=e500-%j.out
-#SBATCH --time=16:00:00
+#SBATCH --time=14:00:00
 #SBATCH --partition=dgx-b200          # example GPU partition on Betty
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128GB
 
 num_epochs=500
-num_paraphrased=9
+num_paraphrased=4
 
 python -s finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-7B \
