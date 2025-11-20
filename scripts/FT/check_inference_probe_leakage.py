@@ -55,6 +55,7 @@ def main():
     explanations_base_dir = os.path.join(project_root, 'data/arxiv/explanations')
     
     domains = [d for d in os.listdir(probes_base_dir) if os.path.isdir(os.path.join(probes_base_dir, d))]
+    subfolders = ['', 'blogs', 'stackexchange', 'textbooks']
     
     all_results = {}
 
@@ -62,7 +63,7 @@ def main():
         print(f"Processing domain: {domain}...")
         
         # Load probes
-        probes_file = os.path.join(probes_base_dir, domain, 'probes_v6.csv')
+        probes_file = os.path.join(probes_base_dir, domain, 'probes_v7.csv')
         if not os.path.exists(probes_file):
             print(f"Probes file not found for {domain}, skipping.")
             continue
@@ -70,31 +71,40 @@ def main():
         probes_df = pd.read_csv(probes_file)
         probes = probes_df['fact'].tolist()
         
-        # Load explanations
-        explanation_dir = os.path.join(explanations_base_dir, domain)
-        if not os.path.isdir(explanation_dir):
-            print(f"Explanations directory not found for {domain}, skipping.")
-            continue
-            
-        explanation_files = [f for f in os.listdir(explanation_dir) if f.endswith('.txt')]
-        
         candidate_pairs_for_domain = []
         
-        for filename in explanation_files:
-            print(f"  Checking against {filename}...")
-            filepath = os.path.join(explanation_dir, filename)
-            with open(filepath, 'r', encoding='utf-8') as f:
-                explanation_text = f.read()
+        # Check each subfolder
+        for subfolder in subfolders:
+            explanation_dir = os.path.join(explanations_base_dir, domain, subfolder) if subfolder else os.path.join(explanations_base_dir, domain)
             
-            similar_pairs = find_similar_excerpts(probes, explanation_text, filename)
+            if not os.path.isdir(explanation_dir):
+                print(f"  Directory not found: {subfolder or 'explanations'}, skipping.")
+                continue
             
-            for pair in similar_pairs:
-                excerpt = pair.get('excerpt')
-                if excerpt and is_text_in_document(excerpt, explanation_text, threshold=0.9):
-                    pair['source_file'] = filename
-                    candidate_pairs_for_domain.append(pair)
-                else:
-                    print(f"  Dropping excerpt not found in source: {excerpt[:100]}...")
+            explanation_files = [f for f in os.listdir(explanation_dir) if f.endswith('.txt')]
+            
+            if not explanation_files:
+                print(f"  No .txt files found in {subfolder or 'explanations'}")
+                continue
+            
+            print(f"  Checking {len(explanation_files)} files in {subfolder or 'explanations'}...")
+            
+            for filename in explanation_files:
+                print(f"    Checking against {filename}...")
+                filepath = os.path.join(explanation_dir, filename)
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    explanation_text = f.read()
+                
+                similar_pairs = find_similar_excerpts(probes, explanation_text, filename)
+                
+                for pair in similar_pairs:
+                    excerpt = pair.get('excerpt')
+                    if excerpt and is_text_in_document(excerpt, explanation_text, threshold=0.9):
+                        pair['source_file'] = filename
+                        pair['source_type'] = subfolder if subfolder else 'explanations'
+                        candidate_pairs_for_domain.append(pair)
+                    else:
+                        print(f"    Dropping excerpt not found in source: {excerpt[:100] if excerpt else 'None'}...")
 
         # Get top 5 for the domain
         candidate_pairs_for_domain.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
