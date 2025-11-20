@@ -54,7 +54,6 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             'log_prob': [],
             'perplexity': [],
             'hit_accuracy_at_1': [],
-            'hit_accuracy_at_5': [],
             'hit_accuracy_at_10': [],
             'hit_accuracy_at_100': [],
         }
@@ -127,21 +126,38 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 if valid_mask.any():
                     log_data[f"{self.log_prefix}/{metric_name}_avg"] = values[valid_mask].mean().item()
             
-            # Log log_prob and hit_accuracy_at_5 for each inference subtype
-            if self.probes_df is not None and 'inference_type' in self.probes_df.columns:
-                # Only log for log_prob and hit_accuracy_at_5
-                if metric_name in ['log_prob', 'hit_accuracy_at_5']:
-                    for inference_type in ["Conceptual Synthesis", "Analogy", "Mathematical Understanding", "New Insight", "Predicting Hypothetical"]:
-                        type_mask = self.probes_df['inference_type'] == inference_type
-                        type_indices = type_mask[type_mask].index.tolist()
+            # Calculate and log averages by inference_type if the column exists
+            # Only log for log_prob and hit_accuracy_at_10
+            if self.probes_df is not None and 'inference_type' in self.probes_df.columns and metric_name in ['log_prob', 'hit_accuracy_at_10']:
+                inference_types = self.probes_df['inference_type'].unique()
+                combined_inference_indices = []
+                
+                for inference_type in inference_types:
+                    # Get indices of probes with this inference_type
+                    type_mask = self.probes_df['inference_type'] == inference_type
+                    type_indices = type_mask[type_mask].index.tolist()
+                    
+                    if len(type_indices) > 0:
+                        # Get values for this inference_type
+                        type_values = values[type_indices]
+                        type_valid_mask = ~torch.isinf(type_values) & ~torch.isnan(type_values)
                         
-                        if len(type_indices) > 0:
-                            type_values = values[type_indices]
-                            type_valid_mask = ~torch.isinf(type_values) & ~torch.isnan(type_values)
-                            
-                            if type_valid_mask.any():
-                                avg_value = type_values[type_valid_mask].mean().item()
-                                log_data[f"{self.log_prefix}/{metric_name}_by_type/{inference_type}"] = avg_value
+                        if type_valid_mask.any():
+                            avg_value = type_values[type_valid_mask].mean().item()
+                            log_data[f"{self.log_prefix}/{metric_name}_by_type/{inference_type}"] = avg_value
+                        
+                        # Collect indices for combined "Inference" category
+                        if inference_type in ["New Insight", "Analogy", "Mathematical Understanding", "Predicting Hypothetical"]:
+                            combined_inference_indices.extend(type_indices)
+                
+                # Calculate combined "Inference" average
+                if len(combined_inference_indices) > 0:
+                    combined_values = values[combined_inference_indices]
+                    combined_valid_mask = ~torch.isinf(combined_values) & ~torch.isnan(combined_values)
+                    
+                    if combined_valid_mask.any():
+                        combined_avg = combined_values[combined_valid_mask].mean().item()
+                        log_data[f"{self.log_prefix}/{metric_name}_by_type/Inference"] = combined_avg
         
         # Log to wandb if available
         if state.is_world_process_zero and log_data:
@@ -189,21 +205,38 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             if valid_mask.any():
                 log_data[f"{self.log_prefix}/{metric_name}_avg"] = values[valid_mask].mean().item()
             
-            # Log log_prob and hit_accuracy_at_5 for each inference subtype
-            if self.probes_df is not None and 'inference_type' in self.probes_df.columns:
-                # Only log for log_prob and hit_accuracy_at_5
-                if metric_name in ['log_prob', 'hit_accuracy_at_5']:
-                    for inference_type in ["Conceptual Synthesis", "Analogy", "Mathematical Understanding", "New Insight", "Predicting Hypothetical"]:
-                        type_mask = self.probes_df['inference_type'] == inference_type
-                        type_indices = type_mask[type_mask].index.tolist()
+            # Calculate and log averages by inference_type if the column exists
+            # Only log for log_prob and hit_accuracy_at_10
+            if self.probes_df is not None and 'inference_type' in self.probes_df.columns and metric_name in ['log_prob', 'hit_accuracy_at_10']:
+                inference_types = self.probes_df['inference_type'].unique()
+                combined_inference_indices = []
+                
+                for inference_type in inference_types:
+                    # Get indices of probes with this inference_type
+                    type_mask = self.probes_df['inference_type'] == inference_type
+                    type_indices = type_mask[type_mask].index.tolist()
+                    
+                    if len(type_indices) > 0:
+                        # Get values for this inference_type
+                        type_values = values[type_indices]
+                        type_valid_mask = ~torch.isinf(type_values) & ~torch.isnan(type_values)
                         
-                        if len(type_indices) > 0:
-                            type_values = values[type_indices]
-                            type_valid_mask = ~torch.isinf(type_values) & ~torch.isnan(type_values)
-                            
-                            if type_valid_mask.any():
-                                avg_value = type_values[type_valid_mask].mean().item()
-                                log_data[f"{self.log_prefix}/{metric_name}_by_type/{inference_type}"] = avg_value
+                        if type_valid_mask.any():
+                            avg_value = type_values[type_valid_mask].mean().item()
+                            log_data[f"{self.log_prefix}/{metric_name}_by_type/{inference_type}"] = avg_value
+                        
+                        # Collect indices for combined "Inference" category
+                        if inference_type in ["New Insight", "Analogy", "Mathematical Understanding", "Predicting Hypothetical"]:
+                            combined_inference_indices.extend(type_indices)
+                
+                # Calculate combined "Inference" average
+                if len(combined_inference_indices) > 0:
+                    combined_values = values[combined_inference_indices]
+                    combined_valid_mask = ~torch.isinf(combined_values) & ~torch.isnan(combined_values)
+                    
+                    if combined_valid_mask.any():
+                        combined_avg = combined_values[combined_valid_mask].mean().item()
+                        log_data[f"{self.log_prefix}/{metric_name}_by_type/Inference"] = combined_avg
 
         if state.is_world_process_zero and log_data:
             if self.report_to_wandb and wandb.run:
