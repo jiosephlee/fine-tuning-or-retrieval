@@ -461,14 +461,6 @@ if __name__ == "__main__":
         except ValueError:
             raise ValueError(f"--explanations_cycle must be 'full' or an integer, got: {args.explanations_cycle}")
     
-    # Validate multiple explanation types
-    if args.with_specific_explanation and isinstance(args.with_specific_explanation, list):
-        if len(args.with_specific_explanation) > 1:
-            if not (args.explanations_cycle == "full" or (isinstance(args.explanations_cycle, int) and args.explanations_cycle > 0)):
-                raise ValueError("When using multiple --with_specific_explanation values, you must also set --explanations_cycle.")
-        # Convert list of one element to single string for backwards compatibility
-        if len(args.with_specific_explanation) == 1:
-            args.with_specific_explanation = args.with_specific_explanation[0]
     # --- Setup Logging & Wandb ---
     logging.basicConfig(
         level=logging.INFO,
