@@ -147,9 +147,19 @@ def construct_experiment_name(args):
 
     # Suffix becomes the final leaf directory name for the run
     run_name = args.custom_suffix if args.custom_suffix else datetime.now().strftime('%m_%d_%H_%M')
-    path_parts.append(run_name)
+    # Append shuffle mode marker to run name for easy propagation to wandb
+    shuffle_marker = ''
+    if getattr(args, 'word_shuffled_papers', False):
+        shuffle_marker = '_shuffle_words'
+    elif getattr(args, 'sentence_shuffled_papers', False):
+        shuffle_marker = '_shuffle_sentences'
+    elif getattr(args, 'shuffled_papers', False):
+        shuffle_marker = '_shuffle'
+
+    path_parts.append(run_name + shuffle_marker)
     
     return os.path.join(*path_parts)
+
 
 
 def get_all_domains():
@@ -495,21 +505,7 @@ if __name__ == "__main__":
         json.dump(vars(args), f, indent=4)
     log.info(f"Hyperparameters saved to {hyperparameters_path}")
 
-    # --- Initialize wandb with shuffle tags if requested ---
-    if not args.test_script:
-        tags = []
-        if getattr(args, 'word_shuffled_papers', False):
-            tags.append('shuffle_words')
-        if getattr(args, 'sentence_shuffled_papers', False):
-            tags.append('shuffle_sentences')
-        if getattr(args, 'shuffled_papers', False):
-            tags.append('shuffle_legacy')
-
-        # Provide the experiment directory and shuffle tags in wandb config
-        wandb.init(project=os.environ.get('WANDB_PROJECT', 'fine_tuning_study'),
-                   name=args.experiment_name,
-                   tags=tags,
-                   config={'experiment_dir': experiment_dir, 'shuffle_tags': tags})
+    # (WandB run name will follow the experiment name so no explicit init here)
 
     # --- Load the model ---
     attn_implementation = args.attn_implementation
