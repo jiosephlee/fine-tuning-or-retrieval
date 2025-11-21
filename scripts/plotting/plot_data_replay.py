@@ -125,10 +125,10 @@ def main():
     # Define colors and line styles for different methods
     method_styles = {
         'With No Data Replay': {'color': 'gray', 'linestyle': '-'},
-        'With Data Replay (1:1) via interleave': {'color': 'lightblue', 'linestyle': ':'},
+        'With Data Replay (1:1) via interleave': {'color': 'deepskyblue', 'linestyle': ':'},
         'With Data Replay (1:5) via interleave': {'color': 'darkblue', 'linestyle': ':'},
-        'Data replay (1:1) via fill': {'color': 'lightblue', 'linestyle': '-'},
-        'Data replay (1:3) via fill': {'color': 'blue', 'linestyle': '-'},
+        'Data replay (1:1) via fill': {'color': 'deepskyblue', 'linestyle': '-'},
+        'Data replay (1:3) via fill': {'color': 'cornflowerblue', 'linestyle': '-'},
         'Data replay (1:5) via fill': {'color': 'darkblue', 'linestyle': '-'},
         'Data replay (1:5) via fill, interleave 1 batch': {'color': 'darkblue', 'linestyle': '--'},
         'Data replay (1:5) via fill, interleave 2 batches': {'color': 'darkblue', 'linestyle': '--'},

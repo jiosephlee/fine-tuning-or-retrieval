@@ -207,7 +207,6 @@ def prepare_training_mix(
     domains = strategy_args.get("override_domains", None)
     unique_document_batches = []
     unique_document_batches_with_explanations = None
-    explanation_batches = []
     
     if "PriorKnowledge" in strategy_name:
         prior_knowledge_dir = '../../data/arxiv/prior_knowledge'
@@ -545,7 +544,6 @@ def prepare_training_mix(
             test_script=test_script,
             fill_with_pretraining=fill_with_pretraining,
             use_explanations_every_round=explanation_every_round,
-            explanation_batches=explanation_batches if explanation_batches else None,
         )
     
     if shuffle_chunks_flag and final_chunks:
