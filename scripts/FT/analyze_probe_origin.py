@@ -28,7 +28,7 @@ def find_probe_file(directory: str, probe_type: str) -> str:
     if not os.path.isdir(directory):
         return None
     
-    version_tag = 'v9' if probe_type == 'knowledge' else 'v6'
+    version_tag = 'v9' if probe_type == 'knowledge' else 'v7'
     
     for filename in os.listdir(directory):
         if filename.endswith('.csv') and version_tag in filename:
