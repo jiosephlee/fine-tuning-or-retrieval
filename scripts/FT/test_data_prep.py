@@ -99,10 +99,10 @@ with open(output_file, 'w') as f:
             chunk_text = dataset[chunk_idx]['raw_text']
             # Show first 100 characters
             preview = chunk_text[:100].replace('\n', '\\n')
-            f.write(f"Chunk {i:2d}: {preview}...\n")
+            word_count = len(chunk_text.split())
+            f.write(f"Chunk {i:2d}: {preview}... (words: {word_count})\n")
         
         f.write("\n")
 
 log.info(f"Output written to: {output_file}")
 log.info("Test complete!")
-
