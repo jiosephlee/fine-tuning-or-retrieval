@@ -207,6 +207,7 @@ def prepare_training_mix(
     domains = strategy_args.get("override_domains", None)
     unique_document_batches = []
     unique_document_batches_with_explanations = None
+    explanation_batches = []
     
     if "PriorKnowledge" in strategy_name:
         prior_knowledge_dir = '../../data/arxiv/prior_knowledge'
@@ -449,6 +450,10 @@ def prepare_training_mix(
 
             # 4. Handle explanation replacement logic (legacy path: explanations replace paraphrase chunks)
             if with_explanations and not explanation_in_own_batch and not (granular_explanation_analysis and (explanations_cycle == "full" or (isinstance(explanations_cycle, int) and explanations_cycle > 0))):
+                # Legacy logic here...
+
+            # 5. Granular cycling: create separate explanation batches
+            if with_explanations and granular_explanation_analysis and (explanations_cycle == "full" or (isinstance(explanations_cycle, int) and explanations_cycle > 0)) and files_to_load:
                 domain_doc_chunks_expl = [c[:] for c in domain_doc_chunks]
                 
                 if explanation_chunks:
@@ -544,6 +549,7 @@ def prepare_training_mix(
             test_script=test_script,
             fill_with_pretraining=fill_with_pretraining,
             use_explanations_every_round=explanation_every_round,
+            explanation_batches=explanation_batches if explanation_batches else None,
         )
     
     if shuffle_chunks_flag and final_chunks:

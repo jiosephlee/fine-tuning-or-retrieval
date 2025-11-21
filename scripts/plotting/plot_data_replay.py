@@ -2,7 +2,6 @@ import os
 import sys
 import pandas as pd
 import matplotlib.pyplot as plt
-import re
 import argparse
 import numpy as np
 
@@ -16,22 +15,43 @@ def transform_to_exposure_steps(df, strategy_name):
     """
     if df.empty:
         return df
-    
+
     df = df.copy()
-    if strategy_name == 'With No Data Replay' or 'fill' in strategy_name:
+    if strategy_name == 'With No Data Replay':
         # Each step is an exposure
         df['Exposure Steps'] = df['step']
-    elif 'With Data Replay (1:1)' in strategy_name:
+    elif 'fill' in strategy_name:
+        # Handle fill-based strategies
+        if 'interleave 1 batch' in strategy_name:
+            df = df[(df['step'] == 0) | ((df['step'] > 0) & ((df['step'] - 1) % 2 == 0))].copy()
+            
+            # Mapping: 
+            # Step 1 -> (1+1)//2 = 1
+            # Step 3 -> (3+1)//2 = 2
+            df['Exposure Steps'] = (df['step'] + 1) // 2
+        elif 'interleave 2 batches' in strategy_name:
+            # Pattern: 1, 4, 7, ...
+            # Logic: Subtract 1 from step, check if divisible by 3 (Stride 3)
+            df = df[(df['step'] - 1) % 3 == 0].copy()
+            
+            # Mapping:
+            # Step 1 -> (1+2)//3 = 1
+            # Step 4 -> (4+2)//3 = 2
+            df['Exposure Steps'] = (df['step'] + 2) // 3
+        else:
+            # Regular fill strategies - each step is an exposure
+            df['Exposure Steps'] = df['step']
+    elif 'With Data Replay (1:1) via interleave' in strategy_name:
         # Exposure at step 0, then every 2 steps starting from 1 (0, 1, 3, 5...)
         df = df[(df['step'] == 0) | ((df['step'] > 0) & ((df['step'] - 1) % 2 == 0))].copy()
         df['Exposure Steps'] = (df['step'] + 1) // 2
-    elif 'With Data Replay (1:5)' in strategy_name:
+    elif 'With Data Replay (1:5) via interleave' in strategy_name:
         # Exposure at step 0, then every 6 steps starting from 1 (0, 1, 7, 13...)
         df = df[(df['step'] == 0) | ((df['step'] > 0) & ((df['step'] - 1) % 6 == 0))].copy()
         df['Exposure Steps'] = (df['step'] - 1) // 6 + 1
     else:
         df['Exposure Steps'] = df['step']
-        
+
     return df
 
 def check_exposure_step_consistency(df: pd.DataFrame, probe_type: str):
@@ -80,25 +100,25 @@ def main():
             'Data replay (1:1) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/09_25_02_08'
         },
         '7B': {
-            'With No Data Replay': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm',
-            'With Data Replay (1:1)': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm',
+            'With No Data Replay': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05',
+            'With Data Replay (1:1) via interleave': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05',
             'Data replay (1:1) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/10_14_23_02',
             'Data replay (1:3) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs128_lr2e-05/overlap_1_4/10_15_04_09',
             'Data replay (1:5) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs192_lr2e-05/overlap_1_4/10_15_10_06',
-            'Data replay (1:5) via fill, separate 2 batches': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_2_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/10_15_21_09',
-            'Data replay (1:5) via fill, separate 1 batch': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs96_lr2e-05/overlap_1_4/10_14_23_06',
-            'With Data Replay (1:5)': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_5_dclm'
+            'Data replay (1:5) via fill, interleave 2 batches': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_2_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/10_15_21_09',
+            'Data replay (1:5) via fill, interleave 1 batch': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs96_lr2e-05/overlap_1_4/10_14_23_06',
+            'With Data Replay (1:5) via interleave': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_5_dclm'
         }
     }
     method_order = [
         'With No Data Replay',
-        'With Data Replay (1:1)',
-        'With Data Replay (1:5)',
+        'With Data Replay (1:1) via interleave',
+        'With Data Replay (1:5) via interleave',
         'Data replay (1:1) via fill',
         'Data replay (1:3) via fill',
         'Data replay (1:5) via fill',
-        'Data replay (1:5) via fill, separate 2 batches',
-        'Data replay (1:5) via fill, separate 1 batch',
+        'Data replay (1:5) via fill, interleave 1 batch',
+        'Data replay (1:5) via fill, interleave 2 batches',
     ]
     xlabel = 'Exposure/Training Steps' if args.with_LIMA else 'Exposure Steps'
 
@@ -158,100 +178,92 @@ def main():
 
     set_plot_style()
 
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
     
-    # Manually share y-axes for 1B and 7B plots separately
-    axes[1].sharey(axes[0])
-    axes[3].sharey(axes[2])
-    # Hide y-tick labels on shared axes
-    plt.setp(axes[1].get_yticklabels(), visible=False)
-    plt.setp(axes[3].get_yticklabels(), visible=False)
-    
-    for i, model_id in enumerate(['1B', '7B']):
-        # --- Knowledge Plot ---
-        ax_knowledge = axes[i*2]
-        if all_data[model_id]['knowledge']:
-            final_knowledge_df = pd.concat(all_data[model_id]['knowledge'], ignore_index=True)
-            
-            # Separate LIMA and non-LIMA data to calculate offset
-            if args.with_LIMA and all_lima_data[model_id]['knowledge']:
-                final_lima_knowledge_df = pd.concat(all_lima_data[model_id]['knowledge'], ignore_index=True)
-                final_lima_knowledge_df['Exposure Steps'] = final_lima_knowledge_df['step'] # LIMA doesn't have exposure steps
+    model_id = '7B'
+    # --- Knowledge Plot ---
+    ax_knowledge = axes[0]
+    if all_data[model_id]['knowledge']:
+        final_knowledge_df = pd.concat(all_data[model_id]['knowledge'], ignore_index=True)
 
-                min_lima_knowledge_step = check_exposure_step_consistency(final_lima_knowledge_df, f"{model_id} LIMA Knowledge")
-                if args.cut_off_at_minimal and min_lima_knowledge_step is not None:
-                    final_lima_knowledge_df = final_lima_knowledge_df[final_lima_knowledge_df['Exposure Steps'] <= min_lima_knowledge_step]
+        # Separate LIMA and non-LIMA data to calculate offset
+        if args.with_LIMA and all_lima_data[model_id]['knowledge']:
+            final_lima_knowledge_df = pd.concat(all_lima_data[model_id]['knowledge'], ignore_index=True)
+            final_lima_knowledge_df['Exposure Steps'] = final_lima_knowledge_df['step'] # LIMA doesn't have exposure steps
 
-                if not final_knowledge_df.empty:
-                    max_exp_k = final_knowledge_df['Exposure Steps'].max()
-                    max_exposure_steps[model_id]['knowledge'] = max_exp_k
-                    if not final_lima_knowledge_df.empty:
-                        final_lima_knowledge_df['Exposure Steps'] += max_exp_k
-                        final_knowledge_df = pd.concat([final_knowledge_df, final_lima_knowledge_df], ignore_index=True)
-            
-            check_exposure_step_consistency(final_knowledge_df, f"{model_id} Knowledge")
-            for method in method_order:
-                if method not in final_knowledge_df['method'].unique():
-                    continue
-                method_df = final_knowledge_df[final_knowledge_df['method'] == method]
-                plot_df = method_df.groupby('Exposure Steps')['log_prob'].mean().reset_index()
-                ax_knowledge.plot(plot_df['Exposure Steps'], plot_df['log_prob'], label=method, lw=1.6)
-            ax_knowledge.set_title(f'{model_id}: Factual Probes')
+            min_lima_knowledge_step = check_exposure_step_consistency(final_lima_knowledge_df, f"{model_id} LIMA Knowledge")
+            if args.cut_off_at_minimal and min_lima_knowledge_step is not None:
+                final_lima_knowledge_df = final_lima_knowledge_df[final_lima_knowledge_df['Exposure Steps'] <= min_lima_knowledge_step]
+
             if not final_knowledge_df.empty:
-                max_x = final_knowledge_df['Exposure Steps'].max()
-                ax_knowledge.set_xticks(np.arange(0, max_x + 1, 30))
-        else:
-            ax_knowledge.set_title(f'{model_id}: Factual Probes (No Data)')
-        ax_knowledge.set_xlabel(xlabel)
-        if i == 0:
-            ax_knowledge.set_ylabel('Mean Log Probability')
+                max_exp_k = final_knowledge_df['Exposure Steps'].max()
+                max_exposure_steps[model_id]['knowledge'] = max_exp_k
+                if not final_lima_knowledge_df.empty:
+                    final_lima_knowledge_df['Exposure Steps'] += max_exp_k
+                    final_knowledge_df = pd.concat([final_knowledge_df, final_lima_knowledge_df], ignore_index=True)
 
-        # --- Inference Plot ---
-        ax_inference = axes[i*2 + 1]
-        if all_data[model_id]['inference']:
-            final_inference_df = pd.concat(all_data[model_id]['inference'], ignore_index=True)
+        check_exposure_step_consistency(final_knowledge_df, f"{model_id} Knowledge")
+        for method in method_order:
+            if method not in final_knowledge_df['method'].unique():
+                continue
+            method_df = final_knowledge_df[final_knowledge_df['method'] == method]
+            plot_df = method_df.groupby('Exposure Steps')['log_prob'].mean().reset_index()
+            ax_knowledge.plot(plot_df['Exposure Steps'], plot_df['log_prob'], label=method, lw=1.6)
+        ax_knowledge.set_title(f'{model_id}: Factual Probes')
+        if not final_knowledge_df.empty:
+            max_x = final_knowledge_df['Exposure Steps'].max()
+            ax_knowledge.set_xticks(np.arange(0, max_x + 1, 30))
+    else:
+        ax_knowledge.set_title(f'{model_id}: Factual Probes (No Data)')
+    ax_knowledge.set_xlabel(xlabel)
+    ax_knowledge.set_ylabel('Mean Log Probability')
 
-            if args.with_LIMA and all_lima_data[model_id]['inference']:
-                final_lima_inference_df = pd.concat(all_lima_data[model_id]['inference'], ignore_index=True)
-                final_lima_inference_df['Exposure Steps'] = final_lima_inference_df['step']
+    # --- Inference Plot ---
+    ax_inference = axes[1]
+    if all_data[model_id]['inference']:
+        final_inference_df = pd.concat(all_data[model_id]['inference'], ignore_index=True)
 
-                min_lima_inference_step = check_exposure_step_consistency(final_lima_inference_df, f"{model_id} LIMA Inference")
-                if args.cut_off_at_minimal and min_lima_inference_step is not None:
-                    final_lima_inference_df = final_lima_inference_df[final_lima_inference_df['Exposure Steps'] <= min_lima_inference_step]
+        if args.with_LIMA and all_lima_data[model_id]['inference']:
+            final_lima_inference_df = pd.concat(all_lima_data[model_id]['inference'], ignore_index=True)
+            final_lima_inference_df['Exposure Steps'] = final_lima_inference_df['step']
 
-                if not final_inference_df.empty:
-                    max_exp_i = final_inference_df['Exposure Steps'].max()
-                    max_exposure_steps[model_id]['inference'] = max_exp_i
-                    if not final_lima_inference_df.empty:
-                        final_lima_inference_df['Exposure Steps'] += max_exp_i
-                        final_inference_df = pd.concat([final_inference_df, final_lima_inference_df], ignore_index=True)
+            min_lima_inference_step = check_exposure_step_consistency(final_lima_inference_df, f"{model_id} LIMA Inference")
+            if args.cut_off_at_minimal and min_lima_inference_step is not None:
+                final_lima_inference_df = final_lima_inference_df[final_lima_inference_df['Exposure Steps'] <= min_lima_inference_step]
 
-            check_exposure_step_consistency(final_inference_df, f"{model_id} Inference")
-            for method in method_order:
-                if method not in final_inference_df['method'].unique():
-                    continue
-                method_df = final_inference_df[final_inference_df['method'] == method]
-                plot_df = method_df.groupby('Exposure Steps')['log_prob'].mean().reset_index()
-                ax_inference.plot(plot_df['Exposure Steps'], plot_df['log_prob'], label=method, lw=1.6)
-            ax_inference.set_title(f'{model_id}: Compositional Probes')
             if not final_inference_df.empty:
-                max_x = final_inference_df['Exposure Steps'].max()
-                ax_inference.set_xticks(np.arange(0, max_x + 1, 30))
-        else:
-            ax_inference.set_title(f'{model_id}: Compositional Probes (No Data)')
-        ax_inference.set_xlabel(xlabel)
-        ax_inference.set_ylabel('')
+                max_exp_i = final_inference_df['Exposure Steps'].max()
+                max_exposure_steps[model_id]['inference'] = max_exp_i
+                if not final_lima_inference_df.empty:
+                    final_lima_inference_df['Exposure Steps'] += max_exp_i
+                    final_inference_df = pd.concat([final_inference_df, final_lima_inference_df], ignore_index=True)
 
-        # Add vertical lines for this model's plots if LIMA is enabled
-        if args.with_LIMA:
-            max_step_k = max_exposure_steps[model_id]['knowledge']
-            max_step_i = max_exposure_steps[model_id]['inference']
-            if max_step_k > 0:
-                ax_knowledge.axvline(x=max_step_k, color='red', linestyle='--', linewidth=1.5, alpha=0.9)
-            if max_step_i > 0:
-                ax_inference.axvline(x=max_step_i, color='red', linestyle='--', linewidth=1.5, alpha=0.9)
+        check_exposure_step_consistency(final_inference_df, f"{model_id} Inference")
+        for method in method_order:
+            if method not in final_inference_df['method'].unique():
+                continue
+            method_df = final_inference_df[final_inference_df['method'] == method]
+            plot_df = method_df.groupby('Exposure Steps')['log_prob'].mean().reset_index()
+            ax_inference.plot(plot_df['Exposure Steps'], plot_df['log_prob'], label=method, lw=1.6)
+        ax_inference.set_title(f'{model_id}: Compositional Probes')
+        if not final_inference_df.empty:
+            max_x = final_inference_df['Exposure Steps'].max()
+            ax_inference.set_xticks(np.arange(0, max_x + 1, 30))
+    else:
+        ax_inference.set_title(f'{model_id}: Compositional Probes (No Data)')
+    ax_inference.set_xlabel(xlabel)
+    ax_inference.set_ylabel('')
 
-    axes[3].legend(loc='upper right', fontsize='small', title_fontsize='small')
+    # Add vertical lines for this model's plots if LIMA is enabled
+    if args.with_LIMA:
+        max_step_k = max_exposure_steps[model_id]['knowledge']
+        max_step_i = max_exposure_steps[model_id]['inference']
+        if max_step_k > 0:
+            ax_knowledge.axvline(x=max_step_k, color='red', linestyle='--', linewidth=1.5, alpha=0.9)
+        if max_step_i > 0:
+            ax_inference.axvline(x=max_step_i, color='red', linestyle='--', linewidth=1.5, alpha=0.9)
+
+    axes[0].legend(loc='lower left', fontsize='small', title_fontsize='small')
 
     for ax in fig.get_axes():
         ax.grid(True)

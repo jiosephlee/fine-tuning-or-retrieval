@@ -8,7 +8,7 @@
 #SBATCH --mem=128GB
 
 num_epochs=100
-num_paraphrased=9
+num_paraphrased=0
 
 python -s finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-7B \

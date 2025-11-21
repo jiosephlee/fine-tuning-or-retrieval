@@ -33,7 +33,7 @@ train_cfg = TrainingConfig(
 # Strategy args - test with blogs + stackexchange
 strategy_args = {
     "num_paraphrased_texts": 9,
-    "override_domains": ["DPO"],
+    "override_domains": ["DPO", "1_58", "GRPO", "BOFT", "OFT", "QLoRA"],
     "fill_batches_with_pretraining": True,
     "separate_batches_with_pretraining": 0,
     "pretraining_data_type": "dclm",
