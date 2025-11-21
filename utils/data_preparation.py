@@ -450,10 +450,6 @@ def prepare_training_mix(
 
             # 4. Handle explanation replacement logic (legacy path: explanations replace paraphrase chunks)
             if with_explanations and not explanation_in_own_batch and not (granular_explanation_analysis and (explanations_cycle == "full" or (isinstance(explanations_cycle, int) and explanations_cycle > 0))):
-                # Legacy logic here...
-
-            # 5. Granular cycling: create separate explanation batches
-            if with_explanations and granular_explanation_analysis and (explanations_cycle == "full" or (isinstance(explanations_cycle, int) and explanations_cycle > 0)) and files_to_load:
                 domain_doc_chunks_expl = [c[:] for c in domain_doc_chunks]
                 
                 if explanation_chunks:

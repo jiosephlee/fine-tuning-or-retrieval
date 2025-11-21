@@ -122,6 +122,18 @@ def main():
     ]
     xlabel = 'Exposure/Training Steps' if args.with_LIMA else 'Exposure Steps'
 
+    # Define colors and line styles for different methods
+    method_styles = {
+        'With No Data Replay': {'color': 'gray', 'linestyle': '-'},
+        'With Data Replay (1:1) via interleave': {'color': 'lightblue', 'linestyle': ':'},
+        'With Data Replay (1:5) via interleave': {'color': 'darkblue', 'linestyle': ':'},
+        'Data replay (1:1) via fill': {'color': 'lightblue', 'linestyle': '-'},
+        'Data replay (1:3) via fill': {'color': 'blue', 'linestyle': '-'},
+        'Data replay (1:5) via fill': {'color': 'darkblue', 'linestyle': '-'},
+        'Data replay (1:5) via fill, interleave 1 batch': {'color': 'darkblue', 'linestyle': '--'},
+        'Data replay (1:5) via fill, interleave 2 batches': {'color': 'darkblue', 'linestyle': '--'},
+    }
+
     domains_path = os.path.join(project_root, 'data/arxiv/cleaned')
     try:
         domains = sorted([os.path.splitext(f)[0] for f in os.listdir(domains_path) if f.endswith('.tex') and os.path.isfile(os.path.join(domains_path, f))])
@@ -208,7 +220,9 @@ def main():
                 continue
             method_df = final_knowledge_df[final_knowledge_df['method'] == method]
             plot_df = method_df.groupby('Exposure Steps')['log_prob'].mean().reset_index()
-            ax_knowledge.plot(plot_df['Exposure Steps'], plot_df['log_prob'], label=method, lw=1.6)
+            style = method_styles.get(method, {'color': 'black', 'linestyle': '-'})
+            ax_knowledge.plot(plot_df['Exposure Steps'], plot_df['log_prob'], label=method, lw=1.6,
+                            color=style['color'], linestyle=style['linestyle'])
         ax_knowledge.set_title(f'{model_id}: Factual Probes')
         if not final_knowledge_df.empty:
             max_x = final_knowledge_df['Exposure Steps'].max()
@@ -244,7 +258,9 @@ def main():
                 continue
             method_df = final_inference_df[final_inference_df['method'] == method]
             plot_df = method_df.groupby('Exposure Steps')['log_prob'].mean().reset_index()
-            ax_inference.plot(plot_df['Exposure Steps'], plot_df['log_prob'], label=method, lw=1.6)
+            style = method_styles.get(method, {'color': 'black', 'linestyle': '-'})
+            ax_inference.plot(plot_df['Exposure Steps'], plot_df['log_prob'], label=method, lw=1.6,
+                            color=style['color'], linestyle=style['linestyle'])
         ax_inference.set_title(f'{model_id}: Compositional Probes')
         if not final_inference_df.empty:
             max_x = final_inference_df['Exposure Steps'].max()
@@ -263,7 +279,7 @@ def main():
         if max_step_i > 0:
             ax_inference.axvline(x=max_step_i, color='red', linestyle='--', linewidth=1.5, alpha=0.9)
 
-    axes[0].legend(loc='lower left', fontsize='small', title_fontsize='small')
+    axes[0].legend(loc='lower left', fontsize='x-small', title_fontsize='x-small')
 
     for ax in fig.get_axes():
         ax.grid(True)
