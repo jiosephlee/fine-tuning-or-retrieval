@@ -205,6 +205,7 @@ def prepare_training_mix(
 
     # --- 1. Load Domains & Documents ---
     domains = strategy_args.get("override_domains", None)
+    shuffled_papers = strategy_args.get("shuffled_papers", False)
     if domains is None:
         if use_raw: cleaned_dir = '../../data/arxiv/raw'
         elif semi_cleaned_version: cleaned_dir = f'../../data/arxiv/semicleaned_{semi_cleaned_version}'
@@ -226,9 +227,20 @@ def prepare_training_mix(
         log.info(f"Loading data for domain: {domain}")
         
         # Load Source
-        if use_raw: source_path = f'../../data/arxiv/raw/{domain}.tex'
-        elif semi_cleaned_version: source_path = f'../../data/arxiv/semicleaned_{semi_cleaned_version}/{domain}.tex'
-        else: source_path = f'../../data/arxiv/cleaned/{domain}.tex'
+        # Prefer shuffled versions when requested
+        if shuffled_papers:
+            shuffled_candidate = f'../../data/arxiv/cleaned/{domain}_shuffle.tex'
+            if os.path.exists(shuffled_candidate):
+                source_path = shuffled_candidate
+            else:
+                # fallback to original
+                if use_raw: source_path = f'../../data/arxiv/raw/{domain}.tex'
+                elif semi_cleaned_version: source_path = f'../../data/arxiv/semicleaned_{semi_cleaned_version}/{domain}.tex'
+                else: source_path = f'../../data/arxiv/cleaned/{domain}.tex'
+        else:
+            if use_raw: source_path = f'../../data/arxiv/raw/{domain}.tex'
+            elif semi_cleaned_version: source_path = f'../../data/arxiv/semicleaned_{semi_cleaned_version}/{domain}.tex'
+            else: source_path = f'../../data/arxiv/cleaned/{domain}.tex'
 
         try:
             with open(source_path, 'r', encoding='utf-8') as f: source_text = f.read()
@@ -241,6 +253,13 @@ def prepare_training_mix(
             paraphrased_dir = f'../../data/arxiv/paraphrased/{domain}/'
             if os.path.isdir(paraphrased_dir):
                 for i in range(num_paraphrased_texts):
+                    # prefer shuffled paraphrase if requested
+                    if shuffled_papers:
+                        para_shuffle = os.path.join(paraphrased_dir, f'{i}_shuffle.tex')
+                        if os.path.exists(para_shuffle):
+                            with open(para_shuffle, 'r', encoding='utf-8') as f:
+                                paraphrased_chunks_by_doc.append(_chunk(f.read()))
+                            continue
                     para_path = os.path.join(paraphrased_dir, f'{i}.tex')
                     if os.path.exists(para_path):
                         with open(para_path, 'r', encoding='utf-8') as f:
