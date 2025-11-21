@@ -220,7 +220,6 @@ def continue_pretraining(model, tokenizer, log, args):
         "with_specific_explanation": args.with_specific_explanation,
         "times_explanations": args.times_explanations,
         "semi_cleaned": args.semi_cleaned,
-        "with_human": args.with_human,
         "use_raw": args.raw if hasattr(args, "raw") else False,
         "explanation_every_round": args.explanation_every_round,
         "shuffle_chunks": args.shuffle_chunks,
@@ -230,7 +229,7 @@ def continue_pretraining(model, tokenizer, log, args):
         "granular_explanation_analysis": args.granular_explanation_analysis,
     }
 
-    use_special_injection = args.with_explanations or args.with_specific_explanation or args.with_human
+    use_special_injection = args.with_explanations or args.with_specific_explanation
 
     if use_special_injection:
         strategy_name = "ParaphrasedArxivPaperWithExplanations"
@@ -391,7 +390,6 @@ if __name__ == "__main__":
     parser.add_argument("--inference_probes_version", type=str, default="v7", help="Version of the inference probes to use.")
     parser.add_argument("--num_paraphrased_texts", type=int, default=9, help="Number of paraphrased texts to use for training (0-9)")
     parser.add_argument("--lima_afterwards", default=False, action="store_true", help="LIMA-based instruction tuning after continued pretraining")
-    parser.add_argument("--with_human", default=False, action="store_true", help="Use human-written explanations (when available) instead of/generated explanations for special injection.")
 
     # Defaults, do not change unless for ablations
     parser.add_argument("--chunk_by_section", action="store_true", help="Use section-based chunking instead of token-based chunking")

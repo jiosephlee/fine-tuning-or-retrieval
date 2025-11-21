@@ -3,12 +3,12 @@ import torch
 import numpy as np
 import random
 from typing import List, Optional
-from itertools import cycle
 from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
 
 from utils.llm_configs import TrainingConfig
 import utils.chunking as chunking
+from itertools import cycle, repeat
 
 
 class PretrainingDataReplay:
@@ -165,35 +165,25 @@ def prepare_training_mix(
     add_title_prefix: bool = True,
     **strategy_args,
 ):
-    """
-    Prepares the training mix. 
-    Supports:
-    1. Legacy mixing (coupled batches).
-    2. Track mixing (independent streams for docs and explanations).
-    3. Pretraining data injection (separators, batch filling, chunk gap filling).
-    """
+    # ... [Beginning of function remains the same] ...
     log.info(f"Preparing training mix for strategy: {strategy_name}")
 
-    # --- Arguments Extraction ---
+    # ... [Args extraction remains the same] ...
     test_script = strategy_args.get("test_script", False)
     specific_explanation_type = strategy_args.get("with_specific_explanation", None)
-    times_explanations = strategy_args.get("times_explanations", 1)
+    times_explanations = strategy_args.get("times_explanations", 1) # Legacy mode, not used
     semi_cleaned_version = strategy_args.get("semi_cleaned", None)
     use_raw = strategy_args.get("use_raw", False)
-    explanation_every_round = strategy_args.get("explanation_every_round", False)
+    explanation_every_round = strategy_args.get("explanation_every_round", False) # Legacy mode, not used
     shuffle_chunks_flag = strategy_args.get("shuffle_chunks", False)
     shuffle_seed = strategy_args.get("shuffle_seed", 42)
-    with_human = strategy_args.get("with_human", False)
-    explanation_in_own_batch = strategy_args.get("explanation_in_own_batch", False) # Deprecated essentially
     explanations_cycle = strategy_args.get("explanations_cycle", 0)
     double_cycle = strategy_args.get("double_cycle", False)
-    granular_explanation_analysis = strategy_args.get("granular_explanation_analysis", False)
-    
-    # New args for pretraining injection
-    fill_chunk_gaps = strategy_args.get("fill_chunk_gaps", False)
+    granular_explanation_analysis = strategy_args.get("granular_explanation_analysis", True)
+    fill_chunk_gaps = strategy_args.get("fill_chunk_gaps", True)
     chunk_gap_threshold = strategy_args.get("fill_chunk_gap_threshold", 1000)
     pretraining_separators = int(strategy_args.get("separate_batches_with_pretraining", 0))
-    fill_with_pretraining = strategy_args.get("fill_batches_with_pretraining", False)
+    fill_with_pretraining = strategy_args.get("fill_batches_with_pretraining", True)
 
     # --- Helper Functions ---
     def _chunk(text: str) -> List[str]:
@@ -213,15 +203,12 @@ def prepare_training_mix(
         )
         return chunks
 
-    # --- 1. Load Domains & Documents (The "Doc Track") ---
+    # --- 1. Load Domains & Documents ---
     domains = strategy_args.get("override_domains", None)
     if domains is None:
-        if use_raw:
-            cleaned_dir = '../../data/arxiv/raw'
-        elif semi_cleaned_version:
-            cleaned_dir = f'../../data/arxiv/semicleaned_{semi_cleaned_version}'
-        else:
-            cleaned_dir = '../../data/arxiv/cleaned'
+        if use_raw: cleaned_dir = '../../data/arxiv/raw'
+        elif semi_cleaned_version: cleaned_dir = f'../../data/arxiv/semicleaned_{semi_cleaned_version}'
+        else: cleaned_dir = '../../data/arxiv/cleaned'
         domains = [f.replace('.tex', '') for f in os.listdir(cleaned_dir) if f.endswith('.tex')]
     
     log.info(f"Processing domains: {domains}")
@@ -229,14 +216,11 @@ def prepare_training_mix(
     num_paraphrased_texts = strategy_args.get("num_paraphrased_texts", 0)
     with_explanations = "WithExplanations" in strategy_name
     
-    # List of batches for source documents (e.g., [ [SourceChunks], [Para1Chunks], [Para2Chunks] ])
     unique_document_batches = [[] for _ in range(1 + num_paraphrased_texts)]
-    
-    # Placeholder for legacy coupled batches
     unique_document_batches_with_explanations = None
     
-    # List of explanation batches for the New Track Method
-    explanation_pool = []
+    # Structure: List of Domains -> List of Tracks -> List of Chunks
+    domain_explanation_tracks = [] 
 
     for domain in domains:
         log.info(f"Loading data for domain: {domain}")
@@ -249,7 +233,6 @@ def prepare_training_mix(
         try:
             with open(source_path, 'r', encoding='utf-8') as f: source_text = f.read()
         except FileNotFoundError: continue
-        
         source_chunks = _chunk(source_text)
 
         # Load Paraphrases
@@ -269,157 +252,142 @@ def prepare_training_mix(
             if i < len(unique_document_batches):
                 unique_document_batches[i].extend(chunks)
 
-        # --- 2. Load Explanations (Preparation) ---
+        # --- 2. Load Explanations ---
+        current_domain_tracks = [] # We will append 1 or 2 tracks here (Main + Offset)
+        
         if with_explanations:
             explanation_dir = f'../../data/arxiv/explanations/{domain}/'
-            files_to_load = {} # Dict {type: [filenames]}
+            files_to_load = {}
 
-            # Identify files to load
+            # Identify files
             if granular_explanation_analysis and specific_explanation_type:
                 explanation_types = specific_explanation_type if isinstance(specific_explanation_type, list) else [specific_explanation_type]
                 for expl_type in explanation_types:
                     subfolder_path = os.path.join(explanation_dir, expl_type)
                     if os.path.isdir(subfolder_path):
                         all_files = sorted([f for f in os.listdir(subfolder_path) if f.endswith('.txt')])
-                        
-                        if explanations_cycle == "full":
-                            type_files = [os.path.join(expl_type, f) for f in all_files]
-                        elif isinstance(explanations_cycle, int) and explanations_cycle > 0:
-                            type_files = [os.path.join(expl_type, f) for f in all_files[:explanations_cycle]]
-                        else:
-                            type_files = []
+                        if explanations_cycle == "full": type_files = [os.path.join(expl_type, f) for f in all_files]
+                        elif isinstance(explanations_cycle, int) and explanations_cycle > 0: type_files = [os.path.join(expl_type, f) for f in all_files[:explanations_cycle]]
+                        else: type_files = []
                         files_to_load[expl_type] = type_files
             else:
-                # Legacy/Simple loading
                 default_files = [f"{specific_explanation_type}.txt"] if specific_explanation_type else ['blogs.txt', 'stackexchange.txt', 'textbook.txt']
-                human_files = [f"human_blog_{i}.txt" for i in range(1, 4)] if with_human else []
-                
                 if os.path.isdir(explanation_dir):
                     avail = set(os.listdir(explanation_dir))
-                    if human_files and any(f in avail for f in human_files):
-                        actual_files = [f for f in human_files if f in avail]
-                    elif not with_human:
-                        actual_files = [f for f in default_files if f in avail]
-                    else: actual_files = []
+                    actual_files = [f for f in default_files if f in avail]
                     actual_files.sort()
-                    
-                    # For legacy reasons, we treat "default" as a single type
                     files_to_load["default"] = actual_files
 
-            # --- 3. Build Explanation Pools (Track Method vs Legacy) ---
-            
-            # Check if we use the New Track Method (Triggered by specific cycling args or granular analysis)
             use_track_method = granular_explanation_analysis or (explanations_cycle == "full" or (isinstance(explanations_cycle, int) and explanations_cycle > 0))
 
-            if use_track_method and files_to_load:
-                # >> NEW TRACK METHOD CONSTRUCTION <<
-                type_cycles = {}
-                max_cycle_len = 0
-                
-                for expl_type, file_list in files_to_load.items():
-                    type_file_chunks = []
-                    for filename in file_list:
-                        file_path = os.path.join(explanation_dir, filename)
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            file_chunks = _chunk_explanation(f.read())
-                        
-                        if times_explanations > 1 and file_chunks:
-                            file_chunks = file_chunks * times_explanations
-                        
-                        type_file_chunks.append((filename, file_chunks))
-                    
-                    # Handle double cycle (offset)
-                    if double_cycle and type_file_chunks:
-                        offset = len(type_file_chunks) // 2
-                        second_cycle = []
-                        for i in range(len(type_file_chunks)):
-                            offset_idx = (i + offset) % len(type_file_chunks)
-                            fn, ch = type_file_chunks[offset_idx]
-                            second_cycle.append((f"{fn}_offset", ch))
-                        type_file_chunks.extend(second_cycle)
-                    
-                    type_cycles[expl_type] = type_file_chunks
-                    max_cycle_len = max(max_cycle_len, len(type_file_chunks))
+            if use_track_method:
+                # >> TRACK METHOD <<
+                if files_to_load:
+                    # Build base objects {type: [(filename, chunks)]}
+                    type_objects = {} 
+                    for expl_type, file_list in files_to_load.items():
+                        objs = []
+                        for filename in file_list:
+                            file_path = os.path.join(explanation_dir, filename)
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                file_chunks = _chunk_explanation(f.read())
+                            if times_explanations > 1 and file_chunks:
+                                file_chunks = file_chunks * times_explanations
+                            objs.append((filename, file_chunks))
+                        type_objects[expl_type] = objs
 
-                # Create flat pool for this domain
-                for expl_idx in range(max_cycle_len):
-                    chunks_for_this_step = []
-                    for expl_type, file_chunks_list in type_cycles.items():
-                        if not file_chunks_list: continue
-                        _, file_chunks = file_chunks_list[expl_idx % len(file_chunks_list)]
-                        chunks_for_this_step.extend(file_chunks)
-                    
-                    if chunks_for_this_step:
-                        explanation_pool.append(chunks_for_this_step)
+                    # Helper to flatten objects into a pool
+                    def create_pool_from_objects(obj_dict):
+                        pool = []
+                        max_len = max([len(x) for x in obj_dict.values()]) if obj_dict else 0
+                        for idx in range(max_len):
+                            step_chunks = []
+                            for e_type, e_list in obj_dict.items():
+                                if not e_list: continue
+                                _, ch = e_list[idx % len(e_list)]
+                                step_chunks.extend(ch)
+                            if step_chunks: pool.append(step_chunks)
+                        return pool
+
+                    # Track 1: Main
+                    main_pool = create_pool_from_objects(type_objects)
+                    if main_pool:
+                        current_domain_tracks.append(main_pool)
+
+                    # Track 2: Offset (Sequential Addition)
+                    if double_cycle:
+                        offset_objects = {}
+                        for e_type, e_list in type_objects.items():
+                            if not e_list: 
+                                offset_objects[e_type] = []
+                                continue
+                            offset = len(e_list) // 2
+                            rotated_list = e_list[offset:] + e_list[:offset]
+                            offset_objects[e_type] = rotated_list
+                        
+                        offset_pool = create_pool_from_objects(offset_objects)
+                        if offset_pool:
+                            log.info(f"Domain {domain}: Adding OFFSET track (size {len(offset_pool)}).")
+                            current_domain_tracks.append(offset_pool)
 
             elif not use_track_method:
-                # >> LEGACY METHOD CONSTRUCTION (Coupled Batches) <<
-                # We load explanations into a list and splice them into the document lists
+                # >> LEGACY METHOD (Splice) <<
                 legacy_expl_chunks = []
                 if "default" in files_to_load:
                     for filename in files_to_load["default"]:
                         with open(os.path.join(explanation_dir, filename), 'r', encoding='utf-8') as f:
                             legacy_expl_chunks.extend(_chunk_explanation(f.read()))
-                
                 if times_explanations > 1 and legacy_expl_chunks:
                     legacy_expl_chunks = legacy_expl_chunks * times_explanations
 
-                # Init legacy container if needed
                 if unique_document_batches_with_explanations is None:
                     unique_document_batches_with_explanations = [[] for _ in range(len(unique_document_batches))]
-                
-                # Add Source (Batch 0)
                 if len(unique_document_batches_with_explanations) > 0:
                     unique_document_batches_with_explanations[0].extend(source_chunks)
 
-                # Splice logic: Explanations replace the end of Paraphrased chunks
                 if legacy_expl_chunks:
                     to_insert = list(legacy_expl_chunks)
-                    # Iterate paraphrases (Indices 1+)
-                    for i in range(len(unique_document_batches) - 1, 0, -1): # backwards
-                        original_chunks = unique_document_batches[i][-len(paraphrased_chunks_by_doc[i-1]):] # get current doc chunks
-                        
+                    for i in range(len(unique_document_batches) - 1, 0, -1):
+                        original_chunks = unique_document_batches[i][-len(paraphrased_chunks_by_doc[i-1]):]
                         if not to_insert:
                             unique_document_batches_with_explanations[i].extend(original_chunks)
                             continue
-
                         if len(to_insert) >= len(original_chunks):
                             unique_document_batches_with_explanations[i].extend(to_insert[-len(original_chunks):])
                             to_insert = to_insert[:-len(original_chunks)]
                         else:
-                            # Partial replace
                             keep_n = len(original_chunks) - len(to_insert)
                             new_c = original_chunks[:keep_n] + to_insert
                             unique_document_batches_with_explanations[i].extend(new_c)
                             to_insert = []
                 else:
-                    # Fallback if no explanations found but requested
-                    for i in range(1, len(unique_document_batches)):
+                     for i in range(1, len(unique_document_batches)):
                         unique_document_batches_with_explanations[i].extend(unique_document_batches[i][-len(paraphrased_chunks_by_doc[i-1]):])
 
-    # --- 4. Prepare Data Replayer ---
-    # We need this if we are doing separators, filling batches, OR filling chunk gaps
+        # Append the list of tracks for this domain
+        domain_explanation_tracks.append(current_domain_tracks)
+
+    # --- 3. Replay & Replications ---
     data_replay = None
     if fill_with_pretraining or pretraining_separators > 0 or fill_chunk_gaps:
         pretraining_data_type = strategy_args.get('pretraining_data_type', 'dclm')
         log.info(f"Creating Pretraining Data Replayer from '{pretraining_data_type}'...")
         data_replay = PretrainingDataReplay(f'../../data/olmo/{pretraining_data_type}_100M_tokens.npy')
 
-    # --- 5. Calculate Replications ---
     original_epochs = train_cfg.num_train_epochs
     replication_factor = 1
     if unique_document_batches and original_epochs > 1:
         replication_factor = int(original_epochs / len(unique_document_batches))
         log.info(f"Replicating dataset {replication_factor} times.")
 
-    # --- 6. Generate Final Chunks (Routing) ---
     final_chunks = []
+    has_track_explanations = any(len(tracks) > 0 for tracks in domain_explanation_tracks)
 
-    if explanation_pool:
-        log.info("Using NEW Track Method (Independent Doc and Explanation Tracks).")
+    if has_track_explanations:
+        log.info("Using NEW Track Method (Independent Domain Tracks).")
         final_chunks = replicate_and_interleave_tracks(
             doc_batches=unique_document_batches,
-            explanation_pool=explanation_pool,
+            domain_explanation_tracks=domain_explanation_tracks,
             replication_factor=replication_factor,
             data_replay=data_replay,
             pretraining_separators=pretraining_separators,
@@ -445,7 +413,7 @@ def prepare_training_mix(
             use_explanations_every_round=explanation_every_round
         )
 
-    # --- 7. Fill Chunk Gaps (Optional) ---
+    # --- 4. Fill Gaps & Shuffle ---
     if fill_chunk_gaps and final_chunks:
         log.info("Filling gaps in individual chunks...")
         final_chunks = fill_underfilled_chunks(
@@ -457,7 +425,6 @@ def prepare_training_mix(
             log=log
         )
 
-    # --- 8. Shuffle ---
     if shuffle_chunks_flag and final_chunks:
         random.Random(shuffle_seed).shuffle(final_chunks)
         log.info(f"Shuffled final training chunks with seed {shuffle_seed}.")
@@ -468,7 +435,7 @@ def prepare_training_mix(
 
 def replicate_and_interleave_tracks(
     doc_batches: List[List[str]],
-    explanation_pool: List[List[str]],
+    domain_explanation_tracks: List[List[List[List[str]]]], 
     replication_factor: int,
     data_replay: PretrainingDataReplay,
     pretraining_separators: int,
@@ -479,10 +446,7 @@ def replicate_and_interleave_tracks(
     fill_with_pretraining: bool = False,
 ) -> List[str]:
     """
-    The New Way: "Track" based mixing.
-    1. Build the full Document Track (length = docs * reps).
-    2. Build the full Explanation Track (length = docs * reps) by cycling the pool continuously.
-    3. Merge tracks and fill.
+    The New Way: "Track" based mixing with independent domain cycling AND multiple tracks per domain.
     """
     effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
     total_batches = len(doc_batches) * replication_factor
@@ -490,28 +454,43 @@ def replicate_and_interleave_tracks(
     if total_batches == 0: return []
 
     # --- TRACK 1: DOCUMENTS ---
-    # D1, D2, D3... repeated `replication_factor` times
     track_docs = []
     for _ in range(replication_factor):
         track_docs.extend([list(b) for b in doc_batches])
         
-    # --- TRACK 2: EXPLANATIONS ---
-    # E1, E2, E3... cycled continuously to match total_batches
+    # --- TRACK 2+: EXPLANATIONS ---
+    # Flatten all domains' tracks into a single list of active iterators
+    all_iterators = []
+    
+    for domain_tracks in domain_explanation_tracks:
+        if not domain_tracks:
+            # If a domain has no explanations, it adds nothing to the batch
+            all_iterators.append(repeat([]))
+        else:
+            # Add an iterator for EVERY track in this domain (e.g. Main + Offset)
+            for track_pool in domain_tracks:
+                if track_pool:
+                    all_iterators.append(cycle(track_pool))
+                else:
+                    all_iterators.append(repeat([]))
+
     track_explanations = []
-    if explanation_pool:
-        expl_iterator = cycle(explanation_pool)
-        for _ in range(total_batches):
-            track_explanations.append(next(expl_iterator))
-    else:
-        track_explanations = [[] for _ in range(total_batches)]
+    
+    for _ in range(total_batches):
+        combined_explanation_batch = []
+        
+        # Pull from ALL tracks
+        for iterator in all_iterators:
+            track_chunks = next(iterator) 
+            combined_explanation_batch.extend(track_chunks)
+            
+        track_explanations.append(combined_explanation_batch)
 
     # --- MERGE ---
     final_chunks = []
     for i in range(total_batches):
-        # Concatenate: Docs + Explanations
         current_batch = track_docs[i] + track_explanations[i]
         
-        # Batch Fill
         if fill_with_pretraining:
             current_batch = fill_up_batch_with_pretraining_chunks(
                 current_batch, data_replay, effective_batch_size, train_cfg.context_length, tokenizer
@@ -519,7 +498,6 @@ def replicate_and_interleave_tracks(
         
         final_chunks.extend(current_batch)
         
-        # Separator
         if pretraining_separators > 0 and i < total_batches - 1:
              pretraining_fill = get_pretraining_batches(
                 data_replay, pretraining_separators, effective_batch_size,

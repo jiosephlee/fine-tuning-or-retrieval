@@ -23,7 +23,7 @@ tokenizer = AutoTokenizer.from_pretrained("allenai/OLMo-2-1124-7B")
 # Training config
 train_cfg = TrainingConfig(
     run_name="test",
-    num_train_epochs=80,
+    num_train_epochs=10,
     learning_rate=1e-5,
     per_device_train_batch_size=8,
     gradient_accumulation_steps=8,  # effective batch size = 64
@@ -33,21 +33,20 @@ train_cfg = TrainingConfig(
 # Strategy args - test with blogs + stackexchange
 strategy_args = {
     "num_paraphrased_texts": 9,
-    "override_domains": ["DPO", "1_58", "GRPO", "BOFT", "OFT", "QLoRA"],
+    "override_domains": ["DPO", "GRPO", "BOFT", "OFT", "QLoRA", "1_58"],
     "fill_batches_with_pretraining": True,
     "separate_batches_with_pretraining": 0,
     "pretraining_data_type": "dclm",
     "test_script": False,
-    "with_specific_explanation": ["blogs", "stackexchange"],
+    "with_specific_explanation": ["blogs", "stackexchange", "textbooks"],
     "times_explanations": 1,
     "semi_cleaned": None,
-    "with_human": False,
     "use_raw": False,
     "explanation_every_round": False,
     "shuffle_chunks": False,
     "shuffle_seed": 42,
-    "explanations_cycle": 3,  # Use 3 files from each type
-    "double_cycle": False,
+    "explanations_cycle": "full",  # Use 3 files from each type
+    "double_cycle": True,
     "granular_explanation_analysis": True,
 }
 
@@ -58,7 +57,7 @@ dataset, updated_cfg = prepare_training_mix(
     log=log,
     train_cfg=train_cfg,
     chunk_by_section=False,
-    overlap_sections=False,
+    overlap_sections=True,
     overlap_ratio="1_4",
     add_title_prefix=True,
     **strategy_args,
@@ -88,7 +87,7 @@ with open(output_file, 'w') as f:
     f.write("=" * 80 + "\n\n")
     
     # Show first 3 batches in detail
-    for batch_idx in range(min(3, num_batches)):
+    for batch_idx in range(num_batches):
         f.write(f"\n{'=' * 80}\n")
         f.write(f"BATCH {batch_idx}\n")
         f.write(f"{'=' * 80}\n\n")
