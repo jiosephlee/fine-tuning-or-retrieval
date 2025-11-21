@@ -151,6 +151,7 @@ def construct_experiment_name(args):
     
     return os.path.join(*path_parts)
 
+
 def get_all_domains():
     return experiment_utils.get_all_domains()
 
@@ -493,6 +494,22 @@ if __name__ == "__main__":
     with open(hyperparameters_path, 'w') as f:
         json.dump(vars(args), f, indent=4)
     log.info(f"Hyperparameters saved to {hyperparameters_path}")
+
+    # --- Initialize wandb with shuffle tags if requested ---
+    if not args.test_script:
+        tags = []
+        if getattr(args, 'word_shuffled_papers', False):
+            tags.append('shuffle_words')
+        if getattr(args, 'sentence_shuffled_papers', False):
+            tags.append('shuffle_sentences')
+        if getattr(args, 'shuffled_papers', False):
+            tags.append('shuffle_legacy')
+
+        # Provide the experiment directory and shuffle tags in wandb config
+        wandb.init(project=os.environ.get('WANDB_PROJECT', 'fine_tuning_study'),
+                   name=args.experiment_name,
+                   tags=tags,
+                   config={'experiment_dir': experiment_dir, 'shuffle_tags': tags})
 
     # --- Load the model ---
     attn_implementation = args.attn_implementation

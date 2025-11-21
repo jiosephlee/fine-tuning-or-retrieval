@@ -10,6 +10,9 @@ This script uses helpers from scripts.plotting.plot_utils where possible.
 
 import os
 import sys
+import re
+import math
+import collections
 import argparse
 from typing import Dict, List
 
@@ -92,6 +95,140 @@ def _load_metric_series(
     return out
 
 
+# ---------- LEXICAL OVERLAP HELPERS (adapted from plot_lexical.py) ----------
+
+TOKEN_RE = re.compile(r"\b\w+\b", re.UNICODE)
+STOPWORDS = {
+    "the",
+    "and",
+    "of",
+    "to",
+    "a",
+    "in",
+    "for",
+    "on",
+    "with",
+    "is",
+    "are",
+    "was",
+    "were",
+    "that",
+    "this",
+    "it",
+    "as",
+    "by",
+    "an",
+    "at",
+    "from",
+}
+
+
+def _tokenize(text: str):
+    tokens = TOKEN_RE.findall(str(text).lower())
+    return [t for t in tokens if t not in STOPWORDS]
+
+
+def _build_idf_and_texts(
+    project_root: str,
+    probe_folder: str,
+    probes_filename: str,
+    domains: List[str],
+):
+    """
+    Build IDF over all probe facts + explanations for a given probe set.
+
+    probe_folder: "inference" or "facts"
+    probes_filename: e.g. "probes_v7.csv" (inference) or "probes_v9.csv" (facts)
+
+    Returns:
+      idf: dict[token -> idf]
+      probe_texts: dict[(domain, probe_index) -> set(tokens)]
+      expl_texts: dict[domain -> set(tokens)]
+    """
+    probe_root = os.path.join(project_root, "data", "probes", probe_folder)
+    expl_root = os.path.join(project_root, "data", "arxiv", "explanations")
+
+    df_counts = collections.Counter()
+    probe_texts = {}
+    expl_texts = {}
+    docs = []
+
+    for domain in domains:
+        # Probes
+        probe_path = os.path.join(probe_root, domain, probes_filename)
+        if not os.path.exists(probe_path):
+            print(f"[WARN] Probe file not found for domain {domain}: {probe_path}")
+            continue
+
+        probes_df = pd.read_csv(probe_path)
+        if "fact" not in probes_df.columns:
+            raise ValueError(f"'fact' column not found in {probe_path}")
+
+        for probe_index, row in probes_df.iterrows():
+            tokens = set(_tokenize(row["fact"]))
+            probe_texts[(domain, probe_index)] = tokens
+            docs.append(tokens)
+
+        # Explanations / textbooks
+        expl_path = os.path.join(expl_root, domain, "textbook.txt")
+        if not os.path.exists(expl_path):
+            print(f"[WARN] Explanation file not found for domain {domain}: {expl_path}")
+            continue
+
+        with open(expl_path, "r") as f:
+            expl_text = f.read()
+        expl_tokens = set(_tokenize(expl_text))
+        expl_texts[domain] = expl_tokens
+        docs.append(expl_tokens)
+
+    # IDF
+    for doc_tokens in docs:
+        for w in set(doc_tokens):
+            df_counts[w] += 1
+
+    N = len(docs) if docs else 1
+    idf = {w: math.log(N / (1 + df)) for w, df in df_counts.items()}
+
+    return idf, probe_texts, expl_texts
+
+
+def _compute_idf_overlap(idf, probe_texts, expl_texts):
+    """
+    Compute IDF-weighted lexical overlap for each (domain, probe_index).
+
+    sim_lex = sum_{w in T_p ∩ T_e} idf(w) / sum_{w in T_p} idf(w)
+
+    Returns DataFrame with columns:
+      domain, probe_index, lex_sim
+    """
+    records = []
+
+    for (domain, probe_index), probe_tokens in probe_texts.items():
+        if domain not in expl_texts:
+            continue
+
+        expl_tokens = expl_texts[domain]
+
+        numer = 0.0
+        denom = 0.0
+        for w in probe_tokens:
+            w_idf = idf.get(w, 0.0)
+            denom += w_idf
+            if w in expl_tokens:
+                numer += w_idf
+
+        lex_sim = numer / denom if denom > 0 else 0.0
+
+        records.append(
+            {
+                "domain": domain,
+                "probe_index": probe_index,
+                "lex_sim": lex_sim,
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
+
 def plot_two_by_two(
     model_id: str,
     out_dir: str,
@@ -161,6 +298,132 @@ def plot_two_by_two(
     plt.close(fig_h)
 
     print(f"2x2-style plots (log_prob and hits@10) saved to {out_dir}")
+
+
+def plot_two_by_two_lex_filtered(
+    model_id: str,
+    out_dir: str,
+    factual_max_sim: float = 0.75,
+    inference_max_sim: float = 0.85,
+):
+    """
+    Same layout as plot_two_by_two (factual vs compositional log_prob),
+    but we first filter out probes whose IDF-weighted lexical overlap with
+    the textbook exceeds:
+      - factual_max_sim for factual (knowledge) probes
+      - inference_max_sim for inference probes.
+
+    This removes high-lexical-overlap probes before averaging log_prob per step.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Build lexical overlap tables
+    # Inference probes: probes_v7.csv under data/probes/inference
+    idf_inf, probe_texts_inf, expl_texts_inf = _build_idf_and_texts(
+        PROJECT_ROOT,
+        probe_folder="inference",
+        probes_filename="probes_v7.csv",
+        domains=DOMAINS,
+    )
+    lex_inf = _compute_idf_overlap(idf_inf, probe_texts_inf, expl_texts_inf)
+
+    # Factual / knowledge probes: probes_v9.csv under data/probes/facts
+    idf_fact, probe_texts_fact, expl_texts_fact = _build_idf_and_texts(
+        PROJECT_ROOT,
+        probe_folder="facts",
+        probes_filename="probes_v9.csv",
+        domains=DOMAINS,
+    )
+    lex_fact = _compute_idf_overlap(idf_fact, probe_texts_fact, expl_texts_fact)
+
+    # Prepare figure: left=factual, right=compositional (log_prob only)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=False)
+
+    for method in METHODS:
+        run_path = _get_run_path(method["run_key"])
+        if not run_path or not os.path.isdir(run_path):
+            continue
+
+        # --- Factual / knowledge ---
+        df_k = aggregate_across_domains(
+            run_path,
+            "knowledge",
+            DOMAINS,
+            split_probes=False,
+            project_root=PROJECT_ROOT,
+            lima=False,
+        )
+        if not df_k.empty and {"domain", "probe_index"}.issubset(df_k.columns):
+            merged_k = df_k.merge(
+                lex_fact,
+                on=["domain", "probe_index"],
+                how="left",
+            )
+            filtered_k = merged_k[
+                (merged_k["lex_sim"].isna()) | (merged_k["lex_sim"] <= factual_max_sim)
+            ]
+            if not filtered_k.empty:
+                series_k = (
+                    filtered_k.groupby("step")["log_prob"]
+                    .mean()
+                    .reset_index()
+                    .sort_values("step")
+                )
+                axes[0].plot(series_k["step"], series_k["log_prob"], label=method["label"])
+
+        # --- Compositional / inference ---
+        df_i = aggregate_across_domains(
+            run_path,
+            "inference",
+            DOMAINS,
+            split_probes=False,
+            project_root=PROJECT_ROOT,
+            lima=False,
+        )
+        if not df_i.empty and {"domain", "probe_index"}.issubset(df_i.columns):
+            merged_i = df_i.merge(
+                lex_inf,
+                on=["domain", "probe_index"],
+                how="left",
+            )
+            filtered_i = merged_i[
+                (merged_i["lex_sim"].isna()) | (merged_i["lex_sim"] <= inference_max_sim)
+            ]
+            if not filtered_i.empty:
+                series_i = (
+                    filtered_i.groupby("step")["log_prob"]
+                    .mean()
+                    .reset_index()
+                    .sort_values("step")
+                )
+                axes[1].plot(series_i["step"], series_i["log_prob"], label=method["label"])
+
+    axes[0].set_title(
+        f"Factual Probes — log_prob (lex_sim ≤ {factual_max_sim:.2f})"
+    )
+    axes[0].set_xlabel("step")
+    axes[0].set_ylabel("mean log_prob")
+
+    axes[1].set_title(
+        f"Compositional Probes — log_prob (lex_sim ≤ {inference_max_sim:.2f})"
+    )
+    axes[1].set_xlabel("step")
+    axes[1].set_ylabel("mean log_prob")
+
+    add_legend(axes[0])
+    add_legend(axes[1])
+
+    out_path = os.path.join(
+        out_dir,
+        f"factual_vs_compositional_logprob_lexfiltered_7b_{model_id}.pdf",
+    )
+    plt.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+    print(
+        "Lexically filtered 2x2-style log_prob plot (Source vs Para vs Textbooks) "
+        f"saved to {out_path}"
+    )
 
 
 def plot_split_probes(
@@ -380,11 +643,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_id", type=str, default="7b")
     parser.add_argument("--out_dir", type=str, default="plots")
+    parser.add_argument(
+        "--with_lexical_filter",
+        action="store_true",
+        help=(
+            "If set, also produce a version of the main log_prob plot "
+            "where probes with high IDF-weighted lexical overlap are "
+            "filtered out (factual >0.75, inference >0.85)."
+        ),
+    )
     args = parser.parse_args()
 
     plot_two_by_two(args.model_id, args.out_dir)
     plot_split_probes(args.model_id, args.out_dir)
     plot_by_inference_category(args.out_dir)
+
+    if args.with_lexical_filter:
+        plot_two_by_two_lex_filtered(args.model_id, args.out_dir)
 
 
 if __name__ == '__main__':

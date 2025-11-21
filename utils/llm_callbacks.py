@@ -432,7 +432,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             
         return mask
     
-    def _calculate_log_probs(self, logits, labels, context_lengths, target_lengths):
+    def _calculate_log_probs(self, logits, labels, context_lengths, target_lengths, batch_start_index: int = 0):
         full_lengths = context_lengths + target_lengths
         target_mask = self._get_target_mask(labels, context_lengths, target_lengths, full_lengths)
         
@@ -455,9 +455,10 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             mismatch_indices = torch.where(num_tokens_target.long() != target_lengths)[0]
             for i in mismatch_indices:
                 self.logger.warning(f"Number of tokens target mismatch for a probe in batch.")
-                # Note: The original probe index would require passing the batch start index 'i' down to this function.
-                # For now, we log information about the mismatched sample within the current batch.
+                # Include both the batch-local index and the global probe index.
                 self.logger.warning(f"  - Mismatch at batch index: {i.item()}")
+                global_index = int(batch_start_index) + int(i.item())
+                self.logger.warning(f"  - Global probe index: {global_index}")
                 self.logger.warning(f"  - Expected target length: {target_lengths[i].item()}")
                 self.logger.warning(f"  - Calculated target tokens: {num_tokens_target[i].long().item()}")
                 
@@ -469,6 +470,19 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 target_token_ids = labels[i, int(context_lengths[i].item()):int(context_lengths[i].item()) + int(target_lengths[i].item())]
                 self.logger.warning(f"  - Original Target Token IDs: {target_token_ids.tolist()}")
                 self.logger.warning(f"  - Tokenizer pad_token_id: {self.tokenizer.pad_token_id}")
+
+                # If a probes DataFrame is available, log the corresponding texts as well.
+                if self.probes_df is not None and 0 <= global_index < len(self.probes_df):
+                    try:
+                        row = self.probes_df.iloc[global_index]
+                        probe_text = row.get('probe', '')
+                        target_text = row.get('target', '')
+                        fact_text = row.get('fact', '')
+                        self.logger.warning(f"  - Probe text: {probe_text}")
+                        self.logger.warning(f"  - Target text: {target_text}")
+                        self.logger.warning(f"  - Fact text: {fact_text}")
+                    except Exception as e:
+                        self.logger.warning(f"  - Failed to fetch probe row for index {global_index}: {e}")
 
         # assert that num_tokens_target is the same as non-zero in the loss_target
         if not torch.equal(num_tokens_target.long(), (loss_target != 0).sum(dim=1)):
@@ -567,7 +581,13 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             context_lengths = context_lengths - 1
             
             if self.track_logprobs:
-                log_prob, perplexity = self._calculate_log_probs(shift_logits, shift_labels, context_lengths, target_lengths)
+                log_prob, perplexity = self._calculate_log_probs(
+                    shift_logits,
+                    shift_labels,
+                    context_lengths,
+                    target_lengths,
+                    batch_start_index=i,
+                )
                 all_metrics['log_prob'].append(log_prob)
                 all_metrics['perplexity'].append(perplexity)
 

@@ -8,7 +8,7 @@
 #SBATCH --mem=128GB
 
 num_epochs=100
-num_paraphrased=0
+num_paraphrased=9
 
 python -s finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-7B \
@@ -20,9 +20,9 @@ python -s finetuning_knowledge_v8.py \
     --learning_rate 2e-5 \
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
-    --sentence_shuffled_papers \
     --overlap_ratio 1_4 \
     --attn_implementation sdpa \
     --gradient_checkpointing \
+    --sentence_shuffled_papers \
     --full_finetuning \
     --parcc \

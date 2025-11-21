@@ -8,6 +8,7 @@ import collections
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FormatStrFormatter
 
 # ---------------------------------------------------------------------
 # CONFIG
@@ -40,7 +41,7 @@ RUNS_7B = {
     ),
 }
 
-# Try to import your plotting style
+# Optional plot style from your repo
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), ".")))
 try:
     from utils.llm_plotting import set_plot_style
@@ -210,16 +211,19 @@ def compute_idf_overlap(idf, probe_texts, expl_texts):
     return pd.DataFrame.from_records(records)
 
 # ---------------------------------------------------------------------
-# Δ LOG PROB PER PROBE
+# Δ LOG₂ PROB PER PROBE
 # ---------------------------------------------------------------------
 
-def compute_delta_log_prob_per_probe(df: pd.DataFrame):
+LOG2 = math.log(2.0)
+
+def compute_delta_log2_prob_per_probe(df: pd.DataFrame):
     """
-    Compute delta log prob per (domain, probe_index, method):
-    Δ = log_prob(last_step) − log_prob(first_step)
+    Compute delta log2 prob per (domain, probe_index, method):
+
+      Δ log2 p = (ln p_last - ln p_first) / ln 2
 
     Returns DataFrame with:
-      domain, probe_index, method, delta_log_prob
+      domain, probe_index, method, delta_log2_prob
     """
     required_cols = {"domain", "probe_index", "step", "log_prob", "method"}
     if not required_cols.issubset(df.columns):
@@ -231,7 +235,9 @@ def compute_delta_log_prob_per_probe(df: pd.DataFrame):
         idx_max = group["step"].idxmax()
         g0 = group.loc[idx_min, "log_prob"]
         g_last = group.loc[idx_max, "log_prob"]
-        return pd.Series({"delta_log_prob": g_last - g0})
+        delta_ln = g_last - g0
+        delta_log2 = delta_ln / LOG2
+        return pd.Series({"delta_log2_prob": delta_log2})
 
     delta_df = (
         df.groupby(["domain", "probe_index", "method"], as_index=False)
@@ -241,54 +247,76 @@ def compute_delta_log_prob_per_probe(df: pd.DataFrame):
     return delta_df
 
 # ---------------------------------------------------------------------
-# PLOTTING HELPERS
+# PLOTTING HELPERS (scatter + linear trend)
 # ---------------------------------------------------------------------
 
-def plot_delta_vs_similarity_multi_on_ax(ax, merged: pd.DataFrame, num_bins: int, title: str):
-    """
-    Plot Δ log prob vs lexical similarity for multiple methods on a given Axes.
+COLOR_MAP = {
+    "Source": "#1f77b4",           # blue
+    "Para.": "#ff7f0e",            # orange
+    "Para. + Textbooks": "#2ca02c" # green
+}
 
-    merged: DataFrame with columns: domain, probe_index, method, delta_log_prob, lex_sim
+def plot_scatter_with_linear_trend(ax, merged: pd.DataFrame, title: str):
     """
-    df = merged.dropna(subset=["lex_sim", "delta_log_prob"]).copy()
+    Plot:
+      - one scatter point per probe (lex_sim, delta_log2_prob)
+      - linear regression trend line per method
+      - linear y-axis, ticks formatted as integers
+
+    merged: DataFrame with columns:
+        domain, probe_index, method, delta_log2_prob, lex_sim
+    """
+    df = merged.dropna(subset=["lex_sim", "delta_log2_prob"]).copy()
     if df.empty:
-        print(f"[WARN] No data to plot for: {title}")
+        ax.set_title(f"{title} – no data")
+        ax.axis("off")
         return
-
-    bins = np.linspace(0.0, 1.0, num_bins + 1)
-    df["sim_bin"] = pd.cut(df["lex_sim"], bins=bins, include_lowest=True)
-
-    grouped = (
-        df.groupby(["sim_bin", "method"])["delta_log_prob"]
-          .agg(["mean", "count"])
-          .reset_index()
-    )
-    if grouped.empty:
-        print(f"[WARN] No bins with data to plot for: {title}")
-        return
-
-    categories = sorted(df["sim_bin"].cat.categories)
-    bin_centres = [(interval.left + interval.right) / 2 for interval in categories]
 
     methods = sorted(df["method"].unique())
 
+    # --- Scatter points (one per probe) ---
     for method in methods:
-        mdf = grouped[grouped["method"] == method].copy()
-        # Ensure bins are aligned
-        mdf = mdf.set_index("sim_bin").reindex(categories)
-        y = mdf["mean"].values
-        ax.plot(
-            bin_centres,
-            y,
-            marker="o",
-            linewidth=1.8,
-            label=method,
+        mdf = df[df["method"] == method]
+        color = COLOR_MAP.get(method, "#000000")
+        ax.scatter(
+            mdf["lex_sim"],
+            mdf["delta_log2_prob"],
+            alpha=0.10,   # very transparent
+            s=6,          # smaller points
+            color=color,
         )
 
-    ax.set_xlabel("IDF-weighted lexical overlap")
-    ax.set_ylabel("Δ log prob (last − first)")
+    # --- Linear trend line per method ---
+    for method in methods:
+        mdf = df[df["method"] == method].sort_values("lex_sim")
+        if len(mdf) < 2:
+            continue
+
+        x = mdf["lex_sim"].values
+        y = mdf["delta_log2_prob"].values
+
+        # Simple linear regression y = a*x + b
+        a, b = np.polyfit(x, y, 1)
+        x_line = np.linspace(x.min(), x.max(), 100)
+        y_line = a * x_line + b
+
+        color = COLOR_MAP.get(method, "#000000")
+        ax.plot(
+            x_line,
+            y_line,
+            linewidth=2.7,
+            color=color,
+            label=method,
+            zorder=5,
+        )
+
     ax.set_title(title)
-    ax.grid(True, alpha=0.3)
+    ax.set_xlabel("IDF-weighted lexical overlap")
+    ax.set_ylabel("Δ log$_2$ prob (bits)")
+    ax.grid(True, alpha=0.25)
+
+    # Format y-ticks without decimals
+    ax.yaxis.set_major_formatter(FormatStrFormatter('%.0f'))
 
 # ---------------------------------------------------------------------
 # MAIN
@@ -296,20 +324,17 @@ def plot_delta_vs_similarity_multi_on_ax(ax, merged: pd.DataFrame, num_bins: int
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot Δ log prob vs IDF-weighted lexical overlap for 7B runs (Source, Para, Textbooks), "
-                    "for both factual (knowledge) and inference probes, side by side."
+        description=(
+            "Plot Δ log2 prob vs IDF-weighted lexical overlap for 7B runs "
+            "(Source, Para, Textbooks), for both factual (knowledge) and "
+            "inference probes, side by side, with scatter + linear trend."
+        )
     )
     parser.add_argument(
         "--project_root",
         type=str,
         default=DEFAULT_PROJECT_ROOT,
         help="Path to project root (where 'data' and 'results' live)."
-    )
-    parser.add_argument(
-        "--num_bins",
-        type=int,
-        default=10,
-        help="Number of bins for lexical similarity."
     )
     args = parser.parse_args()
 
@@ -367,15 +392,15 @@ def main():
     )
     lex_sim_fact = compute_idf_overlap(idf_fact, probe_texts_fact, expl_texts_fact)
 
-    # 4) Compute Δ log prob per probe per method
+    # 4) Compute Δ log2 prob per probe per method
     if not inference_df.empty:
-        delta_inf = compute_delta_log_prob_per_probe(inference_df)
+        delta_inf = compute_delta_log2_prob_per_probe(inference_df)
         merged_inf = delta_inf.merge(lex_sim_inf, on=["domain", "probe_index"], how="left")
     else:
         merged_inf = pd.DataFrame()
 
     if not factual_df.empty:
-        delta_fact = compute_delta_log_prob_per_probe(factual_df)
+        delta_fact = compute_delta_log2_prob_per_probe(factual_df)
         merged_fact = delta_fact.merge(lex_sim_fact, on=["domain", "probe_index"], how="left")
     else:
         merged_fact = pd.DataFrame()
@@ -392,10 +417,9 @@ def main():
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
 
     if not merged_fact.empty:
-        plot_delta_vs_similarity_multi_on_ax(
+        plot_scatter_with_linear_trend(
             axes[0],
             merged_fact,
-            num_bins=args.num_bins,
             title="Factual (Knowledge) Probes",
         )
     else:
@@ -403,17 +427,16 @@ def main():
         axes[0].axis("off")
 
     if not merged_inf.empty:
-        plot_delta_vs_similarity_multi_on_ax(
+        plot_scatter_with_linear_trend(
             axes[1],
             merged_inf,
-            num_bins=args.num_bins,
             title="Inference Probes",
         )
     else:
         axes[1].set_title("Inference Probes – no data")
         axes[1].axis("off")
 
-    # Only one legend (right subplot)
+    # Legend (based on right axis trend lines)
     handles, labels = axes[1].get_legend_handles_labels()
     if handles:
         fig.legend(handles, labels, loc="lower center", ncol=len(labels), bbox_to_anchor=(0.5, -0.02))
@@ -422,7 +445,7 @@ def main():
 
     plots_dir = os.path.join(project_root, "plots")
     os.makedirs(plots_dir, exist_ok=True)
-    output_path = os.path.join(plots_dir, "delta_vs_lexical_overlap_7b_factual_vs_inference.pdf")
+    output_path = os.path.join(plots_dir, "delta_vs_lexical_overlap_7b_factual_vs_inference_log2_linear.pdf")
     plt.savefig(output_path, bbox_inches="tight")
     plt.close()
     print(f"Saved side-by-side plot to {output_path}")
