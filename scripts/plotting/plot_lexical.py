@@ -5,8 +5,6 @@ import math
 import argparse
 import collections
 
-from datetime import datetime
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -15,7 +13,6 @@ import matplotlib.pyplot as plt
 # CONFIG
 # ---------------------------------------------------------------------
 
-# Adjust to your repo root if needed
 DEFAULT_PROJECT_ROOT = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval"
 
 # Domains used for probes + textbooks
@@ -57,15 +54,19 @@ except ImportError:
 def aggregate_across_domains(run_path, probe_type, domains):
     """
     Aggregates probe data across multiple domains from a specific run path.
-    We only need inference probes for this script.
+
+    probe_type: "inference" or "knowledge"
     """
     all_domain_dfs = []
     for domain in domains:
         if probe_type == "inference":
             probe_dir = f"{domain}_inference_probe"
             file_name = f"{domain}_inference_probe_metrics.csv"
+        elif probe_type == "knowledge":
+            probe_dir = f"{domain}_knowledge_probe"
+            file_name = f"{domain}_knowledge_probe_metrics.csv"
         else:
-            raise ValueError("This script is only set up for probe_type='inference'.")
+            raise ValueError("probe_type must be 'inference' or 'knowledge'.")
 
         metrics_path = os.path.join(run_path, probe_dir, file_name)
 
@@ -96,7 +97,6 @@ def aggregate_across_domains(run_path, probe_type, domains):
     combined_df = pd.concat(all_domain_dfs, ignore_index=True)
     return combined_df
 
-
 # ---------------------------------------------------------------------
 # IDF + LEXICAL OVERLAP
 # ---------------------------------------------------------------------
@@ -111,9 +111,13 @@ def tokenize(text: str):
     tokens = TOKEN_RE.findall(str(text).lower())
     return [t for t in tokens if t not in STOPWORDS]
 
-def build_idf_and_texts(project_root: str, domains=None):
+def build_idf_and_texts(project_root: str, probe_folder: str, probes_filename: str, domains=None):
     """
-    Build IDF over all probe facts + explanations.
+    Build IDF over all probe facts + explanations for a given probe set.
+
+    probe_folder: "inference" or "facts"
+    probes_filename: e.g. "probes_v7.csv" (inference) or "probes_v9.csv" (facts)
+
     Returns:
       idf: dict[token -> idf]
       probe_texts: dict[(domain, probe_index) -> set(tokens)]
@@ -122,7 +126,7 @@ def build_idf_and_texts(project_root: str, domains=None):
     if domains is None:
         domains = DOMAINS
 
-    probe_root = os.path.join(project_root, "data/probes/inference")
+    probe_root = os.path.join(project_root, "data/probes", probe_folder)
     expl_root = os.path.join(project_root, "data/arxiv/explanations")
 
     df_counts = collections.Counter()
@@ -132,7 +136,7 @@ def build_idf_and_texts(project_root: str, domains=None):
 
     for domain in domains:
         # Probes
-        probe_path = os.path.join(probe_root, domain, "probes_v7.csv")
+        probe_path = os.path.join(probe_root, domain, probes_filename)
         if not os.path.exists(probe_path):
             print(f"[WARN] Probe file not found for domain {domain}: {probe_path}")
             continue
@@ -171,6 +175,9 @@ def build_idf_and_texts(project_root: str, domains=None):
 def compute_idf_overlap(idf, probe_texts, expl_texts):
     """
     Compute IDF-weighted lexical overlap for each (domain, probe_index).
+
+    sim_lex = sum_{w in T_p ∩ T_e} idf(w) / sum_{w in T_p} idf(w)
+
     Returns DataFrame with columns:
       domain, probe_index, lex_sim
     """
@@ -202,22 +209,22 @@ def compute_idf_overlap(idf, probe_texts, expl_texts):
 
     return pd.DataFrame.from_records(records)
 
-
 # ---------------------------------------------------------------------
 # Δ LOG PROB PER PROBE
 # ---------------------------------------------------------------------
 
-def compute_delta_log_prob_per_probe(inference_df: pd.DataFrame):
+def compute_delta_log_prob_per_probe(df: pd.DataFrame):
     """
     Compute delta log prob per (domain, probe_index, method):
     Δ = log_prob(last_step) − log_prob(first_step)
+
     Returns DataFrame with:
       domain, probe_index, method, delta_log_prob
     """
     required_cols = {"domain", "probe_index", "step", "log_prob", "method"}
-    if not required_cols.issubset(inference_df.columns):
-        missing = required_cols - set(inference_df.columns)
-        raise ValueError(f"Missing columns in inference_df: {missing}")
+    if not required_cols.issubset(df.columns):
+        missing = required_cols - set(df.columns)
+        raise ValueError(f"Missing columns in df: {missing}")
 
     def _delta(group):
         idx_min = group["step"].idxmin()
@@ -227,28 +234,27 @@ def compute_delta_log_prob_per_probe(inference_df: pd.DataFrame):
         return pd.Series({"delta_log_prob": g_last - g0})
 
     delta_df = (
-        inference_df.groupby(["domain", "probe_index", "method"], as_index=False)
-                    .apply(_delta)
-                    .reset_index(drop=True)
+        df.groupby(["domain", "probe_index", "method"], as_index=False)
+          .apply(_delta)
+          .reset_index(drop=True)
     )
     return delta_df
 
-
 # ---------------------------------------------------------------------
-# PLOTTING: ALL METHODS TOGETHER
+# PLOTTING HELPERS
 # ---------------------------------------------------------------------
 
-def plot_delta_vs_similarity_multi(merged: pd.DataFrame, num_bins: int, title: str, output_path: str):
+def plot_delta_vs_similarity_multi_on_ax(ax, merged: pd.DataFrame, num_bins: int, title: str):
     """
+    Plot Δ log prob vs lexical similarity for multiple methods on a given Axes.
+
     merged: DataFrame with columns: domain, probe_index, method, delta_log_prob, lex_sim
-    Plots one curve per method: Δ log prob vs lexical overlap (binned).
     """
     df = merged.dropna(subset=["lex_sim", "delta_log_prob"]).copy()
     if df.empty:
-        print("No data to plot after dropping NaNs.")
+        print(f"[WARN] No data to plot for: {title}")
         return
 
-    # Equal-width bins over [0, 1]
     bins = np.linspace(0.0, 1.0, num_bins + 1)
     df["sim_bin"] = pd.cut(df["lex_sim"], bins=bins, include_lowest=True)
 
@@ -258,49 +264,31 @@ def plot_delta_vs_similarity_multi(merged: pd.DataFrame, num_bins: int, title: s
           .reset_index()
     )
     if grouped.empty:
-        print("No bins with data to plot.")
+        print(f"[WARN] No bins with data to plot for: {title}")
         return
 
-    # Use bin centres as x
-    bin_centres = [(interval.left + interval.right) / 2 for interval in sorted(df["sim_bin"].cat.categories)]
+    categories = sorted(df["sim_bin"].cat.categories)
+    bin_centres = [(interval.left + interval.right) / 2 for interval in categories]
 
     methods = sorted(df["method"].unique())
 
-    if set_plot_style is not None:
-        set_plot_style()
-
-    plt.figure(figsize=(7, 4.5))
-
-    color_cycle = plt.rcParams.get("axes.prop_cycle", None)
-    if color_cycle is None:
-        colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
-    else:
-        colors = [c["color"] for c in color_cycle]
-
-    for i, method in enumerate(methods):
+    for method in methods:
         mdf = grouped[grouped["method"] == method].copy()
-        # Ensure bins are in consistent order
-        mdf = mdf.set_index("sim_bin").reindex(sorted(df["sim_bin"].cat.categories))
+        # Ensure bins are aligned
+        mdf = mdf.set_index("sim_bin").reindex(categories)
         y = mdf["mean"].values
-
-        plt.plot(
+        ax.plot(
             bin_centres,
             y,
             marker="o",
-            label=method,
             linewidth=1.8,
+            label=method,
         )
 
-    plt.xlabel("IDF-weighted lexical overlap (probe fact vs textbook)")
-    plt.ylabel("Δ log prob (last − first)")
-    plt.title(title)
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_path, bbox_inches="tight")
-    plt.close()
-    print(f"Saved plot to {output_path}")
-
+    ax.set_xlabel("IDF-weighted lexical overlap")
+    ax.set_ylabel("Δ log prob (last − first)")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
 
 # ---------------------------------------------------------------------
 # MAIN
@@ -308,7 +296,8 @@ def plot_delta_vs_similarity_multi(merged: pd.DataFrame, num_bins: int, title: s
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot Δ log prob vs IDF-weighted lexical overlap for 7B runs (Source, Para, Textbooks)."
+        description="Plot Δ log prob vs IDF-weighted lexical overlap for 7B runs (Source, Para, Textbooks), "
+                    "for both factual (knowledge) and inference probes, side by side."
     )
     parser.add_argument(
         "--project_root",
@@ -326,53 +315,117 @@ def main():
 
     project_root = os.path.abspath(args.project_root)
 
-    # 1) Load inference metrics for each of the three runs
+    # 1) Load metrics for each run: factual (knowledge) and inference
     all_inference = []
+    all_factual = []
 
-    for display_name, (method_key, rel_run_path) in RUNS_7B.items():
+    for display_name, (_method_key, rel_run_path) in RUNS_7B.items():
         run_path = os.path.join(project_root, rel_run_path)
-        print(f"Loading inference metrics for '{display_name}' from: {run_path}")
+        print(f"Loading metrics for '{display_name}' from: {run_path}")
         if not os.path.isdir(run_path):
             print(f"[WARN] Run path does not exist: {run_path}")
             continue
 
-        df = aggregate_across_domains(run_path, "inference", DOMAINS)
-        if df.empty:
+        # Inference probes
+        inf_df = aggregate_across_domains(run_path, "inference", DOMAINS)
+        if not inf_df.empty:
+            inf_df["method"] = display_name
+            all_inference.append(inf_df)
+        else:
             print(f"[WARN] No inference data for {display_name}")
-            continue
 
-        df["method"] = display_name
-        all_inference.append(df)
+        # Factual / knowledge probes
+        fact_df = aggregate_across_domains(run_path, "knowledge", DOMAINS)
+        if not fact_df.empty:
+            fact_df["method"] = display_name
+            all_factual.append(fact_df)
+        else:
+            print(f"[WARN] No factual (knowledge) data for {display_name}")
 
-    if not all_inference:
-        print("No inference data loaded for any method. Exiting.")
+    if not all_inference and not all_factual:
+        print("No data loaded for either inference or factual probes. Exiting.")
         return
 
-    inference_df = pd.concat(all_inference, ignore_index=True)
+    inference_df = pd.concat(all_inference, ignore_index=True) if all_inference else pd.DataFrame()
+    factual_df = pd.concat(all_factual, ignore_index=True) if all_factual else pd.DataFrame()
 
-    # 2) Build IDF + lexical overlap
-    idf, probe_texts, expl_texts = build_idf_and_texts(project_root, domains=DOMAINS)
-    lex_sim_df = compute_idf_overlap(idf, probe_texts, expl_texts)
+    # 2) Build IDF + lexical overlap for inference probes (probes_v7)
+    idf_inf, probe_texts_inf, expl_texts_inf = build_idf_and_texts(
+        project_root,
+        probe_folder="inference",
+        probes_filename="probes_v7.csv",
+        domains=DOMAINS,
+    )
+    lex_sim_inf = compute_idf_overlap(idf_inf, probe_texts_inf, expl_texts_inf)
 
-    # 3) Compute Δ log prob per probe per method
-    delta_df = compute_delta_log_prob_per_probe(inference_df)
+    # 3) Build IDF + lexical overlap for factual probes (probes_v9)
+    idf_fact, probe_texts_fact, expl_texts_fact = build_idf_and_texts(
+        project_root,
+        probe_folder="facts",
+        probes_filename="probes_v9.csv",
+        domains=DOMAINS,
+    )
+    lex_sim_fact = compute_idf_overlap(idf_fact, probe_texts_fact, expl_texts_fact)
 
-    # 4) Merge
-    merged = delta_df.merge(lex_sim_df, on=["domain", "probe_index"], how="left")
-    print(merged.head())
+    # 4) Compute Δ log prob per probe per method
+    if not inference_df.empty:
+        delta_inf = compute_delta_log_prob_per_probe(inference_df)
+        merged_inf = delta_inf.merge(lex_sim_inf, on=["domain", "probe_index"], how="left")
+    else:
+        merged_inf = pd.DataFrame()
 
-    # 5) Plot all three methods together
+    if not factual_df.empty:
+        delta_fact = compute_delta_log_prob_per_probe(factual_df)
+        merged_fact = delta_fact.merge(lex_sim_fact, on=["domain", "probe_index"], how="left")
+    else:
+        merged_fact = pd.DataFrame()
+
+    print("Merged factual head:")
+    print(merged_fact.head())
+    print("Merged inference head:")
+    print(merged_inf.head())
+
+    # 5) Plot side by side
+    if set_plot_style is not None:
+        set_plot_style()
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
+
+    if not merged_fact.empty:
+        plot_delta_vs_similarity_multi_on_ax(
+            axes[0],
+            merged_fact,
+            num_bins=args.num_bins,
+            title="Factual (Knowledge) Probes",
+        )
+    else:
+        axes[0].set_title("Factual (Knowledge) Probes – no data")
+        axes[0].axis("off")
+
+    if not merged_inf.empty:
+        plot_delta_vs_similarity_multi_on_ax(
+            axes[1],
+            merged_inf,
+            num_bins=args.num_bins,
+            title="Inference Probes",
+        )
+    else:
+        axes[1].set_title("Inference Probes – no data")
+        axes[1].axis("off")
+
+    # Only one legend (right subplot)
+    handles, labels = axes[1].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="lower center", ncol=len(labels), bbox_to_anchor=(0.5, -0.02))
+
+    plt.tight_layout()
+
     plots_dir = os.path.join(project_root, "plots")
     os.makedirs(plots_dir, exist_ok=True)
-    output_path = os.path.join(plots_dir, "delta_vs_lexical_overlap_7b_source_para_textbooks.pdf")
-
-    title = "7B – Δ log prob vs lexical overlap (Source, Para, Textbooks)"
-    plot_delta_vs_similarity_multi(
-        merged,
-        num_bins=args.num_bins,
-        title=title,
-        output_path=output_path,
-    )
+    output_path = os.path.join(plots_dir, "delta_vs_lexical_overlap_7b_factual_vs_inference.pdf")
+    plt.savefig(output_path, bbox_inches="tight")
+    plt.close()
+    print(f"Saved side-by-side plot to {output_path}")
 
 
 if __name__ == "__main__":

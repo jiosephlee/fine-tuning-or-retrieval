@@ -213,6 +213,9 @@ def continue_pretraining(model, tokenizer, log, args):
     strategy_args = {
         "num_paraphrased_texts": args.num_paraphrased_texts,
         "override_domains": args.override_domains,
+    "shuffled_papers": args.shuffled_papers,
+    "word_shuffled_papers": args.word_shuffled_papers,
+    "sentence_shuffled_papers": args.sentence_shuffled_papers,
         "fill_batches_with_pretraining": args.fill_batches_with_pretraining,
         "separate_batches_with_pretraining": args.separate_batches_with_pretraining,
         "pretraining_data_type": args.pretraining_data_type,
@@ -408,6 +411,9 @@ if __name__ == "__main__":
     parser.add_argument("--explanations_cycle", type=str, default="0", help="Number of explanation files to cycle through across ALL document batches. Use 'full' to load all available files, or specify an integer.")
     parser.add_argument("--double_cycle", action="store_true", help="Create a second cycle offset by half the number of files (e.g., 10 chapters -> 2nd cycle starts at chapter 5).")
     parser.add_argument("--granular_explanation_analysis", action="store_true", help="Use granular subfolder structure for explanations (e.g., blogs/, stackexchange/, textbooks/).")
+    parser.add_argument("--shuffled_papers", action="store_true", help="Legacy: use shuffled versions of papers (files ending with _shuffle.tex) when available.")
+    parser.add_argument("--word_shuffled_papers", action="store_true", help="Use word-shuffled versions of papers (files ending with _shuffle_words.tex) when available.")
+    parser.add_argument("--sentence_shuffled_papers", action="store_true", help="Use sentence-shuffled versions of papers (files ending with _shuffle_sentences.tex) when available.")
 
     # Lora arguments
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA r parameter.")
@@ -532,4 +538,4 @@ if __name__ == "__main__":
     if args.lima_afterwards:
         lima_epochs = 1 if args.test_script else 10
         lima_training(model, tokenizer, log, args, num_train_epochs=lima_epochs)
-    
+
