@@ -179,8 +179,8 @@ def load_stopwords() -> Set[str]:
         "suffices", "summarized",
         "tends", "theoretic", "theoretically", "tradeoff", "trainable",
         "unchanged", "underscoring", "unstated", "unstructured", "usefulness",
-        "variant", "variants", "warn",
-        "parameter", "efficient", "orthogonal", "finetuning", "via", "factorization", "llms", "1.58", "Direct", "Preference", "Optimization", "Your", "Language", "Model", "Secretly", "Reward", "quantized" 
+        "variant", "variants", "warn", "butterfly", "parameter-efficient", "parameter", "efficient",
+        "parameter", "efficient", "orthogonal", "finetuning", "via", "factorization", "llms", "1.58", "direct", "preference", "optimization", "Your", "Language", "Model", "Secretly", "Reward", "quantized" 
     }
 
     print(f"Total unique stopwords (including 10k common words if present): {len(stopwords)}")
@@ -364,7 +364,7 @@ def filter_probe_words_by_corpus_freq(
     for w in probe_words:
         src_freq = source_counts.get(w, 0) / total_source_tokens
         txt_freq = textbook_counts.get(w, 0) / total_textbook_tokens
-        if 1.25 * src_freq > txt_freq:
+        if src_freq > 0.9 * txt_freq:
             removed.add(w)
         else:
             kept.add(w)
