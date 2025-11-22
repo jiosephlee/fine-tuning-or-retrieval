@@ -40,7 +40,7 @@ def main():
     parser.add_argument(
         "--csv_path",
         type=str,
-        default="data/probes/inference/QLoRA/probes_v7.csv",
+        default="data/probes/inference/1_58/probes_v7.csv",
         help="Path to the probes CSV (must contain 'probe', 'target', and 'fact' columns).",
     )
     parser.add_argument(
@@ -61,7 +61,7 @@ def main():
 
     # If a directory is provided, recursively check all probes_*.csv files under it.
     if os.path.isdir(path):
-        pattern = os.path.join(path, "**", "probes_*.csv")
+        pattern = os.path.join(path, "**", "probes_v7.csv")
         csv_files = sorted(glob.glob(pattern, recursive=True))
         if not csv_files:
             print(f"No CSV files matching 'probes_*.csv' found under directory: {path}")

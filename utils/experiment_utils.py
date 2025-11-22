@@ -86,6 +86,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
         # Inference probes path
         inference_probes_version = args.inference_probes_version
         inference_probe_subset = getattr(args, "inference_probe_subset", "all")
+        log.info(f"Using inference_probe_subset='{inference_probe_subset}' for domain {domain}")
 
         # Optional subset-specific test files: test_probes_vX.csv or type_split_test_probes_vX.csv
         if inference_probe_subset in {"test", "type_split_test"}:
