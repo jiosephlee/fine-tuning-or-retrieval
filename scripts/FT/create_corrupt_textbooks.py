@@ -3,9 +3,10 @@ import random
 import re
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple, Set
+from collections import Counter
 
 import pandas as pd
-
+import string
 
 # ---------------------------------------------------------------------
 # CONFIG
@@ -26,8 +27,9 @@ COMMON_WORDS_PATH = Path(
     "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/data/misc/10K_common_words.txt"
 )
 
-PROBE_DOMAINS = ["1_58", "GRPO", "QLoRA", "BOFT", "OFT", "DPO"]
-
+ARXIV_CLEANED_ROOT = Path(
+    "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/data/arxiv/cleaned"
+)
 
 FRUITS: Sequence[str] = (
     "apple", "apricot", "avocado", "banana", "bilberry", "blackberry", "blueberry", "boysenberry", "cantaloupe",
@@ -52,9 +54,8 @@ VEGETABLES: Sequence[str] = (
     "tomato", "turnip", "watercress", "yam", "zucchini", "beetroot", "chives", "taro", "cassava"
 )
 
-REPLACEMENT_WORDS: Tuple[str, ...] = tuple(list("<|endoftext|>"))
-
-WORD_RE = re.compile(r"\w+")
+# Kept for consistency even though we now always use "<|endoftext|>" directly.
+REPLACEMENT_WORDS: Tuple[str, ...] = tuple(["<|endoftext|>"])
 
 # ---------------------------------------------------------------------
 # REGEX FOR BOILERPLATE
@@ -76,15 +77,27 @@ PREFIX_RE = re.compile(
 )
 
 
-
 # ---------------------------------------------------------------------
 # STOPWORD LOADING
 # ---------------------------------------------------------------------
 
+def normalize_token(tok: str) -> str:
+    """
+    Normalise a token for all checks/counts:
+      - lowercase
+      - strip any leading/trailing punctuation characters
+        (keep punctuation in the middle, e.g. '1.58', 'x_y', '\\ell_2').
+    """
+    if tok is None:
+        return ""
+    tok = tok.lower()
+    # strip punctuation only at the ends, not inside
+    return tok.strip(string.punctuation)
+    
 def load_stopwords() -> Set[str]:
     """
-    Load a large stopword set from multiple NLP libraries and the 10k common words file.
-    Everything is lowercased.
+    Load a large stopword set from multiple NLP libraries and the 10k common words file,
+    plus custom hand-curated words. Everything is lowercased.
     """
     stopwords: Set[str] = set()
 
@@ -124,68 +137,58 @@ def load_stopwords() -> Set[str]:
     else:
         print(f"Common words file not found at: {COMMON_WORDS_PATH}")
 
-
+    # Extra curated stopwords / “do not corrupt” words
     stopwords |= {
         "a", "an", "the", "in", "on", "at", "by", "for", "from", "to", "of", "with",
         "and", "or", "but", "if", "then", "so", "because", "as", "that", "this",
         "these", "those", "it", "its", "he", "she", "they", "them", "their",
-        "we", "you", "i", "is", "are", "was", "were", "be", "been", "being", "assigns", "avoids", "equals","prevents","relies", "removes", "replaces", "selects", "underlies", "extracts", "abandoning", "ablated", "ablation", "acheives", "adapts", "aggregates", "aiming", "akin", "aggressively", "approximated", "argues", "captures", "bounds", "causally", "caveats",
-    "abandoning", "ablated", "ablation", "accelerator", "achieves", "activations",
-    "adapts", "additive", "aggregates", "aggressively", "agnostic", "aided",
-    "aiming", "akin", "algebraic", "algorithmic", "aligns", "alphabet",
-    "alternating", "amplitude", "analogous", "analogy", "angles", "approximated",
-    "argues", 
-    "balances",
-    "behaves",
-    "caveats",
-    "concentrated",
-    "concise",
-    "costly",
-    "deliberately",
-    "demonstrating",
-    "depended",
-    "divides",
-    "doubled",
-    "eliminates",
-    "eliminating",
-    "exhibited",
-    "exploiting",
-    "favoring",
-    "folds",
-    "footprint",
-    "forgetting",
-    "forgoes",
-    "forgoing",
- "imperfect", "implicit", "implicitly", "imply", "imposing",
-    "improves", "inadequate", "incurs", 
-    "inefficiency", "initialize", "initialized",
-    "initializing", "instability", "intact", "intentionally",
-    "interpret", "interpreting", "intuitive", "irrelevant",
-    "isolates", "iterations", "iterative", "judgments", "justified", "justifies",
-    "magnitudes", "manifests", "mapped", "mathematically", "minimized", "minimizing", "mitigate", "mitigates",
-    "modalities", "modifies", "modifying", "motivates", "motivating", 
-    "multiplies", "multiply", "multiplying", "naive",  "notable",
-    "noticeable", "observing", "outperforms","paired", "pairwise", "paradigm", "parity", "partitioned", "penalize", "penalizes",
-    "plausible", "premise", "preserved", "preserves", "preserving", "prevented", "prioritize", "probabilities", 
-    "proportional", "proportionally", "proposes", "proving","randomly",
- "reappear", "reconstructs", "recur",
-    "reintroduce", "relational", "reliably", "repeatedly", "repeating",
-    "resembles", "reside", "restricting", "rests", "reverted", "rewritten",
-    "sensible","similarities",
-    "similarity", "simplification", 
-    "stabilizing", "storing", "subset", "subtract", "subtraction", "subtracts",
- "suffices", "summarized",
-    "tends", "theoretic", "theoretically", "tradeoff", "trainable", "unchanged", "underscoring", "unstated", "unstructured", "usefulness",
-    "variant", "variants", "warn",
+        "we", "you", "i", "is", "are", "was", "were", "be", "been", "being",
+        "assigns", "avoids", "equals", "prevents", "relies", "removes", "replaces",
+        "selects", "underlies", "extracts",
+        "abandoning", "ablated", "ablation", "acheives", "adapts", "aggregates",
+        "aiming", "akin", "aggressively", "approximated", "argues", "captures",
+        "bounds", "causally", "caveats",
+        "accelerator", "achieves", "activations",
+        "additive", "agnostic", "aided",
+        "algebraic", "algorithmic", "aligns", "alphabet",
+        "alternating", "amplitude", "analogous", "analogy", "angles",
+        "balances", "behaves", "concentrated", "concise",
+        "costly", "deliberately", "demonstrating", "depended",
+        "divides", "doubled", "eliminates", "eliminating", "exhibited", "exploiting",
+        "favoring", "folds", "footprint", "forgetting", "forgoes", "forgoing",
+        "imperfect", "implicit", "implicitly", "imply", "imposing",
+        "improves", "inadequate", "incurs",
+        "inefficiency", "initialize", "initialized",
+        "initializing", "instability", "intact", "intentionally",
+        "interpret", "interpreting", "intuitive", "irrelevant",
+        "isolates", "iterations", "iterative", "judgments", "justified", "justifies",
+        "magnitudes", "manifests", "mapped", "mathematically", "minimized", "minimizing",
+        "mitigate", "mitigates", "modalities", "modifies", "modifying",
+        "motivates", "motivating",
+        "multiplies", "multiply", "multiplying", "naive",
+        "notable", "noticeable", "observing", "outperforms",
+        "paired", "pairwise", "paradigm", "parity", "partitioned", "penalize",
+        "penalizes", "plausible", "premise", "preserved", "preserves", "preserving",
+        "prevented", "prioritize", "probabilities",
+        "proportional", "proportionally", "proposes", "proving", "randomly",
+        "reappear", "reconstructs", "recur",
+        "reintroduce", "relational", "reliably", "repeatedly", "repeating",
+        "resembles", "reside", "restricting", "rests", "reverted", "rewritten",
+        "sensible", "similarities", "similarity", "simplification",
+        "stabilizing", "storing", "subset", "subtract", "subtraction", "subtracts",
+        "suffices", "summarized",
+        "tends", "theoretic", "theoretically", "tradeoff", "trainable",
+        "unchanged", "underscoring", "unstated", "unstructured", "usefulness",
+        "variant", "variants", "warn",
+        "parameter", "efficient", "orthogonal", "finetuning", "via", "factorization", "llms", "1.58", "Direct", "Preference", "Optimization", "Your", "Language", "Model", "Secretly", "Reward", "quantized" 
     }
-
 
     print(f"Total unique stopwords (including 10k common words if present): {len(stopwords)}")
     return stopwords
 
 
 # ---------------------------------------------------------------------
-# PROBE CSV DISCOVERY
+# PROBE / SOURCE FILE DISCOVERY
 # ---------------------------------------------------------------------
 
 def collect_probe_csv_paths() -> List[Path]:
@@ -208,6 +211,27 @@ def collect_probe_csv_paths() -> List[Path]:
     for p in csvs:
         print(f"  - {p}")
     return csvs
+
+
+def collect_source_tex_paths() -> List[Path]:
+    """
+    Collect cleaned arxiv .tex source files for each domain, if they exist.
+    Expected path: ARXIV_CLEANED_ROOT / f"{domain}.tex"
+    """
+    tex_paths: List[Path] = []
+    for dom in PROBE_DOMAINS:
+        p = ARXIV_CLEANED_ROOT / f"{dom}.tex"
+        if p.exists():
+            tex_paths.append(p)
+        else:
+            print(f"Warning: source .tex not found for domain {dom}: {p}")
+    if not tex_paths:
+        print(f"Warning: no source .tex files found under {ARXIV_CLEANED_ROOT}")
+    else:
+        print("Using the following source .tex files:")
+        for p in tex_paths:
+            print(f"  - {p}")
+    return tex_paths
 
 
 # ---------------------------------------------------------------------
@@ -237,11 +261,48 @@ def strip_fact_prefix_with_assert(raw_fact: str) -> str:
     stripped = s[m.end():].strip()
     return stripped
 
+def tokenize_for_counts(text: str) -> List[str]:
+    """
+    Tokenisation for corpus counts:
+    - split on whitespace (space-separated clumps),
+    - normalise each token via `normalize_token`,
+    - drop empty tokens after normalisation.
+    """
+    raw_tokens = text.split()
+    tokens: List[str] = []
+    for t in raw_tokens:
+        norm = normalize_token(t)
+        if norm:
+            tokens.append(norm)
+    return tokens
+
+
+def get_word_counts_from_files(files: List[Path]) -> Tuple[Counter, int]:
+    """
+    Build word count and total token count from a list of files,
+    using punctuation-aware whitespace tokenisation.
+    """
+    counts: Counter = Counter()
+    total = 0
+    for p in files:
+        with p.open("r", encoding="utf-8") as f:
+            txt = f.read()
+        tokens = tokenize_for_counts(txt)
+        counts.update(tokens)
+        total += len(tokens)
+    return counts, total
+
 
 def build_probe_word_set_from_many(csv_paths: List[Path], stopwords: Set[str]) -> Set[str]:
     """
     Build a global probe word set from multiple probes_v7.csv files (across domains),
-    applying boilerplate stripping, punctuation removal, lowercasing, and stopword filtering.
+    applying:
+      - boilerplate stripping,
+      - lowercase,
+      - punctuation-aware whitespace tokenisation,
+      - stopword/common-word filtering using a *normalized* form that strips punctuation,
+      - min length (normalized) > 1.
+    Stored probe words keep punctuation (lowercased), matching the corpora tokens.
     """
     probe_words: Set[str] = set()
     total_facts = 0
@@ -257,24 +318,62 @@ def build_probe_word_set_from_many(csv_paths: List[Path], stopwords: Set[str]) -
             # strip boilerplate
             fact = strip_fact_prefix_with_assert(raw_fact)
 
-            # remove punctuation
-            fact = re.sub(r"[^\w\s]", " ", fact)
-
-            # lowercase
+            # lowercase + space-based tokens
             fact = fact.lower()
-
-            for w in WORD_RE.findall(fact):
-                if w in stopwords:
+            for tok in fact.split():
+                norm = normalize_token(tok)
+                if not norm:
                     continue
-                if len(w) <= 1:
+                if norm in stopwords:
                     continue
-                probe_words.add(w)
+                if len(norm) <= 1:
+                    continue
+                # Store the NORMALISED form in probe_words, since all our checks
+                # and counts also use normalised tokens.
+                probe_words.add(norm)
 
     print(
-        f"Collected {len(probe_words)} unique probe words from {len(csv_paths)} CSVs "
-        f"({total_facts} total facts, after boilerplate strip + punctuation removal + stopwords)."
+        f"Collected {len(probe_words)} unique probe tokens from {len(csv_paths)} CSVs "
+        f"({total_facts} total facts, after boilerplate strip + stopwords)."
     )
+    print(probe_words)
     return probe_words
+
+
+def filter_probe_words_by_corpus_freq(
+    probe_words: Set[str],
+    source_counts: Counter,
+    total_source_tokens: int,
+    textbook_counts: Counter,
+    total_textbook_tokens: int,
+) -> Tuple[Set[str], Set[str]]:
+    """
+    Exclude words that are more frequent (normalized by token count)
+    in the source (.tex) corpus than in the textbook chapters.
+
+    Returns:
+      kept_probe_words, removed_probe_words
+    """
+    if total_source_tokens == 0 or total_textbook_tokens == 0:
+        print("Warning: zero tokens in source or textbook corpus; skipping frequency-based filtering.")
+        return probe_words, set()
+
+    kept: Set[str] = set()
+    removed: Set[str] = set()
+
+    for w in probe_words:
+        src_freq = source_counts.get(w, 0) / total_source_tokens
+        txt_freq = textbook_counts.get(w, 0) / total_textbook_tokens
+        if 1.25 * src_freq > txt_freq:
+            removed.add(w)
+        else:
+            kept.add(w)
+
+    print(
+        f"Frequency filter: kept {len(kept)} probe tokens, "
+        f"removed {len(removed)} that were more frequent in source than textbooks."
+    )
+    return kept, removed
 
 
 def replace_probe_words_in_text(
@@ -283,32 +382,32 @@ def replace_probe_words_in_text(
     rng: random.Random,
 ) -> Tuple[str, int, int, Set[str]]:
     """
-    Replace any word that appears in probe_words with a random fruit/vegetable.
+    Replace any whitespace-delimited token whose NORMALISED form
+    is in probe_words with <|endoftext|>.
 
-    Returns:
-      (new_text, total_words, replaced_words, removed_words_set)
+    Token = any clump of characters separated by whitespace.
     """
-    tokens = re.split(r"(\w+)", text)
+    parts = re.split(r"(\s+)", text)
 
-    total_words = 0
-    replaced_words = 0
-    removed_words: Set[str] = set()
+    total_tokens = 0
+    replaced_tokens = 0
+    removed_tokens: Set[str] = set()
 
-    for i, tok in enumerate(tokens):
-        if not tok:
+    for i, part in enumerate(parts):
+        if not part:
+            continue
+        if part.isspace():
             continue
 
-        if re.fullmatch(r"\w+", tok):
-            total_words += 1
-            base = tok.lower()
-            if base in probe_words:
-                tokens[i] = rng.choice(REPLACEMENT_WORDS)
-                replaced_words += 1
-                removed_words.add(base)
+        total_tokens += 1
+        base = normalize_token(part)
+        if base and base in probe_words:
+            parts[i] = "<|endoftext|>"
+            replaced_tokens += 1
+            removed_tokens.add(base)
 
-    new_text = "".join(tokens)
-    return new_text, total_words, replaced_words, removed_words
-
+    new_text = "".join(parts)
+    return new_text, total_tokens, replaced_tokens, removed_tokens
 
 # ---------------------------------------------------------------------
 # MAIN PROCESSING
@@ -350,10 +449,12 @@ def write_report(
     report_path: Path,
     probe_words: Set[str],
     probe_csv_paths: List[Path],
+    source_heavy_words: Set[str],
 ) -> None:
     """
     Write a text report with:
-      - global probe word pool
+      - global probe word pool (kept)
+      - words excluded for being source-heavy
       - overall stats
       - per-domain stats
       - per-chapter stats + removed words per chapter
@@ -392,6 +493,7 @@ def write_report(
     )
 
     probe_words_sorted = sorted(probe_words)
+    source_heavy_sorted = sorted(source_heavy_words)
 
     with report_path.open("w", encoding="utf-8") as f:
         f.write("--- Fruit Textbook Replacement Report ---\n\n")
@@ -402,21 +504,30 @@ def write_report(
             f.write(f"  - {p}\n")
         f.write("\n")
 
-        # Global probe word pool (post-stopwords)
-        f.write("Global probe word pool (after stopword/common-word removal):\n")
-        f.write(f"  Total probe words: {len(probe_words_sorted)}\n")
-        f.write("  Words:\n")
+        # Global probe word pool (post-stopwords and frequency filter)
+        f.write("Global probe token pool (after stopword/common-word removal and source-vs-textbook filtering):\n")
+        f.write(f"  Total probe tokens: {len(probe_words_sorted)}\n")
+        f.write("  Tokens:\n")
         if probe_words_sorted:
             f.write("    " + ", ".join(probe_words_sorted) + "\n\n")
+        else:
+            f.write("    (none)\n\n")
+
+        # Words excluded because they are more frequent in source than textbooks
+        f.write("Tokens more frequent in source than textbooks (excluded from probe pool):\n")
+        f.write(f"  Total excluded tokens: {len(source_heavy_sorted)}\n")
+        f.write("  Tokens:\n")
+        if source_heavy_sorted:
+            f.write("    " + ", ".join(source_heavy_sorted) + "\n\n")
         else:
             f.write("    (none)\n\n")
 
         # Overall
         f.write("Overall statistics (word-count weighted):\n")
         f.write(
-            f"  Total words          : {overall_total_words}\n"
-            f"  Total replaced words : {overall_replaced_words}\n"
-            f"  Overall replacement %: {overall_pct:.2f}%\n\n"
+            f"  Total tokens          : {overall_total_words}\n"
+            f"  Total replaced tokens : {overall_replaced_words}\n"
+            f"  Overall replacement % : {overall_pct:.2f}%\n\n"
         )
 
         # Per-domain aggregates
@@ -427,24 +538,24 @@ def write_report(
             dpct = 100.0 * dr / dw if dw > 0 else 0.0
             f.write(
                 f"  Domain {domain}:\n"
-                f"    Chapters          : {agg['chapters']}\n"
-                f"    Total words       : {dw}\n"
-                f"    Replaced words    : {dr}\n"
-                f"    Replacement %     : {dpct:.2f}%\n"
+                f"    Chapters           : {agg['chapters']}\n"
+                f"    Total tokens       : {dw}\n"
+                f"    Replaced tokens    : {dr}\n"
+                f"    Replacement %      : {dpct:.2f}%\n"
             )
         f.write("\n")
 
         # Per-chapter stats + list of removed words
-        f.write("Per-chapter statistics and removed words:\n")
+        f.write("Per-chapter statistics and removed tokens:\n")
         for row in per_chapter_stats:
             removed_sorted = sorted(row["removed_words"])
             removed_str = ", ".join(removed_sorted) if removed_sorted else "(none)"
             f.write(
                 f"  Domain={row['domain']}, chapter={row['chapter_name']}:\n"
-                f"    Total words    : {row['total_words']}\n"
-                f"    Replaced words : {row['replaced_words']}\n"
+                f"    Total tokens   : {row['total_words']}\n"
+                f"    Replaced tokens: {row['replaced_words']}\n"
                 f"    Replacement %  : {row['replacement_pct']:.2f}%\n"
-                f"    Removed words  : {removed_str}\n"
+                f"    Removed tokens : {removed_str}\n"
             )
 
     print(f"Report written to: {report_path}")
@@ -456,30 +567,46 @@ def main() -> None:
         "--seed",
         type=int,
         default=42,
-        help="Random seed for fruit/vegetable replacements.",
+        help="Random seed (kept for compatibility).",
     )
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
 
-    # 1. Load stopwords (NLP libs + 10k common words).
+    # 1. Load stopwords (NLP libs + 10k common words + curated).
     stopwords = load_stopwords()
 
     # 2. Collect all probes_v7.csv paths across domains.
     probe_csv_paths = collect_probe_csv_paths()
 
-    # 3. Build global probe word set from all those CSVs.
-    probe_words = build_probe_word_set_from_many(probe_csv_paths, stopwords)
-
-    # 4. Find all chapter files.
+    # 3. Find all chapter files (textbooks).
     chapter_files = find_chapter_files(EXPLANATIONS_ROOT)
     if not chapter_files:
         print(f"No chapter_*.txt files found under {EXPLANATIONS_ROOT}")
         return
-
     print(f"Found {len(chapter_files)} chapter files to process.")
 
-    # 5. Process each chapter.
+    # 4. Collect source .tex files and build corpus counts.
+    source_tex_paths = collect_source_tex_paths()
+    textbook_counts, total_textbook_tokens = get_word_counts_from_files(chapter_files)
+    source_counts, total_source_tokens = get_word_counts_from_files(source_tex_paths)
+
+    print(f"Textbook corpus: {total_textbook_tokens} tokens, {len(textbook_counts)} unique.")
+    print(f"Source corpus  : {total_source_tokens} tokens, {len(source_counts)} unique.")
+
+    # 5. Build global probe token set from all probes CSVs (using stopwords only).
+    probe_words_raw = build_probe_word_set_from_many(probe_csv_paths, stopwords)
+
+    # 6. Filter probe tokens using source vs textbook frequency.
+    probe_words, source_heavy_words = filter_probe_words_by_corpus_freq(
+        probe_words_raw,
+        source_counts,
+        total_source_tokens,
+        textbook_counts,
+        total_textbook_tokens,
+    )
+
+    # 7. Process each chapter with the filtered probe token set.
     per_chapter_stats: List[Dict] = []
 
     for path in sorted(chapter_files):
@@ -498,10 +625,10 @@ def main() -> None:
             }
         )
 
-    # 6. Write report (includes global probe word pool and CSV list).
+    # 8. Write report (includes global probe pool, source-heavy tokens, and CSV list).
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     report_path = REPORTS_DIR / "fruit_textbook_replacement_report.txt"
-    write_report(per_chapter_stats, report_path, probe_words, probe_csv_paths)
+    write_report(per_chapter_stats, report_path, probe_words, probe_csv_paths, source_heavy_words)
 
 
 if __name__ == "__main__":
