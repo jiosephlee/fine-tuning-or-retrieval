@@ -99,7 +99,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                 candidate_path.append(os.path.join(base_dir, f'type_split_train_probes_{inference_probes_version}.csv'))
                 candidate_path.append(os.path.join(base_dir, f'type_split_test_probes_{inference_probes_version}.csv'))
 
-            if os.path.exists(candidate_path):
+            if os.path.exists(candidate_path[0]):
                 inference_probe_path = candidate_path[0]
                 log.info(
                     f"Loaded {inference_probe_subset} inference probes for domain {domain} "
