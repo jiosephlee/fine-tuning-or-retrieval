@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=run
 #SBATCH --output=%j.out
-#SBATCH --time=6:00:00
+#SBATCH --time=8:00:00
 #SBATCH --partition=dgx-b200          # example GPU partition on Betty
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=8
