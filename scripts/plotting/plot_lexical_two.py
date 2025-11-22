@@ -22,10 +22,6 @@ except ImportError:
 
 DEFAULT_PROJECT_ROOT = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval"
 DOMAINS = ["1_58", "DPO", "GRPO", "BOFT", "OFT", "QLoRA"]
-
-# 1. UPDATED TITLES & ADDED PLACEHOLDERS
-# keys = Title to display
-# values = (run_name, relative_path)
 RUNS_7B = {
     "Source": (
         "source_only",
@@ -55,7 +51,6 @@ RUNS_7B = {
     ),
 }
 
-# 2. UPDATED CORPUS DEFINITIONS (Added Blogs + StackExchange)
 CORPUS_DEFINITIONS = {
     "source":   [("data/arxiv/cleaned", "{domain}.tex")],
     "para":     [("data/arxiv/paraphrased/{domain}", "0.tex")],
@@ -64,7 +59,6 @@ CORPUS_DEFINITIONS = {
     "stackexchange": [("data/arxiv/explanations/{domain}", "stackexchange.txt")],
 }
 
-# 3. MAP METHOD TITLES TO CORPUS KEYS
 METHOD_TO_CORPUS = {
     "Source": "source",
     "Paraphrase": "para",
@@ -80,7 +74,7 @@ except ImportError:
     set_plot_style = None
 
 # ---------------------------------------------------------------------
-# DATA LOADING & BM25
+# DATA LOADING & BM25 (BIGRAM VERSION)
 # ---------------------------------------------------------------------
 
 TOKEN_RE = re.compile(r"\b\w+\b", re.UNICODE)
@@ -89,9 +83,23 @@ STOPWORDS = {
     "that","this","it","as","by","an","at","from","be","has","have"
 }
 
-def tokenize(text: str):
+def tokenize_bigrams(text: str):
+    """
+    Tokenizes text into BIGRAMS.
+    1. Extracts words (removes punctuation).
+    2. Filters stopwords.
+    3. Creates pairs: "mitochondria powerhouse"
+    """
+    # 1. Get cleaned unigrams
     tokens = TOKEN_RE.findall(str(text).lower())
-    return [t for t in tokens if t not in STOPWORDS]
+    tokens = [t for t in tokens if t not in STOPWORDS]
+    
+    # 2. Create Bigrams
+    if len(tokens) < 2:
+        return [] # No bigrams possible for single words
+    
+    # Return as list of strings "word1_word2" for BM25 hashing
+    return [f"{t1}_{t2}" for t1, t2 in zip(tokens, tokens[1:])]
 
 def load_probe_data(project_root, domains):
     data = {"inference": {}, "knowledge": {}}
@@ -103,7 +111,8 @@ def load_probe_data(project_root, domains):
             df = pd.read_csv(p)
             if "fact" in df.columns:
                 for idx, row in df.iterrows():
-                    data["inference"][(d, idx)] = tokenize(str(row["fact"]))
+                    # USE BIGRAM TOKENIZER
+                    data["inference"][(d, idx)] = tokenize_bigrams(str(row["fact"]))
 
     path_fact = os.path.join(project_root, "data/probes/facts")
     for d in domains:
@@ -112,14 +121,15 @@ def load_probe_data(project_root, domains):
             df = pd.read_csv(p)
             if "fact" in df.columns:
                 for idx, row in df.iterrows():
-                    data["knowledge"][(d, idx)] = tokenize(str(row["fact"]))
+                    # USE BIGRAM TOKENIZER
+                    data["knowledge"][(d, idx)] = tokenize_bigrams(str(row["fact"]))
                     
     return data
 
 def build_bm25_indices(project_root, domains, k1=10.0, b=0.75):
     indices = {}
     for corpus_name, file_configs in CORPUS_DEFINITIONS.items():
-        print(f"Building BM25 index for corpus: {corpus_name.upper()}...")
+        print(f"Building Bigram BM25 index for corpus: {corpus_name.upper()}...")
         corpus_tokens = []
         domain_to_idx = {}
         for i, domain in enumerate(domains):
@@ -132,11 +142,11 @@ def build_bm25_indices(project_root, domains, k1=10.0, b=0.75):
                 )
                 if os.path.exists(fpath):
                     with open(fpath, "r") as f:
-                        domain_tokens.extend(tokenize(f.read()))
+                        # USE BIGRAM TOKENIZER ON CORPUS TOO
+                        domain_tokens.extend(tokenize_bigrams(f.read()))
             corpus_tokens.append(domain_tokens)
             domain_to_idx[domain] = i
-        
-        # Check if empty
+            
         if not any(corpus_tokens):
             print(f"  [WARN] No data found for {corpus_name}")
             
@@ -168,7 +178,7 @@ def get_scores_for_probes(probe_tokens_map, bm25_data):
 # ---------------------------------------------------------------------
 
 def aggregate_metrics(run_path, probe_type, domains):
-    if not run_path: return pd.DataFrame() # Handle None path
+    if not run_path: return pd.DataFrame()
     dfs = []
     for domain in domains:
         folder = f"{domain}_{probe_type}_probe"
@@ -192,7 +202,7 @@ def compute_delta_log_prob(df):
         return last - first
 
     return (df.groupby(["domain", "probe_index", "method"], as_index=False)
-            [['log_prob', 'step']] # Fixed Syntax
+            [['log_prob', 'step']]
             .apply(lambda x: pd.Series({'delta_log_prob': _delta(x)}))
             .reset_index(drop=True))
 
@@ -229,7 +239,7 @@ def plot_scatter(ax, df, title, color):
         ax.text(x_txt, y_txt, f"m={a:.3f}", color='red', fontsize=10, fontweight='bold')
 
     ax.set_title(title)
-    ax.set_xlabel("BM25+ Score") # UPDATED LABEL
+    ax.set_xlabel("Bigram BM25+ Score")
     ax.grid(True, alpha=0.2)
 
 # ---------------------------------------------------------------------
@@ -244,15 +254,14 @@ def main():
 
     if set_plot_style: set_plot_style()
 
-    print("Loading probe tokens...")
+    print("Loading probe tokens (Bigrams)...")
     probe_tokens = load_probe_data(root, DOMAINS)
     
-    print("Building BM25 indices (Source, Para, Textbook, Blogs, StackExchange)...")
+    print("Building Bigram BM25 indices...")
+    # Indices now store BIGRAMS, not words
     bm25_indices = build_bm25_indices(root, DOMAINS, k1=10.0, b=0.75)
     
-    # Define explicit order for columns
     display_order = ["Paraphrase", "Textbook", "Source", "Blogs", "StackExchange"]
-    # Filter to only those present in RUNS_7B (which is all of them now)
     methods = [m for m in display_order if m in RUNS_7B]
     
     nrows, ncols = 2, len(methods)
@@ -290,7 +299,7 @@ def main():
             
             ax = axes[0, col_idx]
             plot_scatter(ax, merged, f"{method}\nFactual", "#1f77b4")
-            if col_idx == 0: ax.set_ylabel(r"$\Delta$ Log Prob") # SYMBOL
+            if col_idx == 0: ax.set_ylabel(r"$\Delta$ Log Prob")
         else:
             axes[0, col_idx].axis('off')
 
@@ -303,12 +312,12 @@ def main():
             
             ax = axes[1, col_idx]
             plot_scatter(ax, merged, f"{method}\nInference", "#ff7f0e")
-            if col_idx == 0: ax.set_ylabel(r"$\Delta$ Log Prob") # SYMBOL
+            if col_idx == 0: ax.set_ylabel(r"$\Delta$ Log Prob")
         else:
             axes[1, col_idx].axis('off')
 
     plt.tight_layout()
-    out = os.path.join(root, "plots", "delta_log_prob_vs_bm25_final.pdf")
+    out = os.path.join(root, "plots", "delta_log_prob_vs_bigram_bm25.pdf")
     plt.savefig(out, bbox_inches="tight")
     print(f"\nSaved plot to {out}")
 

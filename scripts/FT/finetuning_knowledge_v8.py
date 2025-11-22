@@ -402,6 +402,13 @@ if __name__ == "__main__":
     parser.add_argument("--overrule_warmup_via_steps", type=int, default=None, help="Override warmup_ratio and specify warmup in steps instead")
     parser.add_argument("--knowledge_probes_version", type=str, default="v9", help="Version of the knowledge probes to use.")
     parser.add_argument("--inference_probes_version", type=str, default="v7", help="Version of the inference probes to use.")
+    parser.add_argument(
+        "--inference_probe_subset",
+        type=str,
+        default="all",
+        choices=["all", "test", "type_split_test"],
+        help="Subset of inference probes to use for domain 1_58 when using v7 probes.",
+    )
     parser.add_argument("--num_paraphrased_texts", type=int, default=9, help="Number of paraphrased texts to use for training (0-9)")
     parser.add_argument("--lima_afterwards", default=False, action="store_true", help="LIMA-based instruction tuning after continued pretraining")
 
@@ -551,4 +558,3 @@ if __name__ == "__main__":
     if args.lima_afterwards:
         lima_epochs = 1 if args.test_script else 10
         lima_training(model, tokenizer, log, args, num_train_epochs=lima_epochs)
-

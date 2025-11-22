@@ -85,16 +85,39 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
 
         # Inference probes path
         inference_probes_version = args.inference_probes_version
-        path1 = f'../../data/probes/inference/{domain}/probes_{inference_probes_version}.csv'
-        path2 = f'../../data/probes/inference/{domain}/{domain.lower()}_high_level_probes_{inference_probes_version}.csv'
+        inference_probe_subset = getattr(args, "inference_probe_subset", "all")
 
-        if os.path.exists(path1):
-            inference_probe_path = path1
-        elif os.path.exists(path2):
-            inference_probe_path = path2
+        # Optional subset-specific test files: test_probes_vX.csv or type_split_test_probes_vX.csv
+        if inference_probe_subset in {"test", "type_split_test"}:
+            base_dir = f'../../data/probes/inference/{domain}'
+            if inference_probe_subset == "test":
+                candidate_path = os.path.join(base_dir, f'test_probes_{inference_probes_version}.csv')
+            else:  # type_split_test
+                candidate_path = os.path.join(base_dir, f'type_split_test_probes_{inference_probes_version}.csv')
+
+            if os.path.exists(candidate_path):
+                inference_probe_path = candidate_path
+                log.info(
+                    f"Loaded {inference_probe_subset} inference probes for domain {domain} "
+                    f"from {inference_probe_path}"
+                )
+            else:
+                inference_probe_path = None
+                log.warning(
+                    f"Requested inference_probe_subset='{inference_probe_subset}' for domain {domain} "
+                    f"but file not found at {candidate_path}"
+                )
         else:
-            inference_probe_path = None
-            log.warning(f"Inference probe file not found for domain {domain} with version {inference_probes_version}")
+            path1 = f'../../data/probes/inference/{domain}/probes_{inference_probes_version}.csv'
+            path2 = f'../../data/probes/inference/{domain}/{domain.lower()}_high_level_probes_{inference_probes_version}.csv'
+
+            if os.path.exists(path1):
+                inference_probe_path = path1
+            elif os.path.exists(path2):
+                inference_probe_path = path2
+            else:
+                inference_probe_path = None
+                log.warning(f"Inference probe file not found for domain {domain} with version {inference_probes_version}")
 
         if inference_probe_path:
             inference_probe_df = pd.read_csv(inference_probe_path)
@@ -201,4 +224,3 @@ def save_probe_results(callbacks, log, args):
         elif isinstance(callback, llm_callbacks.CorpusPerplexityCallback):
             callback.save_results(output_dir=callback.output_dir)
             log.info(f"Corpus perplexity metrics for {callback.log_prefix} saved to {callback.output_dir}")
-
