@@ -232,30 +232,35 @@ def prepare_training_mix(
         # Load Source
         # Prefer shuffled versions when requested. Priority: word_shuffled -> sentence_shuffled -> legacy shuffled -> original
         source_path = None
-        shuffled_root = '../../data/arxiv/shuffled'
 
-        # check shuffled/cleaned first
-        if word_shuffled:
-            cand = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle_words.tex')
-            if os.path.exists(cand):
-                source_path = cand
-        if source_path is None and sentence_shuffled:
-            cand = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle_sentences.tex')
-            if os.path.exists(cand):
-                source_path = cand
-        if source_path is None and shuffled_papers:
-            cand = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle.tex')
-            if os.path.exists(cand):
-                source_path = cand
+        # For PriorKnowledge, use the prior_knowledge textbook directly instead of the Arxiv paper .tex
+        if strategy_name == "PriorKnowledge":
+            source_path = f'../../data/arxiv/prior_knowledge/{domain}/textbook.txt'
+        else:
+            shuffled_root = '../../data/arxiv/shuffled'
 
-        # fallback to original cleaned/paraphrased/raw locations
-        if source_path is None:
-            if use_raw:
-                source_path = f'../../data/arxiv/raw/{domain}.tex'
-            elif semi_cleaned_version:
-                source_path = f'../../data/arxiv/semicleaned_{semi_cleaned_version}/{domain}.tex'
-            else:
-                source_path = f'../../data/arxiv/cleaned/{domain}.tex'
+            # check shuffled/cleaned first
+            if word_shuffled:
+                cand = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle_words.tex')
+                if os.path.exists(cand):
+                    source_path = cand
+            if source_path is None and sentence_shuffled:
+                cand = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle_sentences.tex')
+                if os.path.exists(cand):
+                    source_path = cand
+            if source_path is None and shuffled_papers:
+                cand = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle.tex')
+                if os.path.exists(cand):
+                    source_path = cand
+
+            # fallback to original cleaned/paraphrased/raw locations
+            if source_path is None:
+                if use_raw:
+                    source_path = f'../../data/arxiv/raw/{domain}.tex'
+                elif semi_cleaned_version:
+                    source_path = f'../../data/arxiv/semicleaned_{semi_cleaned_version}/{domain}.tex'
+                else:
+                    source_path = f'../../data/arxiv/cleaned/{domain}.tex'
 
         try:
             with open(source_path, 'r', encoding='utf-8') as f: source_text = f.read()
