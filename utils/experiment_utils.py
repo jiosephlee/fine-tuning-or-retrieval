@@ -91,16 +91,19 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
         # Optional subset-specific test files: test_probes_vX.csv or type_split_test_probes_vX.csv
         if inference_probe_subset in {"test", "type_split_test"}:
             base_dir = f'../../data/probes/inference/{domain}'
+            candidate_path = []
             if inference_probe_subset == "test":
-                candidate_path = os.path.join(base_dir, f'test_probes_{inference_probes_version}.csv')
+                candidate_path.append(os.path.join(base_dir, f'train_probes_{inference_probes_version}.csv'))
+                candidate_path.append(os.path.join(base_dir, f'test_probes_{inference_probes_version}.csv'))
             else:  # type_split_test
-                candidate_path = os.path.join(base_dir, f'type_split_test_probes_{inference_probes_version}.csv')
+                candidate_path.append(os.path.join(base_dir, f'type_split_train_probes_{inference_probes_version}.csv'))
+                candidate_path.append(os.path.join(base_dir, f'type_split_test_probes_{inference_probes_version}.csv'))
 
             if os.path.exists(candidate_path):
-                inference_probe_path = candidate_path
+                inference_probe_path = candidate_path[0]
                 log.info(
                     f"Loaded {inference_probe_subset} inference probes for domain {domain} "
-                    f"from {inference_probe_path}"
+                    f"from {inference_probe_path} and {candidate_path[1]}"
                 )
             else:
                 inference_probe_path = None
@@ -108,6 +111,27 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                     f"Requested inference_probe_subset='{inference_probe_subset}' for domain {domain} "
                     f"but file not found at {candidate_path}"
                 )
+            for inference_probe_path in candidate_path:
+                inference_probe_df = pd.read_csv(inference_probe_path)
+                facts = inference_probe_df['fact'].tolist()
+                probes = inference_probe_df['probe'].tolist()
+                targets = inference_probe_df['target'].tolist()
+
+                inference_probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
+                    tokenizer=tokenizer,
+                    facts=facts,
+                    probes=probes,
+                    targets=targets,
+                    probes_df=inference_probe_df,
+                    batch_size=probe_batch_size,
+                    logger=log,
+                    output_dir=output_dir_inference_probe,
+                    log_prefix=f"train_{domain}_inference_probe" if "train" in inference_probe_path else f"test_{domain}_inference_probe",
+                    report_to_wandb=report_to_wandb,
+                    sparse_eval=sparse_eval,
+                )
+                callbacks.append(inference_probe_callback)
+                log.info(f"Loaded {len(inference_probe_df)} inference probes from {inference_probe_path}")
         else:
             path1 = f'../../data/probes/inference/{domain}/probes_{inference_probes_version}.csv'
             path2 = f'../../data/probes/inference/{domain}/{domain.lower()}_high_level_probes_{inference_probes_version}.csv'
@@ -120,7 +144,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                 inference_probe_path = None
                 log.warning(f"Inference probe file not found for domain {domain} with version {inference_probes_version}")
 
-        if inference_probe_path:
+        if inference_probe_path and inference_probe_subset not in {"test", "type_split_test"}:
             inference_probe_df = pd.read_csv(inference_probe_path)
             facts = inference_probe_df['fact'].tolist()
             probes = inference_probe_df['probe'].tolist()

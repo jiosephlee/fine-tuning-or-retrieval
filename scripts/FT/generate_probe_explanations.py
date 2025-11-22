@@ -30,7 +30,7 @@ SPLITS = [
     ("inference_type_probes", "type_split_train_probes_v7.csv", "inference_type_probes"),
 ]
 
-MAX_WORKERS = 2
+MAX_WORKERS = 4
 
 # -----------------------------------------------------------
 # UTILS LOADING
@@ -50,7 +50,7 @@ def load_utils(project_root: str):
 # LLM CALL FOR EXPLANATIONS
 # -----------------------------------------------------------
 
-def build_explanation_prompt(paper_text: str, fact: str, contextualized) -> dict:
+def build_explanation_prompt(paper_text: str, fact: str, contextualized, textbook_style) -> dict:
     """
     Build messages dict for utils.query_llm to generate a single-paragraph explanation
     of a probe fact using the original paper as context.
@@ -70,6 +70,25 @@ def build_explanation_prompt(paper_text: str, fact: str, contextualized) -> dict
         "- Begin the paragraph by restating the fact exactly (or nearly exactly), followed by an explanation.\n"
         "- Write all math expressions in LaTeX.\n"
     )
+    elif textbook_style:
+        system_msg = (
+            "You are an expert textbook author writing for college students.\n\n"
+            "You will be given:\n"
+            "- The full text/LaTeX content of a research paper.\n"
+            "- A single fact derived from that paper that is not explicitly stated in the text.\n\n"
+            "Your task is to write a detailed, cohesive textbook chapter based strictly on the provided paper.\n"
+            "The chapter must be comprehensive and suitable for a student learning this material for the first time "
+            "in order to understand the knowledge presented in the fact.\n\n"
+            "Guidelines:\n"
+            "1. **Content & Depth**: Elaborate on the provided fact at full length with a focus on intuition. "
+            "Spell everything out clearly to remove ambiguity. Dedicate multiple paragraphs to each subtopic.\n"
+            "2. **Strict Grounding**: Your output must be grounded solely in the provided paper. "
+            "Do not incorporate outside information or details not found in the source text.\n"
+            "3. **Format**: Write in full prose. Do not use bullet points. "
+            "Start with the Chapter Title on the first line. Use a section header '#' for each subtopic.\n"
+            "4. **Mathematical Notation**: Write ALL mathematical notation in LaTeX only (e.g., $x^2$, $\\pi$). "
+            "Do NOT use unicode mathematical characters.\n"
+        )
     else:
         system_msg = (
             "You are an expert instructor explaining research papers to advanced students.\n\n"
@@ -102,13 +121,14 @@ def generate_explanation_for_fact(
     fact: str,
     reasoning_effort: str = "low",
     max_tokens: int = 512,
-    contextualized: bool = False
+    contextualized: bool = False,
+    textbook_style=False,
 ) -> str:
     """
     Call LLM once to generate an explanation paragraph for a single fact.
     Returns plain text.
     """
-    prompt = build_explanation_prompt(paper_text, fact, contextualized)
+    prompt = build_explanation_prompt(paper_text, fact, contextualized, textbook_style)
     response = utils.query_llm(
         prompt,
         model=model,
@@ -144,6 +164,7 @@ def generate_explanations_parallel(
     domain: str,
     split_name: str,
     contextualized=False,
+    textbook_style=False,
 ) -> List[str]:
     """
     Generate explanations for a list of facts in parallel with a ThreadPoolExecutor.
@@ -163,7 +184,8 @@ def generate_explanations_parallel(
                 model,
                 paper_text,
                 fact,
-                contextualized=contextualized
+                contextualized=contextualized,
+                textbook_style=textbook_style
             )
             future_to_idx[fut] = idx
 
@@ -226,9 +248,8 @@ def process_train_split_for_domain(
     num_probes = df.shape[0]
     print(f"[{domain}][{split_name}] Loaded {num_probes} train probes from {input_csv_path}.")
 
-    # --- 1) Write raw facts file ---
+    # --- 1) Write raw facts files (one file per probe) ---
     facts = [str(fact).strip() for fact in df["fact"].tolist() if isinstance(fact, str)]
-    plain_facts_text = "\n\n".join(facts)
 
     base_out_dir = os.path.join(
         project_root,
@@ -238,10 +259,11 @@ def process_train_split_for_domain(
     )
     os.makedirs(base_out_dir, exist_ok=True)
 
-    facts_out_path = os.path.join(base_out_dir, "train_probes.txt")
-    with open(facts_out_path, "w") as f:
-        f.write(plain_facts_text + "\n")
-    print(f"[{domain}][{split_name}] Wrote plain facts to {facts_out_path}")
+    # for idx, fact in enumerate(facts, start=1):
+    #     fact_path = os.path.join(base_out_dir, f"train_probe_{idx}.txt")
+    #     with open(fact_path, "w") as f:
+    #         f.write(fact + "\n")
+    # print(f"[{domain}][{split_name}] Wrote {len(facts)} plain fact files to {base_out_dir}")
 
     # --- 2) Load paper context ---
     paper_text = load_cleaned_paper(project_root, domain)
@@ -249,37 +271,37 @@ def process_train_split_for_domain(
         print(f"[{domain}][{split_name}] No paper context; skipping explanation generation.")
         return
 
-    # --- 3) Generate explanations in parallel ---
-    print(f"[{domain}][{split_name}] Generating explanations with model '{model}' (max_workers={MAX_WORKERS})...")
-    explanations = generate_explanations_parallel(
-        utils=utils,
-        model=model,
-        paper_text=paper_text,
-        facts=facts,
-        domain=domain,
-        split_name=split_name,
-    )
+    # # --- 3) Generate explanations in parallel ---
+    # print(f"[{domain}][{split_name}] Generating explanations with model '{model}' (max_workers={MAX_WORKERS})...")
+    # explanations = generate_explanations_parallel(
+    #     utils=utils,
+    #     model=model,
+    #     paper_text=paper_text,
+    #     facts=facts,
+    #     domain=domain,
+    #     split_name=split_name,
+    # )
 
-    explanations_text = "\n\n".join(explanations)
+    # explanations_text = "\n\n".join(explanations)
 
-    # --- 4) Write explanations file ---
-    expl_out_dir = os.path.join(
-        project_root,
-        EXPLANATIONS_BASE_DIR,
-        domain,
-        f"{output_subdir_base}_with_explanations",
-    )
-    os.makedirs(expl_out_dir, exist_ok=True)
+    # # --- 4) Write explanations file ---
+    # expl_out_dir = os.path.join(
+    #     project_root,
+    #     EXPLANATIONS_BASE_DIR,
+    #     domain,
+    #     f"{output_subdir_base}_with_explanations",
+    # )
+    # os.makedirs(expl_out_dir, exist_ok=True)
 
-    expl_out_path = os.path.join(expl_out_dir, "train_probes.txt")
-    with open(expl_out_path, "w") as f:
-        f.write(explanations_text + "\n")
+    # expl_out_path = os.path.join(expl_out_dir, "train_probes.txt")
+    # with open(expl_out_path, "w") as f:
+    #     f.write(explanations_text + "\n")
 
-    print(f"[{domain}][{split_name}] Wrote explanations to {expl_out_path}")
+    # print(f"[{domain}][{split_name}] Wrote explanations to {expl_out_path}")
     
 
     # --- 5) Generate explanations in parallel ---
-    print(f"[{domain}][{split_name}] Generating explanations with model '{model}' (max_workers={MAX_WORKERS})...")
+    print(f"[{domain}][{split_name}] Generating textbook explanations with model '{model}' (max_workers={MAX_WORKERS})...")
     explanations = generate_explanations_parallel(
         utils=utils,
         model=model,
@@ -287,25 +309,24 @@ def process_train_split_for_domain(
         facts=facts,
         domain=domain,
         split_name=split_name,
-        contextualized=True
+        textbook_style=True
     )
 
-    explanations_text = "\n\n".join(explanations)
-
-    # --- 6) Write explanations file ---
+    # --- 6) Write explanations files (one file per probe) ---
     expl_out_dir = os.path.join(
         project_root,
         EXPLANATIONS_BASE_DIR,
         domain,
-        f"{output_subdir_base}_with_explanations_longer",
+        f"{output_subdir_base}_with_explanations_textbooks_style",
     )
     os.makedirs(expl_out_dir, exist_ok=True)
 
-    expl_out_path = os.path.join(expl_out_dir, "train_probes.txt")
-    with open(expl_out_path, "w") as f:
-        f.write(explanations_text + "\n")
+    for idx, explanation in enumerate(explanations, start=1):
+        expl_out_path = os.path.join(expl_out_dir, f"train_probe_{idx}.txt")
+        with open(expl_out_path, "w") as f:
+            f.write(explanation + "\n")
 
-    print(f"[{domain}][{split_name}] Wrote explanations to {expl_out_path}")
+    print(f"[{domain}][{split_name}] Wrote {len(explanations)} explanation files to {expl_out_dir}")
 
 # -----------------------------------------------------------
 # MAIN
