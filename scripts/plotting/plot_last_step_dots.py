@@ -231,7 +231,7 @@ def main():
     # Defaults for 7B if not provided
     if args.model_id.lower() == "7b":
         default_para9 = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e500/bs32_lr2e-05_const/overlap_1_4/11_19_20_24"
-        default_source = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e500/bs32_lr2e-05_const/overlap_1_4/11_21_02_45"
+        default_source = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e500/bs32_lr2e-05_const/overlap_1_4/11_22_16_47"
     else:
         default_para9 = None
         default_source = None
@@ -302,22 +302,47 @@ def main():
     x_positions = {label: idx for idx, label in enumerate(para_order, start=1)}
     color_1b = '#1f77b4'   # blue
     color_7b = '#d62728'   # bright red
+    color_13b = '#2ca02c'  # green
+
+    # 13B paraphrasing level paths
+    para_13b_paths = {
+        'Para. 4': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para4/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_22_16_48',
+        'Para. 9': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_13_18',
+        'Para. 19': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para19/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_22_18_39',
+        'Para. 49': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para49/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_22_20_30',
+    }
 
     # Collect data and plot for both models
-    for model_size, color in [('1b', color_1b), ('7b', color_7b)]:
-        k_df, i_df = get_paraphrasing_data(model_size, domains, project_root)
+    for model_size, color in [('1b', color_1b), ('7b', color_7b), ('13b', color_13b)]:
         xs, ys_k, ys_i = [], [], []
-        for label in para_order:
-            val_k = np.nan
-            val_i = np.nan
-            if k_df is not None and not k_df.empty and label in k_df['method'].unique():
-                val_k = get_final_step_value(k_df[k_df['method'] == label])
-            if i_df is not None and not i_df.empty and label in i_df['method'].unique():
-                val_i = get_final_step_value(i_df[i_df['method'] == label])
-            if not np.isnan(val_k) or not np.isnan(val_i):
-                xs.append(x_positions[label])
-                ys_k.append(val_k)
-                ys_i.append(val_i)
+        
+        # For 13B, use direct paths; for 1B and 7B, use get_paraphrasing_data
+        if model_size.lower() == '13b':
+            for label in para_order:
+                path = para_13b_paths.get(label)
+                if path:
+                    resolved = path if os.path.isdir(path) else find_latest_run(path)
+                    if resolved and os.path.isdir(resolved):
+                        df_k, df_i = get_probe_data_for_method(resolved, domains, project_root)
+                        val_k = get_final_step_value(df_k)
+                        val_i = get_final_step_value(df_i)
+                        if not np.isnan(val_k) or not np.isnan(val_i):
+                            xs.append(x_positions[label])
+                            ys_k.append(val_k)
+                            ys_i.append(val_i)
+        else:
+            k_df, i_df = get_paraphrasing_data(model_size, domains, project_root)
+            for label in para_order:
+                val_k = np.nan
+                val_i = np.nan
+                if k_df is not None and not k_df.empty and label in k_df['method'].unique():
+                    val_k = get_final_step_value(k_df[k_df['method'] == label])
+                if i_df is not None and not i_df.empty and label in i_df['method'].unique():
+                    val_i = get_final_step_value(i_df[i_df['method'] == label])
+                if not np.isnan(val_k) or not np.isnan(val_i):
+                    xs.append(x_positions[label])
+                    ys_k.append(val_k)
+                    ys_i.append(val_i)
         # Determine baseline (x=0) for both models
         baseline_k = np.nan
         baseline_i = np.nan
@@ -331,6 +356,14 @@ def main():
                 df_k_base, df_i_base = get_probe_data_for_method(resolved_1b, domains, project_root)
                 baseline_k = get_final_step_value(df_k_base)
                 baseline_i = get_final_step_value(df_i_base)
+        elif model_size.lower() == '13b':
+            baseline_13b_path = para_13b_paths.get('Para. 4')
+            if baseline_13b_path:
+                resolved_13b = baseline_13b_path if os.path.isdir(baseline_13b_path) else find_latest_run(baseline_13b_path)
+                if resolved_13b and os.path.isdir(resolved_13b):
+                    df_k_base, df_i_base = get_probe_data_for_method(resolved_13b, domains, project_root)
+                    baseline_k = get_final_step_value(df_k_base)
+                    baseline_i = get_final_step_value(df_i_base)
 
         # Plot with baseline included to connect lines
         xs_plot = xs.copy()
@@ -357,10 +390,11 @@ def main():
         # Add extra padding at both ends so first/last points aren't on the axes
         ax_rr.set_xlim(-0.5, len(para_order) + 0.5)
 
-    # Legend for rightmost subplot: 7B vs 1B colors + styles
+    # Legend for rightmost subplot: 7B vs 1B vs 13B colors + styles
     legend_rr = [
         Line2D([0], [0], color=color_7b, lw=2, linestyle='-', label='7B'),
         Line2D([0], [0], color=color_1b, lw=2, linestyle='-', label='1B'),
+        Line2D([0], [0], color=color_13b, lw=2, linestyle='-', label='13B'),
         Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Factual'),
         Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Compositional'),
     ]
