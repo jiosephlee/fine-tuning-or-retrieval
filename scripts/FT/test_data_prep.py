@@ -25,20 +25,20 @@ train_cfg = TrainingConfig(
     run_name="test",
     num_train_epochs=10,
     learning_rate=1e-5,
-    per_device_train_batch_size=8,
-    gradient_accumulation_steps=8,  # effective batch size = 64
+    per_device_train_batch_size=16,
+    gradient_accumulation_steps=16,  # effective batch size = 64
     context_length=3072,
 )
 
 # Strategy args - test with blogs + stackexchange
 strategy_args = {
-    "num_paraphrased_texts": 9,
+    "num_paraphrased_texts": 0,
     "override_domains": ["DPO", "GRPO", "BOFT", "OFT", "QLoRA", "1_58"],
     "fill_batches_with_pretraining": True,
     "separate_batches_with_pretraining": 0,
     "pretraining_data_type": "dclm",
     "test_script": False,
-    "with_specific_explanation": ["blogs", "stackexchange", "textbooks"],
+    "with_specific_explanation": None,
     "times_explanations": 1,
     "semi_cleaned": None,
     "use_raw": False,
@@ -52,13 +52,13 @@ strategy_args = {
 
 log.info("Preparing training mix...")
 dataset, updated_cfg = prepare_training_mix(
-    strategy_name="ParaphrasedArxivPaperWithExplanations",
+    strategy_name="PriorKnowledge",
     tokenizer=tokenizer,
     log=log,
     train_cfg=train_cfg,
     chunk_by_section=False,
     overlap_sections=True,
-    overlap_ratio="1_4",
+    overlap_ratio="1_10",
     add_title_prefix=True,
     **strategy_args,
 )
@@ -66,12 +66,12 @@ dataset, updated_cfg = prepare_training_mix(
 log.info(f"Dataset created with {len(dataset)} total chunks")
 
 # Calculate batches
-effective_batch_size = 64
+effective_batch_size = 256
 num_batches = len(dataset) // effective_batch_size
 log.info(f"Total batches: {num_batches}")
 
 # Write output
-output_file = "../../results/tests/data_prep_test_output.txt"
+output_file = "../../reports/data_prep_test_output.txt"
 import os
 os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
