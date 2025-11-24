@@ -16,25 +16,25 @@ conda activate "$HOME/.conda/envs/finetuning"
 num_epochs=100
 num_paraphrased=0
 
-python -s finetuning_knowledge_v8.py \
-    --model_id allenai/OLMo-2-1124-13B \
-    --device_batch_size 32 \
-    --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
-    --effective_batch_size_for_cpt 32 \
-    --fill_batches_with_pretraining \
-    --num_train_epochs $num_epochs \
-    --learning_rate 2e-5 \
-    --num_paraphrased_texts $num_paraphrased \
-    --overlap_sections \
-    --overlap_ratio 1_4 \
-    --attn_implementation sdpa \
-    --gradient_checkpointing \
-    --full_finetuning \
-    --parcc \
+# python -s finetuning_knowledge_v8.py \
+#     --model_id allenai/OLMo-2-1124-13B \
+#     --device_batch_size 32 \
+#     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
+#     --effective_batch_size_for_cpt 32 \
+#     --fill_batches_with_pretraining \
+#     --num_train_epochs $num_epochs \
+#     --learning_rate 2e-5 \
+#     --num_paraphrased_texts $num_paraphrased \
+#     --overlap_sections \
+#     --overlap_ratio 1_4 \
+#     --attn_implementation sdpa \
+#     --gradient_checkpointing \
+#     --full_finetuning \
+#     --parcc \
 
 python -s finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-13B \
-    --device_batch_size 64 \
+    --device_batch_size 32 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --effective_batch_size_for_cpt 128 \
     --fill_batches_with_pretraining \
@@ -50,7 +50,7 @@ python -s finetuning_knowledge_v8.py \
 
 python -s finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-13B \
-    --device_batch_size 64 \
+    --device_batch_size 32 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --effective_batch_size_for_cpt 256 \
     --fill_batches_with_pretraining \
@@ -67,25 +67,25 @@ python -s finetuning_knowledge_v8.py \
 num_epochs=100
 num_paraphrased=9
 
-python -s finetuning_knowledge_v8.py \
-    --model_id allenai/OLMo-2-1124-13B \
-    --device_batch_size 32 \
-    --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
-    --effective_batch_size_for_cpt 32 \
-    --fill_batches_with_pretraining \
-    --num_train_epochs $num_epochs \
-    --learning_rate 2e-5 \
-    --num_paraphrased_texts $num_paraphrased \
-    --overlap_sections \
-    --overlap_ratio 1_4 \
-    --attn_implementation sdpa \
-    --gradient_checkpointing \
-    --full_finetuning \
-    --parcc \
+# python -s finetuning_knowledge_v8.py \
+#     --model_id allenai/OLMo-2-1124-13B \
+#     --device_batch_size 32 \
+#     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
+#     --effective_batch_size_for_cpt 32 \
+#     --fill_batches_with_pretraining \
+#     --num_train_epochs $num_epochs \
+#     --learning_rate 2e-5 \
+#     --num_paraphrased_texts $num_paraphrased \
+#     --overlap_sections \
+#     --overlap_ratio 1_4 \
+#     --attn_implementation sdpa \
+#     --gradient_checkpointing \
+#     --full_finetuning \
+#     --parcc \
 
 python -s finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-13B \
-    --device_batch_size 64 \
+    --device_batch_size 32 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --effective_batch_size_for_cpt 128 \
     --fill_batches_with_pretraining \
@@ -101,7 +101,7 @@ python -s finetuning_knowledge_v8.py \
 
 python -s finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-13B \
-    --device_batch_size 64 \
+    --device_batch_size 32 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --effective_batch_size_for_cpt 256 \
     --fill_batches_with_pretraining \
