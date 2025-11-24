@@ -16,7 +16,7 @@ python -s finetuning_knowledge_v8.py \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --effective_batch_size_for_cpt 96 \
     --fill_batches_with_pretraining \
-    --with_specific_explanation fruit_textbooks_v2 fruit_blogs_v2 fruit_stackexchange_v2 \
+    --with_specific_explanation fruit_textbooks_v3 fruit_blogs_v3 fruit_stackexchange_v3 \
     --double_cycle \
     --explanations_cycle full \
     --granular_explanation_analysis \
