@@ -7,7 +7,7 @@ import collections
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FormatStrFormatter
+import matplotlib.lines as mlines
 
 # ---------------------------------------------------------------------
 # CONFIG
@@ -16,30 +16,44 @@ from matplotlib.ticker import FormatStrFormatter
 DEFAULT_PROJECT_ROOT = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval"
 DOMAINS = ["1_58", "DPO", "GRPO", "BOFT", "OFT", "QLoRA"]
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--baseline", choices=["Source", "Paraphrase"], default="Source", help="Baseline strategy")
+parser.add_argument("--filter", action="store_true", default=True, help="Enable filtering (Target > Baseline)")
+parser.add_argument("--no-filter", action="store_false", dest="filter", help="Disable filtering")
+parser.add_argument("--project_root", default=DEFAULT_PROJECT_ROOT)
+
+# NEW: Axis Scale Arguments
+parser.add_argument("--x_scale", choices=["linear", "log"], default="log", help="Scale for X-axis (linear or symlog base 2)")
+parser.add_argument("--y_scale", choices=["linear", "log"], default="log", help="Scale for Y-axis (linear or symlog base 2)")
+
+args = parser.parse_args()
+
+BASELINE_STRAT = args.baseline
+FILTER_PROBES = args.filter
+X_SCALE_TYPE = args.x_scale
+Y_SCALE_TYPE = args.y_scale
+
+# Plotting Hyperparameters (Used only if scale is 'log')
+PLOT_LOG_BASE = 5     
+PLOT_LINTHRESH = 1.0    
+PLOT_LINSCALE = 0.5
+
+# Define paths
+SOURCE_PATH = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_20_22_51"
+PARA_PATH = "results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_22_05_50"
+
 RUNS_7B = {
-    "Source": (
-        "source_only",
-        "results/FT/full/7b/probes_v9/newline2/source_only/"
-        "fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/"
-        "e100/bs64_lr2e-05/overlap_1_4/11_20_22_51",
-    ),
-    "Paraphrase": (
-        "para9",
-        "results/FT/full/7b/probes_v9/newline2/para9/"
-        "fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/"
-        "e100/bs64_lr2e-05/overlap_1_4/11_20_22_51",
+    "Baseline": (
+        "baseline_run",
+        SOURCE_PATH if BASELINE_STRAT == "Source" else PARA_PATH
     ),
     "Textbook": (
         "para9_expl_textbooks_cyclefull",
-        "results/FT/full/7b/probes_v9/newline2/para9_expl_textbooks_cyclefull/"
-        "fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/"
-        "overlap_1_4/11_21_02_11",
+        "results/FT/full/7b/probes_v9/newline2/para9_expl_textbooks_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_02_11",
     ),
     "Blogs": (
         "blogs_run",
-        "results/FT/full/7b/probes_v9/newline2/para9_expl_stackexchange_cyclefull/"
-        "fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/"
-        "overlap_1_4/11_21_02_11",
+        "results/FT/full/7b/probes_v9/newline2/para9_expl_stackexchange_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_02_11",
     ),
     "StackExchange": (
         "stack_run",
@@ -47,22 +61,50 @@ RUNS_7B = {
         "fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/"
         "overlap_1_4/11_21_02_11",
     ),
+    "Corrupted Textbook": (
+        "corrupted_textbook_run",
+        "results/FT/full/7b/probes_v9/newline2/para9_expl_fruit_textbooks_cyclefull/"
+        "fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/"
+        "overlap_1_4/11_22_03_57",
+    ),
 }
 
 CORPUS_DEFINITIONS = {
     "source":   [("data/arxiv/cleaned", "{domain}.tex")],
     "para":     [("data/arxiv/paraphrased/{domain}", "0.tex")],
+    "Baseline": [("data/arxiv/cleaned", "{domain}.tex")] if BASELINE_STRAT == "Source" else [("data/arxiv/paraphrased/{domain}", "0.tex")],
     "textbook": [("data/arxiv/explanations/{domain}", "textbook.txt")],
     "blogs":    [("data/arxiv/explanations/{domain}", "blogs.txt")],
     "stackexchange": [("data/arxiv/explanations/{domain}", "stackexchange.txt")],
+    "corrupted_textbook": [("data/arxiv/explanations/{domain}/fruit_textbooks_v2", "*.txt")],
 }
 
 METHOD_TO_CORPUS = {
-    "Source": "source",
-    "Paraphrase": "para",
+    "Baseline": "source" if BASELINE_STRAT == "Source" else "para",
     "Textbook": "textbook",
     "Blogs": "blogs",
     "StackExchange": "stackexchange",
+    "Corrupted Textbook": "corrupted_textbook",
+}
+
+# --- COLORS ---
+STRATEGY_COLORS = {
+    "Source": "#1f77b4",       # Blue
+    "Paraphrase": "#ff7f0e",   # Orange
+    "Blogs": "#9467bd",        # Purple
+    "StackExchange": "#bcbd22",# Yellow (Olive-ish)
+    "Textbook": "#2ca02c",     # Green
+    "Corrupted Textbook": "#8c564b", # Brown
+}
+
+# Darker, fully opaque colors for the legend
+STRATEGY_COLORS_LEGEND = {
+    "Source": "#0b3d66",       # Dark Blue
+    "Paraphrase": "#b35900",   # Dark Orange
+    "Blogs": "#5c3d7a",        # Dark Purple
+    "StackExchange": "#7f8016",# Dark Olive
+    "Textbook": "#1a661a",     # Dark Green
+    "Corrupted Textbook": "#5e3a32", # Dark Brown
 }
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), ".")))
@@ -72,37 +114,48 @@ except ImportError:
     set_plot_style = None
 
 # ---------------------------------------------------------------------
-# TOKENISATION
+# TOKENISATION (Unchanged)
 # ---------------------------------------------------------------------
 
 TOKEN_RE = re.compile(r"\b\w+\b", re.UNICODE)
-STOPWORDS = {
-    "the","and","of","to","a","in","for","on","with","is","are","was","were",
-    "that","this","it","as","by","an","at","from","be","has","have"
-}
 
-def tokenize_unigrams(text: str):
-    tokens = TOKEN_RE.findall(str(text).lower())
-    return [t for t in tokens if t not in STOPWORDS]
+def load_stopwords():
+    stopwords = set()
+    try:
+        from spacy.lang.en.stop_words import STOP_WORDS as SPACY_STOP_WORDS
+        stopwords |= {w.lower() for w in SPACY_STOP_WORDS}
+    except ImportError: pass
+    try:
+        from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS as SK_STOP_WORDS
+        stopwords |= {w.lower() for w in SK_STOP_WORDS}
+    except ImportError: pass
+    try:
+        from nltk.corpus import stopwords as nltk_stopwords
+        stopwords |= {w.lower() for w in nltk_stopwords.words("english")}
+    except Exception: pass
 
-def tokenize_bigrams(text: str):
+    common_words_path = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/data/misc/10K_common_words.txt"
+    if os.path.exists(common_words_path):
+        with open(common_words_path, "r", encoding="utf-8") as f:
+            stopwords |= {line.strip().lower() for line in f if line.strip()}
+    
+    print(f"Total unique stopwords: {len(stopwords)}")
+    return stopwords
+
+def tokenize_unigrams(text: str, stopwords: set = None):
+    if stopwords is None: stopwords = set()
     tokens = TOKEN_RE.findall(str(text).lower())
-    tokens = [t for t in tokens if t not in STOPWORDS]
-    if len(tokens) < 2:
-        return []
+    return [t for t in tokens if t not in stopwords]
+
+def tokenize_bigrams(text: str, stopwords: set = None):
+    if stopwords is None: stopwords = set()
+    tokens = TOKEN_RE.findall(str(text).lower())
+    tokens = [t for t in tokens if t not in stopwords]
+    if len(tokens) < 2: return []
     return [f"{t1}_{t2}" for t1, t2 in zip(tokens, tokens[1:])]
 
 def load_probe_data(project_root, domains, tokenize_fn):
-    """
-    Returns:
-      data: {
-        "inference": {(domain, idx): [tokens...]},
-        "knowledge": {(domain, idx): [tokens...]}
-      }
-    """
     data = {"inference": {}, "knowledge": {}}
-
-    # Inference probes
     path_inf = os.path.join(project_root, "data/probes/inference")
     for d in domains:
         p = os.path.join(path_inf, d, "probes_v7.csv")
@@ -112,7 +165,6 @@ def load_probe_data(project_root, domains, tokenize_fn):
                 for idx, row in df.iterrows():
                     data["inference"][(d, idx)] = tokenize_fn(str(row["fact"]))
 
-    # Factual probes
     path_fact = os.path.join(project_root, "data/probes/facts")
     for d in domains:
         p = os.path.join(path_fact, d, "probes_v9.csv")
@@ -123,620 +175,375 @@ def load_probe_data(project_root, domains, tokenize_fn):
                     data["knowledge"][(d, idx)] = tokenize_fn(str(row["fact"]))
     return data
 
-def load_inference_types(project_root, domains):
-    """
-    For inference probes, load inference_type from probes_v7.csv.
-    Keys are (domain, probe_index) where probe_index is taken from the
-    'probe_index' column if present; else we fall back to row index.
-    """
-    types = {}
-    path_inf = os.path.join(project_root, "data/probes/inference")
-    for d in domains:
-        p = os.path.join(path_inf, d, "probes_v7.csv")
-        if os.path.exists(p):
-            df = pd.read_csv(p)
-            # normalise probe_index if present
-            if "probe_index" in df.columns:
-                df["probe_index"] = pd.to_numeric(df["probe_index"], errors="coerce")
-            else:
-                df["probe_index"] = np.arange(len(df), dtype=float)
-
-            if "inference_type" in df.columns:
-                for _, row in df.iterrows():
-                    if pd.isna(row["probe_index"]):
-                        continue
-                    key = (d, int(row["probe_index"]))
-                    types[key] = str(row["inference_type"])
-            else:
-                # Default to "Other" if inference_type missing
-                for _, row in df.iterrows():
-                    if pd.isna(row["probe_index"]):
-                        continue
-                    key = (d, int(row["probe_index"]))
-                    types[key] = "Other"
-    return types
-
 # ---------------------------------------------------------------------
-# SOURCE TF + RARITY + BM25+
+# SCORING (Unchanged)
 # ---------------------------------------------------------------------
 
 def compute_source_tf(project_root, domains, tokenize_fn):
-    """
-    Build term-frequency counters for the Source corpus per domain.
-    Returns: dict[domain] -> Counter(token -> tf_in_source)
-    """
     print("Computing Source term frequencies...")
-    source_tf = {}
+    source_stats = {}
     file_configs = CORPUS_DEFINITIONS["source"]
-
     for domain in domains:
         tokens = []
         for folder_tmpl, file_tmpl in file_configs:
-            fpath = os.path.join(
-                project_root,
-                folder_tmpl.format(domain=domain),
-                file_tmpl.format(domain=domain),
-            )
+            fpath = os.path.join(project_root, folder_tmpl.format(domain=domain), file_tmpl.format(domain=domain))
             if os.path.exists(fpath):
-                with open(fpath, "r") as f:
-                    tokens.extend(tokenize_fn(f.read()))
-        source_tf[domain] = collections.Counter(tokens)
-    return source_tf
+                with open(fpath, "r") as f: tokens.extend(tokenize_fn(f.read()))
+        source_stats[domain] = (collections.Counter(tokens), len(tokens))
+    return source_stats
 
 def rarity_weight(tf_source):
-    """
-    Rarity weight function: w(x) = 5 / (1 + x)
-    where x is the term frequency in the Source corpus.
-    """
     return 5.0 / (1.0 + float(tf_source))
 
-def score_target_corpus_bm25_plus_rarity(
-    project_root,
-    domains,
-    corpus_name,
-    source_tf_map,
-    probe_data,
-    tokenize_fn,
-    k1=10.0,
-    b=0.75,
-    delta=1.0,
-):
-    """
-    Scores probes in a target corpus using BM25+ with Source-rarity weights
-    instead of IDF, with the important tweak that we give *no* credit when
-    tf_target == 0 (i.e. gate delta on presence).
-
-    For each probe (domain, idx):
-        score = sum_t [ w_source(t) * ( (tf_tgt*(k1+1)) /
-                                       (tf_tgt + k1*(1-b + b*|D|/avgdl)) + delta ) ]
-    where:
-        w_source(t) = 5 / (1 + TF_source(t)),
-        and the term contributes only if tf_tgt > 0.
-    """
-    print(f"Scoring {corpus_name.upper()} using Source-rarity-weighted BM25+ (delta={delta})...")
-
-    domain_stats = {}  # domain -> (Counter(tf_target), doc_len)
+def score_target_corpus_bm25_plus_rarity(project_root, domains, corpus_name, source_stats_map, probe_data, tokenize_fn, k1=10.0, b=0.75, delta=1.0):
+    print(f"Scoring {corpus_name.upper()}...")
+    domain_stats = {}
     file_configs = CORPUS_DEFINITIONS.get(corpus_name)
-    if not file_configs:
-        return pd.DataFrame()
+    if not file_configs: return pd.DataFrame()
 
     total_len = 0
     num_docs = 0
-
-    # Build TF and lengths for target corpus
     for domain in domains:
         tokens = []
         for folder_tmpl, file_tmpl in file_configs:
-            fpath = os.path.join(
-                project_root,
-                folder_tmpl.format(domain=domain),
-                file_tmpl.format(domain=domain),
-            )
-            if os.path.exists(fpath):
-                with open(fpath, "r") as f:
-                    tokens.extend(tokenize_fn(f.read()))
+            import glob
+            dir_path = os.path.join(project_root, folder_tmpl.format(domain=domain))
+            if "*" in file_tmpl:
+                for fpath in glob.glob(os.path.join(dir_path, file_tmpl)):
+                    if os.path.exists(fpath):
+                        with open(fpath, "r") as f: tokens.extend(tokenize_fn(f.read()))
+            else:
+                fpath = os.path.join(dir_path, file_tmpl.format(domain=domain))
+                if os.path.exists(fpath):
+                    with open(fpath, "r") as f: tokens.extend(tokenize_fn(f.read()))
         doc_len = len(tokens)
         domain_stats[domain] = (collections.Counter(tokens), doc_len)
         if doc_len > 0:
             total_len += doc_len
             num_docs += 1
-
     avgdl = total_len / num_docs if num_docs > 0 else 1.0
 
-    # Score probes
     records = []
     for (domain, idx), p_tokens in probe_data.items():
         if domain not in domain_stats or not p_tokens:
             score = 0.0
         else:
             tf_target, doc_len = domain_stats[domain]
-            tf_source = source_tf_map.get(domain, collections.Counter())
+            tf_source, _ = source_stats_map.get(domain, (collections.Counter(), 0))
             score = 0.0
-
             for token in p_tokens:
                 tgt_freq = tf_target.get(token, 0)
-                if tgt_freq <= 0:
-                    # No lexical presence -> no contribution at all
-                    continue
-
                 src_freq = tf_source.get(token, 0)
-                denom = tgt_freq + k1 * (1.0 - b + b * (doc_len / avgdl))
-                if denom <= 0:
-                    continue
-
-                bm25_plus_term = (tgt_freq * (k1 + 1.0)) / denom + delta
                 w = rarity_weight(src_freq)
-                term_score = w * bm25_plus_term
-                score += term_score
-
-        records.append({
-            "domain": domain,
-            "probe_index": idx,
-            "bm25_score": score,
-        })
-
+                if tgt_freq > 0:
+                    denom = tgt_freq + k1 * (1.0 - b + b * (doc_len / avgdl))
+                    if denom > 0:
+                        bm25_plus_term = (tgt_freq * (k1 + 1.0)) / denom + delta
+                        score += w * bm25_plus_term
+        records.append({"domain": domain, "probe_index": idx, "bm25_score": score})
     return pd.DataFrame.from_records(records)
 
 # ---------------------------------------------------------------------
-# METRICS & Δ VS SOURCE
+# METRICS HELPERS
 # ---------------------------------------------------------------------
 
 def aggregate_metrics(run_path, probe_type, domains):
-    if not run_path:
-        return pd.DataFrame()
+    if not run_path: return pd.DataFrame()
     dfs = []
     for domain in domains:
-        folder = f"{domain}_{probe_type}_probe"
-        filename = f"{domain}_{probe_type}_probe_metrics.csv"
-        path = os.path.join(run_path, folder, filename)
-        if os.path.exists(path) and os.path.getsize(path) > 0:
+        base_dir = os.path.join(run_path, f"{domain}_{probe_type}_probe")
+        candidates = [f"{domain}_{probe_type}_probe_metrics.csv", f"test_{domain}_{probe_type}_probe_metrics.csv"]
+        path = None
+        if os.path.exists(base_dir):
+            for cand in candidates:
+                p = os.path.join(base_dir, cand)
+                if os.path.exists(p) and os.path.getsize(p) > 0:
+                    path = p
+                    break
+        if path:
             df = pd.read_csv(path)
-            # We care at least about step, log_prob, probe_index, and possibly hit_accuracy_at_100
-            if "probe_index" not in df.columns:
-                continue
-            if "step" in df.columns:
-                df["step"] = pd.to_numeric(df["step"], errors="coerce")
-            if "log_prob" in df.columns:
-                df["log_prob"] = pd.to_numeric(df["log_prob"], errors="coerce")
-            if "hit_accuracy_at_100" in df.columns:
-                df["hit_accuracy_at_100"] = pd.to_numeric(df["hit_accuracy_at_100"], errors="coerce")
+            if "step" in df.columns: df["step"] = pd.to_numeric(df["step"], errors="coerce")
+            if "log_prob" in df.columns: df["log_prob"] = pd.to_numeric(df["log_prob"], errors="coerce")
             df = df.dropna(subset=["step"])
             if not df.empty:
                 df["domain"] = domain
                 dfs.append(df)
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-def final_metric_per_probe(df, metric_col):
-    """
-    Given metrics for a single run (one method), return the final-step metric
-    per (domain, probe_index).
-    """
-    if df.empty or metric_col not in df.columns:
-        return pd.DataFrame(columns=["domain", "probe_index", metric_col])
-    df = df.dropna(subset=[metric_col])
-    if df.empty:
-        return pd.DataFrame(columns=["domain", "probe_index", metric_col])
-    df_sorted = df.sort_values("step")
-    last = df_sorted.groupby(["domain", "probe_index"], as_index=False).tail(1)
-    return last[["domain", "probe_index", metric_col]]
+def get_final_metric(df, metric_col):
+    if df.empty or metric_col not in df.columns: return pd.DataFrame(columns=["domain", "probe_index", "final_metric"])
+    df = df.dropna(subset=[metric_col, "step"])
+    return df.sort_values("step").groupby(["domain", "probe_index"]).tail(1)[["domain", "probe_index", metric_col]].rename(columns={metric_col: "final_metric"})
 
-def plot_scatter(ax, df, title, color, y_label=None, show_ylabel=False):
-    df = df.dropna(subset=["bm25_score", "delta_metric"])
-    ax.axhline(0.0, linestyle="--", color="gray", linewidth=0.8)  # baseline at 0
-    if df.empty:
-        ax.set_title(f"{title}\n(no data)")
-        ax.axis("off")
-        return
-
-    ax.scatter(
-        df["bm25_score"],
-        df["delta_metric"],
-        alpha=0.15,
-        s=10,
-        color=color,
-        edgecolors="none",
-    )
-
-    if len(df) > 1:
-        x = df["bm25_score"].values
-        y = df["delta_metric"].values
-        a, b = np.polyfit(x, y, 1)
-        x_line = np.linspace(x.min(), x.max(), 100)
-        y_line = a * x_line + b
-        ax.plot(x_line, y_line, linewidth=1.5, color="red", zorder=10)
-
-        x_txt = x.min() + (x.max() - x.min()) * 0.05
-        y_txt = y.min() + (y.max() - y.min()) * 0.90
-        ax.text(
-            x_txt,
-            y_txt,
-            f"m={a:.3f}",
-            color="red",
-            fontsize=10,
-            fontweight="bold",
-        )
-
-    ax.set_title(title)
-    if show_ylabel and y_label is not None:
-        ax.set_ylabel(y_label)
-    ax.set_xlabel("Source-rarity-weighted BM25+ score")
-    ax.grid(True, alpha=0.2)
+def internal_delta_per_probe(df, metric_col):
+    if df.empty or metric_col not in df.columns: return pd.DataFrame(columns=["domain", "probe_index", "delta_metric"])
+    df = df.dropna(subset=[metric_col, "step"]).sort_values("step")
+    grouped = df.groupby(["domain", "probe_index"])
+    delta = grouped.tail(1).set_index(["domain", "probe_index"])[metric_col] - grouped.head(1).set_index(["domain", "probe_index"])[metric_col]
+    return delta.reset_index().rename(columns={metric_col: "delta_metric"})
 
 # ---------------------------------------------------------------------
-# MAIN FIGURE BUILDING
+# PLOTTING FUNCTIONS
+# ---------------------------------------------------------------------
+
+def plot_scatter_overlay(ax, dfs_with_color, baseline_name, show_ylabel=False, x_scale="log", y_scale="log"):
+    # Apply Y-Axis Scale
+    if y_scale == "log":
+        ax.set_yscale('symlog', base=PLOT_LOG_BASE, linthresh=PLOT_LINTHRESH, linscale=PLOT_LINSCALE, subs=[1.0])
+    else:
+        ax.set_yscale('linear')
+    
+    # Apply X-Axis Scale
+    if x_scale == "log":
+        ax.set_xscale('symlog', base=PLOT_LOG_BASE, linthresh=PLOT_LINTHRESH, linscale=PLOT_LINSCALE, subs=[1.0])
+    else:
+        ax.set_xscale('linear')
+    
+    ax.axhline(0.0, linestyle="--", color="gray", linewidth=0.8)
+    
+    legend_handles = []
+    
+    for df, color, label, alpha in dfs_with_color:
+        df = df.dropna(subset=["bm25_score", "delta_metric"])
+        if df.empty: continue
+        
+        display_label = baseline_name if label == "Baseline" else label
+        
+        # Determine Legend Color (Darker)
+        strat_key = BASELINE_STRAT if label == "Baseline" else label
+        legend_color = STRATEGY_COLORS_LEGEND.get(strat_key, color)
+
+        # Plot Scatter
+        ax.scatter(df["bm25_score"], df["delta_metric"], alpha=alpha, s=10, color=color, edgecolors="none")
+        
+        mean_overlap = df["bm25_score"].mean()
+        ax.axvline(mean_overlap, linestyle="--", color=color, linewidth=1.5, alpha=0.7)
+        mean_delta = df["delta_metric"].mean()
+        ax.axhline(mean_delta, linestyle=":", color=color, linewidth=1.5, alpha=0.7)
+
+        # Legend Handle with Darker Color
+        handle = mlines.Line2D([], [], color=legend_color, marker='o', linestyle='None', label=display_label)
+        legend_handles.append(handle)
+
+    if show_ylabel:
+        ax.set_ylabel(r"$\Delta$ LogProb" + "\n(Final Step - Initial Step)")
+        
+    ax.set_xlabel("Overlap Score of Corpus")
+    ax.grid(True, alpha=0.2)
+    
+    if legend_handles:
+        ax.legend(handles=legend_handles, fontsize='medium', loc='lower right')
+
+def plot_delta_vs_delta(ax, df, color, label, baseline_name, show_ylabel=False, x_scale="log", y_scale="log"):
+    # Apply Y-Axis Scale
+    if y_scale == "log":
+        ax.set_yscale('symlog', base=PLOT_LOG_BASE, linthresh=PLOT_LINTHRESH, linscale=PLOT_LINSCALE, subs=[1.0])
+    else:
+        ax.set_yscale('linear')
+
+    # Apply X-Axis Scale
+    if x_scale == "log":
+        ax.set_xscale('symlog', base=PLOT_LOG_BASE, linthresh=PLOT_LINTHRESH, linscale=PLOT_LINSCALE, subs=[1.0])
+    else:
+        ax.set_xscale('linear')
+
+    ax.axhline(0.0, linestyle="--", color="gray", linewidth=0.8)
+    ax.axvline(0.0, linestyle="--", color="gray", linewidth=0.8)
+    
+    df = df.dropna(subset=["delta_overlap", "delta_perf"])
+    if not df.empty:
+        ax.scatter(df["delta_overlap"], df["delta_perf"], alpha=0.4, s=10, color=color, edgecolors="none")
+        
+        # Trend line
+        if len(df) > 1:
+            x = df["delta_overlap"].values
+            y = df["delta_perf"].values
+            try:
+                a, b = np.polyfit(x, y, 1)
+                x_line = np.linspace(x.min(), x.max(), 100)
+                y_line = a * x_line + b
+                ax.plot(x_line, y_line, linewidth=1.0, linestyle=":", color="red", zorder=10)
+            except: pass
+
+    if show_ylabel:
+        ax.set_ylabel(rf"$\Delta$ LogProb" + f"\n(Target Final Step - {baseline_name} Final Step)")
+        
+    ax.set_xlabel(rf"$\Delta$ Overlap Score (Target - {baseline_name})")
+    ax.grid(True, alpha=0.2)
+    
+    # Custom Legend Logic
+    strat_key = label
+    legend_color = STRATEGY_COLORS_LEGEND.get(strat_key, color)
+    handle = mlines.Line2D([], [], color=legend_color, marker='o', linestyle='None', label=label)
+    
+    ax.legend(handles=[handle], fontsize='medium', loc='lower right')
+
+# ---------------------------------------------------------------------
+# MAIN
 # ---------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--project_root", type=str, default=DEFAULT_PROJECT_ROOT)
-    args = parser.parse_args()
     root = os.path.abspath(args.project_root)
+    if set_plot_style: set_plot_style()
+    
+    print("Loading stopwords and tokens...")
+    STOPWORDS = load_stopwords()
+    def tokenize_uni(text): return tokenize_unigrams(text, STOPWORDS)
+    def tokenize_bi(text): return tokenize_bigrams(text, STOPWORDS)
 
-    if set_plot_style:
-        set_plot_style()
+    probe_tokens_uni = load_probe_data(root, DOMAINS, tokenize_uni)
+    probe_tokens_bi = load_probe_data(root, DOMAINS, tokenize_bi)
 
-    print("Loading probe tokens (unigrams & bigrams)...")
-    probe_tokens_uni = load_probe_data(root, DOMAINS, tokenize_unigrams)
-    probe_tokens_bi = load_probe_data(root, DOMAINS, tokenize_bigrams)
+    ngram_configs = [("unigram", tokenize_uni, probe_tokens_uni), ("bigram", tokenize_bi, probe_tokens_bi)]
+    target_domains = ["Blogs", "StackExchange", "Textbook", "Corrupted Textbook"]
+    
+    # Pre-calc metrics
+    strategy_data = {}
+    strategies_needed = ["Baseline"] + target_domains
+    print("Pre-calculating metrics...")
+    for strat in strategies_needed:
+        if strat in RUNS_7B:
+            _, rel_path = RUNS_7B[strat]
+            full_path = os.path.join(root, rel_path)
+            metrics_fact = aggregate_metrics(full_path, "knowledge", DOMAINS)
+            metrics_inf = aggregate_metrics(full_path, "inference", DOMAINS)
+            strategy_data[strat] = (
+                internal_delta_per_probe(metrics_fact, "log_prob"),
+                internal_delta_per_probe(metrics_inf, "log_prob"),
+                get_final_metric(metrics_fact, "log_prob"),
+                get_final_metric(metrics_inf, "log_prob")
+            )
 
-    print("Loading inference types...")
-    inference_types = load_inference_types(root, DOMAINS)
+    # UPDATED: Use sharey=False to control axes independently manually later
+    fig1, axes1 = plt.subplots(4, len(target_domains), figsize=(4 * len(target_domains), 5 * 4), sharey=False, sharex=True)
+    fig2, axes2 = plt.subplots(4, len(target_domains), figsize=(4 * len(target_domains), 5 * 4), sharey=False, sharex=True)
 
-    # Methods to display (drop Source column, but keep Source for baseline)
-    display_order = ["Paraphrase", "Textbook", "Blogs", "StackExchange"]
-    methods = [m for m in display_order if m in RUNS_7B]
-
-    # Source run path (baseline)
-    if "Source" not in RUNS_7B:
-        raise ValueError("Source run must be present in RUNS_7B for Δ vs Source.")
-    _, src_rel_path = RUNS_7B["Source"]
-    src_full_path = os.path.join(root, src_rel_path)
-
-    # Convenience for ngram configs
-    ngram_configs = [
-        ("unigram", tokenize_unigrams, probe_tokens_uni),
-        ("bigram", tokenize_bigrams, probe_tokens_bi),
-    ]
-
-    # ==============================================================
-    # FIGURE 1: Δ FINAL LOG-PROB VS SOURCE (4x4, fact/inf × uni/bi)
-    # ==============================================================
-
-    print("\n=== Figure 1: Δ final log-prob vs Source ===")
-    fig1, axes1 = plt.subplots(
-        4, len(methods), figsize=(4 * len(methods), 5 * 4), sharey=True
-    )
-
-    # Source baseline metrics for log_prob
-    source_metrics_fact = aggregate_metrics(src_full_path, "knowledge", DOMAINS)
-    source_metrics_inf = aggregate_metrics(src_full_path, "inference", DOMAINS)
-    source_final_fact_log = final_metric_per_probe(source_metrics_fact, "log_prob") \
-        .rename(columns={"log_prob": "metric_source"})
-    source_final_inf_log = final_metric_per_probe(source_metrics_inf, "log_prob") \
-        .rename(columns={"log_prob": "metric_source"})
+    row_labels = {} 
 
     for nrow_block, (ngram_name, tokenize_fn, probe_tokens) in enumerate(ngram_configs):
-        print(f"\n[log_prob] N-gram: {ngram_name}")
-        source_tf_map = compute_source_tf(root, DOMAINS, tokenize_fn)
+        print(f"\n[N-gram: {ngram_name}]")
+        source_stats_map = compute_source_tf(root, DOMAINS, tokenize_fn)
+        
+        # Baseline Scores
+        scores_source_fact = score_target_corpus_bm25_plus_rarity(root, DOMAINS, "Baseline", source_stats_map, probe_tokens["knowledge"], tokenize_fn)
+        scores_source_inf = score_target_corpus_bm25_plus_rarity(root, DOMAINS, "Baseline", source_stats_map, probe_tokens["inference"], tokenize_fn)
+        
+        row_fact = 0 if nrow_block == 0 else 1
+        row_inf = 2 if nrow_block == 0 else 3
+        
+        row_labels[row_fact] = f"Factual Probes ({ngram_name})"
+        # UPDATED: Rename Inference to Compositional
+        row_labels[row_inf] = f"Compositional Probes ({ngram_name})"
 
-        for col_idx, method in enumerate(methods):
-            print(f"  Method: {method}")
-            target_corpus = METHOD_TO_CORPUS.get(method)
-            run_key, rel_path = RUNS_7B[method]
-            full_path = os.path.join(root, rel_path)
+        for col_idx, target_domain in enumerate(target_domains):
+            tgt_corpus = METHOD_TO_CORPUS.get(target_domain)
+            scores_target_fact = score_target_corpus_bm25_plus_rarity(root, DOMAINS, tgt_corpus, source_stats_map, probe_tokens["knowledge"], tokenize_fn)
+            scores_target_inf = score_target_corpus_bm25_plus_rarity(root, DOMAINS, tgt_corpus, source_stats_map, probe_tokens["inference"], tokenize_fn)
 
-            # Lexical scores
-            scores_fact = score_target_corpus_bm25_plus_rarity(
-                root, DOMAINS, target_corpus, source_tf_map,
-                probe_tokens["knowledge"], tokenize_fn,
-                k1=10.0, b=0.75, delta=1.0,
-            )
-            scores_inf = score_target_corpus_bm25_plus_rarity(
-                root, DOMAINS, target_corpus, source_tf_map,
-                probe_tokens["inference"], tokenize_fn,
-                k1=10.0, b=0.75, delta=1.0,
-            )
+            # --- Process FACTUAL ---
+            if "Baseline" in strategy_data and target_domain in strategy_data:
+                s_fin, t_fin = strategy_data["Baseline"][2], strategy_data[target_domain][2]
+                merged = s_fin.merge(t_fin, on=["domain", "probe_index"], suffixes=("_src", "_tgt"))
+                valid = merged[merged["final_metric_tgt"] > merged["final_metric_src"]] if FILTER_PROBES else merged
+                
+                m_score = scores_target_fact.merge(scores_source_fact, on=["domain", "probe_index"], suffixes=("_tgt", "_src"))
+                m_score["delta_overlap"] = m_score["bm25_score_tgt"] - m_score["bm25_score_src"]
+                
+                m_perf = merged.copy()
+                m_perf["delta_perf"] = m_perf["final_metric_tgt"] - m_perf["final_metric_src"]
+                
+                fig2_data = m_perf.merge(m_score, on=["domain", "probe_index"], how="inner")
+                if FILTER_PROBES: fig2_data = fig2_data[fig2_data["final_metric_tgt"] > fig2_data["final_metric_src"]]
+                
+                plot_delta_vs_delta(axes2[row_fact, col_idx], fig2_data, STRATEGY_COLORS[target_domain], target_domain, BASELINE_STRAT, show_ylabel=(col_idx==0), x_scale=X_SCALE_TYPE, y_scale=Y_SCALE_TYPE)
 
-            # Target metrics
-            metrics_fact_tgt = aggregate_metrics(full_path, "knowledge", DOMAINS)
-            metrics_inf_tgt = aggregate_metrics(full_path, "inference", DOMAINS)
+            dfs_fact = []
+            valid_keys = valid[["domain", "probe_index"]] if 'valid' in locals() else pd.DataFrame()
+            for strat in ["Baseline", target_domain]:
+                if strat in strategy_data and not strategy_data[strat][0].empty:
+                    d_df = strategy_data[strat][0].merge(valid_keys, on=["domain", "probe_index"], how="inner")
+                    scores = scores_source_fact if strat == "Baseline" else scores_target_fact
+                    merged = d_df.merge(scores, on=["domain", "probe_index"], how="inner")
+                    col = STRATEGY_COLORS[BASELINE_STRAT] if strat == "Baseline" else STRATEGY_COLORS[strat]
+                    dfs_fact.append((merged, col, strat, 0.4 if strat == target_domain else 0.175))
+            
+            plot_scatter_overlay(axes1[row_fact, col_idx], dfs_fact, BASELINE_STRAT, show_ylabel=(col_idx==0), x_scale=X_SCALE_TYPE, y_scale=Y_SCALE_TYPE)
 
-            target_final_fact = final_metric_per_probe(metrics_fact_tgt, "log_prob") \
-                .rename(columns={"log_prob": "metric_target"})
-            target_final_inf = final_metric_per_probe(metrics_inf_tgt, "log_prob") \
-                .rename(columns={"log_prob": "metric_target"})
+            # --- Process INFERENCE ---
+            if "Baseline" in strategy_data and target_domain in strategy_data:
+                s_fin, t_fin = strategy_data["Baseline"][3], strategy_data[target_domain][3]
+                merged = s_fin.merge(t_fin, on=["domain", "probe_index"], suffixes=("_src", "_tgt"))
+                valid_inf = merged[merged["final_metric_tgt"] > merged["final_metric_src"]] if FILTER_PROBES else merged
+                
+                m_score = scores_target_inf.merge(scores_source_inf, on=["domain", "probe_index"], suffixes=("_tgt", "_src"))
+                m_score["delta_overlap"] = m_score["bm25_score_tgt"] - m_score["bm25_score_src"]
+                
+                m_perf = merged.copy()
+                m_perf["delta_perf"] = m_perf["final_metric_tgt"] - m_perf["final_metric_src"]
+                
+                fig2_data = m_perf.merge(m_score, on=["domain", "probe_index"], how="inner")
+                if FILTER_PROBES: fig2_data = fig2_data[fig2_data["final_metric_tgt"] > fig2_data["final_metric_src"]]
+                
+                plot_delta_vs_delta(axes2[row_inf, col_idx], fig2_data, STRATEGY_COLORS[target_domain], target_domain, BASELINE_STRAT, show_ylabel=(col_idx==0), x_scale=X_SCALE_TYPE, y_scale=Y_SCALE_TYPE)
 
-            # Merge with Source baseline and lexical scores
-            # --- Factual row ---
-            if not target_final_fact.empty and not source_final_fact_log.empty:
-                merged_log = target_final_fact.merge(
-                    source_final_fact_log,
-                    on=["domain", "probe_index"],
-                    how="inner",
-                )
-                merged_log["delta_metric"] = (
-                    merged_log["metric_target"] - merged_log["metric_source"]
-                )
-                merged_fact = merged_log.merge(
-                    scores_fact,
-                    on=["domain", "probe_index"],
-                    how="left",
-                )
+            dfs_inf = []
+            valid_keys_inf = valid_inf[["domain", "probe_index"]] if 'valid_inf' in locals() else pd.DataFrame()
+            for strat in ["Baseline", target_domain]:
+                if strat in strategy_data and not strategy_data[strat][1].empty:
+                    d_df = strategy_data[strat][1].merge(valid_keys_inf, on=["domain", "probe_index"], how="inner")
+                    scores = scores_source_inf if strat == "Baseline" else scores_target_inf
+                    merged = d_df.merge(scores, on=["domain", "probe_index"], how="inner")
+                    col = STRATEGY_COLORS[BASELINE_STRAT] if strat == "Baseline" else STRATEGY_COLORS[strat]
+                    dfs_inf.append((merged, col, strat, 0.4 if strat == target_domain else 0.15))
 
-                row_fact = 0 + 2 * nrow_block  # 0 for unigram, 2 for bigram? no: 0/1 for fact, 2/3 for inf
-                # For our 4 rows: 0=fact-uni, 1=fact-bi, 2=inf-uni, 3=inf-bi
-                row_fact = 0 if nrow_block == 0 else 1
+            plot_scatter_overlay(axes1[row_inf, col_idx], dfs_inf, BASELINE_STRAT, show_ylabel=(col_idx==0), x_scale=X_SCALE_TYPE, y_scale=Y_SCALE_TYPE)
 
-                ax = axes1[row_fact, col_idx]
-                plot_scatter(
-                    ax,
-                    merged_fact,
-                    f"{method}\nFactual ({ngram_name})",
-                    "#1f77b4",
-                    y_label=r"$\Delta$ final log-prob (target − Source)",
-                    show_ylabel=(col_idx == 0 and row_fact == 0),
-                )
-            else:
-                row_fact = 0 if nrow_block == 0 else 1
-                axes1[row_fact, col_idx].axis("off")
+    for r in range(4):
+        title = row_labels.get(r, "")
+        axes1[r, 0].text(-0.35, 0.5, title, transform=axes1[r, 0].transAxes, va='center', ha='right', rotation=90, fontsize=12, fontweight='bold')
+        axes2[r, 0].text(-0.35, 0.5, title, transform=axes2[r, 0].transAxes, va='center', ha='right', rotation=90, fontsize=12, fontweight='bold')
 
-            # --- Inference row ---
-            if not target_final_inf.empty and not source_final_inf_log.empty:
-                merged_log = target_final_inf.merge(
-                    source_final_inf_log,
-                    on=["domain", "probe_index"],
-                    how="inner",
-                )
-                merged_log["delta_metric"] = (
-                    merged_log["metric_target"] - merged_log["metric_source"]
-                )
-                merged_inf = merged_log.merge(
-                    scores_inf,
-                    on=["domain", "probe_index"],
-                    how="left",
-                )
+    # UPDATED: Post-processing to standardize Y-axis per group (Factual vs Compositional)
+    for fig_obj, ax_arr in [(fig1, axes1), (fig2, axes2)]:
+        # Group 1: Factual (Rows 0, 1)
+        y_min_fact, y_max_fact = float('inf'), float('-inf')
+        # Scan for limits
+        for r in [0, 1]:
+            for ax in ax_arr[r]:
+                ymin, ymax = ax.get_ylim()
+                if ymin < y_min_fact: y_min_fact = ymin
+                if ymax > y_max_fact: y_max_fact = ymax
+        # Apply limits
+        for r in [0, 1]:
+            for ax in ax_arr[r]:
+                ax.set_ylim(y_min_fact, y_max_fact)
+        
+        # Group 2: Compositional (Rows 2, 3)
+        y_min_comp, y_max_comp = float('inf'), float('-inf')
+        # Scan for limits
+        for r in [2, 3]:
+            for ax in ax_arr[r]:
+                ymin, ymax = ax.get_ylim()
+                if ymin < y_min_comp: y_min_comp = ymin
+                if ymax > y_max_comp: y_max_comp = ymax
+        # Apply limits
+        for r in [2, 3]:
+            for ax in ax_arr[r]:
+                ax.set_ylim(y_min_comp, y_max_comp)
 
-                row_inf = 2 if nrow_block == 0 else 3
-                ax = axes1[row_inf, col_idx]
-                plot_scatter(
-                    ax,
-                    merged_inf,
-                    f"{method}\nInference ({ngram_name})",
-                    "#ff7f0e",
-                    y_label=r"$\Delta$ final log-prob (target − Source)",
-                    show_ylabel=(col_idx == 0 and row_inf == 2),
-                )
-            else:
-                row_inf = 2 if nrow_block == 0 else 3
-                axes1[row_inf, col_idx].axis("off")
-
-    plt.tight_layout()
-    out1 = os.path.join(root, "plots", "delta_logprob_vs_source_rarity_bm25_plus_uni_bigram.pdf")
+    fig1.tight_layout()
+    fig1.subplots_adjust(left=0.1) 
+    out1 = os.path.join(root, "plots", "internal_delta_logprob_vs_target_overlap_filtered_4cols.pdf")
     os.makedirs(os.path.dirname(out1), exist_ok=True)
-    plt.savefig(out1, bbox_inches="tight")
-    print(f"\nSaved Figure 1 to {out1}")
-
-    # ==============================================================
-    # FIGURE 2: Δ HIT@100 VS SOURCE (same 4x4 structure)
-    # ==============================================================
-
-    print("\n=== Figure 2: Δ hit@100 vs Source ===")
-    fig2, axes2 = plt.subplots(
-        4, len(methods), figsize=(4 * len(methods), 5 * 4), sharey=True
-    )
-
-    # Source baseline metrics for hit@100
-    source_metrics_fact = aggregate_metrics(src_full_path, "knowledge", DOMAINS)
-    source_metrics_inf = aggregate_metrics(src_full_path, "inference", DOMAINS)
-    source_final_fact_hit = final_metric_per_probe(source_metrics_fact, "hit_accuracy_at_100") \
-        .rename(columns={"hit_accuracy_at_100": "metric_source"})
-    source_final_inf_hit = final_metric_per_probe(source_metrics_inf, "hit_accuracy_at_100") \
-        .rename(columns={"hit_accuracy_at_100": "metric_source"})
-
-    for nrow_block, (ngram_name, tokenize_fn, probe_tokens) in enumerate(ngram_configs):
-        print(f"\n[hit@100] N-gram: {ngram_name}")
-        source_tf_map = compute_source_tf(root, DOMAINS, tokenize_fn)
-
-        for col_idx, method in enumerate(methods):
-            print(f"  Method: {method}")
-            target_corpus = METHOD_TO_CORPUS.get(method)
-            _, rel_path = RUNS_7B[method]
-            full_path = os.path.join(root, rel_path)
-
-            # Lexical scores
-            scores_fact = score_target_corpus_bm25_plus_rarity(
-                root, DOMAINS, target_corpus, source_tf_map,
-                probe_tokens["knowledge"], tokenize_fn,
-                k1=10.0, b=0.75, delta=1.0,
-            )
-            scores_inf = score_target_corpus_bm25_plus_rarity(
-                root, DOMAINS, target_corpus, source_tf_map,
-                probe_tokens["inference"], tokenize_fn,
-                k1=10.0, b=0.75, delta=1.0,
-            )
-
-            # Target metrics
-            metrics_fact_tgt = aggregate_metrics(full_path, "knowledge", DOMAINS)
-            metrics_inf_tgt = aggregate_metrics(full_path, "inference", DOMAINS)
-
-            target_final_fact = final_metric_per_probe(metrics_fact_tgt, "hit_accuracy_at_100") \
-                .rename(columns={"hit_accuracy_at_100": "metric_target"})
-            target_final_inf = final_metric_per_probe(metrics_inf_tgt, "hit_accuracy_at_100") \
-                .rename(columns={"hit_accuracy_at_100": "metric_target"})
-
-            # --- Factual row ---
-            if not target_final_fact.empty and not source_final_fact_hit.empty:
-                merged_log = target_final_fact.merge(
-                    source_final_fact_hit,
-                    on=["domain", "probe_index"],
-                    how="inner",
-                )
-                merged_log["delta_metric"] = (
-                    merged_log["metric_target"] - merged_log["metric_source"]
-                )
-                merged_fact = merged_log.merge(
-                    scores_fact,
-                    on=["domain", "probe_index"],
-                    how="left",
-                )
-
-                row_fact = 0 if nrow_block == 0 else 1
-                ax = axes2[row_fact, col_idx]
-                plot_scatter(
-                    ax,
-                    merged_fact,
-                    f"{method}\nFactual ({ngram_name})",
-                    "#1f77b4",
-                    y_label=r"$\Delta$ hit@100 (target − Source)",
-                    show_ylabel=(col_idx == 0 and row_fact == 0),
-                )
-            else:
-                row_fact = 0 if nrow_block == 0 else 1
-                axes2[row_fact, col_idx].axis("off")
-
-            # --- Inference row ---
-            if not target_final_inf.empty and not source_final_inf_hit.empty:
-                merged_log = target_final_inf.merge(
-                    source_final_inf_hit,
-                    on=["domain", "probe_index"],
-                    how="inner",
-                )
-                merged_log["delta_metric"] = (
-                    merged_log["metric_target"] - merged_log["metric_source"]
-                )
-                merged_inf = merged_log.merge(
-                    scores_inf,
-                    on=["domain", "probe_index"],
-                    how="left",
-                )
-
-                row_inf = 2 if nrow_block == 0 else 3
-                ax = axes2[row_inf, col_idx]
-                plot_scatter(
-                    ax,
-                    merged_inf,
-                    f"{method}\nInference ({ngram_name})",
-                    "#ff7f0e",
-                    y_label=r"$\Delta$ hit@100 (target − Source)",
-                    show_ylabel=(col_idx == 0 and row_inf == 2),
-                )
-            else:
-                row_inf = 2 if nrow_block == 0 else 3
-                axes2[row_inf, col_idx].axis("off")
-
-    plt.tight_layout()
-    out2 = os.path.join(root, "plots", "delta_hit10_vs_source_rarity_bm25_plus_uni_bigram.pdf")
+    fig1.savefig(out1, bbox_inches="tight")
+    print(f"Saved Figure 1 to {out1}")
+    
+    fig2.tight_layout()
+    fig2.subplots_adjust(left=0.1)
+    out2 = os.path.join(root, "plots", "delta_logprob_vs_delta_overlap_4cols.pdf")
     os.makedirs(os.path.dirname(out2), exist_ok=True)
-    plt.savefig(out2, bbox_inches="tight")
-    print(f"\nSaved Figure 2 to {out2}")
-
-    # ==============================================================
-    # FIGURE 3: INFERENCE-ONLY, SPLIT BY INFERENCE TYPE
-    # Rows: Conceptual/uni, Conceptual/bi, Other/uni, Other/bi
-    # Metric: Δ final log-prob vs Source
-    # ==============================================================
-
-    print("\n=== Figure 3: Inference-only, Conceptual vs Other (log-prob) ===")
-    fig3, axes3 = plt.subplots(
-        4, len(methods), figsize=(4 * len(methods), 5 * 4), sharey=True
-    )
-
-    # Source baseline (inference, log_prob)
-    source_metrics_inf = aggregate_metrics(src_full_path, "inference", DOMAINS)
-    source_final_inf_log = final_metric_per_probe(source_metrics_inf, "log_prob") \
-        .rename(columns={"log_prob": "metric_source"})
-
-    for nrow_block, (ngram_name, tokenize_fn, probe_tokens) in enumerate(ngram_configs):
-        print(f"\n[Inference only] N-gram: {ngram_name}")
-        source_tf_map = compute_source_tf(root, DOMAINS, tokenize_fn)
-
-        for col_idx, method in enumerate(methods):
-            print(f"  Method: {method}")
-            target_corpus = METHOD_TO_CORPUS.get(method)
-            _, rel_path = RUNS_7B[method]
-            full_path = os.path.join(root, rel_path)
-
-            # Lexical scores (inference only)
-            scores_inf = score_target_corpus_bm25_plus_rarity(
-                root, DOMAINS, target_corpus, source_tf_map,
-                probe_tokens["inference"], tokenize_fn,
-                k1=10.0, b=0.75, delta=1.0,
-            )
-
-            metrics_inf_tgt = aggregate_metrics(full_path, "inference", DOMAINS)
-            target_final_inf = final_metric_per_probe(metrics_inf_tgt, "log_prob") \
-                .rename(columns={"log_prob": "metric_target"})
-
-            if target_final_inf.empty or source_final_inf_log.empty:
-                # Turn off both conceptual & other rows for this method/ngram
-                row_concept = 0 if nrow_block == 0 else 1
-                row_other = 2 if nrow_block == 0 else 3
-                axes3[row_concept, col_idx].axis("off")
-                axes3[row_other, col_idx].axis("off")
-                continue
-
-            merged_log = target_final_inf.merge(
-                source_final_inf_log,
-                on=["domain", "probe_index"],
-                how="inner",
-            )
-            merged_log["delta_metric"] = (
-                merged_log["metric_target"] - merged_log["metric_source"]
-            )
-
-            merged = merged_log.merge(
-                scores_inf,
-                on=["domain", "probe_index"],
-                how="left",
-            )
-
-            # Attach inference_type
-            def _infer_type(row):
-                return inference_types.get(
-                    (row["domain"], row["probe_index"]),
-                    "Other",
-                )
-
-            merged["inference_type"] = merged.apply(_infer_type, axis=1)
-
-            conceptual = merged[merged["inference_type"] == "Conceptual Synthesis"]
-            other = merged[merged["inference_type"] != "Conceptual Synthesis"]
-
-            # Row indices:
-            #  0: Conceptual/unigram
-            #  1: Conceptual/bigram
-            #  2: Other/unigram
-            #  3: Other/bigram
-            row_concept = 0 if nrow_block == 0 else 1
-            row_other = 2 if nrow_block == 0 else 3
-
-            # Conceptual row
-            ax_c = axes3[row_concept, col_idx]
-            plot_scatter(
-                ax_c,
-                conceptual,
-                f"{method}\nConceptual ({ngram_name})",
-                "#2ca02c",
-                y_label=r"$\Delta$ final log-prob (target − Source)",
-                show_ylabel=(col_idx == 0 and row_concept == 0),
-            )
-
-            # Other row
-            ax_o = axes3[row_other, col_idx]
-            plot_scatter(
-                ax_o,
-                other,
-                f"{method}\nOther inf. ({ngram_name})",
-                "#d62728",
-                y_label=r"$\Delta$ final log-prob (target − Source)",
-                show_ylabel=(col_idx == 0 and row_other == 2),
-            )
-
-    plt.tight_layout()
-    out3 = os.path.join(root, "plots", "delta_logprob_inference_concept_vs_other_rarity_bm25_plus_uni_bigram.pdf")
-    os.makedirs(os.path.dirname(out3), exist_ok=True)
-    plt.savefig(out3, bbox_inches="tight")
-    print(f"\nSaved Figure 3 to {out3}")
+    fig2.savefig(out2, bbox_inches="tight")
+    print(f"Saved Figure 2 to {out2}")
 
 if __name__ == "__main__":
     main()

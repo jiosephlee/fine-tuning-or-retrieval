@@ -138,50 +138,50 @@ def load_stopwords() -> Set[str]:
         print(f"Common words file not found at: {COMMON_WORDS_PATH}")
 
     # Extra curated stopwords / “do not corrupt” words
-    stopwords |= {
-        "a", "an", "the", "in", "on", "at", "by", "for", "from", "to", "of", "with",
-        "and", "or", "but", "if", "then", "so", "because", "as", "that", "this",
-        "these", "those", "it", "its", "he", "she", "they", "them", "their",
-        "we", "you", "i", "is", "are", "was", "were", "be", "been", "being",
-        "assigns", "avoids", "equals", "prevents", "relies", "removes", "replaces",
-        "selects", "underlies", "extracts",
-        "abandoning", "ablated", "ablation", "acheives", "adapts", "aggregates",
-        "aiming", "akin", "aggressively", "approximated", "argues", "captures",
-        "bounds", "causally", "caveats",
-        "accelerator", "achieves", "activations",
-        "additive", "agnostic", "aided",
-        "algebraic", "algorithmic", "aligns", "alphabet",
-        "alternating", "amplitude", "analogous", "analogy", "angles",
-        "balances", "behaves", "concentrated", "concise",
-        "costly", "deliberately", "demonstrating", "depended",
-        "divides", "doubled", "eliminates", "eliminating", "exhibited", "exploiting",
-        "favoring", "folds", "footprint", "forgetting", "forgoes", "forgoing",
-        "imperfect", "implicit", "implicitly", "imply", "imposing",
-        "improves", "inadequate", "incurs",
-        "inefficiency", "initialize", "initialized",
-        "initializing", "instability", "intact", "intentionally",
-        "interpret", "interpreting", "intuitive", "irrelevant",
-        "isolates", "iterations", "iterative", "judgments", "justified", "justifies",
-        "magnitudes", "manifests", "mapped", "mathematically", "minimized", "minimizing",
-        "mitigate", "mitigates", "modalities", "modifies", "modifying",
-        "motivates", "motivating",
-        "multiplies", "multiply", "multiplying", "naive",
-        "notable", "noticeable", "observing", "outperforms",
-        "paired", "pairwise", "paradigm", "parity", "partitioned", "penalize",
-        "penalizes", "plausible", "premise", "preserved", "preserves", "preserving",
-        "prevented", "prioritize", "probabilities",
-        "proportional", "proportionally", "proposes", "proving", "randomly",
-        "reappear", "reconstructs", "recur",
-        "reintroduce", "relational", "reliably", "repeatedly", "repeating",
-        "resembles", "reside", "restricting", "rests", "reverted", "rewritten",
-        "sensible", "similarities", "similarity", "simplification",
-        "stabilizing", "storing", "subset", "subtract", "subtraction", "subtracts",
-        "suffices", "summarized",
-        "tends", "theoretic", "theoretically", "tradeoff", "trainable",
-        "unchanged", "underscoring", "unstated", "unstructured", "usefulness",
-        "variant", "variants", "warn", "butterfly", "parameter-efficient", "parameter", "efficient",
-        "parameter", "efficient", "orthogonal", "finetuning", "via", "factorization", "llms", "1.58", "direct", "preference", "optimization", "Your", "Language", "Model", "Secretly", "Reward", "quantized" 
-    }
+    # stopwords |= {
+    #     "a", "an", "the", "in", "on", "at", "by", "for", "from", "to", "of", "with",
+    #     "and", "or", "but", "if", "then", "so", "because", "as", "that", "this",
+    #     "these", "those", "it", "its", "he", "she", "they", "them", "their",
+    #     "we", "you", "i", "is", "are", "was", "were", "be", "been", "being",
+    #     "assigns", "avoids", "equals", "prevents", "relies", "removes", "replaces",
+    #     "selects", "underlies", "extracts",
+    #     "abandoning", "ablated", "ablation", "acheives", "adapts", "aggregates",
+    #     "aiming", "akin", "aggressively", "approximated", "argues", "captures",
+    #     "bounds", "causally", "caveats",
+    #     "accelerator", "achieves", "activations",
+    #     "additive", "agnostic", "aided",
+    #     "algebraic", "algorithmic", "aligns", "alphabet",
+    #     "alternating", "amplitude", "analogous", "analogy", "angles",
+    #     "balances", "behaves", "concentrated", "concise",
+    #     "costly", "deliberately", "demonstrating", "depended",
+    #     "divides", "doubled", "eliminates", "eliminating", "exhibited", "exploiting",
+    #     "favoring", "folds", "footprint", "forgetting", "forgoes", "forgoing",
+    #     "imperfect", "implicit", "implicitly", "imply", "imposing",
+    #     "improves", "inadequate", "incurs",
+    #     "inefficiency", "initialize", "initialized",
+    #     "initializing", "instability", "intact", "intentionally",
+    #     "interpret", "interpreting", "intuitive", "irrelevant",
+    #     "isolates", "iterations", "iterative", "judgments", "justified", "justifies",
+    #     "magnitudes", "manifests", "mapped", "mathematically", "minimized", "minimizing",
+    #     "mitigate", "mitigates", "modalities", "modifies", "modifying",
+    #     "motivates", "motivating",
+    #     "multiplies", "multiply", "multiplying", "naive",
+    #     "notable", "noticeable", "observing", "outperforms",
+    #     "paired", "pairwise", "paradigm", "parity", "partitioned", "penalize",
+    #     "penalizes", "plausible", "premise", "preserved", "preserves", "preserving",
+    #     "prevented", "prioritize", "probabilities",
+    #     "proportional", "proportionally", "proposes", "proving", "randomly",
+    #     "reappear", "reconstructs", "recur",
+    #     "reintroduce", "relational", "reliably", "repeatedly", "repeating",
+    #     "resembles", "reside", "restricting", "rests", "reverted", "rewritten",
+    #     "sensible", "similarities", "similarity", "simplification",
+    #     "stabilizing", "storing", "subset", "subtract", "subtraction", "subtracts",
+    #     "suffices", "summarized",
+    #     "tends", "theoretic", "theoretically", "tradeoff", "trainable",
+    #     "unchanged", "underscoring", "unstated", "unstructured", "usefulness",
+    #     "variant", "variants", "warn", "butterfly", "parameter-efficient", "parameter", "efficient",
+    #     "parameter", "efficient", "orthogonal", "finetuning", "via", "factorization", "llms", "1.58", "direct", "preference", "optimization", "Your", "Language", "Model", "Secretly", "Reward", "quantized" 
+    # }
 
     print(f"Total unique stopwords (including 10k common words if present): {len(stopwords)}")
     return stopwords
@@ -364,7 +364,7 @@ def filter_probe_words_by_corpus_freq(
     for w in probe_words:
         src_freq = source_counts.get(w, 0) / total_source_tokens
         txt_freq = textbook_counts.get(w, 0) / total_textbook_tokens
-        if src_freq > 0.9 * txt_freq:
+        if src_freq > txt_freq:
             removed.add(w)
         else:
             kept.add(w)
@@ -423,13 +423,38 @@ def process_chapter_file(
     with path.open("r", encoding="utf-8") as f:
         original = f.read()
 
-    corrupted, total_words, replaced_words, removed_words = replace_probe_words_in_text(
-        original, probe_words, rng
-    )
+    # Split into first 3 lines (title, blank, chapter name) and rest of content
+    lines = original.split('\n', 3)  # Split on first 3 newlines
+    if len(lines) >= 4:
+        # We have at least 3 lines plus content
+        header_lines = '\n'.join(lines[:3]) + '\n'
+        rest_of_content = lines[3]
+    elif len(lines) > 0:
+        # File has fewer than 4 lines/sections
+        header_lines = '\n'.join(lines[:-1]) + '\n' if len(lines) > 1 else ''
+        rest_of_content = lines[-1] if lines else ""
+    else:
+        # Empty file
+        header_lines = ""
+        rest_of_content = ""
 
-    # Write corrupted chapter into {domain}/fruit_textbooks/chapter_X.txt
+    # Only corrupt the content after the header
+    if rest_of_content:
+        corrupted_content, total_words, replaced_words, removed_words = replace_probe_words_in_text(
+            rest_of_content, probe_words, rng
+        )
+        # Recombine header with corrupted content
+        corrupted = header_lines + corrupted_content
+    else:
+        # No content to corrupt, just keep the header
+        corrupted = header_lines
+        total_words = 0
+        replaced_words = 0
+        removed_words = set()
+
+    # Write corrupted chapter into {domain}/fruit_textbooks_v2/chapter_X.txt
     domain_dir = EXPLANATIONS_ROOT / domain
-    fruit_dir = domain_dir / "fruit_textbooks"
+    fruit_dir = domain_dir / "fruit_textbooks_v2"
     fruit_dir.mkdir(parents=True, exist_ok=True)
     out_path = fruit_dir / path.name
 
@@ -450,6 +475,7 @@ def write_report(
     probe_words: Set[str],
     probe_csv_paths: List[Path],
     source_heavy_words: Set[str],
+    corpus_name: str = "Textbooks",
 ) -> None:
     """
     Write a text report with:
@@ -457,7 +483,7 @@ def write_report(
       - words excluded for being source-heavy
       - overall stats
       - per-domain stats
-      - per-chapter stats + removed words per chapter
+      - per-file stats + removed words per file
       - list of probe CSVs used
     """
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -476,12 +502,12 @@ def write_report(
             domain_agg[domain] = {
                 "total_words": 0,
                 "replaced_words": 0,
-                "chapters": 0,
+                "files": 0,
             }
 
         domain_agg[domain]["total_words"] += total_words
         domain_agg[domain]["replaced_words"] += replaced_words
-        domain_agg[domain]["chapters"] += 1
+        domain_agg[domain]["files"] += 1
 
         overall_total_words += total_words
         overall_replaced_words += replaced_words
@@ -496,7 +522,7 @@ def write_report(
     source_heavy_sorted = sorted(source_heavy_words)
 
     with report_path.open("w", encoding="utf-8") as f:
-        f.write("--- Fruit Textbook Replacement Report ---\n\n")
+        f.write(f"--- Fruit {corpus_name} Replacement Report ---\n\n")
 
         # Probe CSVs used
         f.write("Probe CSV files used to build the global probe word pool:\n")
@@ -538,20 +564,20 @@ def write_report(
             dpct = 100.0 * dr / dw if dw > 0 else 0.0
             f.write(
                 f"  Domain {domain}:\n"
-                f"    Chapters           : {agg['chapters']}\n"
+                f"    Files              : {agg['files']}\n"
                 f"    Total tokens       : {dw}\n"
                 f"    Replaced tokens    : {dr}\n"
                 f"    Replacement %      : {dpct:.2f}%\n"
             )
         f.write("\n")
 
-        # Per-chapter stats + list of removed words
-        f.write("Per-chapter statistics and removed tokens:\n")
+        # Per-file stats + list of removed words
+        f.write("Per-file statistics and removed tokens:\n")
         for row in per_chapter_stats:
             removed_sorted = sorted(row["removed_words"])
             removed_str = ", ".join(removed_sorted) if removed_sorted else "(none)"
             f.write(
-                f"  Domain={row['domain']}, chapter={row['chapter_name']}:\n"
+                f"  Domain={row['domain']}, file={row['file_name']}:\n"
                 f"    Total tokens   : {row['total_words']}\n"
                 f"    Replaced tokens: {row['replaced_words']}\n"
                 f"    Replacement %  : {row['replacement_pct']:.2f}%\n"
@@ -559,6 +585,104 @@ def write_report(
             )
 
     print(f"Report written to: {report_path}")
+
+
+def process_corpus_type(
+    corpus_name: str,
+    source_folder_name: str,
+    output_folder_name: str,
+    file_pattern: str,
+    probe_csv_paths: List[Path],
+    probe_words: Set[str],
+    source_heavy_words: Set[str],
+    rng: random.Random,
+) -> None:
+    """
+    Process a specific corpus type (textbooks, blogs, or stackexchange).
+    
+    Args:
+        corpus_name: Human-readable name (e.g., "Textbooks", "Blogs")
+        source_folder_name: Folder name to search for (e.g., "textbooks", "blogs")
+        output_folder_name: Output folder name (e.g., "fruit_textbooks_v2")
+        file_pattern: Glob pattern for files (e.g., "chapter_*.txt", "blog_*.txt")
+        probe_csv_paths: List of probe CSV paths
+        probe_words: Set of probe words to replace
+        source_heavy_words: Set of source-heavy words that were filtered out
+        rng: Random number generator
+    """
+    print(f"\n{'='*70}")
+    print(f"Processing {corpus_name}")
+    print(f"{'='*70}\n")
+    
+    # Find all files matching the pattern
+    files = [p for p in EXPLANATIONS_ROOT.rglob(file_pattern) 
+             if p.is_file() and source_folder_name in p.parts]
+    
+    if not files:
+        print(f"No {file_pattern} files found in {source_folder_name} folders under {EXPLANATIONS_ROOT}")
+        return
+    
+    print(f"Found {len(files)} {corpus_name} files to process.")
+    
+    # Process each file
+    per_file_stats: List[Dict] = []
+    
+    for path in sorted(files):
+        domain = extract_domain_from_path(path)
+        
+        with path.open("r", encoding="utf-8") as f:
+            original = f.read()
+        
+        # Split into first 3 lines (title, blank, chapter name) and rest of content
+        lines = original.split('\n', 3)
+        if len(lines) >= 4:
+            header_lines = '\n'.join(lines[:3]) + '\n'
+            rest_of_content = lines[3]
+        elif len(lines) > 0:
+            header_lines = '\n'.join(lines[:-1]) + '\n' if len(lines) > 1 else ''
+            rest_of_content = lines[-1] if lines else ""
+        else:
+            header_lines = ""
+            rest_of_content = ""
+        
+        # Only corrupt the content after the header
+        if rest_of_content:
+            corrupted_content, total_words, replaced_words, removed_words = replace_probe_words_in_text(
+                rest_of_content, probe_words, rng
+            )
+            corrupted = header_lines + corrupted_content
+        else:
+            corrupted = header_lines
+            total_words = 0
+            replaced_words = 0
+            removed_words = set()
+        
+        # Write corrupted file
+        domain_dir = EXPLANATIONS_ROOT / domain
+        output_dir = domain_dir / output_folder_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_path = output_dir / path.name
+        
+        with out_path.open("w", encoding="utf-8") as f:
+            f.write(corrupted)
+        
+        print(f"Wrote corrupted file: {out_path} (total_words={total_words}, replaced={replaced_words})")
+        
+        pct = 100.0 * replaced_words / total_words if total_words > 0 else 0.0
+        per_file_stats.append({
+            "domain": domain,
+            "file_name": path.name,
+            "total_words": total_words,
+            "replaced_words": replaced_words,
+            "replacement_pct": pct,
+            "removed_words": removed_words,
+        })
+    
+    # Write report
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    report_name = corpus_name.lower().replace(" ", "_")
+    report_path = REPORTS_DIR / f"fruit_{report_name}_replacement_report.txt"
+    write_report(per_file_stats, report_path, probe_words, probe_csv_paths, source_heavy_words, corpus_name)
 
 
 def main() -> None:
@@ -579,20 +703,26 @@ def main() -> None:
     # 2. Collect all probes_v7.csv paths across domains.
     probe_csv_paths = collect_probe_csv_paths()
 
-    # 3. Find all chapter files (textbooks).
-    chapter_files = find_chapter_files(EXPLANATIONS_ROOT)
+    # 3. Find all textbook chapter files (for frequency filtering).
+    chapter_files = [p for p in EXPLANATIONS_ROOT.rglob("chapter_*.txt") 
+                     if p.is_file() and "textbooks" in p.parts]
+    
     if not chapter_files:
-        print(f"No chapter_*.txt files found under {EXPLANATIONS_ROOT}")
-        return
-    print(f"Found {len(chapter_files)} chapter files to process.")
+        print(f"WARNING: No chapter_*.txt files found under {EXPLANATIONS_ROOT}")
+        print("Will use source corpus only for frequency filtering.")
+        textbook_counts = collections.Counter()
+        total_textbook_tokens = 0
+    else:
+        print(f"Found {len(chapter_files)} textbook chapter files for frequency analysis.")
+        textbook_counts, total_textbook_tokens = get_word_counts_from_files(chapter_files)
 
     # 4. Collect source .tex files and build corpus counts.
     source_tex_paths = collect_source_tex_paths()
-    textbook_counts, total_textbook_tokens = get_word_counts_from_files(chapter_files)
     source_counts, total_source_tokens = get_word_counts_from_files(source_tex_paths)
 
-    print(f"Textbook corpus: {total_textbook_tokens} tokens, {len(textbook_counts)} unique.")
-    print(f"Source corpus  : {total_source_tokens} tokens, {len(source_counts)} unique.")
+    print(f"\nCorpus Statistics:")
+    print(f"  Textbook corpus: {total_textbook_tokens} tokens,{len(textbook_counts)} unique.")
+    print(f"  Source corpus  : {total_source_tokens} tokens, {len(source_counts)} unique.")
 
     # 5. Build global probe token set from all probes CSVs (using stopwords only).
     probe_words_raw = build_probe_word_set_from_many(probe_csv_paths, stopwords)
@@ -606,29 +736,28 @@ def main() -> None:
         total_textbook_tokens,
     )
 
-    # 7. Process each chapter with the filtered probe token set.
-    per_chapter_stats: List[Dict] = []
-
-    for path in sorted(chapter_files):
-        domain, total_words, replaced_words, removed_words = process_chapter_file(
-            path, probe_words, rng
+    # 7. Process each corpus type (textbooks, blogs, stackexchange)
+    corpus_configs = [
+        ("Textbooks", "textbooks", "fruit_textbooks_v2", "chapter_*.txt"),
+        ("Blogs", "blogs", "fruit_blogs_v2", "blog_*.txt"),
+        ("StackExchange", "stackexchange", "fruit_stackexchange_v2", "stack_*.txt"),
+    ]
+    
+    for corpus_name, source_folder, output_folder, file_pattern in corpus_configs:
+        process_corpus_type(
+            corpus_name=corpus_name,
+            source_folder_name=source_folder,
+            output_folder_name=output_folder,
+            file_pattern=file_pattern,
+            probe_csv_paths=probe_csv_paths,
+            probe_words=probe_words,
+            source_heavy_words=source_heavy_words,
+            rng=rng,
         )
-        pct = 100.0 * replaced_words / total_words if total_words > 0 else 0.0
-        per_chapter_stats.append(
-            {
-                "domain": domain,
-                "chapter_name": path.name,
-                "total_words": total_words,
-                "replaced_words": replaced_words,
-                "replacement_pct": pct,
-                "removed_words": removed_words,
-            }
-        )
-
-    # 8. Write report (includes global probe pool, source-heavy tokens, and CSV list).
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = REPORTS_DIR / "fruit_textbook_replacement_report.txt"
-    write_report(per_chapter_stats, report_path, probe_words, probe_csv_paths, source_heavy_words)
+    
+    print(f"\n{'='*70}")
+    print("All corpus types processed successfully!")
+    print(f"{'='*70}\n")
 
 
 if __name__ == "__main__":

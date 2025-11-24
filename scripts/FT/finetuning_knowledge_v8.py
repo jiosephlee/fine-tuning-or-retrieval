@@ -221,36 +221,47 @@ def continue_pretraining(model, tokenizer, log, args):
     
     # --- Load the Texts and Fine-Tune ---
     # --- Determine Training Strategy ---
-    strategy_args = {
-        "num_paraphrased_texts": args.num_paraphrased_texts,
-        "override_domains": args.override_domains,
-    "shuffled_papers": args.shuffled_papers,
-    "word_shuffled_papers": args.word_shuffled_papers,
-    "sentence_shuffled_papers": args.sentence_shuffled_papers,
-        "fill_batches_with_pretraining": args.fill_batches_with_pretraining,
-        "separate_batches_with_pretraining": args.separate_batches_with_pretraining,
-        "pretraining_data_type": args.pretraining_data_type,
-        "test_script": args.test_script,
-        "with_specific_explanation": args.with_specific_explanation,
-        "times_explanations": args.times_explanations,
-        "semi_cleaned": args.semi_cleaned,
-        "use_raw": args.raw if hasattr(args, "raw") else False,
-        "explanation_every_round": args.explanation_every_round,
-        "shuffle_chunks": args.shuffle_chunks,
-        "shuffle_seed": args.shuffle_seed,
-        "explanations_cycle": args.explanations_cycle,
-        "double_cycle": args.double_cycle,
-        "granular_explanation_analysis": args.granular_explanation_analysis,
-    }
-
-    use_special_injection = args.with_explanations or args.with_specific_explanation
-
-    if use_special_injection:
-        strategy_name = "ParaphrasedArxivPaperWithExplanations"
-    elif args.num_paraphrased_texts > 0:
-        strategy_name = "ParaphrasedArxivPaper"
+    if args.prior_knowledge:
+        # Use prior-knowledge textbooks as the source instead of arXiv papers.
+        strategy_args = {
+            "override_domains": args.override_domains,
+            "fill_batches_with_pretraining": args.fill_batches_with_pretraining,
+            "separate_batches_with_pretraining": args.separate_batches_with_pretraining,
+            "pretraining_data_type": args.pretraining_data_type,
+            "test_script": args.test_script,
+        }
+        strategy_name = "PriorKnowledge"
     else:
-        strategy_name = "SingleArxivPaper" # Or a more generic name like "Source"
+        strategy_args = {
+            "num_paraphrased_texts": args.num_paraphrased_texts,
+            "override_domains": args.override_domains,
+            "shuffled_papers": args.shuffled_papers,
+            "word_shuffled_papers": args.word_shuffled_papers,
+            "sentence_shuffled_papers": args.sentence_shuffled_papers,
+            "fill_batches_with_pretraining": args.fill_batches_with_pretraining,
+            "separate_batches_with_pretraining": args.separate_batches_with_pretraining,
+            "pretraining_data_type": args.pretraining_data_type,
+            "test_script": args.test_script,
+            "with_specific_explanation": args.with_specific_explanation,
+            "times_explanations": args.times_explanations,
+            "semi_cleaned": args.semi_cleaned,
+            "use_raw": args.raw if hasattr(args, "raw") else False,
+            "explanation_every_round": args.explanation_every_round,
+            "shuffle_chunks": args.shuffle_chunks,
+            "shuffle_seed": args.shuffle_seed,
+            "explanations_cycle": args.explanations_cycle,
+            "double_cycle": args.double_cycle,
+            "granular_explanation_analysis": args.granular_explanation_analysis,
+        }
+
+        use_special_injection = args.with_explanations or args.with_specific_explanation
+
+        if use_special_injection:
+            strategy_name = "ParaphrasedArxivPaperWithExplanations"
+        elif args.num_paraphrased_texts > 0:
+            strategy_name = "ParaphrasedArxivPaper"
+        else:
+            strategy_name = "SingleArxivPaper" # Or a more generic name like "Source"
 
     chunking_args = {
         "chunk_by_section": args.chunk_by_section,
@@ -389,6 +400,12 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
     if not args.test_script:
         wandb.finish()
 
+    # Optionally push LIMA-tuned model to hub
+    if args.push_to_hub_lima_id:
+        log.info(f"Pushing LIMA-tuned model to hub: {args.push_to_hub_lima_id}")
+        model.push_to_hub(args.push_to_hub_lima_id)
+        tokenizer.push_to_hub(args.push_to_hub_lima_id)
+
 if __name__ == "__main__":
     # --- Parser ---
     parser = argparse.ArgumentParser()
@@ -411,6 +428,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num_paraphrased_texts", type=int, default=9, help="Number of paraphrased texts to use for training (0-9)")
     parser.add_argument("--lima_afterwards", default=False, action="store_true", help="LIMA-based instruction tuning after continued pretraining")
+    parser.add_argument("--prior_knowledge", action="store_true", help="Use prior_knowledge textbooks instead of arXiv papers for continued pretraining.")
+    parser.add_argument("--prior_knowledge_num_train_epochs", type=int, default=None, help="If set, override num_train_epochs during prior-knowledge CPT.")
+    parser.add_argument("--prior_knowledge_effective_batch_size_for_cpt", type=int, default=None, help="If set, override effective_batch_size_for_cpt during prior-knowledge CPT.")
 
     # Defaults, do not change unless for ablations
     parser.add_argument("--chunk_by_section", action="store_true", help="Use section-based chunking instead of token-based chunking")
@@ -449,6 +469,8 @@ if __name__ == "__main__":
     parser.add_argument("--device_batch_size", type=int, default=2, help="The batch size per device.")
     parser.add_argument("--context_length_for_cpt", type=int, default=3072, help="Context length for continued pretraining.")
     parser.add_argument("--context_length_for_lima", type=int, default=2560, help="Context length for LIMA training.")
+    parser.add_argument("--push_to_hub_cpt_id", type=str, default="", help="Optional Hub model ID to push CPT model to.")
+    parser.add_argument("--push_to_hub_lima_id", type=str, default="", help="Optional Hub model ID to push LIMA-tuned model to.")
     parser.add_argument("--semi_cleaned", type=str, default=None, choices=['v1', 'v2','v3'], help="Use semi-cleaned data from a specific version (v1 or v2).")
     parser.add_argument("--attn_implementation", type=str, default="sdpa", choices=["sdpa", "flash_attention_2", "flash_attention_3", "kernels-community/vllm-flash-attn3"], help="Attention implementation to use.")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
@@ -469,6 +491,19 @@ if __name__ == "__main__":
         args.cache_dir = "/vast/projects/myatskar/design-documents"
     else:
         args.cache_dir = None
+
+    # When using prior knowledge textbooks, adjust defaults:
+    # - disable paraphrases and explanations
+    # - optionally override CPT epochs and effective batch size
+    if args.prior_knowledge:
+        args.num_paraphrased_texts = 0
+        args.with_explanations = False
+        args.with_specific_explanation = None
+
+        if args.prior_knowledge_num_train_epochs is not None:
+            args.num_train_epochs = args.prior_knowledge_num_train_epochs
+        if args.prior_knowledge_effective_batch_size_for_cpt is not None:
+            args.effective_batch_size_for_cpt = args.prior_knowledge_effective_batch_size_for_cpt
 
     # --- Argument Validation ---
     if args.with_explanations and args.with_specific_explanation:
@@ -553,6 +588,11 @@ if __name__ == "__main__":
     # --- Continue Pretraining (we also evaluate our probes during this) ---
     if args.num_train_epochs > 0:
         continue_pretraining(model, tokenizer, log, args)
+        # Optionally push CPT model snapshot to hub
+        if args.push_to_hub_cpt_id:
+            log.info(f"Pushing CPT model to hub: {args.push_to_hub_cpt_id}")
+            model.push_to_hub(args.push_to_hub_cpt_id)
+            tokenizer.push_to_hub(args.push_to_hub_cpt_id)
     
     # -- LIMA-based instruction tuning ---
     if args.lima_afterwards:
