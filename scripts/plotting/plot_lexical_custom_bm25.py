@@ -17,14 +17,14 @@ DEFAULT_PROJECT_ROOT = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval"
 DOMAINS = ["1_58", "DPO", "GRPO", "BOFT", "OFT", "QLoRA"]
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--baseline", choices=["Source", "Paraphrase"], default="Source", help="Baseline strategy")
+parser.add_argument("--baseline", choices=["Source", "Paraphrase"], default="Paraphrase", help="Baseline strategy")
 parser.add_argument("--filter", action="store_true", default=True, help="Enable filtering (Target > Baseline)")
 parser.add_argument("--no-filter", action="store_false", dest="filter", help="Disable filtering")
 parser.add_argument("--project_root", default=DEFAULT_PROJECT_ROOT)
 
 # NEW: Axis Scale Arguments
-parser.add_argument("--x_scale", choices=["linear", "log"], default="log", help="Scale for X-axis (linear or symlog base 2)")
-parser.add_argument("--y_scale", choices=["linear", "log"], default="log", help="Scale for Y-axis (linear or symlog base 2)")
+parser.add_argument("--x_scale", choices=["linear", "log"], default="linear", help="Scale for X-axis (linear or symlog base 2)")
+parser.add_argument("--y_scale", choices=["linear", "log"], default="linear", help="Scale for Y-axis (linear or symlog base 2)")
 
 args = parser.parse_args()
 
@@ -61,22 +61,33 @@ RUNS_7B = {
         "fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/"
         "overlap_1_4/11_21_02_11",
     ),
-    "Corrupted Textbook": (
+    "Corrupted Aux. Views": (
         "corrupted_textbook_run",
-        "results/FT/full/7b/probes_v9/newline2/para9_expl_fruit_textbooks_cyclefull/"
-        "fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/"
-        "overlap_1_4/11_22_03_57",
+        "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_fruit_textbooks_v2+fruit_blogs_v2+fruit_stackexchange_v2_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_23_22_58",
     ),
 }
 
 CORPUS_DEFINITIONS = {
     "source":   [("data/arxiv/cleaned", "{domain}.tex")],
-    "para":     [("data/arxiv/paraphrased/{domain}", "0.tex")],
-    "Baseline": [("data/arxiv/cleaned", "{domain}.tex")] if BASELINE_STRAT == "Source" else [("data/arxiv/paraphrased/{domain}", "0.tex")],
+    
+    # Updated: Includes Source file + 0.tex through 9.tex
+    "para":     [("data/arxiv/cleaned", "{domain}.tex")] + \
+                [("data/arxiv/paraphrased/{domain}", f"{i}.tex") for i in range(10)],
+    
+    # Updated: Baseline logic now uses the expanded definition if strategy is Paraphrase
+    "Baseline": [("data/arxiv/cleaned", "{domain}.tex")] if BASELINE_STRAT == "Source" else \
+                ([("data/arxiv/paraphrased/{domain}", f"{i}.tex") for i in range(9)]),
+    
     "textbook": [("data/arxiv/explanations/{domain}", "textbook.txt")],
     "blogs":    [("data/arxiv/explanations/{domain}", "blogs.txt")],
     "stackexchange": [("data/arxiv/explanations/{domain}", "stackexchange.txt")],
-    "corrupted_textbook": [("data/arxiv/explanations/{domain}/fruit_textbooks_v2", "*.txt")],
+    
+    # Updated: Includes textbooks, blogs, and stackexchange fruit versions
+    "corrupted_aux_views": [
+        ("data/arxiv/explanations/{domain}/fruit_textbooks_v2", "*.txt"),
+        ("data/arxiv/explanations/{domain}/fruit_blogs_v2", "*.txt"),
+        ("data/arxiv/explanations/{domain}/fruit_stackexchange_v2", "*.txt")
+    ],
 }
 
 METHOD_TO_CORPUS = {
@@ -84,8 +95,9 @@ METHOD_TO_CORPUS = {
     "Textbook": "textbook",
     "Blogs": "blogs",
     "StackExchange": "stackexchange",
-    "Corrupted Textbook": "corrupted_textbook",
+    "Corrupted Aux. Views": "corrupted_aux_views",
 }
+
 
 # --- COLORS ---
 STRATEGY_COLORS = {
@@ -94,7 +106,7 @@ STRATEGY_COLORS = {
     "Blogs": "#9467bd",        # Purple
     "StackExchange": "#bcbd22",# Yellow (Olive-ish)
     "Textbook": "#2ca02c",     # Green
-    "Corrupted Textbook": "#8c564b", # Brown
+    "Corrupted Aux. Views": "#8c564b", # Brown
 }
 
 # Darker, fully opaque colors for the legend
@@ -104,7 +116,7 @@ STRATEGY_COLORS_LEGEND = {
     "Blogs": "#5c3d7a",        # Dark Purple
     "StackExchange": "#7f8016",# Dark Olive
     "Textbook": "#1a661a",     # Dark Green
-    "Corrupted Textbook": "#5e3a32", # Dark Brown
+    "Corrupted Aux. Views": "#5e3a32", # Dark Brown
 }
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), ".")))
@@ -395,8 +407,7 @@ def main():
     probe_tokens_bi = load_probe_data(root, DOMAINS, tokenize_bi)
 
     ngram_configs = [("unigram", tokenize_uni, probe_tokens_uni), ("bigram", tokenize_bi, probe_tokens_bi)]
-    target_domains = ["Blogs", "StackExchange", "Textbook", "Corrupted Textbook"]
-    
+    target_domains = ["Blogs", "StackExchange", "Textbook", "Corrupted Aux. Views"]    
     # Pre-calc metrics
     strategy_data = {}
     strategies_needed = ["Baseline"] + target_domains

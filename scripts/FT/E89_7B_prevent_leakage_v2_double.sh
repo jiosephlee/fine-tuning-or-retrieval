@@ -12,9 +12,9 @@ num_paraphrased=9
 
 python -s finetuning_knowledge_v8.py \
     --model_id allenai/OLMo-2-1124-7B \
-    --device_batch_size 64 \
+    --device_batch_size 48 \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
-    --effective_batch_size_for_cpt 64 \
+    --effective_batch_size_for_cpt 96 \
     --fill_batches_with_pretraining \
     --with_specific_explanation fruit_textbooks_v2 fruit_blogs_v2 fruit_stackexchange_v2 \
     --double_cycle \

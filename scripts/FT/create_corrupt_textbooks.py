@@ -364,10 +364,10 @@ def filter_probe_words_by_corpus_freq(
     for w in probe_words:
         src_freq = source_counts.get(w, 0) / total_source_tokens
         txt_freq = textbook_counts.get(w, 0) / total_textbook_tokens
-        if src_freq > txt_freq:
-            removed.add(w)
-        else:
-            kept.add(w)
+        # if src_freq > txt_freq:
+        #     removed.add(w)
+        # else:
+        kept.add(w)
 
     print(
         f"Frequency filter: kept {len(kept)} probe tokens, "
@@ -452,9 +452,9 @@ def process_chapter_file(
         replaced_words = 0
         removed_words = set()
 
-    # Write corrupted chapter into {domain}/fruit_textbooks_v2/chapter_X.txt
+    # Write corrupted chapter into {domain}/fruit_textbooks_v3/chapter_X.txt
     domain_dir = EXPLANATIONS_ROOT / domain
-    fruit_dir = domain_dir / "fruit_textbooks_v2"
+    fruit_dir = domain_dir / "fruit_textbooks_v3"
     fruit_dir.mkdir(parents=True, exist_ok=True)
     out_path = fruit_dir / path.name
 
@@ -603,7 +603,7 @@ def process_corpus_type(
     Args:
         corpus_name: Human-readable name (e.g., "Textbooks", "Blogs")
         source_folder_name: Folder name to search for (e.g., "textbooks", "blogs")
-        output_folder_name: Output folder name (e.g., "fruit_textbooks_v2")
+        output_folder_name: Output folder name (e.g., "fruit_textbooks_v3")
         file_pattern: Glob pattern for files (e.g., "chapter_*.txt", "blog_*.txt")
         probe_csv_paths: List of probe CSV paths
         probe_words: Set of probe words to replace
@@ -738,9 +738,9 @@ def main() -> None:
 
     # 7. Process each corpus type (textbooks, blogs, stackexchange)
     corpus_configs = [
-        ("Textbooks", "textbooks", "fruit_textbooks_v2", "chapter_*.txt"),
-        ("Blogs", "blogs", "fruit_blogs_v2", "blog_*.txt"),
-        ("StackExchange", "stackexchange", "fruit_stackexchange_v2", "stack_*.txt"),
+        ("Textbooks", "textbooks", "fruit_textbooks_v3", "chapter_*.txt"),
+        ("Blogs", "blogs", "fruit_blogs_v3", "blog_*.txt"),
+        ("StackExchange", "stackexchange", "fruit_stackexchange_v3", "stack_*.txt"),
     ]
     
     for corpus_name, source_folder, output_folder, file_pattern in corpus_configs:
