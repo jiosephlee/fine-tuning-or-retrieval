@@ -34,13 +34,23 @@ def shuffle_sentences(text):
     return ' '.join(parts)
 
 
+def shuffle_paragraphs(text):
+    # Split by double newlines to identify paragraphs
+    parts = re.split(r'\n\s*\n', text)
+    parts = [p for p in parts if p.strip()]
+    random.shuffle(parts)
+    return '\n\n'.join(parts)
+
+
 def process_and_write(src_path, dst_path, mode='sentences'):
     with open(src_path, 'r', encoding='utf-8') as f:
         content = f.read()
     if mode == 'words':
         out = preserve_title_and_apply(content, shuffle_words)
-    else:
+    elif mode == 'sentences':
         out = preserve_title_and_apply(content, shuffle_sentences)
+    else:
+        out = preserve_title_and_apply(content, shuffle_paragraphs)
     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
     with open(dst_path, 'w', encoding='utf-8') as f:
         f.write(out)
@@ -61,9 +71,11 @@ def generate_shuffled_for_domain(domain, base_dir, paraphrase_count=9):
         else:
             dst_words = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle_words.tex')
             dst_sent = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle_sentences.tex')
-            print(f"Shuffling source {domain} -> {os.path.basename(dst_words)}, {os.path.basename(dst_sent)}")
+            dst_para = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle_paragraphs.tex')
+            print(f"Shuffling source {domain} -> {os.path.basename(dst_words)}, {os.path.basename(dst_sent)}, {os.path.basename(dst_para)}")
             process_and_write(src_tex, dst_words, mode='words')
             process_and_write(src_tex, dst_sent, mode='sentences')
+            process_and_write(src_tex, dst_para, mode='paragraphs')
     else:
         print(f"Source tex not found for {domain}: {src_tex}")
 
@@ -84,9 +96,11 @@ def generate_shuffled_for_domain(domain, base_dir, paraphrase_count=9):
             continue
         dst_words = os.path.join(out_para_dir, f'{i}_shuffle_words.tex')
         dst_sent = os.path.join(out_para_dir, f'{i}_shuffle_sentences.tex')
-        print(f"Shuffling paraphrase {domain}/{i} -> {os.path.basename(dst_words)}, {os.path.basename(dst_sent)}")
+        dst_para = os.path.join(out_para_dir, f'{i}_shuffle_paragraphs.tex')
+        print(f"Shuffling paraphrase {domain}/{i} -> {os.path.basename(dst_words)}, {os.path.basename(dst_sent)}, {os.path.basename(dst_para)}")
         process_and_write(src_para, dst_words, mode='words')
         process_and_write(src_para, dst_sent, mode='sentences')
+        process_and_write(src_para, dst_para, mode='paragraphs')
 
 
 def main():
