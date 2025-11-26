@@ -100,6 +100,47 @@ def shuffle_sentences_in_text(text):
     
     return result
 
+def shuffle_paragraphs_in_text(text):
+    """Shuffle all paragraphs in the text while preserving title and headers."""
+    lines = text.split('\n')
+    title = None
+    headers = []
+    non_header_text = []
+    first_non_empty = True
+    
+    for line in lines:
+        # Keep the first non-empty line as title
+        if first_non_empty and line.strip():
+            title = line
+            first_non_empty = False
+        elif line.strip().startswith('#'):
+            headers.append(line)
+        else:
+            non_header_text.append(line)
+    
+    # Rejoin non-header text and split by double newlines (paragraphs)
+    full_text = '\n'.join(non_header_text)
+    paragraphs = re.split(r'\n\s*\n', full_text)
+    
+    # Filter out empty paragraphs
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
+    
+    # Shuffle paragraphs
+    random.shuffle(paragraphs)
+    
+    # Reconstruct text with title and headers at the beginning
+    result_parts = []
+    if title:
+        result_parts.append(title)
+    if headers:
+        result_parts.append('\n'.join(headers))
+    if paragraphs:
+        result_parts.append('\n\n'.join(paragraphs))
+    
+    result = '\n\n'.join(result_parts)
+    
+    return result
+
 def generate_shuffled_textbooks(paper_name, base_dir):
     """Generate both word-shuffled and sentence-shuffled textbooks."""
     print(f"\n{'='*60}")
@@ -112,9 +153,11 @@ def generate_shuffled_textbooks(paper_name, base_dir):
     # Output directories
     words_output_dir = os.path.join(base_dir, 'explanations', paper_name, 'fruit_shuffled_words_textbook_v3')
     sentences_output_dir = os.path.join(base_dir, 'explanations', paper_name, 'fruit_shuffled_sentences_textbook_v3')
+    paragraphs_output_dir = os.path.join(base_dir, 'explanations', paper_name, 'fruit_shuffled_paragraphs_textbook_v3')
     
     os.makedirs(words_output_dir, exist_ok=True)
     os.makedirs(sentences_output_dir, exist_ok=True)
+    os.makedirs(paragraphs_output_dir, exist_ok=True)
     
     # Check if textbooks directory exists
     if not os.path.exists(textbooks_dir):
@@ -129,6 +172,7 @@ def generate_shuffled_textbooks(paper_name, base_dir):
     
     all_word_shuffled_chapters = []
     all_sentence_shuffled_chapters = []
+    all_paragraph_shuffled_chapters = []
     
     for chapter_file in chapter_files:
         chapter_path = os.path.join(textbooks_dir, chapter_file)
@@ -144,8 +188,9 @@ def generate_shuffled_textbooks(paper_name, base_dir):
         
         # Save individual word-shuffled chapter
         word_output_path = os.path.join(words_output_dir, chapter_file)
-        with open(word_output_path, 'w') as f:
-            f.write(word_shuffled)
+        if not os.path.exists(word_output_path):
+            with open(word_output_path, 'w') as f:
+                f.write(word_shuffled)
         
         # Generate sentence-shuffled version
         sentence_shuffled = shuffle_sentences_in_text(chapter_content)
@@ -153,28 +198,55 @@ def generate_shuffled_textbooks(paper_name, base_dir):
         
         # Save individual sentence-shuffled chapter
         sentence_output_path = os.path.join(sentences_output_dir, chapter_file)
-        with open(sentence_output_path, 'w') as f:
-            f.write(sentence_shuffled)
+        if not os.path.exists(sentence_output_path):
+            with open(sentence_output_path, 'w') as f:
+                f.write(sentence_shuffled)
+
+        # Generate paragraph-shuffled version
+        paragraph_shuffled = shuffle_paragraphs_in_text(chapter_content)
+        all_paragraph_shuffled_chapters.append(paragraph_shuffled)
+
+        # Save individual paragraph-shuffled chapter
+        paragraph_output_path = os.path.join(paragraphs_output_dir, chapter_file)
+        if not os.path.exists(paragraph_output_path):
+            with open(paragraph_output_path, 'w') as f:
+                f.write(paragraph_shuffled)
     
     # Save combined word-shuffled textbook
     full_word_shuffled = "\n\n".join(all_word_shuffled_chapters)
     full_word_textbook = f"Title: Textbook of {paper_title}\n\n{full_word_shuffled}"
     
     word_textbook_path = os.path.join(words_output_dir, 'textbook.txt')
-    with open(word_textbook_path, 'w') as f:
-        f.write(full_word_textbook)
-    
-    print(f"Saved word-shuffled textbook to: {word_textbook_path}")
+    if not os.path.exists(word_textbook_path):
+        with open(word_textbook_path, 'w') as f:
+            f.write(full_word_textbook)
+        print(f"Saved word-shuffled textbook to: {word_textbook_path}")
+    else:
+        print(f"Skipping existing word-shuffled textbook: {word_textbook_path}")
     
     # Save combined sentence-shuffled textbook
     full_sentence_shuffled = "\n\n".join(all_sentence_shuffled_chapters)
     full_sentence_textbook = f"Title: Textbook of {paper_title}\n\n{full_sentence_shuffled}"
     
     sentence_textbook_path = os.path.join(sentences_output_dir, 'textbook.txt')
-    with open(sentence_textbook_path, 'w') as f:
-        f.write(full_sentence_textbook)
-    
-    print(f"Saved sentence-shuffled textbook to: {sentence_textbook_path}")
+    if not os.path.exists(sentence_textbook_path):
+        with open(sentence_textbook_path, 'w') as f:
+            f.write(full_sentence_textbook)
+        print(f"Saved sentence-shuffled textbook to: {sentence_textbook_path}")
+    else:
+        print(f"Skipping existing sentence-shuffled textbook: {sentence_textbook_path}")
+
+    # Save combined paragraph-shuffled textbook
+    full_paragraph_shuffled = "\n\n".join(all_paragraph_shuffled_chapters)
+    full_paragraph_textbook = f"Title: Textbook of {paper_title}\n\n{full_paragraph_shuffled}"
+
+    paragraph_textbook_path = os.path.join(paragraphs_output_dir, 'textbook.txt')
+    if not os.path.exists(paragraph_textbook_path):
+        with open(paragraph_textbook_path, 'w') as f:
+            f.write(full_paragraph_textbook)
+        print(f"Saved paragraph-shuffled textbook to: {paragraph_textbook_path}")
+    else:
+        print(f"Skipping existing paragraph-shuffled textbook: {paragraph_textbook_path}")
 
 def main():
     base_dir = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/data/arxiv'

@@ -16,7 +16,7 @@ python -s finetuning_knowledge_v8.py \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
     --effective_batch_size_for_cpt 64 \
     --fill_batches_with_pretraining \
-    --with_specific_explanation shuffled_words_fruit_textbook_v3 \
+    --with_specific_explanation fruit_shuffled_paragraphs_textbook_v3 \
     --explanations_cycle full \
     --granular_explanation_analysis \
     --num_train_epochs $num_epochs \
@@ -24,7 +24,8 @@ python -s finetuning_knowledge_v8.py \
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
     --overlap_ratio 1_4 \
-    --attn_implementation sdpa \
+    --attn_implementation flash_attention_2 \
     --gradient_checkpointing \
     --full_finetuning \
     --parcc \
+    
