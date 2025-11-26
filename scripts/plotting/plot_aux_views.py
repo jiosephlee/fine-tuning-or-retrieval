@@ -123,27 +123,65 @@ def main():
         s_strat_data['c'].append(val_c - base_c if val_c is not None and base_c is not None else None)
 
 
-    # --- 3. Shuffling Data (Delta Values) ---
+    # --- 3. Shuffling Data (Relative Delta Values) ---
     print("Gathering data for Shuffling...")
+    
+    # Define Baselines for each group
+    path_source_base = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_20_22_51'
+    path_para9_base = s_scaling_paths['Baseline (Para9)']['7B'] # Same as above
+    path_tb_base = s_strat_paths['Textbooks']
+    
+    # Load Baseline Values
+    # Source
+    base_source_f = get_final_val(path_source_base, 'knowledge', domains, project_root)
+    base_source_c = get_final_val(path_source_base, 'inference', domains, project_root)
+    # Para 9
+    base_para9_f = base_f # Already loaded
+    base_para9_c = base_c # Already loaded
+    # Textbook
+    base_tb_f = get_final_val(path_tb_base, 'knowledge', domains, project_root)
+    base_tb_c = get_final_val(path_tb_base, 'inference', domains, project_root)
+    
     s_shuf_paths = {
-        'Word Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_30_shuffle_words',
-        'Sent Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_31_shuffle_sentences',
+        # Source Group
+        'Source Word Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_30_shuffle_words',
+        'Source Sent Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_31_shuffle_sentences',
+        
+        # Para 9 Group
+        'Para 9 Word Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_30_shuffle_words',
+        'Para 9 Sent Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_31_shuffle_sentences',
+        
+        # Textbook Group
         'TB Word Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_shuffled_words_textbook_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_02_11',
         'TB Sent Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_shuffled_sentences_textbook_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_02_11',
     }
     
     s_shuf_data = {'labels': [], 'f': [], 'c': []}
-    order_shuf = ['Word Shuf', 'Sent Shuf', 'TB Word Shuf', 'TB Sent Shuf']
+    order_shuf = [
+        'Source Word Shuf', 'Source Sent Shuf',
+        'Para 9 Word Shuf', 'Para 9 Sent Shuf',
+        'TB Word Shuf', 'TB Sent Shuf'
+    ]
     
     for label in order_shuf:
         path = s_shuf_paths[label]
         val_f = get_final_val(path, 'knowledge', domains, project_root)
         val_c = get_final_val(path, 'inference', domains, project_root)
         
-        # Store DELTA
+        # Select Baseline
+        if 'Source' in label:
+            curr_base_f, curr_base_c = base_source_f, base_source_c
+        elif 'Para 9' in label:
+            curr_base_f, curr_base_c = base_para9_f, base_para9_c
+        elif 'TB' in label:
+            curr_base_f, curr_base_c = base_tb_f, base_tb_c
+        else:
+            curr_base_f, curr_base_c = None, None
+            
+        # Store RELATIVE DELTA
         s_shuf_data['labels'].append(label)
-        s_shuf_data['f'].append(val_f - base_f if val_f is not None and base_f is not None else None)
-        s_shuf_data['c'].append(val_c - base_c if val_c is not None and base_c is not None else None)
+        s_shuf_data['f'].append(val_f - curr_base_f if val_f is not None and curr_base_f is not None else None)
+        s_shuf_data['c'].append(val_c - curr_base_c if val_c is not None and curr_base_c is not None else None)
 
 
     # ==========================================
@@ -152,7 +190,7 @@ def main():
     print("Generating plot...")
     # Layout: Strategies (Hist) | Scaling (Lines) | Shuffling (Hist)
     fig = plt.figure(figsize=(20, 6))
-    gs = GridSpec(1, 3, width_ratios=[1.2, 1.5, 1.2], figure=fig, wspace=0.25)
+    gs = GridSpec(1, 3, width_ratios=[1.2, 1.5, 1.5], figure=fig, wspace=0.25)
     ax1 = fig.add_subplot(gs[0]) # Strategies
     ax2 = fig.add_subplot(gs[1]) # Scaling
     ax3 = fig.add_subplot(gs[2]) # Shuffling
@@ -165,14 +203,17 @@ def main():
         'Aux Views': '#2ca02c',      # Green
         'Baseline (Para9)': '#ff7f0e', # Orange
         'Corrupted Aux': '#d62728',    # Red
-        'Word Shuf': '#ff7f0e',      # Orange (Para 9 based)
-        'Sent Shuf': '#ff7f0e',      # Orange
-        'TB Word Shuf': '#8c564b',   # Brown (TB based)
-        'TB Sent Shuf': '#8c564b',   # Brown
+        
+        'Source Word Shuf': '#1f77b4', # Blue (Source Based)
+        'Source Sent Shuf': '#1f77b4', # Blue
+        'Para 9 Word Shuf': '#ff7f0e', # Orange (Para 9 Based)
+        'Para 9 Sent Shuf': '#ff7f0e', # Orange
+        'TB Word Shuf': '#8c564b',     # Brown (TB Based)
+        'TB Sent Shuf': '#8c564b',     # Brown
     }
 
     # --- SUBPLOT 1: Strategies (Histogram) ---
-    def plot_delta_hist(ax, data, title, color_map):
+    def plot_delta_hist(ax, data, title, color_map, ylabel, xtick_labels=None):
         x = np.arange(len(data['labels']))
         width = 0.35
         
@@ -186,13 +227,16 @@ def main():
         ax.bar(x + width/2, c_vals, width, label='Compositional', color=bar_colors, hatch='//', alpha=0.5, edgecolor='black')
         
         ax.set_xticks(x)
-        ax.set_xticklabels(data['labels'], rotation=25, ha='right')
+        if xtick_labels:
+            ax.set_xticklabels(xtick_labels, rotation=25, ha='right')
+        else:
+            ax.set_xticklabels(data['labels'], rotation=25, ha='right')
         ax.set_title(title)
-        ax.set_ylabel(r"$\Delta$ Final Log Prob. (Target - Para. 9)")
+        ax.set_ylabel(ylabel)
         ax.grid(axis='y', alpha=0.3)
         ax.axhline(0, color='black', linewidth=0.8)
 
-    plot_delta_hist(ax1, s_strat_data, "Data Strategies (7B)", colors)
+    plot_delta_hist(ax1, s_strat_data, "Data Strategies (7B)", colors, r"$\Delta$ Final Log Prob. (Target - Para. 9)")
     
     # --- SUBPLOT 2: Model Scaling (Lines) ---
     x_vals = np.arange(len(models))
@@ -227,10 +271,13 @@ def main():
 
 
     # --- SUBPLOT 3: Shuffling Effect (Histogram) ---
-    plot_delta_hist(ax3, s_shuf_data, "Shuffling Effect (7B)", colors)
+    # Simplified labels: "Word", "Sentence" repeated
+    simplified_labels = ['Word', 'Sentence', 'Word', 'Sentence', 'Word', 'Sentence']
+    plot_delta_hist(ax3, s_shuf_data, "Shuffling Effect (7B)", colors, r"$\Delta$ Final Log Prob. (Shuffled - Unshuffled)", xtick_labels=simplified_labels)
 
     # Legend for Subplot 3 (Colors + Hatching)
     legend_elements_s3 = [
+        mpatches.Patch(facecolor='#1f77b4', alpha=0.8, label='Source Based'),
         mpatches.Patch(facecolor='#ff7f0e', alpha=0.8, label='Para 9 Based'),
         mpatches.Patch(facecolor='#8c564b', alpha=0.8, label='Textbook Based'),
         mpatches.Patch(facecolor='gray', alpha=0.8, label='Factual'),
@@ -256,7 +303,14 @@ def main():
     
     ylim_delta = (min_y - padding, max_y + padding)
     
-    ax1.set_ylim(ylim_delta)
+    # Set limits
+    # Subplot 1: Force bottom to 0
+    s1_deltas = [x for x in s_strat_data['f'] if x is not None] + [x for x in s_strat_data['c'] if x is not None] + [0]
+    s1_max = max(s1_deltas)
+    s1_pad = s1_max * 0.1 if s1_max > 0 else 0.1
+    ax1.set_ylim(bottom=0, top=s1_max + s1_pad)
+    
+    # Subplot 3: Use full range (can be negative)
     ax3.set_ylim(ylim_delta)
 
     output_dir = 'plots'

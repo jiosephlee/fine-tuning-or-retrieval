@@ -148,12 +148,12 @@ def generate_shuffled_textbooks(paper_name, base_dir):
     print(f"{'='*60}")
     
     paper_path = os.path.join(base_dir, 'cleaned', f'{paper_name}.tex')
-    textbooks_dir = os.path.join(base_dir, 'explanations', paper_name, 'fruit_textbooks_v3')
+    textbooks_dir = os.path.join(base_dir, 'explanations', paper_name, 'textbooks')
     
     # Output directories
-    words_output_dir = os.path.join(base_dir, 'explanations', paper_name, 'fruit_shuffled_words_textbook_v3')
-    sentences_output_dir = os.path.join(base_dir, 'explanations', paper_name, 'fruit_shuffled_sentences_textbook_v3')
-    paragraphs_output_dir = os.path.join(base_dir, 'explanations', paper_name, 'fruit_shuffled_paragraphs_textbook_v3')
+    words_output_dir = os.path.join(base_dir, 'explanations', paper_name, 'shuffled_words_textbook')
+    sentences_output_dir = os.path.join(base_dir, 'explanations', paper_name, 'shuffled_sentences_textbook')
+    paragraphs_output_dir = os.path.join(base_dir, 'explanations', paper_name, 'shuffled_paragraphs_textbook')
     
     os.makedirs(words_output_dir, exist_ok=True)
     os.makedirs(sentences_output_dir, exist_ok=True)

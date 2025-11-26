@@ -155,6 +155,8 @@ def construct_experiment_name(args):
         shuffle_marker = '_shuffle_sentences'
     elif getattr(args, 'shuffled_papers', False):
         shuffle_marker = '_shuffle'
+    elif getattr(args, 'paragraph_shuffled_papers', False):
+        shuffle_marker = '_shuffle_paragraphs'
 
     path_parts.append(run_name + shuffle_marker)
     
@@ -238,6 +240,7 @@ def continue_pretraining(model, tokenizer, log, args):
             "shuffled_papers": args.shuffled_papers,
             "word_shuffled_papers": args.word_shuffled_papers,
             "sentence_shuffled_papers": args.sentence_shuffled_papers,
+            "paragraph_shuffled_papers": args.paragraph_shuffled_papers,
             "fill_batches_with_pretraining": args.fill_batches_with_pretraining,
             "separate_batches_with_pretraining": args.separate_batches_with_pretraining,
             "pretraining_data_type": args.pretraining_data_type,
@@ -452,6 +455,7 @@ if __name__ == "__main__":
     parser.add_argument("--shuffled_papers", action="store_true", help="Legacy: use shuffled versions of papers (files ending with _shuffle.tex) when available.")
     parser.add_argument("--word_shuffled_papers", action="store_true", help="Use word-shuffled versions of papers (files ending with _shuffle_words.tex) when available.")
     parser.add_argument("--sentence_shuffled_papers", action="store_true", help="Use sentence-shuffled versions of papers (files ending with _shuffle_sentences.tex) when available.")
+    parser.add_argument("--paragraph_shuffled_papers", action="store_true", help="Use paragraph-shuffled versions of papers (files ending with _shuffle_paragraphs.tex) when available.")
 
     # Lora arguments
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA r parameter.")

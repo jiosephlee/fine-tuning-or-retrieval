@@ -209,6 +209,7 @@ def prepare_training_mix(
     shuffled_papers = strategy_args.get("shuffled_papers", False)
     word_shuffled = strategy_args.get("word_shuffled_papers", False)
     sentence_shuffled = strategy_args.get("sentence_shuffled_papers", False)
+    paragraph_shuffled = strategy_args.get("paragraph_shuffled_papers", False)
     if domains is None:
         if use_raw: cleaned_dir = '../../data/arxiv/raw'
         elif semi_cleaned_version: cleaned_dir = f'../../data/arxiv/semicleaned_{semi_cleaned_version}'
@@ -248,6 +249,10 @@ def prepare_training_mix(
                 cand = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle_sentences.tex')
                 if os.path.exists(cand):
                     source_path = cand
+            if source_path is None and paragraph_shuffled:
+                cand = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle_paragraphs.tex')
+                if os.path.exists(cand):
+                    source_path = cand
             if source_path is None and shuffled_papers:
                 cand = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle.tex')
                 if os.path.exists(cand):
@@ -285,6 +290,10 @@ def prepare_training_mix(
                         cand = os.path.join(shuffled_root, 'paraphrased', domain, f'{i}_shuffle_sentences.tex')
                         if os.path.exists(cand):
                             picked = cand
+                    if picked is None and paragraph_shuffled:
+                        cand = os.path.join(shuffled_root, 'paraphrased', domain, f'{i}_shuffle_paragraphs.tex')
+                        if os.path.exists(cand):
+                            picked = cand
                     if picked is None and shuffled_papers:
                         cand = os.path.join(shuffled_root, 'paraphrased', domain, f'{i}_shuffle.tex')
                         if os.path.exists(cand):
@@ -296,6 +305,10 @@ def prepare_training_mix(
                             picked = cand
                     if picked is None and sentence_shuffled:
                         cand = os.path.join(paraphrased_dir, f'{i}_shuffle_sentences.tex')
+                        if os.path.exists(cand):
+                            picked = cand
+                    if picked is None and paragraph_shuffled:
+                        cand = os.path.join(paraphrased_dir, f'{i}_shuffle_paragraphs.tex')
                         if os.path.exists(cand):
                             picked = cand
                     if picked is None and shuffled_papers:

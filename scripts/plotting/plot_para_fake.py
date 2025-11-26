@@ -187,7 +187,7 @@ def main():
     # Layout: [P1] [P2] [Space] [P3] [P4] [Space] [P5]
     # Ratios:  1    1    0.2     1    1    0.2     1
     
-    fig = plt.figure(figsize=(25, 5))
+    fig = plt.figure(figsize=(20, 5))
     gs = gridspec.GridSpec(1, 7, width_ratios=[1, 1, 0.2, 1, 1, 0.2, 1], wspace=0.1)
     
     axes = []
