@@ -17,6 +17,7 @@ python -s finetuning_knowledge_v8.py \
     --effective_batch_size_for_cpt 32 \
     --fill_batches_with_pretraining \
     --separate_batches_with_pretraining 1 \
+    --inference_probes_version "v6" \
     --num_train_epochs $num_epochs \
     --learning_rate 2e-5 \
     --num_paraphrased_texts $num_paraphrased \
