@@ -71,10 +71,10 @@ def main():
             '32B': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_06_44',
         },
         'Aux Views': {
-             '1B': None, 
+             '1B': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/para9_expl_textbooks+blogs+stackexchange_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_10_05', 
              '7B': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_stackexchange+blogs+textbooks_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_04_43/',
-             '13B': None, 
-             '32B': None,
+             '13B': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para9_expl_textbooks+blogs+stackexchange_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_07_58', 
+             '32B': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9_expl_textbooks+blogs+stackexchange_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_04_11/',
         },
         'Corrupted Aux': {
             '1B': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/para9_expl_fruit_textbooks_v3+fruit_blogs_v3+fruit_stackexchange_v3_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_24_10_47',
@@ -146,21 +146,30 @@ def main():
         # Source Group
         'Source Word Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_30_shuffle_words',
         'Source Sent Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_31_shuffle_sentences',
+        'Source Para Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_12_57_shuffle_paragraphs',
         
         # Para 9 Group
         'Para 9 Word Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_30_shuffle_words',
         'Para 9 Sent Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_31_shuffle_sentences',
+        'Para 9 Para Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_12_57_shuffle_paragraphs',
         
         # Textbook Group
         'TB Word Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_shuffled_words_textbook_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_02_11',
         'TB Sent Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_shuffled_sentences_textbook_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_02_11',
+        'TB Para Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_shuffled_paragraphs_textbook_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_12_57/',
+
+        # Corrupt Textbook Group
+        'Corrupt TB Word Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_fruit_shuffled_words_textbook_v3_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_04_11/',
+        'Corrupt TB Sent Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_fruit_shuffled_sentences_textbook_v3_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_04_11/',
+        'Corrupt TB Para Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_fruit_shuffled_paragraphs_textbook_v3_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_04_11/',
     }
     
     s_shuf_data = {'labels': [], 'f': [], 'c': []}
     order_shuf = [
-        'Source Word Shuf', 'Source Sent Shuf',
-        'Para 9 Word Shuf', 'Para 9 Sent Shuf',
-        'TB Word Shuf', 'TB Sent Shuf'
+        'Source Word Shuf', 'Source Sent Shuf', 'Source Para Shuf',
+        'Para 9 Word Shuf', 'Para 9 Sent Shuf', 'Para 9 Para Shuf',
+        'TB Word Shuf', 'TB Sent Shuf', 'TB Para Shuf',
+        'Corrupt TB Word Shuf', 'Corrupt TB Sent Shuf', 'Corrupt TB Para Shuf'
     ]
     
     for label in order_shuf:
@@ -173,7 +182,10 @@ def main():
             curr_base_f, curr_base_c = base_source_f, base_source_c
         elif 'Para 9' in label:
             curr_base_f, curr_base_c = base_para9_f, base_para9_c
-        elif 'TB' in label:
+        elif 'TB' in label and 'Corrupt' not in label:
+            curr_base_f, curr_base_c = base_tb_f, base_tb_c
+        elif 'Corrupt TB' in label:
+            # Using Textbooks as baseline for Corrupt TB as well, to show degradation from clean
             curr_base_f, curr_base_c = base_tb_f, base_tb_c
         else:
             curr_base_f, curr_base_c = None, None
@@ -190,7 +202,7 @@ def main():
     print("Generating plot...")
     # Layout: Strategies (Hist) | Scaling (Lines) | Shuffling (Hist)
     fig = plt.figure(figsize=(20, 6))
-    gs = GridSpec(1, 3, width_ratios=[1.2, 1.5, 1.5], figure=fig, wspace=0.25)
+    gs = GridSpec(1, 3, width_ratios=[1.2, 1.5, 2.0], figure=fig, wspace=0.25)
     ax1 = fig.add_subplot(gs[0]) # Strategies
     ax2 = fig.add_subplot(gs[1]) # Scaling
     ax3 = fig.add_subplot(gs[2]) # Shuffling
@@ -206,10 +218,19 @@ def main():
         
         'Source Word Shuf': '#1f77b4', # Blue (Source Based)
         'Source Sent Shuf': '#1f77b4', # Blue
+        'Source Para Shuf': '#1f77b4', # Blue
+
         'Para 9 Word Shuf': '#ff7f0e', # Orange (Para 9 Based)
         'Para 9 Sent Shuf': '#ff7f0e', # Orange
+        'Para 9 Para Shuf': '#ff7f0e', # Orange
+
         'TB Word Shuf': '#8c564b',     # Brown (TB Based)
         'TB Sent Shuf': '#8c564b',     # Brown
+        'TB Para Shuf': '#8c564b',     # Brown
+
+        'Corrupt TB Word Shuf': '#d62728', # Red (Corrupt Based)
+        'Corrupt TB Sent Shuf': '#d62728', # Red
+        'Corrupt TB Para Shuf': '#d62728', # Red
     }
 
     # --- SUBPLOT 1: Strategies (Histogram) ---
@@ -271,8 +292,8 @@ def main():
 
 
     # --- SUBPLOT 3: Shuffling Effect (Histogram) ---
-    # Simplified labels: "Word", "Sentence" repeated
-    simplified_labels = ['Word', 'Sentence', 'Word', 'Sentence', 'Word', 'Sentence']
+    # Simplified labels: "Word", "Sentence", "Paragraph" repeated
+    simplified_labels = ['Word', 'Sentence', 'Paragraph'] * 4
     plot_delta_hist(ax3, s_shuf_data, "Shuffling Effect (7B)", colors, r"$\Delta$ Final Log Prob. (Shuffled - Unshuffled)", xtick_labels=simplified_labels)
 
     # Legend for Subplot 3 (Colors + Hatching)
@@ -280,6 +301,7 @@ def main():
         mpatches.Patch(facecolor='#1f77b4', alpha=0.8, label='Source Based'),
         mpatches.Patch(facecolor='#ff7f0e', alpha=0.8, label='Para 9 Based'),
         mpatches.Patch(facecolor='#8c564b', alpha=0.8, label='Textbook Based'),
+        mpatches.Patch(facecolor='#d62728', alpha=0.8, label='Corrupt TB Based'),
         mpatches.Patch(facecolor='gray', alpha=0.8, label='Factual'),
         mpatches.Patch(facecolor='gray', alpha=0.5, hatch='//', edgecolor='black', label='Compositional')
     ]

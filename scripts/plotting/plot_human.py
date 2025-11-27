@@ -30,16 +30,18 @@ def main():
         "Para. 9": {
             "7B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_20_22_51",
             "13B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_13_18",
+            "32B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_06_44",
         },
         "Para. 9 + Humans": {
             "7B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_human_cyclefull/fill_dclm/domains_DPO-GRPO/e100/bs64_lr2e-05/overlap_1_4/11_24_05_15",
             "13B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para9_expl_human_cyclefull/fill_dclm/domains_DPO-GRPO/e100/bs64_lr2e-05/overlap_1_4/11_24_06_09",
+            "32B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9_expl_human_cyclefull/fill_dclm/domains_DPO-GRPO/e100/bs64_lr2e-05/overlap_1_4/11_26_12_57/",
         }
     }
 
     # --- Calculate Deltas ---
     # Delta = (Para. 9 + Humans) - (Para. 9)
-    model_sizes = ["7B", "13B"]
+    model_sizes = ["7B", "13B", "32B"]
     deltas = {
         "labels": model_sizes,
         "f": [], # Factual Deltas
