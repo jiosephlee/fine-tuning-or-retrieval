@@ -107,7 +107,7 @@ def main():
 
     plt.tight_layout()
     os.makedirs('plots', exist_ok=True)
-    out_path = os.path.join('plots', 'model_size_scaling_delta.pdf')
+    out_path = os.path.join('plots', 'human.pdf')
     plt.savefig(out_path, bbox_inches='tight')
     print(f"Saved plot to {out_path}")
 
