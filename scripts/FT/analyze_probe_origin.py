@@ -36,6 +36,8 @@ def find_probe_file(directory: str, probe_type: str) -> str:
             
     return None
 
+import string
+
 def is_ngram_in_document(target: str, document: str) -> bool:
     """
     Check if 2-grams from target appear in document using word-level matching.
@@ -57,10 +59,8 @@ def is_ngram_in_document(target: str, document: str) -> bool:
     
     # Normalize both texts
     def normalize(text):
-        # Convert to lowercase and remove extra whitespace
-        text = text.lower().strip()
-        # Remove punctuation for better matching
-        text = re.sub(r'[^\w\s]', ' ', text)
+        # Convert to lowercase and strip whitespace/punctuation from ends
+        text = text.lower().strip(string.punctuation + string.whitespace)
         # Split into words and filter empty strings
         words = [w for w in text.split() if w]
         return words
@@ -74,7 +74,7 @@ def is_ngram_in_document(target: str, document: str) -> bool:
     n = len(target_words)
     
     # For single word targets, check exact match
-    if n <= 2: # single word or 2-gram
+    if n == 1: # single word
         return target_words[0] in doc_words
     
     # For 2+ word targets, check if any 2-gram appears in document
@@ -87,6 +87,26 @@ def is_ngram_in_document(target: str, document: str) -> bool:
             return True
     
     return False
+
+def is_exact_match_in_document(target: str, document: str) -> bool:
+    """
+    Check if target appears in document using exact string matching (normalized).
+    """
+    if not target or pd.isna(target):
+        return False
+    
+    # Normalize both texts
+    def normalize(text):
+        # Convert to lowercase and strip whitespace/punctuation from ends
+        text = text.lower().strip(string.punctuation + string.whitespace)
+        # Collapse whitespace
+        text = ' '.join(text.split())
+        return text
+    
+    target_norm = normalize(target)
+    doc_norm = normalize(document)
+    
+    return target_norm in doc_norm
 
 def analyze_domain(domain: str, project_root: str, probe_type: str):
     """
@@ -107,64 +127,122 @@ def analyze_domain(domain: str, project_root: str, probe_type: str):
     probes_df = pd.read_csv(probes_file)
 
     # --- Load Text Sources ---
-    explanations_text = load_all_text_from_dir(os.path.join(project_root, 'data/arxiv/explanations', domain), '.txt')
-    paraphrased_text = load_all_text_from_dir(os.path.join(project_root, 'data/arxiv/paraphrased', domain), '.tex')
-    
+    # 1. Explanations (Textbooks, Blogs, StackExchange)
+    explanations_dir = os.path.join(project_root, 'data/arxiv/explanations', domain)
+    categories = ['textbooks', 'blogs', 'stackexchange']
+    explanations_text = ""
+    for category in categories:
+        category_dir = os.path.join(explanations_dir, category)
+        explanations_text += load_all_text_from_dir(category_dir, '.txt')
+
+    # 2. Source (Cleaned)
     cleaned_file_path = os.path.join(project_root, 'data/arxiv/cleaned', f"{domain}.tex")
-    cleaned_text = ""
+    source_text = ""
     if os.path.exists(cleaned_file_path):
         with open(cleaned_file_path, 'r', encoding='utf-8') as f:
-            cleaned_text = f.read()
-            
-    source_and_paraphrased_text = paraphrased_text + "\n" + cleaned_text
+            source_text = f.read()
+
+    # 3. Paraphrased (0-9 only)
+    paraphrased_dir = os.path.join(project_root, 'data/arxiv/paraphrased', domain)
+    paraphrased_text = ""
+    if os.path.isdir(paraphrased_dir):
+        for i in range(10):
+            para_file = os.path.join(paraphrased_dir, f"{i}.tex")
+            if os.path.exists(para_file):
+                try:
+                    with open(para_file, 'r', encoding='utf-8') as f:
+                        paraphrased_text += f.read() + "\n"
+                except Exception as e:
+                    print(f"Could not read {para_file}: {e}")
 
     if not explanations_text.strip():
         print("  - No explanation text found.")
-    if not source_and_paraphrased_text.strip():
-        print("  - No source or paraphrased text found.")
+    if not source_text.strip():
+        print("  - No source text found.")
+    if not paraphrased_text.strip():
+        print("  - No paraphrased text (0-9) found.")
 
-    # --- Perform Analysis ---
-    in_explanations_only_indices = []
-    in_source_only_indices = []
-    in_both_indices = []
-    in_neither_indices = []
+    # --- Perform Analysis Helper ---
+    def categorize_probes(match_function):
+        in_source_indices = []
+        in_source_and_paraphrase_indices = []
+        in_explanations_only_indices = []
+        in_source_and_paraphrase_only_indices = []
+        in_none_indices = []
+        in_all_indices = []
+        in_explanations_indices = []
+        source_only_indices = []
 
-    for index, row in probes_df.iterrows():
-        target = str(row['target'])
-        if pd.isna(target):
-            continue
-        
-        # Use n-gram matching for more flexible matching
-        in_expl = is_ngram_in_document(target, explanations_text)
-        in_src = is_ngram_in_document(target, source_and_paraphrased_text)
-
-        if in_expl and not in_src:
-            in_explanations_only_indices.append(index)
-        elif in_src and not in_expl:
-            in_source_only_indices.append(index)
-        elif in_expl and in_src:
-            in_both_indices.append(index)
-        else:
-            in_neither_indices.append(index)
+        for index, row in probes_df.iterrows():
+            target = str(row['target'])
+            if pd.isna(target):
+                continue
             
-    # --- Save filter.json ---
-    filter_data = {
-        'in_explanations_only': in_explanations_only_indices,
-        'in_source_only': in_source_only_indices,
-        'in_both': in_both_indices,
-        'in_neither': in_neither_indices
-    }
+            is_in_expl = match_function(target, explanations_text)
+            is_in_source = match_function(target, source_text)
+            is_in_para = match_function(target, paraphrased_text)
+
+            # 1) in_source
+            if is_in_source:
+                in_source_indices.append(index)
+            
+            # 2) in_source_and_paraphrase
+            if is_in_source and is_in_para:
+                in_source_and_paraphrase_indices.append(index)
+
+            # 3) in_explanations_only
+            if is_in_expl and not is_in_source and not is_in_para:
+                in_explanations_only_indices.append(index)
+
+            # 4) in_source_and_paraphrase_only
+            if is_in_source and is_in_para and not is_in_expl:
+                in_source_and_paraphrase_only_indices.append(index)
+
+            # 5) in_none
+            if not is_in_source and not is_in_para and not is_in_expl:
+                in_none_indices.append(index)
+
+            # 6) in_all
+            if is_in_source and is_in_para and is_in_expl:
+                in_all_indices.append(index)
+                
+            # 7) in_explanations (inclusive)
+            if is_in_expl:
+                in_explanations_indices.append(index)
+                
+            # 8) source_only (exclusive)
+            if is_in_source and not is_in_para and not is_in_expl:
+                source_only_indices.append(index)
+        
+        return {
+            'in_source': in_source_indices,
+            'in_source_and_paraphrase': in_source_and_paraphrase_indices,
+            'in_explanations_only': in_explanations_only_indices,
+            'in_source_and_paraphrase_only': in_source_and_paraphrase_only_indices,
+            'in_none': in_none_indices,
+            'in_all': in_all_indices,
+            'in_explanations': in_explanations_indices,
+            'source_only': source_only_indices
+        }
+
+    # --- Run Analysis for N-Gram ---
+    ngram_results = categorize_probes(is_ngram_in_document)
     filter_output_path = os.path.join(project_root, 'data/probes', probe_folder, domain, 'filter.json')
     os.makedirs(os.path.dirname(filter_output_path), exist_ok=True)
     with open(filter_output_path, 'w', encoding='utf-8') as f:
-        json.dump(filter_data, f, indent=2)
-    print(f"  - Saved filter data to {filter_output_path}")
+        json.dump(ngram_results, f, indent=2)
+    print(f"  - Saved N-Gram filter data to {filter_output_path}")
+
+    # --- Run Analysis for Exact Match ---
+    em_results = categorize_probes(is_exact_match_in_document)
+    filter_em_output_path = os.path.join(project_root, 'data/probes', probe_folder, domain, 'filter_em.json')
+    with open(filter_em_output_path, 'w', encoding='utf-8') as f:
+        json.dump(em_results, f, indent=2)
+    print(f"  - Saved Exact Match filter data to {filter_em_output_path}")
 
     return {
-        'in_explanations_but_not_source': len(in_explanations_only_indices),
-        'in_source_but_not_explanations': len(in_source_only_indices),
-        'in_both': len(in_both_indices),
-        'in_neither': len(in_neither_indices),
+        'ngram': {k: len(v) for k, v in ngram_results.items()},
+        'em': {k: len(v) for k, v in em_results.items()},
         'total_targets': len(probes_df['target'].dropna())
     }
 
@@ -206,13 +284,22 @@ def main():
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(f"Analysis of {args.probe_type.capitalize()} Probe Target Origins\n")
         f.write("="*40 + "\n\n")
-        for domain, counts in all_results.items():
+        for domain, result in all_results.items():
             f.write(f"Domain: {domain}\n")
-            f.write(f"  - Total Targets Analyzed: {counts['total_targets']}\n")
-            f.write(f"  - Targets in Explanations ONLY: {counts['in_explanations_but_not_source']}\n")
-            f.write(f"  - Targets in Source/Paraphrased ONLY: {counts['in_source_but_not_explanations']}\n")
-            f.write(f"  - Targets in BOTH: {counts['in_both']}\n")
-            f.write(f"  - Targets in NEITHER: {counts['in_neither']}\n\n")
+            f.write(f"  - Total Targets Analyzed: {result['total_targets']}\n")
+            
+            for match_type, label in [('ngram', 'N-Gram Match'), ('em', 'Exact Match')]:
+                counts = result[match_type]
+                f.write(f"  [{label}]\n")
+                f.write(f"    - In Source: {counts['in_source']}\n")
+                f.write(f"    - In Source AND Paraphrase: {counts['in_source_and_paraphrase']}\n")
+                f.write(f"    - In Explanations ONLY: {counts['in_explanations_only']}\n")
+                f.write(f"    - In Source AND Paraphrase ONLY: {counts['in_source_and_paraphrase_only']}\n")
+                f.write(f"    - In NONE: {counts['in_none']}\n")
+                f.write(f"    - In ALL: {counts['in_all']}\n")
+                f.write(f"    - In Explanations (Inclusive): {counts['in_explanations']}\n")
+                f.write(f"    - Source ONLY (Exclusive): {counts['source_only']}\n")
+            f.write("\n")
 
     print(f"\nAnalysis complete. Results saved to {output_file}")
 

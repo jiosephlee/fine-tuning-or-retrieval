@@ -96,18 +96,189 @@ def filter_steps(df):
     filtered['Exposure Steps'] = (filtered['step'] + 1) // 2
     return filtered
 
+def plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, hits_ylim):
+    print("Plotting 4-Panel Figure...")
+    # Layout: [P1] [P2] [Space] [P3] [P4]
+    # Ratios:  1    1    0.2     1    1
+    # Total width ratio units: 4.2. Previous was 5.4.
+    # Keeping width=20 makes them wider (20/4.2 > 20/5.4)
+    
+    fig = plt.figure(figsize=(20, 5))
+    gs = gridspec.GridSpec(1, 5, width_ratios=[1, 1, 0.2, 1, 1], wspace=0.15)
+    
+    axes = []
+    axes.append(fig.add_subplot(gs[0, 0])) # Panel 1
+    axes.append(fig.add_subplot(gs[0, 1])) # Panel 2
+    axes.append(fig.add_subplot(gs[0, 3])) # Panel 3
+    axes.append(fig.add_subplot(gs[0, 4])) # Panel 4
+    
+    # --- Panel 1: Source Compositional ---
+    ax1 = axes[0]
+    ax1_right = ax1.twinx()
+    
+    for model_size, df in p1_data:
+        ax1.plot(df['Exposure Steps'], df['log_prob'], color=model_colors[model_size], linestyle='-', linewidth=2, label=f"{model_size} LogProb")
+        if 'hit_accuracy_at_10' in df.columns:
+            ax1_right.plot(df['Exposure Steps'], df['hit_accuracy_at_10'], color=model_colors[model_size], linestyle=':', linewidth=2, label=f"{model_size} Hits@10")
+            
+    ax1.set_title("Source")
+    ax1.set_xlabel("Exposure #")
+    ax1.set_ylabel("Log Prob.")
+    ax1_right.set_yticklabels([]) # Hide right ticks
+    
+    apply_ylim([ax1], lp_ylim)
+    if hits_ylim:
+        apply_ylim([ax1_right], hits_ylim)
+    ax1.grid(True, alpha=0.1)
+
+    # --- Panel 2: Para 9 Compositional ---
+    ax2 = axes[1]
+    ax2_right = ax2.twinx()
+    
+    for model_size, df in p2_data:
+        ax2.plot(df['Exposure Steps'], df['log_prob'], color=model_colors[model_size], linestyle='-', linewidth=2)
+        if 'hit_accuracy_at_10' in df.columns:
+            ax2_right.plot(df['Exposure Steps'], df['hit_accuracy_at_10'], color=model_colors[model_size], linestyle=':', linewidth=2)
+
+    ax2.set_title("Para. 9")
+    ax2.set_xlabel("Exposure #")
+    ax2.set_yticklabels([]) # Hide left ticks
+    ax2_right.set_ylabel("Hits@10") # Show right label
+    # ax2_right.set_yticklabels([]) # Show right ticks (Default)
+    
+    apply_ylim([ax2], lp_ylim)
+    if hits_ylim:
+        apply_ylim([ax2_right], hits_ylim)
+    ax2.grid(True, alpha=0.1)
+
+    # --- Panels 3 & 4: Batch Size Scaling ---
+    probe_types = ["Factual", "Compositional"]
+    ax_bs_list = [axes[2], axes[3]]
+    
+    for i, (ax, p_type) in enumerate(zip(ax_bs_list, probe_types)):
+        if df_bs.empty:
+            continue
+            
+        subset = df_bs[df_bs["Type"] == p_type]
+        pairs = subset[['Model', 'Strategy']].drop_duplicates()
+        
+        for _, row in pairs.iterrows():
+            m = row['Model']
+            s = row['Strategy']
+            
+            series = subset[(subset['Model'] == m) & (subset['Strategy'] == s)].sort_values("BatchSize")
+            if series.empty:
+                continue
+                
+            color = model_colors.get(m, 'black')
+            ls = bs_styles.get(s, {}).get("linestyle", "-")
+            marker = bs_styles.get(s, {}).get("marker", "o")
+            
+            ax.plot(series['BatchSize'], series['Value'], color=color, linestyle=ls, marker=marker, linewidth=1.5)
+
+        ax.set_title(p_type)
+        ax.set_xscale('log', base=2)
+        ax.set_xticks([32, 64, 128, 256])
+        ax.set_xticklabels(['32', '64', '128', '256'])
+        ax.set_xlabel("Batch Size")
+        
+        if i == 0:
+            pass
+        else:
+            ax.set_yticklabels([])
+            
+        ax.grid(True, which="major", ls="-", alpha=0.1)
+
+    if not df_bs.empty:
+        ylim = compute_unified_ylim(values=df_bs["Value"].tolist())
+        if ylim:
+            apply_ylim(ax_bs_list, ylim)
+
+    # --- Legends ---
+    p1_legend_elements = [
+        Line2D([0], [0], color='#ffd700', lw=2, linestyle='-', label='1B'),
+        Line2D([0], [0], color='#ff7f0e', lw=2, linestyle='-', label='7B'),
+        Line2D([0], [0], color='#d62728', lw=2, linestyle='-', label='13B'),
+        Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Log Prob'),
+        Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Hits@10'),
+    ]
+    axes[0].legend(handles=p1_legend_elements, loc='lower right', fontsize='small', frameon=True)
+
+    bs_legend_elements = [
+        Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Para 9'),
+        Line2D([0], [0], color='gray', lw=2, linestyle='--', label='Source'),
+        Line2D([0], [0], color='#ffd700', lw=2, linestyle='-', label='1B'),
+        Line2D([0], [0], color='#ff7f0e', lw=2, linestyle='-', label='7B'),
+        Line2D([0], [0], color='#d62728', lw=2, linestyle='-', label='13B'),
+    ]
+    axes[2].legend(handles=bs_legend_elements, loc='lower left', fontsize='small', frameon=True)
+
+    plt.tight_layout()
+    os.makedirs('plots', exist_ok=True)
+    out_path = os.path.join('plots', 'combined_4panel.pdf')
+    plt.savefig(out_path, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved 4-panel plot to {out_path}")
+
+def plot_grokking(df_k, df_i, color_factual, color_comp):
+    print("Plotting Grokking Figure...")
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax_right = ax.twinx()
+    
+    # Knowledge (Factual)
+    if df_k is not None:
+        ax.plot(df_k['Exposure Steps'], df_k['log_prob'], color=color_factual, linestyle='-', linewidth=2, label="Factual LogProb")
+        if 'hit_accuracy_at_10' in df_k.columns:
+            ax_right.plot(df_k['Exposure Steps'], df_k['hit_accuracy_at_10'], color=color_factual, linestyle=':', linewidth=2, label="Factual Hits@10")
+
+    # Inference (Compositional)
+    if df_i is not None:
+        ax.plot(df_i['Exposure Steps'], df_i['log_prob'], color=color_comp, linestyle='-', linewidth=2, label="Comp. LogProb")
+        if 'hit_accuracy_at_10' in df_i.columns:
+            ax_right.plot(df_i['Exposure Steps'], df_i['hit_accuracy_at_10'], color=color_comp, linestyle=':', linewidth=2, label="Comp. Hits@10")
+
+    ax.set_title("Source")
+    ax.set_xlabel("Exposure #")
+    ax.set_ylabel("Log Prob.")
+    ax_right.set_ylabel("Hits@10")
+    ax.grid(True, alpha=0.1)
+    
+    # Scale down Hits@10 (Manual +0.5)
+    current_ylim = ax_right.get_ylim()
+    ax_right.set_ylim(0.5, current_ylim[1] + 0.08)
+
+    # Legend
+    traj_legend_elements = [
+        Line2D([0], [0], color=color_factual, lw=2, linestyle='-', label='Factual'),
+        Line2D([0], [0], color=color_comp, lw=2, linestyle='-', label='Compositional'),
+        Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Log Prob'),
+        Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Hits@10'),
+    ]
+    ax.legend(handles=traj_legend_elements, loc='lower right', fontsize='small', frameon=True)
+
+    plt.tight_layout()
+    out_path = os.path.join('plots', 'grokking.pdf')
+    plt.savefig(out_path, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved grokking plot to {out_path}")
+
 def main():
     set_plot_style()
+    # Override with larger fonts
+    plt.rcParams.update({
+        "axes.labelsize": 18,
+        "xtick.labelsize": 16,
+        "ytick.labelsize": 16,
+        "legend.fontsize": 16,
+        "figure.titlesize": 22,
+        "axes.titlesize": 20,
+    })
     project_root = REPO_ROOT
     domains = discover_domains(project_root)
     
     # --- Data Configuration ---
-    
-    # 1. Trajectory Data for Panel 5 (7B 500 epochs) - Source Only
     traj_path_7b_500 = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e500/bs32_lr2e-05_const/overlap_1_4/11_22_16_47"
     
-    # 2. Trajectory Data for Panels 1 & 2 (Compositional: Source & Para 9)
-    # Paths from plot_hitsat10_and_logprobs.py
     trajectory_config = {
         "Source": {
             "1B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4",
@@ -121,7 +292,6 @@ def main():
         }
     }
 
-    # 3. Batch Size Scaling Data
     bs_run_config = {
         "7B": {
             "Para 9": {
@@ -177,48 +347,27 @@ def main():
         "Source": {"linestyle": "--", "marker": "s"},
         "Para 9": {"linestyle": "-", "marker": "o"},
     }
-    
-    # Trajectory Colors (Panel 5)
     color_factual = "#00008B" # Dark Blue
     color_comp = "#87CEEB"    # Light Blue
 
-    # --- Plotting Setup ---
-    # 5 panels, equal width, with spacers between (2,3) and (4,5)
-    # Layout: [P1] [P2] [Space] [P3] [P4] [Space] [P5]
-    # Ratios:  1    1    0.2     1    1    0.2     1
-    
-    fig = plt.figure(figsize=(20, 5))
-    gs = gridspec.GridSpec(1, 7, width_ratios=[1, 1, 0.2, 1, 1, 0.2, 1], wspace=0.1)
-    
-    axes = []
-    axes.append(fig.add_subplot(gs[0, 0])) # Panel 1
-    axes.append(fig.add_subplot(gs[0, 1])) # Panel 2
-    axes.append(fig.add_subplot(gs[0, 3])) # Panel 3
-    axes.append(fig.add_subplot(gs[0, 4])) # Panel 4
-    axes.append(fig.add_subplot(gs[0, 6])) # Panel 5
-    
-    # --- Collect Data for Panels 1 & 2 to Compute Shared Limits ---
-    p1_data = [] # List of (model, df)
-    p2_data = [] # List of (model, df)
-    
-    # Panel 1 Data
+    # --- Data Collection ---
+    # Panels 1 & 2
+    p1_data = []
+    p2_data = []
     for model_size in ["1B", "7B", "13B"]:
         path = trajectory_config["Source"].get(model_size)
         if path:
             df = get_trajectory_data(path, 'inference', domains, project_root)
-            # No filtering for Panels 1 & 2
             if df is not None:
-                df['Exposure Steps'] = df['step'] # Every step is exposure
+                df['Exposure Steps'] = df['step']
                 p1_data.append((model_size, df))
                 
-    # Panel 2 Data
     for model_size in ["1B", "7B", "13B"]:
         path = trajectory_config["Para 9"].get(model_size)
         if path:
             df = get_trajectory_data(path, 'inference', domains, project_root)
-            # No filtering for Panels 1 & 2
             if df is not None:
-                df['Exposure Steps'] = df['step'] # Every step is exposure
+                df['Exposure Steps'] = df['step']
                 p2_data.append((model_size, df))
 
     # Compute Limits for Panels 1 & 2
@@ -232,63 +381,7 @@ def main():
     lp_ylim = compute_unified_ylim(all_logprobs)
     hits_ylim = compute_unified_ylim(all_hits) if all_hits else None
     
-    # Scale down Hits@10 by increasing ymax by 0.5
-    if hits_ylim:
-        hits_ylim = (hits_ylim[0], hits_ylim[1])
-
-    # --- Panel 1: Source Compositional (1B, 7B, 13B) ---
-    print("Plotting Panel 1: Source Compositional...")
-    ax1 = axes[0]
-    ax1_right = ax1.twinx()
-    
-    for model_size, df in p1_data:
-        # LogProb (Solid)
-        ax1.plot(df['Exposure Steps'], df['log_prob'], color=model_colors[model_size], linestyle='-', linewidth=2, label=f"{model_size} LogProb")
-        # Hits@10 (Dotted)
-        if 'hit_accuracy_at_10' in df.columns:
-            ax1_right.plot(df['Exposure Steps'], df['hit_accuracy_at_10'], color=model_colors[model_size], linestyle=':', linewidth=2, label=f"{model_size} Hits@10")
-            
-    ax1.set_title("Source")
-    ax1.set_xlabel("Exposure #")
-    ax1.set_ylabel("Log Prob.") # Only leftmost label
-    
-    # Hide right tick labels for Panel 1
-    ax1_right.set_yticklabels([])
-    
-    apply_ylim([ax1], lp_ylim)
-    if hits_ylim:
-        apply_ylim([ax1_right], hits_ylim)
-        
-    ax1.grid(True, alpha=0.1)
-
-    # --- Panel 2: Para 9 Compositional (1B, 7B, 13B) ---
-    print("Plotting Panel 2: Para 9 Compositional...")
-    ax2 = axes[1]
-    ax2_right = ax2.twinx()
-    
-    for model_size, df in p2_data:
-        # LogProb (Solid)
-        ax2.plot(df['Exposure Steps'], df['log_prob'], color=model_colors[model_size], linestyle='-', linewidth=2)
-        # Hits@10 (Dotted)
-        if 'hit_accuracy_at_10' in df.columns:
-            ax2_right.plot(df['Exposure Steps'], df['hit_accuracy_at_10'], color=model_colors[model_size], linestyle=':', linewidth=2)
-
-    ax2.set_title("Para. 9")
-    ax2.set_xlabel("Exposure #")
-    
-    # Hide left tick labels for Panel 2
-    ax2.set_yticklabels([])
-    
-    apply_ylim([ax2], lp_ylim)
-    if hits_ylim:
-        apply_ylim([ax2_right], hits_ylim)
-    
-    ax2.grid(True, alpha=0.1)
-
-    # --- Panels 3 & 4: Batch Size Scaling ---
-    print("Plotting Panels 3 & 4: Batch Size Scaling...")
-    
-    # Collect BS data
+    # Panels 3 & 4
     bs_data = []
     for model, strategies in bs_run_config.items():
         for strategy, batches in strategies.items():
@@ -296,143 +389,25 @@ def main():
                 resolved = find_latest_run(path)
                 if not resolved:
                     continue
-                
-                # We need final step values
                 df_k = aggregate_across_domains(resolved, 'knowledge', domains, split_probes=False, project_root=project_root)
                 df_i = aggregate_across_domains(resolved, 'inference', domains, split_probes=False, project_root=project_root)
-                
                 val_k = get_final_step_value(df_k)
                 val_i = get_final_step_value(df_i)
-                
                 if not np.isnan(val_k):
                     bs_data.append({"Model": model, "Strategy": strategy, "BatchSize": bs, "Type": "Factual", "Value": val_k})
                 if not np.isnan(val_i):
                     bs_data.append({"Model": model, "Strategy": strategy, "BatchSize": bs, "Type": "Compositional", "Value": val_i})
-
     df_bs = pd.DataFrame(bs_data)
-    
-    # Panel 3: Factual, Panel 4: Compositional
-    probe_types = ["Factual", "Compositional"]
-    ax_bs_list = [axes[2], axes[3]]
-    
-    for i, (ax, p_type) in enumerate(zip(ax_bs_list, probe_types)):
-        if df_bs.empty:
-            continue
-            
-        subset = df_bs[df_bs["Type"] == p_type]
-        pairs = subset[['Model', 'Strategy']].drop_duplicates()
-        
-        for _, row in pairs.iterrows():
-            m = row['Model']
-            s = row['Strategy']
-            
-            series = subset[(subset['Model'] == m) & (subset['Strategy'] == s)].sort_values("BatchSize")
-            if series.empty:
-                continue
-                
-            color = model_colors.get(m, 'black')
-            ls = bs_styles.get(s, {}).get("linestyle", "-")
-            marker = bs_styles.get(s, {}).get("marker", "o")
-            
-            ax.plot(series['BatchSize'], series['Value'], color=color, linestyle=ls, marker=marker, linewidth=1.5)
 
-        ax.set_title(p_type)
-        ax.set_xscale('log', base=2)
-        ax.set_xticks([32, 64, 128, 256])
-        ax.set_xticklabels(['32', '64', '128', '256'])
-        ax.set_xlabel("Batch Size")
-        
-        # Add Y-label for Panel 3 (index 0 in this loop)
-        if i == 0:
-            ax.set_ylabel("Final Log Prob.")
-        
-        # Hide left tick labels for Panel 4 (which is index 1 in this loop)
-        if i == 1:
-            ax.set_yticklabels([])
-            
-        ax.grid(True, which="major", ls="-", alpha=0.1)
+    # Panel 5 (Grokking)
+    df_k_grok = get_trajectory_data(traj_path_7b_500, 'knowledge', domains, project_root)
+    df_k_grok = filter_steps(df_k_grok)
+    df_i_grok = get_trajectory_data(traj_path_7b_500, 'inference', domains, project_root)
+    df_i_grok = filter_steps(df_i_grok)
 
-    # Unified Y-limit for Panels 3 & 4
-    if not df_bs.empty:
-        ylim = compute_unified_ylim(values=df_bs["Value"].tolist())
-        if ylim:
-            apply_ylim(ax_bs_list, ylim)
-
-    # --- Panel 5: Training Dynamics (Source Only, Dual Axis) ---
-    print("Plotting Panel 5: Training Dynamics...")
-    ax5 = axes[4]
-    ax5_right = ax5.twinx()
-    
-    # Knowledge (Factual) - Dark Blue
-    df_k = get_trajectory_data(traj_path_7b_500, 'knowledge', domains, project_root)
-    df_k = filter_steps(df_k)
-    
-    if df_k is not None:
-        # Log Prob (Solid)
-        ax5.plot(df_k['Exposure Steps'], df_k['log_prob'], color=color_factual, linestyle='-', linewidth=2, label="Factual LogProb")
-        # Hits@10 (Dotted)
-        if 'hit_accuracy_at_10' in df_k.columns:
-            ax5_right.plot(df_k['Exposure Steps'], df_k['hit_accuracy_at_10'], color=color_factual, linestyle=':', linewidth=2, label="Factual Hits@10")
-
-    # Inference (Compositional) - Light Blue
-    df_i = get_trajectory_data(traj_path_7b_500, 'inference', domains, project_root)
-    df_i = filter_steps(df_i)
-    
-    if df_i is not None:
-        # Log Prob (Solid)
-        ax5.plot(df_i['Exposure Steps'], df_i['log_prob'], color=color_comp, linestyle='-', linewidth=2, label="Comp. LogProb")
-        # Hits@10 (Dotted)
-        if 'hit_accuracy_at_10' in df_i.columns:
-            ax5_right.plot(df_i['Exposure Steps'], df_i['hit_accuracy_at_10'], color=color_comp, linestyle=':', linewidth=2, label="Comp. Hits@10")
-
-    ax5.set_title("Source")
-    ax5.set_xlabel("Exposure #")
-    ax5.set_ylabel("Log Prob.")
-    ax5_right.set_ylabel("Hits@10")
-    ax5.grid(True, alpha=0.1)
-    
-    # Scale down Hits@10 for Panel 5 as well
-    # Get current ylim and add 0.5
-    current_ylim = ax5_right.get_ylim()
-    ax5_right.set_ylim(0.5, current_ylim[1] + 0.08)
-
-    # --- Legends ---
-    
-    # Legend for Panels 1 & 2 (Models + Metrics)
-    p1_legend_elements = [
-        Line2D([0], [0], color='#ffd700', lw=2, linestyle='-', label='1B'),
-        Line2D([0], [0], color='#ff7f0e', lw=2, linestyle='-', label='7B'),
-        Line2D([0], [0], color='#d62728', lw=2, linestyle='-', label='13B'),
-        Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Log Prob'),
-        Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Hits@10'),
-    ]
-    axes[0].legend(handles=p1_legend_elements, loc='lower right', fontsize='x-small', frameon=True)
-
-    # Legend for Panels 3 & 4 (Batch Size)
-    bs_legend_elements = [
-        Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Para 9'),
-        Line2D([0], [0], color='gray', lw=2, linestyle='--', label='Source'),
-        Line2D([0], [0], color='#ffd700', lw=2, linestyle='-', label='1B'),
-        Line2D([0], [0], color='#ff7f0e', lw=2, linestyle='-', label='7B'),
-        Line2D([0], [0], color='#d62728', lw=2, linestyle='-', label='13B'),
-    ]
-    axes[2].legend(handles=bs_legend_elements, loc='lower left', fontsize='x-small', frameon=True)
-
-    # Legend for Panel 5 (Trajectory)
-    traj_legend_elements = [
-        Line2D([0], [0], color=color_factual, lw=2, linestyle='-', label='Factual'),
-        Line2D([0], [0], color=color_comp, lw=2, linestyle='-', label='Compositional'),
-        Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Log Prob'),
-        Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Hits@10'),
-    ]
-    axes[4].legend(handles=traj_legend_elements, loc='lower right', fontsize='x-small', frameon=True)
-
-    plt.tight_layout()
-    os.makedirs('plots', exist_ok=True)
-    out_path = os.path.join('plots', 'combined_5panel.pdf')
-    plt.savefig(out_path, bbox_inches='tight')
-    plt.close(fig)
-    print(f"Saved plot to {out_path}")
+    # --- Generate Plots ---
+    plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, hits_ylim)
+    plot_grokking(df_k_grok, df_i_grok, color_factual, color_comp)
 
 if __name__ == "__main__":
     main()
