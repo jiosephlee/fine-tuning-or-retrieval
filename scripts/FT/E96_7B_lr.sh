@@ -19,7 +19,7 @@ python -s finetuning_knowledge_v8.py \
     --separate_batches_with_pretraining 1 \
     --inference_probes_version "v6" \
     --num_train_epochs $num_epochs \
-    --learning_rate 2e-5 \
+    --learning_rate 4e-5 \
     --num_paraphrased_texts $num_paraphrased \
     --overlap_sections \
     --overlap_ratio 1_4 \
