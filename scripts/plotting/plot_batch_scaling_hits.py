@@ -22,61 +22,85 @@ from scripts.plotting.plot_utils import (
 )
 
 def plot_batch_scaling_hits(df_bs, model_colors, bs_styles):
-    print("Plotting Batch Scaling Hits@10 Figure...")
+    print("Plotting Batch Scaling Hits Figure (1/10/100)...")
     
-    # Layout: [Factual] [Compositional]
-    # Ratios: 1 1
-    # Width: 10 (similar to factual scaling plot)
+    # Layout: 3 Rows (Hits@1, Hits@10, Hits@100) x 2 Columns (Factual, Compositional)
+    # Width: 10, Height: 15 (5 per row)
     
-    fig = plt.figure(figsize=(10, 5))
-    gs = gridspec.GridSpec(1, 2, width_ratios=[1, 1], wspace=0.15)
+    fig = plt.figure(figsize=(10, 15))
+    gs = gridspec.GridSpec(3, 2, width_ratios=[1, 1], wspace=0.15, hspace=0.3)
     
-    axes = []
-    axes.append(fig.add_subplot(gs[0, 0])) # Factual
-    axes.append(fig.add_subplot(gs[0, 1])) # Compositional
-    
+    metrics = ["Hits@1", "Hits@10", "Hits@100"]
     probe_types = ["Factual", "Compositional"]
     
-    for i, (ax, p_type) in enumerate(zip(axes, probe_types)):
-        if df_bs.empty:
-            continue
-            
-        subset = df_bs[df_bs["Type"] == p_type]
-        pairs = subset[['Model', 'Strategy']].drop_duplicates()
+    axes_grid = []
+    for r in range(3):
+        row_axes = []
+        for c in range(2):
+            row_axes.append(fig.add_subplot(gs[r, c]))
+        axes_grid.append(row_axes)
         
-        for _, row in pairs.iterrows():
-            m = row['Model']
-            s = row['Strategy']
+    for r, metric in enumerate(metrics):
+        for c, p_type in enumerate(probe_types):
+            ax = axes_grid[r][c]
             
-            series = subset[(subset['Model'] == m) & (subset['Strategy'] == s)].sort_values("BatchSize")
-            if series.empty:
+            if df_bs.empty:
                 continue
                 
-            color = model_colors.get(m, 'black')
-            ls = bs_styles.get(s, {}).get("linestyle", "-")
-            marker = bs_styles.get(s, {}).get("marker", "o")
+            subset = df_bs[(df_bs["Type"] == p_type) & (df_bs["Metric"] == metric)]
+            pairs = subset[['Model', 'Strategy']].drop_duplicates()
             
-            ax.plot(series['BatchSize'], series['Value'], color=color, linestyle=ls, marker=marker, linewidth=1.5)
+            for _, row in pairs.iterrows():
+                m = row['Model']
+                s = row['Strategy']
+                
+                series = subset[(subset['Model'] == m) & (subset['Strategy'] == s)].sort_values("BatchSize")
+                if series.empty:
+                    continue
+                    
+                color = model_colors.get(m, 'black')
+                ls = bs_styles.get(s, {}).get("linestyle", "-")
+                marker = bs_styles.get(s, {}).get("marker", "o")
+                
+                ax.plot(series['BatchSize'], series['Value'], color=color, linestyle=ls, marker=marker, linewidth=1.5)
 
-        ax.set_title(p_type)
-        ax.set_xscale('log', base=2)
-        ax.set_xticks([32, 64, 128, 256])
-        ax.set_xticklabels(['32', '64', '128', '256'])
-        ax.set_xlabel("Batch Size")
-        
-        if i == 0:
-            ax.set_ylabel("Hits@10")
-        else:
-            ax.set_yticklabels([])
+            # Titles only on top row
+            if r == 0:
+                ax.set_title(p_type)
             
-        ax.grid(True, which="major", ls="-", alpha=0.1)
+            ax.set_xscale('log', base=2)
+            ax.set_xticks([32, 64, 128, 256])
+            ax.set_xticklabels(['32', '64', '128', '256'])
+            
+            # X-label only on bottom row
+            if r == 2:
+                ax.set_xlabel("Batch Size")
+            else:
+                ax.set_xticklabels([]) # Hide x-ticks for upper rows? Or keep them? 
+                # Usually better to keep them if not shared x-axis, but here x-axis is same.
+                # Let's hide labels to be cleaner, or keep them. 
+                # User didn't specify, but standard is bottom only.
+                # Actually, let's keep them for clarity as spacing is 0.3
+                pass
+            
+            # Y-label on left column
+            if c == 0:
+                ax.set_ylabel(metric)
+            else:
+                ax.set_yticklabels([])
+                
+            ax.grid(True, which="major", ls="-", alpha=0.1)
 
+    # Unified Y-limits per row? Or global?
+    # Usually hits metrics are 0-1, but let's compute per row.
     if not df_bs.empty:
-        ylim = compute_unified_ylim(values=df_bs["Value"].tolist())
-        if ylim:
-            apply_ylim(axes, ylim)
+        for r, metric in enumerate(metrics):
+            row_vals = df_bs[df_bs["Metric"] == metric]["Value"].tolist()
+            ylim = compute_unified_ylim(values=row_vals)
+            if ylim:
+                apply_ylim(axes_grid[r], ylim)
 
-    # --- Legend ---
+    # --- Legend (Bottom Left Panel) ---
     bs_legend_elements = [
         Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Para 9'),
         Line2D([0], [0], color='gray', lw=2, linestyle='--', label='Source'),
@@ -84,7 +108,9 @@ def plot_batch_scaling_hits(df_bs, model_colors, bs_styles):
         Line2D([0], [0], color='#ff7f0e', lw=2, linestyle='-', label='7B'),
         Line2D([0], [0], color='#d62728', lw=2, linestyle='-', label='13B'),
     ]
-    axes[0].legend(handles=bs_legend_elements, loc='lower left', fontsize='small', frameon=True)
+    # Place legend in the first subplot (Top Left) or maybe outside?
+    # Previous was lower left of first panel.
+    axes_grid[0][0].legend(handles=bs_legend_elements, loc='lower left', fontsize='small', frameon=True)
 
     plt.tight_layout()
     os.makedirs('plots', exist_ok=True)
@@ -164,7 +190,7 @@ def main():
         "Para 9": {"linestyle": "-", "marker": "o"},
     }
 
-    # --- Data Collection (Hits@10) ---
+    # --- Data Collection (Hits@1, Hits@10, Hits@100) ---
     bs_data = []
     for model, strategies in bs_run_config.items():
         for strategy, batches in strategies.items():
@@ -175,14 +201,22 @@ def main():
                 df_k = aggregate_across_domains(resolved, 'knowledge', domains, split_probes=False, project_root=project_root)
                 df_i = aggregate_across_domains(resolved, 'inference', domains, split_probes=False, project_root=project_root)
                 
-                # CHANGED: Fetch Hits@10
-                val_k = get_final_step_value(df_k, value_col='hit_accuracy_at_10')
-                val_i = get_final_step_value(df_i, value_col='hit_accuracy_at_10')
+                # Fetch Metrics
+                metrics_map = {
+                    "Hits@1": 'hit_accuracy_at_1',
+                    "Hits@10": 'hit_accuracy_at_10',
+                    "Hits@100": 'hit_accuracy_at_100'
+                }
                 
-                if not np.isnan(val_k):
-                    bs_data.append({"Model": model, "Strategy": strategy, "BatchSize": bs, "Type": "Factual", "Value": val_k})
-                if not np.isnan(val_i):
-                    bs_data.append({"Model": model, "Strategy": strategy, "BatchSize": bs, "Type": "Compositional", "Value": val_i})
+                for m_name, col in metrics_map.items():
+                    val_k = get_final_step_value(df_k, value_col=col)
+                    val_i = get_final_step_value(df_i, value_col=col)
+                    
+                    if not np.isnan(val_k):
+                        bs_data.append({"Model": model, "Strategy": strategy, "BatchSize": bs, "Type": "Factual", "Metric": m_name, "Value": val_k})
+                    if not np.isnan(val_i):
+                        bs_data.append({"Model": model, "Strategy": strategy, "BatchSize": bs, "Type": "Compositional", "Metric": m_name, "Value": val_i})
+
     df_bs = pd.DataFrame(bs_data)
 
     # --- Generate Plot ---

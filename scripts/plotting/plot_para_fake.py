@@ -220,47 +220,57 @@ def plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, hits_
     plt.close(fig)
     print(f"Saved 4-panel plot to {out_path}")
 
-def plot_grokking(df_k, df_i, color_factual, color_comp):
+def plot_grokking(df_k_src, df_i_src, df_k_para, df_i_para, color_factual, color_comp):
     print("Plotting Grokking Figure...")
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax_right = ax.twinx()
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharey=True)
     
-    # Knowledge (Factual)
-    if df_k is not None:
-        ax.plot(df_k['Exposure Steps'], df_k['log_prob'], color=color_factual, linestyle='-', linewidth=2, label="Factual LogProb")
-        if 'hit_accuracy_at_10' in df_k.columns:
-            ax_right.plot(df_k['Exposure Steps'], df_k['hit_accuracy_at_10'], color=color_factual, linestyle=':', linewidth=2, label="Factual Hits@10")
+    # Helper to plot one panel
+    def plot_panel(ax, df_k, df_i, title):
+        ax_right = ax.twinx()
+        
+        # Knowledge (Factual)
+        if df_k is not None:
+            ax.plot(df_k['Exposure Steps'], df_k['log_prob'], color=color_factual, linestyle='-', linewidth=2, label="Factual LogProb")
+            if 'hit_accuracy_at_10' in df_k.columns:
+                ax_right.plot(df_k['Exposure Steps'], df_k['hit_accuracy_at_10'], color=color_factual, linestyle=':', linewidth=2, label="Factual Hits@10")
 
-    # Inference (Compositional)
-    if df_i is not None:
-        ax.plot(df_i['Exposure Steps'], df_i['log_prob'], color=color_comp, linestyle='-', linewidth=2, label="Comp. LogProb")
-        if 'hit_accuracy_at_10' in df_i.columns:
-            ax_right.plot(df_i['Exposure Steps'], df_i['hit_accuracy_at_10'], color=color_comp, linestyle=':', linewidth=2, label="Comp. Hits@10")
+        # Inference (Compositional)
+        if df_i is not None:
+            ax.plot(df_i['Exposure Steps'], df_i['log_prob'], color=color_comp, linestyle='-', linewidth=2, label="Comp. LogProb")
+            if 'hit_accuracy_at_10' in df_i.columns:
+                ax_right.plot(df_i['Exposure Steps'], df_i['hit_accuracy_at_10'], color=color_comp, linestyle=':', linewidth=2, label="Comp. Hits@10")
 
-    ax.set_title("Source")
-    ax.set_xlabel("Exposure #")
-    ax.set_ylabel("Log Prob.")
-    ax_right.set_ylabel("Hits@10")
-    ax.grid(True, alpha=0.1)
+        ax.set_title(title)
+        ax.set_xlabel("Exposure #")
+        ax.set_ylabel("Log Prob.")
+        ax_right.set_ylabel("Hits@10")
+        ax.grid(True, alpha=0.1)
+        
+        # Scale down Hits@10 (Manual +0.5)
+        current_ylim = ax_right.get_ylim()
+        ax_right.set_ylim(0.5, current_ylim[1] + 0.08)
+        
+        return ax_right
+
+    # Plot Source
+    plot_panel(axes[0], df_k_src, df_i_src, "Source")
     
-    # Scale down Hits@10 (Manual +0.5)
-    current_ylim = ax_right.get_ylim()
-    ax_right.set_ylim(0.5, current_ylim[1] + 0.08)
+    # Plot Para
+    plot_panel(axes[1], df_k_para, df_i_para, "Para 9")
 
-    # Legend
+    # Legend (on the last plot)
     traj_legend_elements = [
         Line2D([0], [0], color=color_factual, lw=2, linestyle='-', label='Factual'),
         Line2D([0], [0], color=color_comp, lw=2, linestyle='-', label='Compositional'),
         Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Log Prob'),
         Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Hits@10'),
     ]
-    ax.legend(handles=traj_legend_elements, loc='lower right', fontsize='small', frameon=True)
+    axes[1].legend(handles=traj_legend_elements, loc='lower right', fontsize='small', frameon=True)
 
     plt.tight_layout()
     out_path = os.path.join('plots', 'grokking.pdf')
     plt.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
-    print(f"Saved grokking plot to {out_path}")
 
 def main():
     set_plot_style()
@@ -277,18 +287,21 @@ def main():
     domains = discover_domains(project_root)
     
     # --- Data Configuration ---
-    traj_path_7b_500 = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e500/bs32_lr2e-05_const/overlap_1_4/11_22_16_47"
+    # Grokking Paths
+    traj_path_7b_500_source = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e500/bs32_lr2e-05_const/overlap_1_4/11_22_16_47"
+    traj_path_7b_500_para = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e500/bs32_lr2e-05_const/overlap_1_4/11_19_20_24/"
     
+    # BS32 Trajectories (Derived from bs_run_config where possible)
     trajectory_config = {
         "Source": {
-            "1B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4",
-            "7B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_20_22_51",
-            "13B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_30",
+            "1B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_23_05_24",
+            "7B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_23_05_24",
+            "13B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05",
         },
         "Para 9": {
-            "1B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4",
-            "7B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_20_22_51",
-            "13B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_13_18",
+            "1B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_23_07_13",
+            "7B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_23_10_36",
+            "13B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_23_07_02",
         }
     }
 
@@ -400,14 +413,21 @@ def main():
     df_bs = pd.DataFrame(bs_data)
 
     # Panel 5 (Grokking)
-    df_k_grok = get_trajectory_data(traj_path_7b_500, 'knowledge', domains, project_root)
-    df_k_grok = filter_steps(df_k_grok)
-    df_i_grok = get_trajectory_data(traj_path_7b_500, 'inference', domains, project_root)
-    df_i_grok = filter_steps(df_i_grok)
+    # Source
+    df_k_grok_src = get_trajectory_data(traj_path_7b_500_source, 'knowledge', domains, project_root)
+    df_k_grok_src = filter_steps(df_k_grok_src)
+    df_i_grok_src = get_trajectory_data(traj_path_7b_500_source, 'inference', domains, project_root)
+    df_i_grok_src = filter_steps(df_i_grok_src)
+    
+    # Para
+    df_k_grok_para = get_trajectory_data(traj_path_7b_500_para, 'knowledge', domains, project_root)
+    df_k_grok_para = filter_steps(df_k_grok_para)
+    df_i_grok_para = get_trajectory_data(traj_path_7b_500_para, 'inference', domains, project_root)
+    df_i_grok_para = filter_steps(df_i_grok_para)
 
     # --- Generate Plots ---
     plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, hits_ylim)
-    plot_grokking(df_k_grok, df_i_grok, color_factual, color_comp)
+    plot_grokking(df_k_grok_src, df_i_grok_src, df_k_grok_para, df_i_grok_para, color_factual, color_comp)
 
 if __name__ == "__main__":
     main()
