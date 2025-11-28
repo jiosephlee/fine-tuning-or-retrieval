@@ -4,6 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import argparse
 import numpy as np
+from matplotlib.lines import Line2D
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from scripts.plotting.plot_comparison import aggregate_across_domains, find_latest_run_path
@@ -45,6 +46,10 @@ def transform_to_exposure_steps(df, strategy_name):
         # Exposure at step 0, then every 2 steps starting from 1 (0, 1, 3, 5...)
         df = df[(df['step'] == 0) | ((df['step'] > 0) & ((df['step'] - 1) % 2 == 0))].copy()
         df['Exposure Steps'] = (df['step'] + 1) // 2
+    elif 'With Data Replay (1:3) via interleave' in strategy_name:
+        # Exposure at step 0, then every 4 steps starting from 1 (0, 1, 5, 9...)
+        df = df[(df['step'] == 0) | ((df['step'] > 0) & ((df['step'] - 1) % 4 == 0))].copy()
+        df['Exposure Steps'] = (df['step'] - 1) // 4 + 1
     elif 'With Data Replay (1:5) via interleave' in strategy_name:
         # Exposure at step 0, then every 6 steps starting from 1 (0, 1, 7, 13...)
         df = df[(df['step'] == 0) | ((df['step'] > 0) & ((df['step'] - 1) % 6 == 0))].copy()
@@ -102,36 +107,39 @@ def main():
         '7B': {
             'With No Data Replay': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05',
             'With Data Replay (1:1) via interleave': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05',
+            'With Data Replay (1:3) via interleave': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_3_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_23_09_31',
+            'With Data Replay (1:5) via interleave': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_5_dclm',
             'Data replay (1:1) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/10_14_23_02',
             'Data replay (1:3) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs128_lr2e-05/overlap_1_4/10_15_04_09',
             'Data replay (1:5) via fill': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs192_lr2e-05/overlap_1_4/10_15_10_06',
-            'Data replay (1:5) via fill, interleave 2 batches': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_2_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/10_15_21_09',
-            'Data replay (1:5) via fill, interleave 1 batch': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs96_lr2e-05/overlap_1_4/10_14_23_06',
-            'With Data Replay (1:5) via interleave': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_5_dclm'
+            # 'Data replay (1:5) via fill, interleave 2 batches': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_2_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/10_15_21_09',
+            # 'Data replay (1:5) via fill, interleave 1 batch': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs96_lr2e-05/overlap_1_4/10_14_23_06',
         }
     }
     method_order = [
         'With No Data Replay',
         'With Data Replay (1:1) via interleave',
+        #'With Data Replay (1:3) via interleave',
         'With Data Replay (1:5) via interleave',
         'Data replay (1:1) via fill',
-        'Data replay (1:3) via fill',
+        #'Data replay (1:3) via fill',
         'Data replay (1:5) via fill',
-        'Data replay (1:5) via fill, interleave 1 batch',
-        'Data replay (1:5) via fill, interleave 2 batches',
+        # 'Data replay (1:5) via fill, interleave 1 batch',
+        # 'Data replay (1:5) via fill, interleave 2 batches',
     ]
     xlabel = 'Exposure/Training Steps' if args.with_LIMA else 'Exposure Steps'
 
     # Define colors and line styles for different methods
     method_styles = {
         'With No Data Replay': {'color': 'gray', 'linestyle': '-'},
-        'With Data Replay (1:1) via interleave': {'color': 'deepskyblue', 'linestyle': ':'},
-        'With Data Replay (1:5) via interleave': {'color': 'darkblue', 'linestyle': ':'},
+        'With Data Replay (1:1) via interleave': {'color': 'deepskyblue', 'linestyle': '--'},
+        #'With Data Replay (1:3) via interleave': {'color': 'cornflowerblue', 'linestyle': '--'},
+        'With Data Replay (1:5) via interleave': {'color': 'darkblue', 'linestyle': '--'},
         'Data replay (1:1) via fill': {'color': 'deepskyblue', 'linestyle': '-'},
-        'Data replay (1:3) via fill': {'color': 'cornflowerblue', 'linestyle': '-'},
+        #'Data replay (1:3) via fill': {'color': 'cornflowerblue', 'linestyle': '-'},
         'Data replay (1:5) via fill': {'color': 'darkblue', 'linestyle': '-'},
-        'Data replay (1:5) via fill, interleave 1 batch': {'color': 'darkblue', 'linestyle': '--'},
-        'Data replay (1:5) via fill, interleave 2 batches': {'color': 'darkblue', 'linestyle': '--'},
+        # 'Data replay (1:5) via fill, interleave 1 batch': {'color': 'darkblue', 'linestyle': '--'},
+        # 'Data replay (1:5) via fill, interleave 2 batches': {'color': 'darkblue', 'linestyle': '--'},
     }
 
     domains_path = os.path.join(project_root, 'data/arxiv/cleaned')
@@ -230,7 +238,7 @@ def main():
     else:
         ax_knowledge.set_title(f'{model_id}: Factual Probes (No Data)')
     ax_knowledge.set_xlabel(xlabel)
-    ax_knowledge.set_ylabel('Mean Log Probability')
+    ax_knowledge.set_ylabel('Log Prob.')
 
     # --- Inference Plot ---
     ax_inference = axes[1]
@@ -279,7 +287,18 @@ def main():
         if max_step_i > 0:
             ax_inference.axvline(x=max_step_i, color='red', linestyle='--', linewidth=1.5, alpha=0.9)
 
-    axes[0].legend(loc='lower left', fontsize='x-small', title_fontsize='x-small')
+
+
+    # Generic Legend
+    legend_elements = [
+        Line2D([0], [0], color='gray', lw=2, linestyle='-', label='No Data Replay'),
+        Line2D([0], [0], color='deepskyblue', lw=2, linestyle='-', label='1:1 Ratio'),
+        #Line2D([0], [0], color='cornflowerblue', lw=2, linestyle='-', label='1:3 Ratio'),
+        Line2D([0], [0], color='darkblue', lw=2, linestyle='-', label='1:5 Ratio'),
+        Line2D([0], [0], color='black', lw=2, linestyle='-', label='Via Fill'),
+        Line2D([0], [0], color='black', lw=2, linestyle='--', label='Via Interleave'),
+    ]
+    axes[0].legend(handles=legend_elements, loc='lower right', fontsize='x-small', title_fontsize='x-small')
 
     for ax in fig.get_axes():
         ax.grid(True)
