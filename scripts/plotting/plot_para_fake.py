@@ -63,10 +63,20 @@ def get_trajectory_data(run_path, probe_type, domains, project_root):
             df['step'] = pd.to_numeric(df['step'], errors='coerce')
             df['log_prob'] = pd.to_numeric(df['log_prob'], errors='coerce')
             
+            if 'hit_accuracy_at_1' in df.columns:
+                df['hit_accuracy_at_1'] = pd.to_numeric(df['hit_accuracy_at_1'], errors='coerce')
+            else:
+                df['hit_accuracy_at_1'] = np.nan
+
             if 'hit_accuracy_at_10' in df.columns:
                 df['hit_accuracy_at_10'] = pd.to_numeric(df['hit_accuracy_at_10'], errors='coerce')
             else:
                 df['hit_accuracy_at_10'] = np.nan
+
+            if 'hit_accuracy_at_100' in df.columns:
+                df['hit_accuracy_at_100'] = pd.to_numeric(df['hit_accuracy_at_100'], errors='coerce')
+            else:
+                df['hit_accuracy_at_100'] = np.nan
 
             df.dropna(subset=['step', 'log_prob'], inplace=True)
             
@@ -81,8 +91,12 @@ def get_trajectory_data(run_path, probe_type, domains, project_root):
     combined_df = pd.concat(all_domain_dfs, ignore_index=True)
     
     metric_cols = ['log_prob']
+    if 'hit_accuracy_at_1' in combined_df.columns:
+        metric_cols.append('hit_accuracy_at_1')
     if 'hit_accuracy_at_10' in combined_df.columns:
         metric_cols.append('hit_accuracy_at_10')
+    if 'hit_accuracy_at_100' in combined_df.columns:
+        metric_cols.append('hit_accuracy_at_100')
 
     agg = combined_df.groupby('step')[metric_cols].mean().reset_index()
     agg = agg.sort_values('step')
@@ -103,7 +117,7 @@ def plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, hits_
     # Total width ratio units: 4.2. Previous was 5.4.
     # Keeping width=20 makes them wider (20/4.2 > 20/5.4)
     
-    fig = plt.figure(figsize=(20, 5))
+    fig = plt.figure(figsize=(20, 6))
     gs = gridspec.GridSpec(1, 5, width_ratios=[1, 1, 0.2, 1, 1], wspace=0.15)
     
     axes = []
@@ -199,10 +213,12 @@ def plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, hits_
         Line2D([0], [0], color='#ffd700', lw=2, linestyle='-', label='1B'),
         Line2D([0], [0], color='#ff7f0e', lw=2, linestyle='-', label='7B'),
         Line2D([0], [0], color='#d62728', lw=2, linestyle='-', label='13B'),
+        Line2D([0], [0], color='#9467bd', lw=2, linestyle='-', label='32B'),
         Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Log Prob'),
         Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Hits@10'),
     ]
-    axes[0].legend(handles=p1_legend_elements, loc='lower right', fontsize='small', frameon=True)
+    leg1 = axes[0].legend(handles=p1_legend_elements, loc='lower right', fontsize=14, frameon=True)
+    leg1.get_frame().set_facecolor('none')
 
     bs_legend_elements = [
         Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Para 9'),
@@ -212,7 +228,8 @@ def plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, hits_
         Line2D([0], [0], color='#d62728', lw=2, linestyle='-', label='13B'),
         Line2D([0], [0], color='#9467bd', lw=2, linestyle='-', label='32B'),
     ]
-    axes[2].legend(handles=bs_legend_elements, loc='lower left', fontsize='small', frameon=True)
+    leg2 = axes[2].legend(handles=bs_legend_elements, loc='lower left', fontsize=14, frameon=True)
+    leg2.get_frame().set_facecolor('none')
 
     plt.tight_layout()
     os.makedirs('plots', exist_ok=True)
@@ -231,15 +248,23 @@ def plot_grokking(df_k_src, df_i_src, df_k_para, df_i_para, color_factual, color
         
         # Knowledge (Factual)
         if df_k is not None:
-            ax.plot(df_k['Exposure Steps'], df_k['log_prob'], color=color_factual, linestyle='-', linewidth=2, label="Factual LogProb")
+            ax.plot(df_k['Exposure Steps'], df_k['log_prob'], color=color_factual, linestyle='-', linewidth=2.5, label="Factual LogProb")
+            if 'hit_accuracy_at_1' in df_k.columns:
+                ax_right.plot(df_k['Exposure Steps'], df_k['hit_accuracy_at_1'], color=color_factual, linestyle='--', linewidth=2.0, label="Factual Hits@1")
             if 'hit_accuracy_at_10' in df_k.columns:
-                ax_right.plot(df_k['Exposure Steps'], df_k['hit_accuracy_at_10'], color=color_factual, linestyle=':', linewidth=2, label="Factual Hits@10")
+                ax_right.plot(df_k['Exposure Steps'], df_k['hit_accuracy_at_10'], color=color_factual, linestyle=':', linewidth=2.0, label="Factual Hits@10")
+            if 'hit_accuracy_at_100' in df_k.columns:
+                ax_right.plot(df_k['Exposure Steps'], df_k['hit_accuracy_at_100'], color=color_factual, linestyle='-.', linewidth=2.0, label="Factual Hits@100")
 
         # Inference (Compositional)
         if df_i is not None:
-            ax.plot(df_i['Exposure Steps'], df_i['log_prob'], color=color_comp, linestyle='-', linewidth=2, label="Comp. LogProb")
+            ax.plot(df_i['Exposure Steps'], df_i['log_prob'], color=color_comp, linestyle='-', linewidth=2.5, label="Comp. LogProb")
+            if 'hit_accuracy_at_1' in df_i.columns:
+                ax_right.plot(df_i['Exposure Steps'], df_i['hit_accuracy_at_1'], color=color_comp, linestyle='--', linewidth=2.0, label="Comp. Hits@1")
             if 'hit_accuracy_at_10' in df_i.columns:
-                ax_right.plot(df_i['Exposure Steps'], df_i['hit_accuracy_at_10'], color=color_comp, linestyle=':', linewidth=2, label="Comp. Hits@10")
+                ax_right.plot(df_i['Exposure Steps'], df_i['hit_accuracy_at_10'], color=color_comp, linestyle=':', linewidth=2.0, label="Comp. Hits@10")
+            if 'hit_accuracy_at_100' in df_i.columns:
+                ax_right.plot(df_i['Exposure Steps'], df_i['hit_accuracy_at_100'], color=color_comp, linestyle='-.', linewidth=2.0, label="Comp. Hits@100")
 
         ax.set_title(title)
         ax.set_xlabel("Exposure #")
@@ -264,7 +289,9 @@ def plot_grokking(df_k_src, df_i_src, df_k_para, df_i_para, color_factual, color
         Line2D([0], [0], color=color_factual, lw=2, linestyle='-', label='Factual'),
         Line2D([0], [0], color=color_comp, lw=2, linestyle='-', label='Compositional'),
         Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Log Prob'),
+        Line2D([0], [0], color='gray', lw=2, linestyle='--', label='Hits@1'),
         Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Hits@10'),
+        Line2D([0], [0], color='gray', lw=2, linestyle='-.', label='Hits@100'),
     ]
     axes[1].legend(handles=traj_legend_elements, loc='lower right', fontsize='small', frameon=True)
 
@@ -280,7 +307,7 @@ def main():
         "axes.labelsize": 18,
         "xtick.labelsize": 16,
         "ytick.labelsize": 16,
-        "legend.fontsize": 16,
+        "legend.fontsize": 14,
         "figure.titlesize": 22,
         "axes.titlesize": 20,
     })
@@ -298,11 +325,13 @@ def main():
             "1B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_23_05_24",
             "7B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_23_05_24",
             "13B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05",
+            "32B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_27_05_20",
         },
         "Para 9": {
             "1B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_23_07_13",
             "7B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_23_10_36",
             "13B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_23_07_02",
+            "32B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_27_05_20",
         }
     }
 
@@ -337,16 +366,16 @@ def main():
         },
         "32B": {
             "Para 9": {
-                32: "",
+                32: "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_27_05_20",
                 64: "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_06_44",
-                128: "",
-                256: "",
+                128: "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs128_lr2e-05/overlap_1_4/11_27_05_26",
+                256: "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs256_lr2e-05/overlap_1_4/11_27_05_26",
             },
             "Source": {
-                32: "",
+                32: "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_27_05_20",
                 64: "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_06_14",
-                128: "",
-                256: "",
+                128: "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs128_lr2e-05/overlap_1_4/11_27_05_20",
+                256: "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs256_lr2e-05/overlap_1_4/11_27_05_20",
             },
         },
         "1B": {
@@ -383,7 +412,7 @@ def main():
     # Panels 1 & 2
     p1_data = []
     p2_data = []
-    for model_size in ["1B", "7B", "13B"]:
+    for model_size in ["1B", "7B", "13B", "32B"]:
         path = trajectory_config["Source"].get(model_size)
         if path:
             df = get_trajectory_data(path, 'inference', domains, project_root)
@@ -391,7 +420,7 @@ def main():
                 df['Exposure Steps'] = df['step']
                 p1_data.append((model_size, df))
                 
-    for model_size in ["1B", "7B", "13B"]:
+    for model_size in ["1B", "7B", "13B", "32B"]:
         path = trajectory_config["Para 9"].get(model_size)
         if path:
             df = get_trajectory_data(path, 'inference', domains, project_root)
@@ -408,6 +437,8 @@ def main():
             all_hits.extend(df['hit_accuracy_at_10'].dropna().tolist())
             
     lp_ylim = compute_unified_ylim(all_logprobs)
+    if lp_ylim:
+        lp_ylim = (lp_ylim[0] - 1, lp_ylim[1])
     hits_ylim = compute_unified_ylim(all_hits) if all_hits else None
     
     # Panels 3 & 4

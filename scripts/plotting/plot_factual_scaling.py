@@ -142,6 +142,7 @@ def plot_2panel_factual(p1_data, p2_data, model_colors, lp_ylim, hits_ylim):
         Line2D([0], [0], color='#ffd700', lw=2, linestyle='-', label='1B'),
         Line2D([0], [0], color='#ff7f0e', lw=2, linestyle='-', label='7B'),
         Line2D([0], [0], color='#d62728', lw=2, linestyle='-', label='13B'),
+        Line2D([0], [0], color='#9467bd', lw=2, linestyle='-', label='32B'),
         Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Log Prob'),
         Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Hits@10'),
     ]
@@ -179,7 +180,15 @@ def main():
             "1B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/1b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_23_07_13",
             "7B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_23_10_36",
             "13B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_23_07_02",
-        }
+        },
+        "32B": {
+            "Para 9": {
+                "32B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_27_05_20",
+            },
+            "Source": {
+                "32B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/11_27_05_20",
+            },
+        },
     }
 
     # Styles
@@ -187,6 +196,7 @@ def main():
         "1B": "#ffd700",   # Yellow
         "7B": "#ff7f0e",   # Orange
         "13B": "#d62728",  # Red
+        "32B": "#9467bd",  # Purple
     }
 
     # --- Data Collection (FACTUAL) ---
@@ -194,8 +204,12 @@ def main():
     p2_data = []
     
     # Panel 1: Source (Factual)
-    for model_size in ["1B", "7B", "13B"]:
+    # Panel 1: Source (Factual)
+    for model_size in ["1B", "7B", "13B", "32B"]:
         path = trajectory_config["Source"].get(model_size)
+        if not path and model_size == "32B":
+             path = trajectory_config["32B"]["Source"].get("32B")
+        
         if path:
             # CHANGED: 'inference' -> 'knowledge'
             df = get_trajectory_data(path, 'knowledge', domains, project_root)
@@ -204,8 +218,12 @@ def main():
                 p1_data.append((model_size, df))
                 
     # Panel 2: Para 9 (Factual)
-    for model_size in ["1B", "7B", "13B"]:
+    # Panel 2: Para 9 (Factual)
+    for model_size in ["1B", "7B", "13B", "32B"]:
         path = trajectory_config["Para 9"].get(model_size)
+        if not path and model_size == "32B":
+             path = trajectory_config["32B"]["Para 9"].get("32B")
+
         if path:
             # CHANGED: 'inference' -> 'knowledge'
             df = get_trajectory_data(path, 'knowledge', domains, project_root)
