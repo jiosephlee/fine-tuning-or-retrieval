@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import re
 import argparse
+import json
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 import matplotlib.patches as mpatches
@@ -44,6 +45,108 @@ def get_final_val(run_path, probe_type, domains, project_root):
     final_val = df[df['step'] == max_step]['log_prob'].mean()
     return final_val
 
+def get_avg_token_counts(json_path):
+    """
+    Parses reports/token_lengths_summary.json to get average token counts
+    for blogs, stackexchange, textbooks, and aux views.
+    """
+    if not os.path.exists(json_path):
+        print(f"Warning: Token summary file not found at {json_path}")
+        return None
+    
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+        
+    papers = data.get('papers', {})
+    
+    # Accumulate averages
+    blogs_avgs = []
+    se_avgs = []
+    tb_avgs = []
+    
+    for domain, details in papers.items():
+        expl = details.get('explanations', {})
+        if 'blogs' in expl:
+            blogs_avgs.append(expl['blogs']['avg'])
+        if 'stackexchange' in expl:
+            se_avgs.append(expl['stackexchange']['avg'])
+        if 'textbooks' in expl:
+            tb_avgs.append(expl['textbooks']['avg'])
+            
+    # Compute global averages
+    avg_blogs = np.mean(blogs_avgs) if blogs_avgs else 1.0
+    avg_se = np.mean(se_avgs) if se_avgs else 1.0
+    avg_tb = np.mean(tb_avgs) if tb_avgs else 1.0
+    
+    # Aux Views is the sum of the three (since the strategy uses all three)
+    avg_aux = avg_blogs + avg_se + avg_tb
+    
+    return {
+        'Blogs': avg_blogs,
+        'StackExchange': avg_se,
+        'Textbooks': avg_tb,
+        'Aux Views': avg_aux
+    }
+
+def load_filtered_series(run_path, probe_type, domains, project_root):
+    """
+    Loads probe series and filters out 'Source Only' probes.
+    """
+    if not run_path:
+        return None
+        
+    all_dfs = []
+    # Map probe_type to folder/file names
+    if probe_type == "knowledge":
+        probe_dir_suffix = "_knowledge_probe"
+        file_suffix = "_knowledge_probe_metrics.csv"
+        probe_folder = 'facts'
+    else: # inference
+        probe_dir_suffix = "_inference_probe"
+        file_suffix = "_inference_probe_metrics.csv"
+        probe_folder = 'inference'
+
+    resolved_path = run_path # Assuming path is already resolved or direct
+    
+    for domain in domains:
+        probe_dir = f"{domain}{probe_dir_suffix}"
+        file_name = f"{domain}{file_suffix}"
+        metrics_path = os.path.join(resolved_path, probe_dir, file_name)
+        
+        if os.path.exists(metrics_path) and os.path.getsize(metrics_path) > 0:
+            try:
+                df = pd.read_csv(metrics_path)
+            except Exception:
+                continue
+
+            if 'step' not in df.columns or 'log_prob' not in df.columns:
+                continue
+
+            # Load Filter
+            filter_path = os.path.join(project_root, 'data/probes', probe_folder, domain, 'filter.json')
+            if os.path.exists(filter_path):
+                with open(filter_path, 'r') as f:
+                    filter_data = json.load(f)
+                source_only_indices = filter_data.get('in_source_only', [])
+                
+                # Filter out Source Only
+                df = df[~df['probe_index'].isin(source_only_indices)]
+            
+            df['step'] = pd.to_numeric(df['step'], errors='coerce')
+            df['log_prob'] = pd.to_numeric(df['log_prob'], errors='coerce')
+            df.dropna(subset=['step', 'log_prob'], inplace=True)
+            
+            if not df.empty:
+                all_dfs.append(df)
+
+    if not all_dfs:
+        return None
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+    agg = combined.groupby('step')['log_prob'].mean().reset_index().sort_values('step')
+    return agg
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate intricate multi-panel comparison plot.")
     args = parser.parse_args()
@@ -59,7 +162,65 @@ def main():
     # Data Definitions
     # ==========================================
     
-    # --- 1. Model Scaling Data (Absolute Values) ---
+    # --- 1. Step-by-Step Comparison (32B) ---
+    print("Gathering data for Step-by-Step Comparison...")
+    # Paths for 32B BS64
+    path_32b_source = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_06_14'
+    path_32b_para9 = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_06_44'
+    path_32b_aux = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9_expl_textbooks+blogs+stackexchange_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_04_11/'
+
+    s1_data = {
+        'Source': {'path': path_32b_source, 'color': '#1f77b4'},
+        'Para 9': {'path': path_32b_para9, 'color': '#ff7f0e'},
+        'Aux Views': {'path': path_32b_aux, 'color': '#2ca02c'}
+    }
+    
+    for label, info in s1_data.items():
+        info['f_series'] = load_filtered_series(info['path'], 'knowledge', domains, project_root)
+        info['c_series'] = load_filtered_series(info['path'], 'inference', domains, project_root)
+
+    
+    # --- 2. Strategies Data (Normalized Delta Values) ---
+    print("Gathering data for Strategies...")
+    s_strat_paths = {
+        'Textbooks': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_textbooks_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_02_11/',
+        'StackExchange': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_stackexchange_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_02_11/',
+        'Blogs': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_blogs_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_02_11/',
+        'Aux Views': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_stackexchange+blogs+textbooks_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_04_43/'
+    }
+    
+    # Token Counts for Normalization
+    token_counts = get_avg_token_counts(os.path.join(project_root, 'reports/token_lengths_summary.json'))
+    
+    # Calculate Baseline (Para 9 7B) for Delta
+    # Note: Using the same baseline path as before
+    baseline_path_7b = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_20_22_51'
+    base_f = get_final_val(baseline_path_7b, 'knowledge', domains, project_root)
+    base_c = get_final_val(baseline_path_7b, 'inference', domains, project_root)
+    
+    s_strat_data = {'labels': [], 'f': [], 'c': []}
+    order_strat = ['Textbooks', 'StackExchange', 'Blogs']
+    
+    for label in order_strat:
+        path = s_strat_paths[label]
+        val_f = get_final_val(path, 'knowledge', domains, project_root)
+        val_c = get_final_val(path, 'inference', domains, project_root)
+        
+        # Calculate Delta
+        delta_f = val_f - base_f if val_f is not None and base_f is not None else 0
+        delta_c = val_c - base_c if val_c is not None and base_c is not None else 0
+        
+        # Normalize (per 1K tokens)
+        norm_factor = token_counts.get(label, 1.0)
+        # Avoid division by zero
+        if norm_factor == 0: norm_factor = 1.0
+        
+        s_strat_data['labels'].append(label)
+        s_strat_data['f'].append((delta_f / norm_factor) * 1000)
+        s_strat_data['c'].append((delta_c / norm_factor) * 1000)
+
+
+    # --- 3. Model Scaling Data (Delta vs Para 9) ---
     print("Gathering data for Model Scaling...")
     models = ['1B', '7B', '13B', '32B']
     
@@ -85,127 +246,40 @@ def main():
     }
 
     s_scaling_data = {}
-    for method, m_paths in s_scaling_paths.items():
+    # We only want Aux Views and Corrupted Aux, plotted as delta against Para 9
+    target_methods = ['Aux Views', 'Corrupted Aux']
+    
+    for method in target_methods:
         s_scaling_data[method] = {'factual': [], 'compositional': []}
         for model in models:
-            path = m_paths.get(model)
+            # Get Target Value
+            path = s_scaling_paths[method].get(model)
             val_k = get_final_val(path, 'knowledge', domains, project_root)
             val_i = get_final_val(path, 'inference', domains, project_root)
-            s_scaling_data[method]['factual'].append(val_k)
-            s_scaling_data[method]['compositional'].append(val_i)
-
-
-    # --- 2. Strategies Data (Delta Values) ---
-    print("Gathering data for Strategies...")
-    s_strat_paths = {
-        'Textbooks': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_textbooks_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_02_11/',
-        'StackExchange': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_stackexchange_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_02_11/',
-        'Blogs': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_blogs_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_02_11/',
-        'Aux Views': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_stackexchange+blogs+textbooks_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_04_43/'
-    }
-    
-    # Calculate Baseline (Para 9 7B) for Delta
-    baseline_path_7b = s_scaling_paths['Baseline (Para9)']['7B']
-    base_f = get_final_val(baseline_path_7b, 'knowledge', domains, project_root)
-    base_c = get_final_val(baseline_path_7b, 'inference', domains, project_root)
-    
-    s_strat_data = {'labels': [], 'f': [], 'c': []}
-    order_strat = ['Textbooks', 'StackExchange', 'Blogs', 'Aux Views']
-    
-    for label in order_strat:
-        path = s_strat_paths[label]
-        val_f = get_final_val(path, 'knowledge', domains, project_root)
-        val_c = get_final_val(path, 'inference', domains, project_root)
-        
-        # Store DELTA
-        s_strat_data['labels'].append(label)
-        s_strat_data['f'].append(val_f - base_f if val_f is not None and base_f is not None else None)
-        s_strat_data['c'].append(val_c - base_c if val_c is not None and base_c is not None else None)
-
-
-    # --- 3. Shuffling Data (Relative Delta Values) ---
-    print("Gathering data for Shuffling...")
-    
-    # Define Baselines for each group
-    path_source_base = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_20_22_51'
-    path_para9_base = s_scaling_paths['Baseline (Para9)']['7B'] # Same as above
-    path_tb_base = s_strat_paths['Textbooks']
-    
-    # Load Baseline Values
-    # Source
-    base_source_f = get_final_val(path_source_base, 'knowledge', domains, project_root)
-    base_source_c = get_final_val(path_source_base, 'inference', domains, project_root)
-    # Para 9
-    base_para9_f = base_f # Already loaded
-    base_para9_c = base_c # Already loaded
-    # Textbook
-    base_tb_f = get_final_val(path_tb_base, 'knowledge', domains, project_root)
-    base_tb_c = get_final_val(path_tb_base, 'inference', domains, project_root)
-    
-    s_shuf_paths = {
-        # Source Group
-        'Source Word Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_30_shuffle_words',
-        'Source Sent Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_31_shuffle_sentences',
-        'Source Para Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_12_57_shuffle_paragraphs',
-        
-        # Para 9 Group
-        'Para 9 Word Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_30_shuffle_words',
-        'Para 9 Sent Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_31_shuffle_sentences',
-        'Para 9 Para Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_12_57_shuffle_paragraphs',
-        
-        # Textbook Group
-        'TB Word Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_shuffled_words_textbook_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_02_11',
-        'TB Sent Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_shuffled_sentences_textbook_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_02_11',
-        'TB Para Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_shuffled_paragraphs_textbook_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_12_57/',
-
-        # Corrupt Textbook Group
-        'Corrupt TB Word Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_fruit_shuffled_words_textbook_v3_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_04_11/',
-        'Corrupt TB Sent Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_fruit_shuffled_sentences_textbook_v3_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_04_11/',
-        'Corrupt TB Para Shuf': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_fruit_shuffled_paragraphs_textbook_v3_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_04_11/',
-    }
-    
-    s_shuf_data = {'labels': [], 'f': [], 'c': []}
-    order_shuf = [
-        'Source Word Shuf', 'Source Sent Shuf', 'Source Para Shuf',
-        'Para 9 Word Shuf', 'Para 9 Sent Shuf', 'Para 9 Para Shuf',
-        'TB Word Shuf', 'TB Sent Shuf', 'TB Para Shuf',
-        'Corrupt TB Word Shuf', 'Corrupt TB Sent Shuf', 'Corrupt TB Para Shuf'
-    ]
-    
-    for label in order_shuf:
-        path = s_shuf_paths[label]
-        val_f = get_final_val(path, 'knowledge', domains, project_root)
-        val_c = get_final_val(path, 'inference', domains, project_root)
-        
-        # Select Baseline
-        if 'Source' in label:
-            curr_base_f, curr_base_c = base_source_f, base_source_c
-        elif 'Para 9' in label:
-            curr_base_f, curr_base_c = base_para9_f, base_para9_c
-        elif 'TB' in label and 'Corrupt' not in label:
-            curr_base_f, curr_base_c = base_tb_f, base_tb_c
-        elif 'Corrupt TB' in label:
-            # Using Textbooks as baseline for Corrupt TB as well, to show degradation from clean
-            curr_base_f, curr_base_c = base_tb_f, base_tb_c
-        else:
-            curr_base_f, curr_base_c = None, None
             
-        # Store RELATIVE DELTA
-        s_shuf_data['labels'].append(label)
-        s_shuf_data['f'].append(val_f - curr_base_f if val_f is not None and curr_base_f is not None else None)
-        s_shuf_data['c'].append(val_c - curr_base_c if val_c is not None and curr_base_c is not None else None)
+            # Get Baseline Value (Para 9)
+            base_path = s_scaling_paths['Baseline (Para9)'].get(model)
+            base_k = get_final_val(base_path, 'knowledge', domains, project_root)
+            base_i = get_final_val(base_path, 'inference', domains, project_root)
+            
+            # Calculate Delta
+            delta_k = val_k - base_k if val_k is not None and base_k is not None else None
+            delta_i = val_i - base_i if val_i is not None and base_i is not None else None
+            
+            s_scaling_data[method]['factual'].append(delta_k)
+            s_scaling_data[method]['compositional'].append(delta_i)
 
 
     # ==========================================
     # PLOTTING
     # ==========================================
     print("Generating plot...")
-    # Layout: Strategies (Hist) | Scaling (Lines) | Shuffling (Hist)
+    # Layout: Step-by-Step (Lines) | Strategies (Hist) | Scaling (Lines)
     fig = plt.figure(figsize=(20, 6))
-    gs = GridSpec(1, 3, width_ratios=[1.2, 1.5, 2.0], figure=fig, wspace=0.25)
-    ax1 = fig.add_subplot(gs[0]) # Strategies
-    ax2 = fig.add_subplot(gs[1]) # Scaling
-    ax3 = fig.add_subplot(gs[2]) # Shuffling
+    gs = GridSpec(1, 3, width_ratios=[1.2, 1.2, 1.5], figure=fig, wspace=0.25)
+    ax1 = fig.add_subplot(gs[0]) # Step-by-Step
+    ax2 = fig.add_subplot(gs[1]) # Strategies
+    ax3 = fig.add_subplot(gs[2]) # Scaling
 
     # --- Colors ---
     colors = {
@@ -215,25 +289,34 @@ def main():
         'Aux Views': '#2ca02c',      # Green
         'Baseline (Para9)': '#ff7f0e', # Orange
         'Corrupted Aux': '#d62728',    # Red
-        
-        'Source Word Shuf': '#1f77b4', # Blue (Source Based)
-        'Source Sent Shuf': '#1f77b4', # Blue
-        'Source Para Shuf': '#1f77b4', # Blue
-
-        'Para 9 Word Shuf': '#ff7f0e', # Orange (Para 9 Based)
-        'Para 9 Sent Shuf': '#ff7f0e', # Orange
-        'Para 9 Para Shuf': '#ff7f0e', # Orange
-
-        'TB Word Shuf': '#8c564b',     # Brown (TB Based)
-        'TB Sent Shuf': '#8c564b',     # Brown
-        'TB Para Shuf': '#8c564b',     # Brown
-
-        'Corrupt TB Word Shuf': '#d62728', # Red (Corrupt Based)
-        'Corrupt TB Sent Shuf': '#d62728', # Red
-        'Corrupt TB Para Shuf': '#d62728', # Red
+        'Source': '#1f77b4',           # Blue
+        'Para 9': '#ff7f0e',           # Orange
     }
 
-    # --- SUBPLOT 1: Strategies (Histogram) ---
+    # --- SUBPLOT 1: Step-by-Step Comparison (32B) ---
+    for label, info in s1_data.items():
+        if info['f_series'] is not None:
+            ax1.plot(info['f_series']['step'], info['f_series']['log_prob'], color=info['color'], linestyle='-', lw=2, label=f"{label} (Factual)")
+        if info['c_series'] is not None:
+            ax1.plot(info['c_series']['step'], info['c_series']['log_prob'], color=info['color'], linestyle=':', lw=2, label=f"{label} (Comp.)")
+            
+    ax1.set_title("32B: Source-Only Probes")
+    ax1.set_xlabel("Exposure #")
+    ax1.set_ylabel("Log Prob.")
+    ax1.grid(True, alpha=0.3)
+    
+    # Legend for Subplot 1
+    legend_elements_s1 = [
+        Line2D([0], [0], color='#1f77b4', lw=2, label='Source'),
+        Line2D([0], [0], color='#ff7f0e', lw=2, label='Para 9'),
+        Line2D([0], [0], color='#2ca02c', lw=2, label='Aux Views'),
+        Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Factual'),
+        Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Compositional'),
+    ]
+    ax1.legend(handles=legend_elements_s1, loc='lower right', fontsize='small')
+
+
+    # --- SUBPLOT 2: Strategies (Normalized Histogram) ---
     def plot_delta_hist(ax, data, title, color_map, ylabel, xtick_labels=None):
         x = np.arange(len(data['labels']))
         width = 0.35
@@ -257,83 +340,45 @@ def main():
         ax.grid(axis='y', alpha=0.3)
         ax.axhline(0, color='black', linewidth=0.8)
 
-    plot_delta_hist(ax1, s_strat_data, "Data Strategies (7B)", colors, r"$\Delta$ Final Log Prob. (Target - Para. 9)")
+    plot_delta_hist(ax2, s_strat_data, "Data Strategies (7B)", colors, r"$\Delta$ Final Log Prob / 1K Tokens")
     
-    # --- SUBPLOT 2: Model Scaling (Lines) ---
+    
+    # --- SUBPLOT 3: Model Scaling (Delta Lines) ---
     x_vals = np.arange(len(models))
     for method, data in s_scaling_data.items():
         c = colors.get(method, 'gray')
         # Factual (solid)
         f_data = [d if d is not None else np.nan for d in data['factual']]
         if not all(np.isnan(f_data)):
-            ax2.plot(x_vals, f_data, label=f"{method}", color=c, marker='o', lw=2, linestyle='-')
+            ax3.plot(x_vals, f_data, label=f"{method}", color=c, marker='o', lw=2, linestyle='-')
         
         # Compositional (dotted)
         c_data = [d if d is not None else np.nan for d in data['compositional']]
         if not all(np.isnan(c_data)):
-            ax2.plot(x_vals, c_data, color=c, linestyle=':', marker='o', lw=2)
+            ax3.plot(x_vals, c_data, color=c, linestyle=':', marker='o', lw=2)
 
-    ax2.set_xticks(x_vals)
-    ax2.set_xticklabels(models)
-    ax2.set_title("Model Scaling")
-    ax2.set_ylabel("Final Log Prob.")
-    ax2.set_xlabel("Model Size")
+    ax3.set_xticks(x_vals)
+    ax3.set_xticklabels(models)
+    ax3.set_title("Corrupted Aux. Views")
+    ax3.set_ylabel(r"$\Delta$ Final Log Prob. (Target - Para. 9)")
+    ax3.set_xlabel("Model Size")
+    ax3.axhline(0, color='black', linewidth=0.8, linestyle='--')
     
-    # Legend for Subplot 2
-    legend_elements_s2 = [
-        Line2D([0], [0], color='#ff7f0e', lw=2, label='Baseline (Para9)'),
+    # Legend for Subplot 3
+    legend_elements_s3 = [
         Line2D([0], [0], color='#2ca02c', lw=2, label='Aux Views'),
         Line2D([0], [0], color='#d62728', lw=2, label='Corrupted Aux'),
         Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Factual'),
         Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Compositional'),
     ]
-    ax2.legend(handles=legend_elements_s2, loc='lower right', fontsize='small')
-    ax2.grid(True, alpha=0.3)
-
-
-    # --- SUBPLOT 3: Shuffling Effect (Histogram) ---
-    # Simplified labels: "Word", "Sentence", "Paragraph" repeated
-    simplified_labels = ['Word', 'Sentence', 'Paragraph'] * 4
-    plot_delta_hist(ax3, s_shuf_data, "Shuffling Effect (7B)", colors, r"$\Delta$ Final Log Prob. (Shuffled - Unshuffled)", xtick_labels=simplified_labels)
-
-    # Legend for Subplot 3 (Colors + Hatching)
-    legend_elements_s3 = [
-        mpatches.Patch(facecolor='#1f77b4', alpha=0.8, label='Source Based'),
-        mpatches.Patch(facecolor='#ff7f0e', alpha=0.8, label='Para 9 Based'),
-        mpatches.Patch(facecolor='#8c564b', alpha=0.8, label='Textbook Based'),
-        mpatches.Patch(facecolor='#d62728', alpha=0.8, label='Corrupt TB Based'),
-        mpatches.Patch(facecolor='gray', alpha=0.8, label='Factual'),
-        mpatches.Patch(facecolor='gray', alpha=0.5, hatch='//', edgecolor='black', label='Compositional')
-    ]
     ax3.legend(handles=legend_elements_s3, loc='lower right', fontsize='small')
+    ax3.grid(True, alpha=0.3)
 
-    # Auto-scale Y-limits for Histograms (Delta)
-    all_deltas = []
-    for d in [s_strat_data, s_shuf_data]:
-        all_deltas.extend([x for x in d['f'] if x is not None])
-        all_deltas.extend([x for x in d['c'] if x is not None])
-    
-    # Include 0 in the range
-    all_deltas.append(0)
-    
-    min_y = min(all_deltas)
-    max_y = max(all_deltas)
-    
-    # Add padding
-    range_y = max_y - min_y
-    padding = range_y * 0.1 if range_y > 0 else 0.1
-    
-    ylim_delta = (min_y - padding, max_y + padding)
-    
-    # Set limits
-    # Subplot 1: Force bottom to 0
-    s1_deltas = [x for x in s_strat_data['f'] if x is not None] + [x for x in s_strat_data['c'] if x is not None] + [0]
-    s1_max = max(s1_deltas)
-    s1_pad = s1_max * 0.1 if s1_max > 0 else 0.1
-    ax1.set_ylim(bottom=0, top=s1_max + s1_pad)
-    
-    # Subplot 3: Use full range (can be negative)
-    ax3.set_ylim(ylim_delta)
+    # Auto-scale Y-limits for Histogram (Subplot 2)
+    s2_deltas = [x for x in s_strat_data['f'] if x is not None] + [x for x in s_strat_data['c'] if x is not None] + [0]
+    s2_max = max(s2_deltas)
+    s2_pad = s2_max * 0.1 if s2_max > 0 else 0.1
+    ax2.set_ylim(bottom=0, top=s2_max + s2_pad)
 
     output_dir = 'plots'
     os.makedirs(output_dir, exist_ok=True)
