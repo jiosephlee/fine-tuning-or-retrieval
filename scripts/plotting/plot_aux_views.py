@@ -162,6 +162,18 @@ def main():
     # Data Definitions
     # ==========================================
     
+    # --- Colors ---
+    colors = {
+        'Textbooks': '#8c564b',      # Brown
+        'StackExchange': '#d4ac0d',  # Dark Yellow/Gold
+        'Blogs': '#9467bd',          # Purple
+        'Aux Views': '#2ca02c',      # Green
+        'Baseline (Para9)': '#ff7f0e', # Orange
+        'Corrupted Aux': '#d62728',    # Red
+        'Source': '#1f77b4',           # Blue
+        'Para 9': '#ff7f0e',           # Orange
+    }
+
     # --- 1. Step-by-Step Comparison (32B) ---
     print("Gathering data for Step-by-Step Comparison...")
     # Paths for 32B BS64
@@ -170,9 +182,9 @@ def main():
     path_32b_aux = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9_expl_textbooks+blogs+stackexchange_cyclefull/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_26_04_11/'
 
     s1_data = {
-        'Source': {'path': path_32b_source, 'color': '#1f77b4'},
-        'Para 9': {'path': path_32b_para9, 'color': '#ff7f0e'},
-        'Aux Views': {'path': path_32b_aux, 'color': '#2ca02c'}
+        'Source': {'path': path_32b_source, 'color': colors['Source']},
+        'Para 9': {'path': path_32b_para9, 'color': colors['Para 9']},
+        'Aux Views': {'path': path_32b_aux, 'color': colors['Aux Views']}
     }
     
     for label, info in s1_data.items():
@@ -282,16 +294,7 @@ def main():
     ax3 = fig.add_subplot(gs[2]) # Scaling
 
     # --- Colors ---
-    colors = {
-        'Textbooks': '#8c564b',      # Brown
-        'StackExchange': '#d4ac0d',  # Dark Yellow/Gold
-        'Blogs': '#9467bd',          # Purple
-        'Aux Views': '#2ca02c',      # Green
-        'Baseline (Para9)': '#ff7f0e', # Orange
-        'Corrupted Aux': '#d62728',    # Red
-        'Source': '#1f77b4',           # Blue
-        'Para 9': '#ff7f0e',           # Orange
-    }
+    # Already defined above
 
     # --- SUBPLOT 1: Step-by-Step Comparison (32B) ---
     for label, info in s1_data.items():
@@ -307,9 +310,9 @@ def main():
     
     # Legend for Subplot 1
     legend_elements_s1 = [
-        Line2D([0], [0], color='#1f77b4', lw=2, label='Source'),
-        Line2D([0], [0], color='#ff7f0e', lw=2, label='Para 9'),
-        Line2D([0], [0], color='#2ca02c', lw=2, label='Aux Views'),
+        Line2D([0], [0], color=colors['Source'], lw=2, label='Source'),
+        Line2D([0], [0], color=colors['Para 9'], lw=2, label='Para 9'),
+        Line2D([0], [0], color=colors['Aux Views'], lw=2, label='Aux Views'),
         Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Factual'),
         Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Compositional'),
     ]
@@ -319,7 +322,7 @@ def main():
     # --- SUBPLOT 2: Strategies (Normalized Histogram) ---
     def plot_delta_hist(ax, data, title, color_map, ylabel, xtick_labels=None):
         x = np.arange(len(data['labels']))
-        width = 0.35
+        width = 0.3 # Thinner bars
         
         # Get colors for each bar
         bar_colors = [color_map.get(l, 'gray') for l in data['labels']]
@@ -327,8 +330,9 @@ def main():
         f_vals = [v if v is not None else 0 for v in data['f']]
         c_vals = [v if v is not None else 0 for v in data['c']]
         
-        ax.bar(x - width/2, f_vals, width, label='Factual', color=bar_colors, alpha=0.8)
-        ax.bar(x + width/2, c_vals, width, label='Compositional', color=bar_colors, hatch='//', alpha=0.5, edgecolor='black')
+        # Lighter colors (alpha=0.6)
+        ax.bar(x - width/2, f_vals, width, label='Factual', color=bar_colors, alpha=0.6)
+        ax.bar(x + width/2, c_vals, width, label='Compositional', color=bar_colors, hatch='//', alpha=0.4, edgecolor='black')
         
         ax.set_xticks(x)
         if xtick_labels:
@@ -341,6 +345,13 @@ def main():
         ax.axhline(0, color='black', linewidth=0.8)
 
     plot_delta_hist(ax2, s_strat_data, "Data Strategies (7B)", colors, r"$\Delta$ Final Log Prob / 1K Tokens")
+    
+    # Legend for Subplot 2
+    legend_elements_s2 = [
+        mpatches.Patch(facecolor='gray', alpha=0.6, label='Factual'),
+        mpatches.Patch(facecolor='gray', alpha=0.4, hatch='//', edgecolor='black', label='Compositional')
+    ]
+    ax2.legend(handles=legend_elements_s2, loc='upper right', fontsize='small')
     
     
     # --- SUBPLOT 3: Model Scaling (Delta Lines) ---
@@ -366,8 +377,8 @@ def main():
     
     # Legend for Subplot 3
     legend_elements_s3 = [
-        Line2D([0], [0], color='#2ca02c', lw=2, label='Aux Views'),
-        Line2D([0], [0], color='#d62728', lw=2, label='Corrupted Aux'),
+        Line2D([0], [0], color=colors['Aux Views'], lw=2, label='Aux Views'),
+        Line2D([0], [0], color=colors['Corrupted Aux'], lw=2, label='Corrupted Aux'),
         Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Factual'),
         Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Compositional'),
     ]
@@ -377,8 +388,8 @@ def main():
     # Auto-scale Y-limits for Histogram (Subplot 2)
     s2_deltas = [x for x in s_strat_data['f'] if x is not None] + [x for x in s_strat_data['c'] if x is not None] + [0]
     s2_max = max(s2_deltas)
-    s2_pad = s2_max * 0.1 if s2_max > 0 else 0.1
-    ax2.set_ylim(bottom=0, top=s2_max + s2_pad)
+    # Manually increase by 0.1
+    ax2.set_ylim(bottom=0, top=s2_max + 0.1)
 
     output_dir = 'plots'
     os.makedirs(output_dir, exist_ok=True)

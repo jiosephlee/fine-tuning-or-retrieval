@@ -357,7 +357,7 @@ def main():
                 baseline_k = get_final_step_value(df_k_base)
                 baseline_i = get_final_step_value(df_i_base)
         elif model_size.lower() == '13b':
-            baseline_13b_path = para_13b_paths.get('Para. 4')
+            baseline_13b_path = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_30"
             if baseline_13b_path:
                 resolved_13b = baseline_13b_path if os.path.isdir(baseline_13b_path) else find_latest_run(baseline_13b_path)
                 if resolved_13b and os.path.isdir(resolved_13b):
