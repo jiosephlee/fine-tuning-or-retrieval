@@ -164,19 +164,6 @@ def construct_experiment_name(args):
 
 
 
-def get_all_domains():
-    return experiment_utils.get_all_domains()
-
-def setup_callbacks(domains, tokenizer, log, args, is_lima=False):
-    return experiment_utils.setup_callbacks(domains, tokenizer, log, args, is_lima=is_lima)
-
-def save_probe_results(callbacks, log, args):
-    return experiment_utils.save_probe_results(callbacks, log, args)
-
-
-def load_prompts(prompt_files, append_eot=False):
-    return experiment_utils.load_prompts(prompt_files, append_eot=append_eot)
-
 def continue_pretraining(model, tokenizer, log, args):
     assert args.effective_batch_size_for_cpt % args.device_batch_size == 0, \
         "Effective batch size for CPT must be divisible by device batch size."
@@ -213,7 +200,7 @@ def continue_pretraining(model, tokenizer, log, args):
     training_config = llm_configs.TrainingConfig(**training_config_kwargs)
 
     # --- Load Probe Data ---
-    callbacks_to_use = setup_callbacks(
+    callbacks_to_use = experiment_utils.setup_callbacks(
         domains=args.override_domains, 
         tokenizer=tokenizer, 
         log=log, 
@@ -289,7 +276,7 @@ def continue_pretraining(model, tokenizer, log, args):
         )
 
     # --- Save Metrics and Generate Plots ---
-    save_probe_results(callbacks_to_use, log, args)
+    experiment_utils.save_probe_results(callbacks_to_use, log, args)
 
     # --- Generate Plots ---
     # Note: Plotting logic is removed as it's complex with multiple domains. 
@@ -343,7 +330,7 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
     # --- Load Probes ---
     # Note 1: We track the DPO knowledge probes, DPO inference probes in OG & Q&A format, and generative recall in Q&A format
     # NOte 2: Since we are retracking some of the same probes, we need to make sure they are in separate folders and different prefixes for WandDB
-    callbacks = setup_callbacks(
+    callbacks = experiment_utils.setup_callbacks(
         domains=args.override_domains, 
         tokenizer=tokenizer, 
         log=log, 
@@ -397,7 +384,7 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
     trainer.train()
 
     # --- Save results ---
-    save_probe_results(callbacks, log, args)
+    experiment_utils.save_probe_results(callbacks, log, args)
     
     log.info("LIMA-based instruction tuning complete.")
     if not args.test_script:

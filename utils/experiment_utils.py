@@ -32,6 +32,23 @@ def load_prompts(prompt_files: Dict[str, str], append_eot: bool = False) -> Dict
     return prompts
 
 
+def _create_probe_callback(tokenizer, probe_df, batch_size, log, output_dir, log_prefix, report_to_wandb, sparse_eval):
+    """Create a BaseKnowledgeProbeCallBack from a probe DataFrame."""
+    return llm_callbacks.BaseKnowledgeProbeCallBack(
+        tokenizer=tokenizer,
+        facts=probe_df['fact'].tolist(),
+        probes=probe_df['probe'].tolist(),
+        targets=probe_df['target'].tolist(),
+        probes_df=probe_df,
+        batch_size=batch_size,
+        logger=log,
+        output_dir=output_dir,
+        log_prefix=log_prefix,
+        report_to_wandb=report_to_wandb,
+        sparse_eval=sparse_eval,
+    )
+
+
 def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
     callbacks = []
     report_to_wandb = not args.test_script
@@ -61,22 +78,10 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
 
         if os.path.exists(knowledge_probe_path):
             knowledge_probe_df = pd.read_csv(knowledge_probe_path)
-            facts = knowledge_probe_df['fact'].tolist()
-            probes = knowledge_probe_df['probe'].tolist()
-            targets = knowledge_probe_df['target'].tolist()
-
-            knowledge_probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
-                tokenizer=tokenizer,
-                facts=facts,
-                probes=probes,
-                targets=targets,
-                probes_df=knowledge_probe_df,
-                batch_size=probe_batch_size,
-                logger=log,
-                output_dir=output_dir_knowledge_probe,
-                log_prefix=f"{domain}_knowledge_probe",
-                report_to_wandb=report_to_wandb,
-                sparse_eval=sparse_eval,
+            knowledge_probe_callback = _create_probe_callback(
+                tokenizer, knowledge_probe_df, probe_batch_size, log,
+                output_dir_knowledge_probe, f"{domain}_knowledge_probe",
+                report_to_wandb, sparse_eval,
             )
             callbacks.append(knowledge_probe_callback)
             log.info(f"Loaded {len(knowledge_probe_df)} knowledge probes from {knowledge_probe_path}")
@@ -113,22 +118,11 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                 )
             for inference_probe_path in candidate_path:
                 inference_probe_df = pd.read_csv(inference_probe_path)
-                facts = inference_probe_df['fact'].tolist()
-                probes = inference_probe_df['probe'].tolist()
-                targets = inference_probe_df['target'].tolist()
-
-                inference_probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
-                    tokenizer=tokenizer,
-                    facts=facts,
-                    probes=probes,
-                    targets=targets,
-                    probes_df=inference_probe_df,
-                    batch_size=probe_batch_size,
-                    logger=log,
-                    output_dir=output_dir_inference_probe,
-                    log_prefix=f"train_{domain}_inference_probe" if "train" in inference_probe_path else f"test_{domain}_inference_probe",
-                    report_to_wandb=report_to_wandb,
-                    sparse_eval=sparse_eval,
+                prefix = f"train_{domain}_inference_probe" if "train" in inference_probe_path else f"test_{domain}_inference_probe"
+                inference_probe_callback = _create_probe_callback(
+                    tokenizer, inference_probe_df, probe_batch_size, log,
+                    output_dir_inference_probe, prefix,
+                    report_to_wandb, sparse_eval,
                 )
                 callbacks.append(inference_probe_callback)
                 log.info(f"Loaded {len(inference_probe_df)} inference probes from {inference_probe_path}")
@@ -146,22 +140,10 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
 
         if inference_probe_path and inference_probe_subset not in {"test", "type_split_test"}:
             inference_probe_df = pd.read_csv(inference_probe_path)
-            facts = inference_probe_df['fact'].tolist()
-            probes = inference_probe_df['probe'].tolist()
-            targets = inference_probe_df['target'].tolist()
-
-            inference_probe_callback = llm_callbacks.BaseKnowledgeProbeCallBack(
-                tokenizer=tokenizer,
-                facts=facts,
-                probes=probes,
-                targets=targets,
-                probes_df=inference_probe_df,
-                batch_size=probe_batch_size,
-                logger=log,
-                output_dir=output_dir_inference_probe,
-                log_prefix=f"{domain}_inference_probe",
-                report_to_wandb=report_to_wandb,
-                sparse_eval=sparse_eval,
+            inference_probe_callback = _create_probe_callback(
+                tokenizer, inference_probe_df, probe_batch_size, log,
+                output_dir_inference_probe, f"{domain}_inference_probe",
+                report_to_wandb, sparse_eval,
             )
             callbacks.append(inference_probe_callback)
             log.info(f"Loaded {len(inference_probe_df)} inference probes from {inference_probe_path}")

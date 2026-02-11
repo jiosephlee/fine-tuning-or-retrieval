@@ -12,12 +12,32 @@ import matplotlib.pyplot as plt
 import math
 from tqdm import tqdm
 
+
+def _should_skip_sparse_eval(callback, state) -> bool:
+    """Return True if this step should be skipped under sparse evaluation."""
+    if not callback.sparse_eval:
+        return False
+    total_steps = state.max_steps
+    if not total_steps or total_steps <= 0:
+        return True
+    if not hasattr(callback, "_eval_steps"):
+        steps = [
+            max(1, int(total_steps * 0.25)),
+            max(1, int(total_steps * 0.50)),
+            max(1, int(total_steps * 0.75)),
+        ]
+        callback._eval_steps = set(steps)
+    return state.global_step not in callback._eval_steps
+
+
 class BaseKnowledgeProbeCallBack(TrainerCallback):
     """
     A simplified base callback for evaluating model performance on knowledge probes.
     This class provides shared utilities for evaluating probes and calculating metrics.
     """
-    def __init__(self, 
+    COMBINED_INFERENCE_TYPES = ["New Insight", "Analogy", "Mathematical Understanding", "Predicting Hypothetical"]
+
+    def __init__(self,
                  tokenizer: AutoTokenizer, 
                  facts: List[str],
                  probes: List[str],
@@ -108,6 +128,39 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         
         print("Token lengths pre-computation finished.")
 
+    def _log_inference_type_metrics(self, values, metric_name, log_data):
+        """Calculate and log per-inference-type averages and combined Inference category."""
+        if self.probes_df is None or 'inference_type' not in self.probes_df.columns:
+            return
+        if metric_name not in ['log_prob', 'hit_accuracy_at_10']:
+            return
+
+        inference_types = self.probes_df['inference_type'].unique()
+        combined_inference_indices = []
+
+        for inference_type in inference_types:
+            type_mask = self.probes_df['inference_type'] == inference_type
+            type_indices = type_mask[type_mask].index.tolist()
+
+            if len(type_indices) > 0:
+                type_values = values[type_indices]
+                type_valid_mask = ~torch.isinf(type_values) & ~torch.isnan(type_values)
+
+                if type_valid_mask.any():
+                    avg_value = type_values[type_valid_mask].mean().item()
+                    log_data[f"{self.log_prefix}/{metric_name}_by_type/{inference_type}"] = avg_value
+
+                if inference_type in self.COMBINED_INFERENCE_TYPES:
+                    combined_inference_indices.extend(type_indices)
+
+        if len(combined_inference_indices) > 0:
+            combined_values = values[combined_inference_indices]
+            combined_valid_mask = ~torch.isinf(combined_values) & ~torch.isnan(combined_values)
+
+            if combined_valid_mask.any():
+                combined_avg = combined_values[combined_valid_mask].mean().item()
+                log_data[f"{self.log_prefix}/{metric_name}_by_type/Inference"] = combined_avg
+
     def on_train_begin(self, args, state, control, model, **kwargs):
         """Calculate initial metrics before training starts."""
         print(f"{self.__class__.__name__}: Calculating initial metrics...")
@@ -125,40 +178,9 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 valid_mask = ~torch.isinf(values) & ~torch.isnan(values)
                 if valid_mask.any():
                     log_data[f"{self.log_prefix}/{metric_name}_avg"] = values[valid_mask].mean().item()
-            
-            # Calculate and log averages by inference_type if the column exists
-            # Only log for log_prob and hit_accuracy_at_10
-            if self.probes_df is not None and 'inference_type' in self.probes_df.columns and metric_name in ['log_prob', 'hit_accuracy_at_10']:
-                inference_types = self.probes_df['inference_type'].unique()
-                combined_inference_indices = []
-                
-                for inference_type in inference_types:
-                    # Get indices of probes with this inference_type
-                    type_mask = self.probes_df['inference_type'] == inference_type
-                    type_indices = type_mask[type_mask].index.tolist()
-                    
-                    if len(type_indices) > 0:
-                        # Get values for this inference_type
-                        type_values = values[type_indices]
-                        type_valid_mask = ~torch.isinf(type_values) & ~torch.isnan(type_values)
-                        
-                        if type_valid_mask.any():
-                            avg_value = type_values[type_valid_mask].mean().item()
-                            log_data[f"{self.log_prefix}/{metric_name}_by_type/{inference_type}"] = avg_value
-                        
-                        # Collect indices for combined "Inference" category
-                        if inference_type in ["New Insight", "Analogy", "Mathematical Understanding", "Predicting Hypothetical"]:
-                            combined_inference_indices.extend(type_indices)
-                
-                # Calculate combined "Inference" average
-                if len(combined_inference_indices) > 0:
-                    combined_values = values[combined_inference_indices]
-                    combined_valid_mask = ~torch.isinf(combined_values) & ~torch.isnan(combined_values)
-                    
-                    if combined_valid_mask.any():
-                        combined_avg = combined_values[combined_valid_mask].mean().item()
-                        log_data[f"{self.log_prefix}/{metric_name}_by_type/Inference"] = combined_avg
-        
+
+            self._log_inference_type_metrics(values, metric_name, log_data)
+
         # Log to wandb if available
         if state.is_world_process_zero and log_data:
             if self.report_to_wandb and wandb.run:
@@ -174,20 +196,8 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
 
     def on_step_end(self, args, state, control, model, **kwargs):
         """Evaluate probes at selected training steps and log metrics."""
-        if self.sparse_eval:
-            # Evaluate only at 25%, 50%, and 75% of total training steps.
-            total_steps = state.max_steps
-            if not total_steps or total_steps <= 0:
-                return
-            if not hasattr(self, "_eval_steps"):
-                steps = [
-                    max(1, int(total_steps * 0.25)),
-                    max(1, int(total_steps * 0.50)),
-                    max(1, int(total_steps * 0.75)),
-                ]
-                self._eval_steps = set(steps)
-            if state.global_step not in self._eval_steps:
-                return
+        if _should_skip_sparse_eval(self, state):
+            return
 
         model.eval()
         current_metrics = self._evaluate_probes(model)
@@ -204,44 +214,13 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             valid_mask = ~torch.isinf(values) & ~torch.isnan(values)
             if valid_mask.any():
                 log_data[f"{self.log_prefix}/{metric_name}_avg"] = values[valid_mask].mean().item()
-            
-            # Calculate and log averages by inference_type if the column exists
-            # Only log for log_prob and hit_accuracy_at_10
-            if self.probes_df is not None and 'inference_type' in self.probes_df.columns and metric_name in ['log_prob', 'hit_accuracy_at_10']:
-                inference_types = self.probes_df['inference_type'].unique()
-                combined_inference_indices = []
-                
-                for inference_type in inference_types:
-                    # Get indices of probes with this inference_type
-                    type_mask = self.probes_df['inference_type'] == inference_type
-                    type_indices = type_mask[type_mask].index.tolist()
-                    
-                    if len(type_indices) > 0:
-                        # Get values for this inference_type
-                        type_values = values[type_indices]
-                        type_valid_mask = ~torch.isinf(type_values) & ~torch.isnan(type_values)
-                        
-                        if type_valid_mask.any():
-                            avg_value = type_values[type_valid_mask].mean().item()
-                            log_data[f"{self.log_prefix}/{metric_name}_by_type/{inference_type}"] = avg_value
-                        
-                        # Collect indices for combined "Inference" category
-                        if inference_type in ["New Insight", "Analogy", "Mathematical Understanding", "Predicting Hypothetical"]:
-                            combined_inference_indices.extend(type_indices)
-                
-                # Calculate combined "Inference" average
-                if len(combined_inference_indices) > 0:
-                    combined_values = values[combined_inference_indices]
-                    combined_valid_mask = ~torch.isinf(combined_values) & ~torch.isnan(combined_values)
-                    
-                    if combined_valid_mask.any():
-                        combined_avg = combined_values[combined_valid_mask].mean().item()
-                        log_data[f"{self.log_prefix}/{metric_name}_by_type/Inference"] = combined_avg
+
+            self._log_inference_type_metrics(values, metric_name, log_data)
 
         if state.is_world_process_zero and log_data:
             if self.report_to_wandb and wandb.run:
                 wandb.log(log_data, step=step)
-            
+
         model.train()
 
     def on_train_end(self, args, state, control, model, **kwargs):
@@ -979,20 +958,8 @@ class CorpusPerplexityCallback(TrainerCallback):
         self.sparse_eval = sparse_eval
 
     def on_step_end(self, args, state, control, model, **kwargs):
-        if self.sparse_eval:
-            # Evaluate only at 25%, 50%, and 75% of total training steps.
-            total_steps = state.max_steps
-            if not total_steps or total_steps <= 0:
-                return
-            if not hasattr(self, "_eval_steps"):
-                steps = [
-                    max(1, int(total_steps * 0.25)),
-                    max(1, int(total_steps * 0.50)),
-                    max(1, int(total_steps * 0.75)),
-                ]
-                self._eval_steps = set(steps)
-            if state.global_step not in self._eval_steps:
-                return
+        if _should_skip_sparse_eval(self, state):
+            return
 
         model.eval()
         device = model.device
