@@ -5,13 +5,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import re
 from datetime import datetime
-import json
 import argparse
 from cycler import cycler
 
 # Adjust the path to include the utils directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from utils.llm_plotting import set_plot_style
+
+# Import canonical implementations from plot_utils (avoid duplication)
+from scripts.plotting.plot_utils import aggregate_across_domains  # noqa: F401
 
 
 def find_latest_run_path(base_path, model_id=None, override_dir=None):
@@ -45,9 +47,9 @@ def find_latest_run_path(base_path, model_id=None, override_dir=None):
         if not domain_dirs:
             return None
         domain_dir = domain_dirs[0]
-        
+
         path = os.path.join(base_path, domain_dir)
-        
+
         # Prefer 'e100' if it exists, otherwise find the highest epoch directory.
         e100_path = os.path.join(path, 'e100')
         if os.path.isdir(e100_path):
@@ -64,12 +66,12 @@ def find_latest_run_path(base_path, model_id=None, override_dir=None):
         if not sub_dirs:
             return None
         path = os.path.join(path, sub_dirs[0])
-        
+
         if model_id and '13b' in model_id.lower():
             potential_path = os.path.join(path, 'overlap_1_4')
             if os.path.isdir(potential_path):
                 path = potential_path
-        
+
         run_dirs = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
 
         if override_dir and override_dir in run_dirs:
@@ -85,7 +87,7 @@ def find_latest_run_path(base_path, model_id=None, override_dir=None):
 
         if 'run' in run_dirs:
             return os.path.join(path, 'run')
-            
+
         if 'no_overlap' in run_dirs:
             return os.path.join(path, 'no_overlap')
 
@@ -93,81 +95,6 @@ def find_latest_run_path(base_path, model_id=None, override_dir=None):
         return None
 
     return None
-
-
-def aggregate_across_domains(run_path, probe_type, domains, split_probes=False, project_root='.', lima=False):
-    """
-    Aggregates probe data across multiple domains from a specific run path.
-    """
-    all_domain_dfs = []
-    for domain in domains:
-        if probe_type == "knowledge":
-            probe_dir = f"{domain}_knowledge_probe"
-            file_name = f"{domain}_knowledge_probe_metrics.csv"
-            if lima:
-                probe_dir = f"{domain}_lima_knowledge_probe"
-                file_name = f"{domain}_knowledge_probe_metrics.csv" # The filename is the same, just the directory changes
-        else: # inference
-            probe_dir = f"{domain}_inference_probe"
-            file_name = f"{domain}_inference_probe_metrics.csv"
-            if lima:
-                probe_dir = f"{domain}_lima_inference_probe"
-                file_name = f"{domain}_inference_probe_metrics.csv"
-            
-        metrics_path = os.path.join(run_path, probe_dir, file_name)
-        
-        if os.path.exists(metrics_path) and os.path.getsize(metrics_path) > 0:
-            df = pd.read_csv(metrics_path)
-            if 'step' in df.columns and 'log_prob' in df.columns:
-                df['step'] = pd.to_numeric(df['step'], errors='coerce')
-                df['log_prob'] = pd.to_numeric(df['log_prob'], errors='coerce')
-                df.dropna(subset=['step', 'log_prob'], inplace=True)
-                if not df.empty:
-                    df['step'] = df['step'].astype(int)
-                else:
-                    continue
-            else:
-                print(f"Warning: 'step' or 'log_prob' column not found in {metrics_path}. Skipping.")
-                continue
-
-            df['domain'] = domain
-            
-            if split_probes:
-                probe_folder = 'inference' if probe_type == 'inference' else 'facts'
-                filter_path = os.path.join(project_root, 'data/probes', probe_folder, domain, 'filter.json')
-
-                if os.path.exists(filter_path):
-                    with open(filter_path, 'r') as f:
-                        filter_data = json.load(f)
-                    
-                    explanations_only_indices = filter_data.get('in_explanations_only', [])
-                    source_only_indices = filter_data.get('in_source_only', [])
-                    both_indices = filter_data.get('in_both', [])
-                    neither_indices = filter_data.get('in_neither', [])
-                    
-                    # Default to 'Both' for backwards compatibility with old filter.json files
-                    df['origin'] = 'Both'
-                    df.loc[df['probe_index'].isin(explanations_only_indices), 'origin'] = 'Explanations Only'
-                    df.loc[df['probe_index'].isin(source_only_indices), 'origin'] = 'Source Only'
-                    df.loc[df['probe_index'].isin(both_indices), 'origin'] = 'Both'
-                    df.loc[df['probe_index'].isin(neither_indices), 'origin'] = 'Neither'
-                else:
-                    print(f"Warning: filter.json not found for domain {domain} in {probe_folder}. Probes will not be split by origin.")
-                    df['origin'] = 'Unknown'
-
-            all_domain_dfs.append(df)
-        else:
-            if not os.path.exists(metrics_path):
-                print(f"Warning: File not found at {metrics_path}")
-            else:
-                print(f"Warning: File is empty at {metrics_path}")
-
-    if not all_domain_dfs:
-        return pd.DataFrame()
-
-    combined_df = pd.concat(all_domain_dfs, ignore_index=True)
-    
-    return combined_df
 
 
 def check_step_consistency(df: pd.DataFrame, probe_type: str):

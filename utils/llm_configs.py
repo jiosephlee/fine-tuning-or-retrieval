@@ -55,7 +55,7 @@ class TrainingConfig(BaseModel):
     lr_scheduler_type: str = "cosine"
     warmup_steps: int = 0
     warmup_ratio: float = 0.03
-    sequential_sampling: bool = False # Random sampling is default behavior
+    train_sampling_strategy: Literal["random", "sequential"] = "random"
 
     # Logging + Misc.
     report_to: str = "wandb"
@@ -95,7 +95,7 @@ class TrainingConfig(BaseModel):
             torch_compile=self.compile,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
-            sequential_sampling = self.sequential_sampling,
+            train_sampling_strategy=self.train_sampling_strategy,
             
             # Logging
             run_name=self.run_name,
@@ -104,7 +104,7 @@ class TrainingConfig(BaseModel):
             save_strategy=self.save_strategy,
             report_to=self.report_to,
         )
-    def to_sft_training_args(self, sequential_sampling = False) -> TrainingArguments:
+    def to_sft_training_args(self) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
         return SFTConfig(
             dataset_text_field=self.dataset_text_field,
@@ -136,7 +136,7 @@ class TrainingConfig(BaseModel):
             torch_compile=self.compile,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
-            sequential_sampling = self.sequential_sampling,
+            train_sampling_strategy=self.train_sampling_strategy,
             # reverse_ffd_packing = self.reverse_ffd_packing,
 
             # Logging
