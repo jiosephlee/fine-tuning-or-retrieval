@@ -20,8 +20,19 @@ DEVICE_BS=4
 EFFECTIVE_BS=64
 NUM_PARAPHRASED=9
 
-# Auxiliary-view setup (matches existing repo conventions)
-AUX_EXPLANATIONS=(fruit_textbooks_v3 fruit_blogs_v3 fruit_stackexchange_v3)
+# Auxiliary-view setup (use uncorrupted aux views)
+AUX_EXPLANATIONS=(textbooks blogs stackexchange)
+
+# Optional distributed launch:
+#   USE_TORCHRUN=1 NPROC_PER_NODE=2 bash E99_7B_ffn_channel_heatmaps_quick.sh
+USE_TORCHRUN="${USE_TORCHRUN:-0}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+
+if [[ "${USE_TORCHRUN}" == "1" ]]; then
+  PYTHON_LAUNCH=(torchrun --nproc_per_node "${NPROC_PER_NODE}")
+else
+  PYTHON_LAUNCH=(python -s)
+fi
 
 # Fixed experiment names so downstream paths are deterministic.
 EXP_ROOT="quick_ffn_heatmaps/7b/e50"
@@ -39,22 +50,22 @@ MANIFEST_PATH="${ANALYSIS_DIR}/manifest_quick_7b_e50.json"
 
 mkdir -p "${ANALYSIS_DIR}"
 
-echo "=== [1/4] Training source-only checkpoint ==="
-python -s finetuning_knowledge_v8.py \
-  --model_id "${MODEL_ID}" \
-  --override_domains "${DOMAINS[@]}" \
-  --num_train_epochs "${NUM_EPOCHS}" \
-  --learning_rate "${LR}" \
-  --device_batch_size "${DEVICE_BS}" \
-  --effective_batch_size_for_cpt "${EFFECTIVE_BS}" \
-  --fill_batches_with_pretraining \
-  --num_paraphrased_texts 0 \
-  --full_finetuning \
-  --override_experiment_name "${EXP_SOURCE}" \
-  --save_local_model
+# echo "=== [1/4] Training source-only checkpoint ==="
+# "${PYTHON_LAUNCH[@]}" finetuning_knowledge_v8.py \
+#   --model_id "${MODEL_ID}" \
+#   --override_domains "${DOMAINS[@]}" \
+#   --num_train_epochs "${NUM_EPOCHS}" \
+#   --learning_rate "${LR}" \
+#   --device_batch_size "${DEVICE_BS}" \
+#   --effective_batch_size_for_cpt "${EFFECTIVE_BS}" \
+#   --fill_batches_with_pretraining \
+#   --num_paraphrased_texts 0 \
+#   --full_finetuning \
+#   --override_experiment_name "${EXP_SOURCE}" \
+#   --save_local_model
 
 echo "=== [2/4] Training paraphrase checkpoint ==="
-python -s finetuning_knowledge_v8.py \
+"${PYTHON_LAUNCH[@]}" finetuning_knowledge_v8.py \
   --model_id "${MODEL_ID}" \
   --override_domains "${DOMAINS[@]}" \
   --num_train_epochs "${NUM_EPOCHS}" \
@@ -68,7 +79,7 @@ python -s finetuning_knowledge_v8.py \
   --save_local_model
 
 echo "=== [3/4] Training auxiliary-views checkpoint ==="
-python -s finetuning_knowledge_v8.py \
+"${PYTHON_LAUNCH[@]}" finetuning_knowledge_v8.py \
   --model_id "${MODEL_ID}" \
   --override_domains "${DOMAINS[@]}" \
   --num_train_epochs "${NUM_EPOCHS}" \

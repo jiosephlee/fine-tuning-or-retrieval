@@ -185,14 +185,17 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         if state.is_world_process_zero and log_data:
             if self.report_to_wandb and wandb.run:
                 wandb.log(log_data, step=step)
-        
-        self._generate_full_token_analysis_report(model, "initial")
 
         model.train()
-        print(f"{self.__class__.__name__}: Initial metrics calculated and analysis report generated.")
-
-        output_dir = self.output_dir
-        self._generate_best_probes_report(output_dir)
+        if state.is_world_process_zero:
+            # Avoid DDP race conditions: multiple ranks writing/reading the same JSON report files
+            # can produce transient empty/partial files that break json.load().
+            self._generate_full_token_analysis_report(model, "initial")
+            print(f"{self.__class__.__name__}: Initial metrics calculated and analysis report generated.")
+            output_dir = self.output_dir
+            self._generate_best_probes_report(output_dir)
+        else:
+            print(f"{self.__class__.__name__}: Initial metrics calculated.")
 
     def on_step_end(self, args, state, control, model, **kwargs):
         """Evaluate probes at selected training steps and log metrics."""
@@ -227,13 +230,15 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         """Generate a detailed report of the worst-performing probes at the end of training."""
         print(f"{self.__class__.__name__}: Final evaluation and report generation...")
         model.eval()
-        self._generate_full_token_analysis_report(model, "final")
         model.train()
 
-        output_dir = self.output_dir
-        self._generate_worst_probes_report(output_dir)
-        self._generate_most_and_least_learned_probes_report(output_dir)
-        print(f"{self.__class__.__name__}: Final reports generated.")
+        if state.is_world_process_zero:
+            # Same DDP safety as on_train_begin: keep file-based reporting on rank 0 only.
+            self._generate_full_token_analysis_report(model, "final")
+            output_dir = self.output_dir
+            self._generate_worst_probes_report(output_dir)
+            self._generate_most_and_least_learned_probes_report(output_dir)
+            print(f"{self.__class__.__name__}: Final reports generated.")
 
     def _generate_best_probes_report(self, output_dir, top_k=10):
         """
