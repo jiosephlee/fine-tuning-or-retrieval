@@ -180,7 +180,7 @@ def continue_pretraining(model, tokenizer, log, args):
         "context_length": args.context_length_for_cpt,
         "weight_decay": 0.1,
         "gradient_accumulation_steps": grad_accum_steps,
-        "sequential_sampling": True,
+        "train_sampling_strategy": "sequential",
         "reverse_ffd_packing": False,
         "remove_unused_columns": False,
         "packing": False,
@@ -282,6 +282,7 @@ def continue_pretraining(model, tokenizer, log, args):
     # Note: Plotting logic is removed as it's complex with multiple domains. 
     # Please use regenerate_plots.py script or add custom plotting logic.
     log.info("Finished training and saving all probe results.")
+    return model, tokenizer
 
 
 def lima_training(model, tokenizer, log, args, num_train_epochs=15):
@@ -307,7 +308,7 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
         "per_device_train_batch_size": args.device_batch_size,
         "weight_decay": 0.1,
         "use_liger_kernel": True,
-        "sequential_sampling": False,
+        "train_sampling_strategy": "random",
         "reverse_ffd_packing": False,
         "remove_unused_columns": False,
         "packing": True,
@@ -395,6 +396,7 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
         log.info(f"Pushing LIMA-tuned model to hub: {args.push_to_hub_lima_id}")
         model.push_to_hub(args.push_to_hub_lima_id)
         tokenizer.push_to_hub(args.push_to_hub_lima_id)
+    return model, tokenizer
 
 if __name__ == "__main__":
     # --- Parser ---
@@ -462,6 +464,24 @@ if __name__ == "__main__":
     parser.add_argument("--context_length_for_lima", type=int, default=2560, help="Context length for LIMA training.")
     parser.add_argument("--push_to_hub_cpt_id", type=str, default="", help="Optional Hub model ID to push CPT model to.")
     parser.add_argument("--push_to_hub_lima_id", type=str, default="", help="Optional Hub model ID to push LIMA-tuned model to.")
+    parser.add_argument(
+        "--save_local_model",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save local model/tokenizer checkpoints under the experiment directory.",
+    )
+    parser.add_argument(
+        "--cpt_model_subdir",
+        type=str,
+        default="model_cpt",
+        help="Subdirectory (inside experiment dir) for post-CPT checkpoint save.",
+    )
+    parser.add_argument(
+        "--lima_model_subdir",
+        type=str,
+        default="model_lima",
+        help="Subdirectory (inside experiment dir) for post-LIMA checkpoint save.",
+    )
     parser.add_argument("--semi_cleaned", type=str, default=None, choices=['v1', 'v2','v3'], help="Use semi-cleaned data from a specific version (v1 or v2).")
     parser.add_argument("--attn_implementation", type=str, default="sdpa", choices=["sdpa", "flash_attention_2", "flash_attention_3", "kernels-community/vllm-flash-attn3"], help="Attention implementation to use.")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
@@ -532,6 +552,7 @@ if __name__ == "__main__":
 
     # --- Save Hyperparameters ---
     experiment_dir = os.path.join(args.base_results_dir, args.experiment_name)
+    args.experiment_dir = experiment_dir
     os.makedirs(experiment_dir, exist_ok=True)
     hyperparameters_path = os.path.join(experiment_dir, 'hyperparameters.json')
     with open(hyperparameters_path, 'w') as f:
@@ -578,7 +599,11 @@ if __name__ == "__main__":
     # Model compilation is handled by TrainingArguments via compile flag in TrainingConfig
     # --- Continue Pretraining (we also evaluate our probes during this) ---
     if args.num_train_epochs > 0:
-        continue_pretraining(model, tokenizer, log, args)
+        model, tokenizer = continue_pretraining(model, tokenizer, log, args)
+        if args.save_local_model:
+            cpt_save_path = os.path.join(args.experiment_dir, args.cpt_model_subdir)
+            llm_training.save_model(model, tokenizer, log, cpt_save_path)
+            log.info(f"CPT checkpoint saved to {cpt_save_path}")
         # Optionally push CPT model snapshot to hub
         if args.push_to_hub_cpt_id:
             log.info(f"Pushing CPT model to hub: {args.push_to_hub_cpt_id}")
@@ -588,4 +613,8 @@ if __name__ == "__main__":
     # -- LIMA-based instruction tuning ---
     if args.lima_afterwards:
         lima_epochs = 1 if args.test_script else 10
-        lima_training(model, tokenizer, log, args, num_train_epochs=lima_epochs)
+        model, tokenizer = lima_training(model, tokenizer, log, args, num_train_epochs=lima_epochs)
+        if args.save_local_model:
+            lima_save_path = os.path.join(args.experiment_dir, args.lima_model_subdir)
+            llm_training.save_model(model, tokenizer, log, lima_save_path)
+            log.info(f"LIMA checkpoint saved to {lima_save_path}")
