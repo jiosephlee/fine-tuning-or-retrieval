@@ -105,6 +105,8 @@ cat > "${MANIFEST_PATH}" <<EOF
 }
 EOF
 
+ANALYSIS_DIR="../../plots/ffn_channel_heatmaps/quick_7b_e50"
+MANIFEST_PATH="${ANALYSIS_DIR}/manifest_quick_7b_e50.json"
 python -s ../plotting/plot_ffn_channel_heatmaps.py \
   --manifest "${MANIFEST_PATH}" \
   --output_dir "${ANALYSIS_DIR}" \

@@ -3,7 +3,7 @@ import json
 import os
 import re
 import sys
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -22,7 +22,23 @@ COMPARISONS = (
     ("para_vs_base", "base", "para"),
     ("aux_vs_base", "base", "aux"),
     ("aux_vs_para", "para", "aux"),
+    ("aux_vs_source", "source", "aux"),
 )
+DIFFERENCE_COMPARISONS = (
+    ("aux_base_minus_source_base", "aux_vs_base", "source_vs_base"),
+)
+COMPARISON_TITLES = {
+    "source_vs_base": "Source vs Base",
+    "para_vs_base": "Para vs Base",
+    "aux_vs_base": "Aux vs Base",
+    "aux_vs_para": "Aux vs Para",
+    "aux_vs_source": "Aux vs Source",
+    "aux_base_minus_source_base": "Aux-Base minus Source-Base",
+}
+METRIC_TITLES = {
+    "relative_delta_norm": "relative delta norm",
+    "cosine_distance": "cosine distance",
+}
 EPS = 1e-12
 
 
@@ -91,6 +107,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="viridis",
         help="Matplotlib colormap for heatmaps.",
+    )
+    parser.add_argument(
+        "--diff_cmap",
+        type=str,
+        default="RdBu_r",
+        help="Matplotlib colormap for signed difference heatmaps.",
     )
     parser.add_argument(
         "--trust_remote_code",
@@ -353,6 +375,21 @@ def save_metric_arrays(
             print(f"Saved array: {path}")
 
 
+def subtract_metric_dicts(
+    minuend_metrics: Dict[str, Dict[str, np.ndarray]],
+    subtrahend_metrics: Dict[str, Dict[str, np.ndarray]],
+) -> Dict[str, Dict[str, np.ndarray]]:
+    diff_metrics: Dict[str, Dict[str, np.ndarray]] = {}
+    for projection in PROJECTIONS:
+        diff_metrics[projection] = {}
+        for metric in METRICS:
+            diff_metrics[projection][metric] = (
+                minuend_metrics[projection][metric]
+                - subtrahend_metrics[projection][metric]
+            ).astype(np.float32)
+    return diff_metrics
+
+
 def _compute_vmax(arrays: Iterable[np.ndarray], clip_percentile: float) -> float:
     concat = np.concatenate([x.reshape(-1) for x in arrays]).astype(np.float64)
     finite = concat[np.isfinite(concat)]
@@ -367,6 +404,30 @@ def _compute_vmax(arrays: Iterable[np.ndarray], clip_percentile: float) -> float
     return vmax
 
 
+def _compute_symmetric_vmax(arrays: Iterable[np.ndarray], clip_percentile: float) -> float:
+    concat = np.concatenate([x.reshape(-1) for x in arrays]).astype(np.float64)
+    finite = concat[np.isfinite(concat)]
+    if finite.size == 0:
+        return 1.0
+
+    finite_abs = np.abs(finite)
+    if clip_percentile is not None and clip_percentile > 0:
+        vmax = float(np.percentile(finite_abs, clip_percentile))
+    else:
+        vmax = float(np.max(finite_abs))
+    if vmax <= 0:
+        return float(np.max(finite_abs)) if np.max(finite_abs) > 0 else 1.0
+    return vmax
+
+
+def _format_comparison_title(comparison_name: str) -> str:
+    return COMPARISON_TITLES.get(comparison_name, comparison_name.replace("_", " ").title())
+
+
+def _format_metric_title(metric: str) -> str:
+    return METRIC_TITLES.get(metric, metric.replace("_", " "))
+
+
 def plot_grouped_heatmap(
     metrics_by_projection: Dict[str, Dict[str, np.ndarray]],
     comparison_name: str,
@@ -377,9 +438,18 @@ def plot_grouped_heatmap(
     fig_height: float,
     dpi: int,
     cmap: str,
+    center_zero: bool = False,
 ) -> None:
     arrays = [metrics_by_projection[proj][metric] for proj in PROJECTIONS]
-    vmax = _compute_vmax(arrays, clip_percentile=clip_percentile)
+    if center_zero:
+        vmax = _compute_symmetric_vmax(arrays, clip_percentile=clip_percentile)
+        vmin = -vmax
+    else:
+        vmax = _compute_vmax(arrays, clip_percentile=clip_percentile)
+        vmin = 0.0
+
+    comparison_title = _format_comparison_title(comparison_name)
+    metric_title = _format_metric_title(metric)
 
     fig, axes = plt.subplots(
         3,
@@ -389,7 +459,7 @@ def plot_grouped_heatmap(
         constrained_layout=True,
     )
     fig.suptitle(
-        f"{comparison_name.replace('_', ' ').title()} — {metric.replace('_', ' ')}",
+        f"{comparison_title} — {metric_title}",
         fontsize=16,
     )
 
@@ -407,19 +477,19 @@ def plot_grouped_heatmap(
             aspect="auto",
             interpolation="nearest",
             cmap=cmap,
-            vmin=0.0,
+            vmin=vmin,
             vmax=vmax,
         )
         ax.set_ylabel("Layer")
         ax.set_title(
-            f"{comparison_name.replace('_', ' ').title()} — "
-            f"{projection_labels[projection]} — {metric.replace('_', ' ')}"
+            f"{comparison_title} — "
+            f"{projection_labels[projection]} — {metric_title}"
         )
 
     axes[-1].set_xlabel("Channel")
     if image is not None:
         cbar = fig.colorbar(image, ax=list(axes), shrink=0.95, pad=0.01)
-        cbar.set_label(metric.replace("_", " "))
+        cbar.set_label(metric_title)
 
     os.makedirs(output_dir, exist_ok=True)
     file_name = f"{comparison_name}_{metric}_all_projections.png"
@@ -428,7 +498,7 @@ def plot_grouped_heatmap(
     plt.close(fig)
     print(
         f"Saved heatmap: {path} "
-        f"(metric={metric}, shared_vmin=0, shared_vmax={vmax:.6f}, "
+        f"(metric={metric}, shared_vmin={vmin:.6f}, shared_vmax={vmax:.6f}, "
         f"clip_percentile={clip_percentile})"
     )
 
@@ -443,6 +513,7 @@ def main() -> None:
     for name in REQUIRED_MODELS:
         print(f"  - {name}: {model_paths[name]}")
 
+    metrics_by_comparison = {}
     for comparison_name, ref_name, cmp_name in COMPARISONS:
         print(f"\n=== {comparison_name} ({cmp_name} vs {ref_name}) ===")
         ref_model = load_model(model_paths[ref_name], args)
@@ -456,6 +527,7 @@ def main() -> None:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        metrics_by_comparison[comparison_name] = metrics_by_projection
         save_metric_arrays(metrics_by_projection, comparison_name, args.output_dir)
         for metric in METRICS:
             plot_grouped_heatmap(
@@ -468,6 +540,30 @@ def main() -> None:
                 fig_height=args.fig_height,
                 dpi=args.dpi,
                 cmap=args.cmap,
+            )
+
+    for comparison_name, minuend_name, subtrahend_name in DIFFERENCE_COMPARISONS:
+        print(
+            f"\n=== {comparison_name} "
+            f"({minuend_name} - {subtrahend_name}) ==="
+        )
+        metrics_by_projection = subtract_metric_dicts(
+            metrics_by_comparison[minuend_name],
+            metrics_by_comparison[subtrahend_name],
+        )
+        save_metric_arrays(metrics_by_projection, comparison_name, args.output_dir)
+        for metric in METRICS:
+            plot_grouped_heatmap(
+                metrics_by_projection=metrics_by_projection,
+                comparison_name=comparison_name,
+                metric=metric,
+                output_dir=args.output_dir,
+                clip_percentile=args.clip_percentile,
+                fig_width=args.fig_width,
+                fig_height=args.fig_height,
+                dpi=args.dpi,
+                cmap=args.diff_cmap,
+                center_zero=True,
             )
 
     print("\nDone. FFN channel heatmaps and arrays saved.")
