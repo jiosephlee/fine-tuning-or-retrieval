@@ -27,6 +27,7 @@ import re
 
 def remove_page_artifacts(text: str) -> str:
     """Remove page-level artifacts that interrupt the text flow."""
+    text = text.replace('\f', '\n')
 
     # CAFC/Fifth Circuit page headers:
     # "Case: 24-1039    Document: 68     Page: 3   Filed: 09/24/2025"
@@ -83,6 +84,9 @@ def remove_page_artifacts(text: str) -> str:
 
     # FILED stamps and clerk lines that appear mid-page
     text = re.sub(r'^\s*FILED\s*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*PUBLISH\s*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*[A-Z][a-z]+\s+\d{1,2},\s+\d{4}\s*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^.*Clerk of Court\s*$', '', text, flags=re.MULTILINE)
 
     return text
 
@@ -93,6 +97,9 @@ def remove_decorative_lines(text: str) -> str:
     text = re.sub(r'^\s*_{4,}\s*$', '', text, flags=re.MULTILINE)
     # Lines of "lllll" (Eighth Circuit alignment padding)
     text = re.sub(r'^.*l{4,}.*$', '', text, flags=re.MULTILINE)
+    # Common PDF separator rules
+    text = re.sub(r'^\s*[_\-\u2014]{8,}\s*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*_{3,}.*_{3,}\s*$', '', text, flags=re.MULTILINE)
     return text
 
 
@@ -112,22 +119,78 @@ def rejoin_hyphenated_words(text: str) -> str:
     return text
 
 
+def remove_footnotes(text: str) -> str:
+    """Remove extracted footnote blocks and inline footnote markers."""
+    lines = text.split('\n')
+    result = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        # Footnotes often appear as a standalone number followed by indented lines.
+        if re.match(r'^\s*\d+\s*$', line):
+            j = i + 1
+            footnote_lines = []
+            while j < len(lines):
+                candidate = lines[j]
+                stripped = candidate.strip()
+                leading_spaces = len(candidate) - len(candidate.lstrip())
+
+                if not stripped:
+                    if footnote_lines:
+                        j += 1
+                        break
+                    j += 1
+                    continue
+
+                if re.match(r'^(Case:|Appellate Case:)', stripped):
+                    break
+
+                if leading_spaces >= 4:
+                    footnote_lines.append(candidate)
+                    j += 1
+                    continue
+
+                break
+
+            if footnote_lines:
+                i = j
+                continue
+
+        result.append(line)
+        i += 1
+
+    text = '\n'.join(result)
+
+    # Remove inline footnote callouts like "Party. 1 Other..." after dropping the
+    # corresponding footnote body.
+    text = re.sub(r'(?<=[\.\?\!”\)])\s+\d+\s+(?=[A-Z])', ' ', text)
+    return text
+
+
 def is_section_header(line: str) -> bool:
     """Check if a line is a section header (should be its own paragraph)."""
-    stripped = line.strip()
+    stripped = re.sub(r'\s+', ' ', line.strip())
     if not stripped:
         return False
 
     # Roman numeral sections: "I", "II", "III", "IV", "V", "VI", etc.
     if re.match(r'^[IVX]+$', stripped):
         return True
+    if re.match(r'^[IVX]+[\.\)]\s+\S', stripped):
+        return True
 
     # Letter subsections: "A", "B", "C" (standalone)
     if re.match(r'^[A-F]$', stripped):
         return True
+    if re.match(r'^[A-Z][\.\)]\s+\S', stripped):
+        return True
 
     # Numbered sections: "1.", "2.", etc.
     if re.match(r'^\d+\.$', stripped):
+        return True
+    if re.match(r'^\d{1,2}[\.\)]\s+\S', stripped) and len(stripped) <= 80:
         return True
 
     # ALL-CAPS section titles: "BACKGROUND", "DISCUSSION", "CONCLUSION", etc.
@@ -149,73 +212,122 @@ def is_dialogue_or_quote(line: str, prev_line: str = '') -> bool:
     stripped = line.strip()
     leading_spaces = len(line) - len(line.lstrip())
 
-    # Heavily indented lines (>=6 spaces) are likely block quotes
-    if leading_spaces >= 6:
+    if re.match(r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)*:', stripped):
+        return True
+
+    prev_indent = len(prev_line) - len(prev_line.lstrip()) if prev_line else 0
+
+    # Block quotes tend to stay deeply indented across multiple lines. Ordinary
+    # legal paragraphs often use a first-line indent, so do not treat those as quotes.
+    if leading_spaces >= 10 and prev_indent >= 10:
         return True
 
     return False
 
 
-def join_caption_block(text: str) -> str:
-    """
-    Join the case caption block into a single paragraph.
+def is_captionish_line(line: str) -> bool:
+    """Detect short caption/front-matter lines that should stay separate."""
+    stripped = line.strip()
+    if not stripped:
+        return False
 
-    The caption typically looks like:
-        AMERICA FIRST LEGAL FOUNDATION,
-        APPELLANT
+    if stripped in {
+        'Petitioner.', 'Petitioners.', 'Respondent.', 'Respondents.',
+        'Appellant.', 'Appellee.', 'Plaintiff-Appellee.', 'Defendant-Appellant.',
+        'Petition for Review', 'Per Curiam.',
+    }:
+        return True
 
-        v.
+    if stripped.lower() == 'v.':
+        return True
 
-        JAMIESON GREER, IN HIS OFFICIAL CAPACITY,
-        APPELLEE
+    if re.match(r'^(Before|Appeal from|Petition for Review|Opinion for the Court)', stripped):
+        return True
 
-    We join these short ALL-CAPS lines (party names, roles, "v.") into
-    one block, stopping when we hit a longer substantive line.
-    """
-    lines = text.split('\n')
-    result = []
-    caption_lines = []
-    in_caption = False
+    if re.match(r'^No\.\s+[\d\-]+$', stripped):
+        return True
 
-    def flush_caption():
-        if caption_lines:
-            result.append(' '.join(caption_lines))
-            caption_lines.clear()
+    if ('Court of Appeals' in stripped or 'Circuit' in stripped) and len(stripped) <= 100:
+        return True
 
+    if len(stripped) <= 100 and stripped.isupper():
+        return True
+
+    return False
+
+
+def should_merge_across_blank(prev_line: str, next_line: str) -> bool:
+    """Treat PDF-extraction blank lines as soft wraps when context suggests it."""
+    prev = prev_line.strip()
+    nxt = next_line.strip()
+    if not prev or not nxt:
+        return False
+
+    if is_section_header(prev) or is_section_header(nxt):
+        return False
+
+    if is_captionish_line(prev) or is_captionish_line(nxt):
+        return False
+
+    next_indent = len(next_line) - len(next_line.lstrip())
+
+    if prev.endswith(('-', '–', '—')):
+        return True
+
+    if re.search(r'[,:;(\[]$', prev):
+        return True
+
+    if not re.search(r'[.!?:"”\')\]]$', prev):
+        return True
+
+    if next_indent < 4 and not re.match(r'^[A-Z][A-Z\s]+$', nxt):
+        return True
+
+    return False
+
+
+def find_body_start(lines: list[str]) -> int:
+    """Return the line index where the opinion body likely begins."""
     for i, line in enumerate(lines):
-        stripped = line.strip()
+        stripped = re.sub(r'\s+', ' ', line.strip())
+        if not stripped:
+            continue
 
-        if not in_caption:
-            # Detect start of caption: a short ALL-CAPS line with party name
-            # or a line that is just "v." preceded by what looks like a header
-            if (stripped and
-                len(stripped) < 80 and
-                (stripped == 'v.' or
-                 (stripped.isupper() and
-                  any(role in stripped for role in
-                      ['APPELLANT', 'APPELLEE', 'PLAINTIFF', 'DEFENDANT',
-                       'PETITIONER', 'RESPONDENT']) or
-                  (stripped.endswith(',') and stripped.isupper() and len(stripped) > 5)))):
-                in_caption = True
-                caption_lines.append(stripped)
-                continue
-            result.append(line)
+        if re.match(r'^[A-Z][A-Z\s\.\'\-]+,\s+(Circuit Judge|Judge|Chief Judge)\.?$', stripped):
+            return min(i + 1, len(lines))
+
+        if re.match(r'^[A-Z][A-Z\s\.\'\-]+,\s+(Circuit Judge|Judge|Chief Judge):', stripped):
+            return i
+
+        if stripped in {'PER CURIAM.', 'Per Curiam.'}:
+            return min(i + 1, len(lines))
+
+    return 0
+
+
+def normalize_front_matter(text: str) -> str:
+    """Preserve caption/front matter structure while cleaning spacing lightly."""
+    paragraphs = []
+    current = []
+
+    for line in text.split('\n'):
+        stripped = re.sub(r'\s+', ' ', line.strip())
+        if not stripped:
+            if current:
+                paragraphs.append(' '.join(current))
+                current = []
+            continue
+
+        if current and not should_merge_across_blank(current[-1], stripped):
+            paragraphs.append(' '.join(current))
+            current = [stripped]
         else:
-            if not stripped:
-                # Blank line within caption — skip
-                continue
-            elif (stripped == 'v.' or
-                  (stripped.isupper() and len(stripped) < 80 and
-                   any(c.isalpha() for c in stripped))):
-                caption_lines.append(stripped)
-            else:
-                # End of caption
-                flush_caption()
-                in_caption = False
-                result.append(line)
+            current.append(stripped)
 
-    flush_caption()
-    return '\n'.join(result)
+    if current:
+        paragraphs.append(' '.join(current))
+
+    return '\n\n'.join(paragraphs)
 
 
 def reflow_paragraphs(text: str) -> str:
@@ -249,6 +361,19 @@ def reflow_paragraphs(text: str) -> str:
 
         # Empty line = paragraph boundary
         if not stripped:
+            next_nonempty = ''
+            j = i + 1
+            while j < len(lines):
+                if lines[j].strip():
+                    next_nonempty = lines[j]
+                    break
+                j += 1
+
+            prev_nonempty = current_para[-1] if current_para else ''
+            if prev_nonempty and next_nonempty and should_merge_across_blank(prev_nonempty, next_nonempty):
+                i += 1
+                continue
+
             flush_para()
             i += 1
             continue
@@ -256,7 +381,7 @@ def reflow_paragraphs(text: str) -> str:
         # Section headers get their own paragraph
         if is_section_header(stripped):
             flush_para()
-            paragraphs.append(stripped)
+            paragraphs.append(re.sub(r'\s+', ' ', stripped))
             i += 1
             continue
 
@@ -264,7 +389,7 @@ def reflow_paragraphs(text: str) -> str:
         # These should preserve their line structure but rejoin
         # lines within the same speaker's turn
         leading_spaces = len(line) - len(line.lstrip())
-        if leading_spaces >= 6 and is_dialogue_or_quote(line):
+        if is_dialogue_or_quote(line, lines[i - 1] if i > 0 else ''):
             if not in_quote_block:
                 flush_para()
                 in_quote_block = True
@@ -289,6 +414,30 @@ def reflow_paragraphs(text: str) -> str:
     return '\n\n'.join(paragraphs)
 
 
+def merge_broken_paragraphs(text: str) -> str:
+    """Merge adjacent paragraphs when the first clearly ends mid-sentence."""
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    if not paragraphs:
+        return text
+
+    merged = [paragraphs[0]]
+    for para in paragraphs[1:]:
+        prev = merged[-1]
+
+        if (
+            not is_section_header(prev)
+            and not is_section_header(para)
+            and not is_captionish_line(prev)
+            and not is_captionish_line(para)
+            and not re.search(r'[.!?:"”\')\]]$', prev)
+        ):
+            merged[-1] = f"{prev} {para}"
+        else:
+            merged.append(para)
+
+    return '\n\n'.join(merged)
+
+
 def normalize_final(text: str) -> str:
     """Final cleanup pass."""
     # Remove any remaining triple+ newlines
@@ -305,19 +454,35 @@ def clean_opinion(text: str) -> tuple[str, list[str]]:
     """
     warnings = []
 
-    # Step 1: Remove page-level artifacts
+    # Step 1: Remove extracted footnotes before page cleanup removes their anchors
+    text = remove_footnotes(text)
+
+    # Step 2: Remove page-level artifacts
     text = remove_page_artifacts(text)
 
-    # Step 2: Remove decorative lines
+    # Step 3: Remove decorative lines
     text = remove_decorative_lines(text)
 
-    # Step 3: Rejoin hyphenated words
+    # Step 4: Rejoin hyphenated words
     text = rejoin_hyphenated_words(text)
 
-    # Step 4: Reflow into clean paragraphs
-    text = reflow_paragraphs(text)
+    # Step 5: Preserve front matter lightly and reflow the opinion body aggressively.
+    lines = text.split('\n')
+    body_start = find_body_start(lines)
+    front_matter = '\n'.join(lines[:body_start]).strip()
+    body = '\n'.join(lines[body_start:]).strip()
 
-    # Step 5: Final normalization
+    cleaned_parts = []
+    if front_matter:
+        cleaned_parts.append(normalize_front_matter(front_matter))
+    if body:
+        cleaned_parts.append(reflow_paragraphs(body))
+    text = '\n\n'.join(part for part in cleaned_parts if part)
+
+    # Step 6: Merge paragraphs that still break mid-sentence after reflow.
+    text = merge_broken_paragraphs(text)
+
+    # Step 7: Final normalization
     text = normalize_final(text)
 
     word_count = len(text.split())
