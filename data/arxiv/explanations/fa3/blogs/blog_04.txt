@@ -1,0 +1,82 @@
+# FP8, Laid Bare: How FlashAttention-3 Hits Petaflop Speeds Without Losing Its Mind
+
+## TL;DR
+FlashAttention-3 brings attention on H100 from tens/hundreds of TFLOPs to close to a petaflop by combining three practical low-level tricks: (1) respect FP8 WGMMA layout constraints (k-major operands), (2) perform in-kernel transposes using LDSM/STSM to avoid extra global-memory work, and (3) reorder and permute register layouts so FP32 accumulators produced by one WGMMA are consumable by the next FP8 WGMMA. To make FP8 usable numerically, FlashAttention-3 also applies block quantization and incoherent processing (cheap random orthogonalization). The result: FP8 forward attention near 1.2 PFLOPs/s on H100 and much lower quantization error than naive FP8.
+
+This post walks through the practical issues and the concrete tricks from the paper so you can reason about implementing or integrating FP8 attention kernels safely and efficiently.
+
+## Why FP8 is attractive and why it's tricky
+Hopper-class Tensor Cores support FP8 WGMMA with roughly 2× higher matmul throughput than FP16/BF16. That raw throughput is why FP8 looks irresistible for attention, where the majority of work is GEMMs.
+
+But FP8 WGMMA comes with two important constraints that break naive implementations:
+
+1. Operand layout constraint: the FP8 WGMMA on Hopper accepts only k-major inputs (i.e., contiguous in the inner K dimension for the tiled operand in shared memory). In contrast, many attention tensors are contiguous in the head (d) dimension, not in sequence length, so loaded tiles are not in the required k-major layout.
+
+2. Accumulator/operand layout mismatch: the logical order that the FP32 accumulators are laid out in registers after a WGMMA is not the same register ordering expected by a subsequent WGMMA that consumes those accumulators (when you try to fuse back-to-back WGMMAs inside a kernel). Without transformation, you can't directly feed the accumulator into the next FP8 WGMMA.
+
+These are pure layout and register-format problems — they have nothing to do with math — but they determine whether you can reach FP8 Tensor Core throughput without paying big memory or compute overhead.
+
+## Practical solution 1 — In-kernel transpose with LDSM / STSM (avoid pre-transposes)
+Option A: pre-transpose tensors in global memory to match FP8 WGMMA layout. That works but is costly in memory-bound settings (extra kernels, extra HBM traffic), and it's awkward to integrate in general libraries.
+
+Option B (what FlashAttention-3 uses): do a tile-wise in-kernel transpose after loading a tile into SMEM using LDSM/STSM (ldmatrix / stmatrix) warp-level instructions. Why this works well:
+
+- LDSM/STSM act on 128-byte tiles with warp cooperation and are register-efficient.
+- You can pack FP8 bytes (two 8-bit entries per 16-bit lane when needed) and execute tile transpose with minimal extra register pressure.
+- Because FlashAttention-3 already stages tiles through a circular SMEM buffer and issues loads asynchronously (TMA), the transpose of the next \mathbf{V} tile can be scheduled while Tensor Cores are busy on the current WGMMAs. That hides the transpose latency under matmul work.
+
+Takeaway: do the transpose in shared memory immediately after TMA load and before issuing the FP8 WGMMA. Use LDSM/STSM to keep it efficient and cheap in registers.
+
+## Practical solution 2 — Fix the accumulator-to-operand layout with byte permutes
+After a WGMMA produces FP32 accumulators in registers, the register ordering (how threads own the parts of the accumulator) is not necessarily the order that the next WGMMA expects for its operand layout. FlashAttention-3 resolves this with a register-level byte permutation:
+
+- Inspect the register ordering patterns of the FP32 accumulator produced by the first WGMMA (these are predictable and documented in the PTX/SASS patterns).
+- Apply inexpensive byte-permute (or shuffle/byte-swap) instructions to reorder the accumulator register sequence into the format expected by the consuming WGMMA.
+- Arrange the in-kernel transpose of the \mathbf{V} tile so its row permutation complements the column permutation of \mathbf{P} done by the accumulator permute. That way both sides match up and the second WGMMA computes the correct logical product.
+
+Concrete note from the paper: the register sequence is permuted in blocks (e.g., a pattern like \{d0 d1 d4 d5 d2 d3 d6 d7\} repeated), and that permutation is replicated across the 8-byte granularity used by the instruction. Implementing this with byte permutes avoids expensive inter-thread shuffles.
+
+Takeaway: a small number of register-level permutes makes chaining two FP8 WGMMAs possible without extra memory copies. This unlocks fused FP8 paths and the high Tensor Core throughput.
+
+## Practical solution 3 — Block quantization + incoherent processing (address FP8 accuracy)
+Even if you can run FP8 at full speed, quantizing Q/K/V to FP8 naively (per-tensor scaling) has two failure modes in large models: limited mantissa precision (e4m3) and rare large outliers. FlashAttention-3 uses two simple, cheap mitigations that integrate naturally with the block-oriented FlashAttention tiling:
+
+1. Block quantization: quantize per tile (per-block) instead of per tensor. Since FlashAttention naturally operates on blocks (e.g., blocks of size $B_r \times d$ or $B_c \times d$), keep a scale factor per block. This reduces dynamic range loss without extra global-memory passes; you compute a block scale as you prepare the tile (can be fused into other bandwidth-bound ops).
+
+2. Incoherent processing: multiply Q and K by a cheap structured random orthogonal matrix $M$ before quantization so that each entry becomes a random linear combination of the original entries. Because $M$ is orthogonal, $\left(QM\right)\left(KM\right)^\top = Q K^\top$, so attention is mathematically unchanged. Practically, this spreads out outlier energy and reduces quantization error. Use a fast structured transform (Hadamard × random sign diagonals) so the cost is $O(d\log d)$ and can be fused into pre-attention ops (e.g., rotary embeddings). This is the same idea used in recent quantization works and is cheap to apply.
+
+Empirical result from the paper: combining block quantization and incoherent processing makes FP8 FlashAttention-3 about 2.6× more accurate (lower RMSE versus an FP64 reference) than naive per-tensor FP8 attention in outlier-heavy distributions.
+
+## How these low-level tricks fit into the kernel and scheduling model
+A few more practical implementation notes that matter for performance on H100:
+
+- Use TMA for asynchronous loads from HBM to SMEM. TMA is fully asynchronous relative to Tensor Cores and allows producer/consumer warp specialization.
+- Use warp-specialization (split warps into producer/consumer roles) and a small circular SMEM buffer so loads, in-kernel transposes, and WGMMAs are pipelined. The transpose of the next tile can be scheduled by producer warps while consumer warps run WGMMAs and softmax-related code.
+- Overlap non-GEMM softmax work with asynchronous WGMMAs using a 2-stage (or optionally 3-stage) pipeline inside the consumer warpgroup: issue the next Q×K WGMMA (async), then issue the current P×V WGMMA (async), then wait and run softmax on the just-produced S tile while the other warpmmas progress. This is crucial because on Hopper the special-function throughput (exponentials for softmax) is tiny compared to WGMMA FLOPs; overlapping hides that cost.
+- Be conscious of register pressure: doing extra stages of pipelining requires storing intermediate S tiles in registers. There’s a trade-off between tile sizes and pipeline depth that must be tuned per kernel.
+
+## Observed outcomes (from the paper)
+- FP16 FlashAttention-3 achieves 1.5–2.0× speedup over FlashAttention-2 and reaches up to 740 TFLOPs/s (about 75% utilization on H100).
+- FP8 FlashAttention-3 reaches nearly 1.2 PFLOPs/s on H100 in favorable settings.
+- With block quantization + incoherent processing, FP8 FlashAttention-3 reduces numerical error by about 2.6× compared to baseline FP8 per-tensor quantized attention (on a synthetic outlier-heavy distribution).
+
+## Practical checklist for implementers
+If you want to add FP8 FlashAttention to your stack, here is a boiled-down checklist based on the paper:
+
+1. Implement FP8-capable kernels that:
+   - Load tiles via TMA into SMEM.
+   - Immediately perform a tile transpose in-kernel using LDSM/STSM to produce k-major layout for FP8 WGMMA.
+2. Implement register-level byte permutes to reorder FP32 accumulators produced by a WGMMA into the operand layout expected by the next WGMMA.
+3. Use warp-specialization + circular SMEM buffer:
+   - Producer warps: TMA load + LDSM/STSM transpose.
+   - Consumer warps: asynchronous WGMMA calls + softmax handling.
+4. Pipeline GEMMs and softmax (2-stage pipelining) to hide slow special functions under fast Tensor Cores.
+5. For accuracy:
+   - Apply block-level quantization (one FP8 scale per tile).
+   - Optionally apply cheap structured random orthogonal transforms (Hadamard × random signs) to Q and K before quantization and fuse with other pre-attention ops.
+6. Tune tile sizes and number of pipeline stages to manage register pressure and hit high SM occupancy.
+
+## Final thoughts
+FlashAttention-3 shows that hitting petaflop-class performance on attention is not magical — it's a careful alignment of data layout, asynchronous hardware features, and modest numerical techniques. The key engineering insight is to treat layout and register ordering as first-class citizens in the kernel design: once you can transpose cheaply in SMEM and permute registers cheaply, the FP8 Tensor Core path becomes not only possible but rewarding.
+
+If you care about full-pipeline performance on H100, these are the concrete low-level moves you need to consider. FlashAttention-3 open-sources their implementation, which is a useful reference for those integrating FP8 attention into frameworks and model stacks.

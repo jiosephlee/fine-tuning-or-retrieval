@@ -1,0 +1,31 @@
+### Where is causal masking applied in the pipelined loop, and does it interfere with overlap?
+Question:
+For causal attention, where exactly is the mask applied in the overlapped 2-stage main loop? Is the mask applied as $-\infty$ to entries of $\mathbf{S}_i^{(j)}$ prior to computing $m_i$ and $\widetilde{\mathbf{P}}_i^{(j)}$? Does this introduce additional data-dependent divergence or extra waits that could break the intended overlap between WGMMA and softmax, especially for tiles that straddle the triangular boundary?
+Answer:
+Short answer: the causal mask is applied locally in the softmax stage (after the SS‑GEMM that produces the score tile and before computing the local row‑max / exponentials). In the 2‑stage overlapped loop you still compute each tile’s score block $S_i^{(j)}$ (or skip producing it entirely for fully‑future blocks), then mask the disallowed entries (set them to a very large negative value / logically treat them as $-\infty$) prior to computing $m_i$ and $\widetilde{\mathbf{P}}_i^{(j)}$. Doing this does not force extra cross‑warp synchronization or break the intended overlap between WGMMA and softmax.
+
+Why, in a bit more detail and intuition grounded in the paper’s algorithm:
+
+1) Where the mask belongs in the pipeline
+The pipeline in Algorithm 2 computes a score tile (we call it $S_{cur}$ or $S_{next}$) with an asynchronous WGMMA, then runs the softmax reduction on that tile to produce a row‑normalized $\widetilde{\mathbf{P}}$ tile. Causal masking is part of the softmax computation: after the SS‑GEMM produces $S_i^{(j)}$ you apply the causal mask to the entries of that tile and then compute
+$m_i = \max(m_i^{old}, \operatorname{rowmax}(S_i^{(j)}_{\text{masked}}))$
+and
+$\widetilde{\mathbf{P}}_i^{(j)} = \exp\!\left(S_i^{(j)}_{\text{masked}} - m_i\right).$
+So the mask is logically applied to $S$ before any row‑max, exponentials, accumulation $\ell_i$, or using $\widetilde{\mathbf{P}}$ in the RS‑GEMM. This is exactly the local softmax/rescale part in lines marked code-ws:softmax_start..code-ws:softmax_end / code:softmax in the paper’s pseudocode.
+
+2) Does this need extra waits or data‑dependent divergence?
+No extra synchronization beyond what the pseudocode already needs. Two facts make this inexpensive and non‑blocking in the FlashAttention‑3 design:
+
+- The mask is deterministic from tile indices (query block index $i$ and key block index $j$) and can be evaluated by each thread without communicating with other warps/threads. Whether an element is “future” or not is just a comparison of its (row, column) coordinates against the causal boundary, so implementing the mask is a simple elementwise operation (set to $-\infty$ or a large negative sentinel) performed locally in registers/SMEM.
+
+- Mask application is part of the (non‑GEMM) softmax work, which the algorithm explicitly overlaps with other warpgroups’ GEMMs (and even with some in‑warpgroup WGMMAs). Because softmax (including masking, rowmax, exponentials, and scaling) runs on the separate execution resources from Tensor Cores, it is scheduled to execute while WGMMA from another stage is in flight. Masking itself is cheap (comparisons + conditional write of a sentinel) compared to exponential and reduction, so it does not introduce blocking waits on WGMMA. The only required wait is the normal one for the producing WGMMA to finish generating $S_{cur}/S_{next}$; once $S$ is available you can immediately mask and proceed with rowmax/exp without any new cross‑warp barriers.
+
+3) Tiles that straddle the triangle boundary
+For tiles that partially cross the diagonal (i.e., some columns in the tile are allowed, some are masked), you still produce the score tile via the SS‑GEMM, then apply the elementwise mask to the entries that correspond to future keys and proceed with the local reductions. This is the usual per‑tile local softmax approach. There is no data‑dependent global control flow: the mask pattern is known from tile indices, and every thread executes the same sequence of instructions (with different elements masked), so there is no extra warp divergence beyond normal per‑element branches that are already regular and cheap.
+
+(As an optimization many implementations skip issuing the GEMM for tiles that are fully in the future (entire tile masked) and thus avoid doing wasted WGMMA work; the paper’s FLOP accounting for causal attention divides by two as an approximation of this effect. Whether you skip such tiles is an implementation choice and not required for correctness.)
+
+4) Practical caveats
+Two practical things the paper already calls out are relevant: the compiler sometimes reorders instructions and register pressure is tight. You must ensure the mask and softmax operations are scheduled in the intended place relative to asynchronous WGMMA calls (the implementation does this by issuing WGMMA asynchronously and then waiting for it before running the mask+softmax on that tile). Also, masking and softmax consume on‑chip registers/SMEM; excessive register pressure might force different tile/pipeline tradeoffs. But these are resource/optimization issues, not correctness or fundamental overlap blockers.
+
+Conclusion: the causal mask is applied to each produced score tile before computing $m_i$ and $\widetilde{\mathbf{P}}_i^{(j)}$; it is an elementwise/local operation and does not create extra inter‑warp waits or unpredictable data‑dependent divergence that would defeat the WGMMA ↔ softmax overlap, aside from the ordinary dependency waiting for the WGMMA that produced the score tile.

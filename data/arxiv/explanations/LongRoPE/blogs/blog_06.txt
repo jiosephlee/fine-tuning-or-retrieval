@@ -1,0 +1,104 @@
+# Plugging In LongRoPE: A Practitioner’s Guide to Extending Your LLM
+
+LongRoPE is a practical, mostly non-invasive recipe to extend RoPE-based LLMs from typical context windows (e.g., 4k) all the way to 2,048k tokens. The core idea is simple: search for non-uniform rescale factors for RoPE (per-dimension and optionally preserving early token positions), use those factors as a much better initialization, fine-tune at an intermediate long length (e.g., 128k → 256k), then re-search to push to 2,048k. This keeps the model architecture identical except for modified positional handling so you can reuse most optimizations (quantization, inference kernels, etc.).
+
+Below I give a compact, practical walkthrough: when to rely on search-only, when to fine-tune, what data and compute were used in the paper, search and fine-tune hyperparameters that worked, how to recover short-length behavior, and how to switch dynamically at inference.
+
+## Quick summary of what LongRoPE does and why it works
+- LongRoPE treats positional interpolation as a multidimensional search problem rather than a one-size-fits-all linear rescale. It finds per-RoPE-dimension rescale factors and an optional token-index threshold \hat{n} so that initial positions use original RoPE while later tokens use rescaled angles.
+- The RoPE embedding used becomes, for dimension index i and token position n:
+  cos(I(\hat{\lambda}_i,\hat{n}) * n / \beta^i), sin(I(\hat{\lambda}_i,\hat{n}) * n / \beta^i)
+  where I(...) = 1 when n < \hat{n}, and I(...) = 1 / \lambda_i when n >= \hat{n}.
+- Two practical payoffs: (1) better initialization minimizes catastrophic values introduced by naive new positions, and (2) you can extend up to 8× without any fine-tuning. For larger ratios, a short, focused fine-tune at an intermediate length (256k in the paper) plus a second search yields 2,048k context windows.
+
+## When to use search-only vs. when to fine-tune
+- Use search-only when your target extension ratio is modest (paper demonstrates reliable non-finetuned extension up to 8×, e.g., 4k → 32k). The evolutionary search finds dimension-wise factors that preserve key high-frequency RoPE components, preventing immediate perplexity spikes.
+- Use progressive fine-tuning when you need extreme extensions (hundreds of times larger). LongRoPE’s recommended flow is:
+  1. Search and extend pre-trained model to 128k and 256k (find rescale factors for those targets).
+  2. Fine-tune at 128k for a few hundred steps (paper used 400 steps), then switch to 256k rescale factors and fine-tune another ~600 steps (so ~1k steps total in the paper).
+  3. After the 256k fine-tune, perform a second search for rescale factors targeting 2,048k and apply them at inference (no more fine-tuning required).
+- Rationale: direct fine-tuning from 4k to 2,048k is hard to converge and extremely expensive. Progressive fine-tuning keeps training lengths manageable and uses the search to provide better positional initializations.
+
+## Datasets and data preparation used in the paper (practical notes)
+- For fine-tuning LLaMA2-7B: the authors used RedPajama, chunked into 128k segments that start with BOS and end with EOS when appropriate. Two-stage fine-tuning used these long chunks.
+- For Mistral experiments: Together Computer's Long-Data Collections were used; their fine-tuning followed YaRN’s setup with 16k training chunk length for some settings.
+- For search evaluation (perplexity guidance) they used a small number of long validation samples (e.g., 5 random PG19 samples for windows ≤256k; 3 Pile-Books3 samples for windows >512k). That kept search evaluation light while giving sensible signal.
+- Practical implication: you do not need a massive corpus of million-token documents to run the search. For fine-tuning to 256k they trained on 128k- and 256k-length chunks; to push to 2,048k they did not rely on direct 2M training data.
+
+## Recommended compute and training hyperparameters (from the paper)
+These are the settings that produced the reported results. They are a practical starting point; tune as needed for your scale.
+
+Fine-tuning LLaMA2-7B (paper settings)
+- Learning rate: 2e-5 with linear decay
+- Global batch size: 32
+- Fine-tuning schedule:
+  - 400 steps at 128k (using rescale factors found for 128k)
+  - 600 steps at 256k (switch rescale factors and continue)
+- Hardware: 128k training used 8×A100 GPUs, 256k used 16×A100 GPUs (distributed training).
+- Data: RedPajama chunked into 128k segments.
+
+Fine-tuning Mistral-7B (paper settings)
+- Learning rate: 1e-6 (constant)
+- Global batch size: 64
+- Fine-tuning on Together long-data with 16k chunks for 400 steps per stage
+- Hardware: 4×A100 GPUs for the 128k/256k jobs reported.
+
+Search hyperparameters (evolutionary search)
+- Typical settings for targets ≤256k:
+  - Population size P = 64
+  - Mutation / crossover pool sizes N1 = N2 = 16
+  - Mutation probability p = 0.3
+  - Iterations T = 40
+  - Top-32 parents retained each iteration
+  - Perplexity calculated on 5 PG19 validation samples with minimum length requirement
+- For windows >512k they halved population, mutation, and crossover sizes to keep search time reasonable.
+- Important constraints: they enforce monotonic non-decreasing λ_i across RoPE dimensions (λ_i ≤ λ_{i+1}) to reduce invalid/poor candidates. This both reduces search burden and is theoretically consistent with NTK intuition (higher-frequency dims → smaller interpolation).
+
+Search space details to keep in mind
+- Per-dimension λ_i is searched in [1.0, s × 1.25] with step 0.01, where s is the extension ratio. Lower bound 1.0 allows pure extrapolation for high-frequency dims; upper bound allows slightly more aggressive interpolation than linear PI for some dims.
+- Token threshold \hat{n} is chosen from {0, 1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 64, 128, 256}. When \hat{n} > 0, the initial \hat{n} token positions use original RoPE (no interpolation), which the paper found helps performance because early tokens usually receive large attention weights.
+
+## Practical compute tips
+- Evaluate perplexity on short sets of long validation examples during search rather than computing full-dataset metrics. The paper used 3–5 long examples; that’s enough to guide search and keeps each evaluation fast.
+- Enforce the monotonic λ constraint early: it prevents evaluating many poor candidates and reduces search time.
+- Seed the evolutionary population with known good heuristics (PI, NTK, YaRN) instead of random initialization. This gives a strong starting set and speeds convergence.
+- For fine-tuning, small number of gradient steps (≈1k) at intermediate lengths sufficed in the paper. That’s a big compute saving compared to training many epochs at huge sequence lengths.
+
+## Recovering short-context performance (dynamic switching)
+A common worry: does stretching RoPE kill short-window behavior? Yes, naive high-ratio rescaling can crowd the original 4k positions and degrade performance. LongRoPE addresses this by:
+- Running an extra evolution search on the extended (e.g., 2,048k) model to find RoPE rescale factors tailored to short lengths (4k and 8k). In practice they constrain the maximum λ allowed for these searches so the short-range embedding uses less interpolation.
+- At inference time, LongRoPE dynamically switches the RoPE rescale factors based on the sequence length: if sequence length < 8k, it uses the short-length rescale factors; otherwise it uses the extended factors discovered for long lengths.
+- Implementation note: the model architecture remains the same; you only change the mapping that turns token index n to rotary angle. That mapping can be chosen at runtime based on current context length.
+
+Practical rule of thumb from the paper:
+- If seq_len < 8k → use the recovered short-length rescale factors (searched specifically for 4k/8k).
+- If seq_len ≥ 8k → use the extended rescale factors appropriate to your target (e.g., those found for 256k or for final 2,048k).
+
+This runtime switching preserves the model’s ability on the original benchmarks (the paper shows comparable performance on standard zero/few-shot tasks) while enabling long-context capabilities.
+
+## How LongRoPE integrates with the rest of your stack
+- Minimal architecture change: only the positional encoding (RoPE angles) is adjusted. The transformer layers, weights, attention implementation, quantization, and most inference-optimizations remain unchanged.
+- That means you can reuse:
+  - Flash attention / fused kernels,
+  - Weight-quantized checkpoints,
+  - Existing batching and tokenization pipelines.
+- The small extra operational complexity is: at inference time decide which RoPE mapping to use for the requested sequence length and apply it when generating rotary angles for attention queries/keys.
+
+## Checklist to apply LongRoPE in your environment
+1. Confirm your model uses RoPE-style rotary embeddings (common in many LLMs).
+2. Decide target max length and whether you can afford a small fine-tune:
+   - If you only need up to ~8× extension: run the search and use the discovered rescale factors (no fine-tune).
+   - If you need extreme extension (hundreds of×): follow progressive path: search for 128k/256k → fine-tune (≈1k steps staged) → search on the fine-tuned model for final 2,048k rescale factors → (optional) run a short-length re-search to recover 4k/8k behavior.
+3. Prepare long chunks for the fine-tuning stage (paper used 128k chunks for LLaMA2), and keep batch size and learning rate similar to paper settings as a starting point.
+4. Use the evolutionary search with monotonic constraint and seeded population. Evaluate perplexity on a small number of long validation samples to guide search.
+5. Deploy with dynamic RoPE mapping selection by sequence length.
+
+## Limitations and operational caveats
+- LongRoPE’s extreme extensions rely on the progressive fine-tuning step. If you cannot fine-tune at all on long chunks, you’ll be limited to the non-finetuned extension ceiling (the paper demonstrates robust non-finetuned extensions up to 8×).
+- The paper demonstrates results on LLaMA2-7B and Mistral-7B; while the method applies generally to RoPE-based LLMs, you should validate the search and fine-tune recipes on your specific model and data.
+- For very large models or special training pipelines, hyperparameters (LR, batch size, number of fine-tune steps) may need tuning.
+
+## Final thoughts
+LongRoPE is a pragmatic middle ground between naïve positional interpolation and full retraining. Its strengths are the per-dimension non-uniform rescaling, a small, well-targeted fine-tuning budget, and dynamic short-window recovery—all while keeping the main model architecture and optimizations intact. If you need long-context capability but want to avoid re-architecting attention or rebuilding model stacks, LongRoPE is a practical tool to try.
+
+If you want, I can sketch a minimal implementation plan for your model (how to wrap RoPE angle computation and the inference-time switch), or adapt a concrete runbook with expected GPU-hours given your available hardware.

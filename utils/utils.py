@@ -65,14 +65,16 @@ def query_gpt(prompt: str | dict, model: str = 'gpt-4.1-mini', max_tokens: int =
         api_params = {
             "model": model,
             "messages": messages,
-            "reasoning_effort": reasoning_effort,
         }
+        if reasoning_effort is not None:
+            api_params["reasoning_effort"] = reasoning_effort
     elif 'o3' in model or 'o1' in model or 'o4' in model:
         api_params = {
             "model": model,
-            "reasoning_effort": reasoning_effort,
             "messages": messages,
         }
+        if reasoning_effort is not None:
+            api_params["reasoning_effort"] = reasoning_effort
     else:
         api_params = {
             "model": model,

@@ -1,0 +1,112 @@
+# Hiding Softmax Under Matmuls: The 2-Stage Pipeline That Makes Attention Fly
+
+## Overview
+
+Attention in Transformers computes pairwise scores and then a softmax-weighted sum. While the matrix-multiply parts (GEMMs) get most of the FLOPs, the row-wise softmax—especially its exponential and reduction operations—can become a practical bottleneck on modern hardware. FlashAttention-3 exposes a simple but powerful idea: exploit hardware asynchrony to overlap softmax work with Tensor Core matmuls, both across warpgroups (ping-pong scheduling) and inside a warpgroup (a 2-stage GEMM–softmax pipeline). The result: much higher Tensor Core utilization on Hopper (H100) GPUs and big speedups vs. prior FlashAttention versions.
+
+This post walks through the intuition, the 2-stage pipeline, why Hopper makes it possible, and the practical trade-offs (register pressure, tile sizes, compiler behavior) that determine how much you actually win.
+
+## Why softmax can be a sleeper bottleneck
+
+The forward attention for a single head is conceptually:
+
+- Compute the scores: S = α Q K^T, where α = 1/√d.
+- Row-wise softmax: P = softmax(S).
+- Output: O = P V.
+
+Although the GEMMs (the QK^T and P V multiplications) dominate FLOP counts, the softmax contains operations that are relatively expensive per output element in terms of the hardware unit that executes them (special functions like exponential, and scalar reductions). On Hopper H100 the asymmetry is stark:
+
+- FP16 Tensor Core matmul throughput: on the order of 989 TFLOPS (device peak).
+- Special-function throughput (e.g., exp): roughly 3.9 TFLOPS (16 special-function ops per SM per cycle × SM count × clock).
+
+That means matmul throughput is hundreds of times larger than special-function throughput. So although overall matmul FLOPs are much larger, the softmax's special-function instructions (exp, row max, reductions) can still occupy a significant fraction of wall-clock time unless you hide them under matmuls.
+
+## The key enabler: hardware asynchrony on Hopper
+
+Hopper gives us two important asynchronous resources:
+
+- An asynchronous Tensor Core execution model exposed via the WGMMA/Warpgroup-wide WGMMA instruction, which can issue matmuls that proceed without stalling the calling threads immediately.
+- An asynchronous memory-copy engine, the Tensor Memory Accelerator (TMA), to move tiles between global memory (HBM) and shared memory (SMEM).
+
+Because these units do useful work independently of the CUDA cores issuing control instructions, we can structure threads (warps) so some warps issue and wait for memory movement while others perform (or issue) WGMMA matmuls and other warps run the softmax kernels. This warp-specialization and asynchrony is what FlashAttention-3 leverages.
+
+## Two complementary forms of overlap
+
+FlashAttention-3 overlaps softmax and GEMMs in two ways:
+
+1. Inter-warpgroup overlap (ping-pong scheduling). Entire warpgroups alternate roles so that while one warpgroup runs its softmax, another is driving Tensor Cores on GEMMs. This balances the use of Tensor Cores, multi-function units, and TMA, reducing idle cycles.
+
+2. Intra-warpgroup 2-stage GEMM–softmax pipeline. Even inside a single warpgroup, we can pipeline work across iterations of the attention inner loop so that one WGMMA computes the next QK^T block while a second WGMMA multiplies the previously computed softmax block by V, and the softmax/exponential work for the "next" block runs between these two WGMMA issuances.
+
+Below I focus on the 2-stage pipeline, the cleaner conceptual unit to understand how softmax gets "hidden" under matmuls.
+
+## The 2-stage pipeline: conceptually
+
+Imagine the attention inner loop over key/value blocks indexed by j. In a typical (synchronous) inner loop you do, for each j:
+
+1. GEMM0: S^{(j)} = Q_i K_j^T
+2. Softmax (row max, exp, row sum) on S^{(j)} producing scaled \tilde{P}^{(j)}
+3. GEMM1: O_i += \tilde{P}^{(j)} V_j
+
+These steps are sequential and force Tensor Cores or the special-function unit to wait for each other. The 2-stage pipeline rearranges the work across iterations so that some steps for iteration j and j+1 overlap:
+
+- Precompute S_cur = Q_i K_0^T (GEMM0 for j=0).
+- For j = 1..T_c-2:
+  - Issue GEMM0 asynchronously to compute S_next = Q_i K_j^T (do not wait).
+  - Ensure V_{j-1} is present; issue GEMM1 asynchronously to compute O_i += \tilde{P}_cur V_{j-1} (do not wait).
+  - Wait for the GEMM0 result (S_next) and then run softmax on S_next to get \tilde{P}_next and updated rescaling accumulators.
+  - Wait for GEMM1 to finish and then perform rescaling updates on O_i.
+  - Move S_next → S_cur and continue.
+
+So at any iteration in steady state you have:
+
+- One WGMMA executing Q_i K_j^T (producing S_next),
+- One WGMMA executing \tilde{P}_cur V_{j-1} (consuming the previous softmax result),
+- The softmax/exponential computation running on S_next (implemented on scalar/FPU/special-function units).
+
+Because WGMMA matmuls can execute asynchronously, the softmax's special-function work tends to be scheduled while the Tensor Cores are busy on the asynchronous GEMMs. Thus the expensive but low-throughput special-function operations rarely sit on the critical path by themselves.
+
+## Why this actually works on Hopper
+
+Three hardware / software properties make the pipeline practical:
+
+- WGMMA is asynchronous and can source inputs from shared memory. Issued WGMMA calls do not necessarily block the issuing warps until they are needed.
+- TMA moves tiles into shared memory asynchronously, so producer warps can stream K/V tiles into SMEM while consumer warps perform compute.
+- Warp-specialization enables dedicating some warps to producer roles (TMA and in-kernel transpose for FP8) and others to consumer roles (issuing WGMMA, performing softmax reductions). This reduces scheduling interference and can be tuned for register allocation (e.g., reassigning registers across warpgroups with setmaxnreg).
+
+Combined, these mean you can have matmuls running on Tensor Cores and softmax/exponential work running on multi-function units concurrently, with TMA bringing in the next tiles in the background.
+
+## Ping-pong scheduling across warpgroups
+
+The ping-pong idea lifts overlap to the warpgroup level. Partition the warps of a CTA into two warpgroups and alternate which warpgroup performs GEMMs and which performs softmax+reduction. More concretely:
+
+- Warpgroup A starts executing GEMM for block j while Warpgroup B executes softmax for block j−1 and issues GEMM for block j−1's P V.
+- Synchronize at barriers so that the GEMMs of the next warpgroup are scheduled after the current warpgroup's GEMMs, which encourages the softmax of the current warpgroup to execute while the other group's Tensor Cores are active.
+
+This alternating schedule evens out usage across execution units and reduces idle time for Tensor Cores and multi-function units. The paper reports that ping-pong scheduling improved FP16 forward throughput in an example from about 570 TFLOPS to around 620–640 TFLOPS (head dim 128, seqlen 8192) on H100.
+
+## Practical trade-offs and limitations
+
+Pipelining softmax under GEMMs is powerful, but it comes with practical costs you must manage.
+
+- Register pressure. The 2-stage pipeline requires holding intermediate tiles (e.g., S_next) in registers while other work is in flight. That increases register usage by roughly the size of a tile (B_r × B_c × sizeof(float)) per threadblock. Higher register usage reduces occupancy or forces smaller tile sizes. FlashAttention-3 balances pipeline depth and tile sizes empirically; going to a 3-stage pipeline increases register needs further and yields diminishing returns unless you can afford the registers.
+
+- Tile size trade-offs. Larger tiles improve arithmetic intensity for WGMMA but also increase the amount of register buffer you must keep between stages. If registers are the limiting resource, larger tiles can degrade overall throughput by reducing the number of active CTAs. So you must tune B_r and B_c relative to available registers and desired pipeline depth.
+
+- Compiler reordering. The CUDA compiler (nvcc) can reorder instructions, sometimes undermining the intended overlap. In practice FlashAttention-3 examines emitted SASS to verify that the compiler-generated code preserves the desired overlapped structure. In real kernels you may need careful placement of barriers and use of explicit wait/commit semantics to avoid the compiler collapsing the pipeline.
+
+- Cost of special functions remains. The pipeline hides but does not remove softmax cost. If special-function throughput is extremely low relative to matmul (e.g., FP8 doubles matmul throughput), you may need stronger overlapping or smaller softmax tiles to avoid the special functions creeping onto the critical path.
+
+- FP8 and layout constraints. When targeting FP8 Tensor Cores, operand layout restrictions (k-major only for FP8 WGMMA) force in-kernel transposes and register permutations. Those extra steps can be overlapped but add complexity and extra register or instruction overhead.
+
+## Empirical impact (as reported)
+
+FlashAttention-3 combines warp-specialization, ping-pong scheduling, and the intra-warpgroup 2-stage pipeline to significantly raise Tensor Core utilization on H100:
+
+- FP16 forward pass throughput reaches up to 740 TFLOPS (about 75% of the theoretical FP16 WGMMA peak), achieving roughly 1.5–2.0× speedup over FlashAttention-2 in many settings.
+- The 2-stage pipelining and warp-specialization alone improved an example FP16 forward run from 570 TFLOPS to ~661 TFLOPS (ablation reported).
+- When moving to FP8-enabled Tensor Cores, FP8 FlashAttention-3 approaches ~1.2 PFLOPS for matmul throughput, though FP8 requires extra care (block quantization, incoherent processing, layout transforms).
+
+## Bottom line
+
+Softmax isn't expensive because it has many FLOPs—it's expensive because it uses different, lower-throughput hardware (special-function units and scalar work) that can become the critical path when not overlapped. The 2-stage GEMM–softmax pipeline (combined with warp-specialization and ping-pong scheduling) sidesteps this by letting Tensor Cores do continuous heavy lifting while softmax work happens concurrently. On Hopper-style GPUs with asynchronous Tensor Cores and TMA, this is a practical and effective technique to get much closer to Tensor Core peaks for attention, at the cost of careful register and tile-size tuning and some added implementation complexity.

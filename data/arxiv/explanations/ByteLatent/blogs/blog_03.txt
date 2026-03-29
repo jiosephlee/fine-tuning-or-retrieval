@@ -1,0 +1,121 @@
+# Inside BLT’s Architecture: Local Bytes, Global Brains
+
+BLT (Byte Latent Transformer) reframes how large language models operate on raw bytes. Instead of relying on a fixed token vocabulary, BLT dynamically groups bytes into patches and splits model work across three cooperating components: two lightweight local models that operate on bytes (an encoder and a decoder) and a heavyweight global latent transformer that operates on patch-level latents. This post walks through those three parts, the mechanisms that connect them (cross-attention, hash n‑gram embeddings), and the attention pattern that makes the global model efficient (block-causal attention). No diagrams — just a clear textual walkthrough of the data flow during training and generation.
+
+## Why patches at all?
+
+Working directly on raw bytes gives advantages (robustness to noise, better handling of long-tail and multilingual data), but the obvious cost is sequence length: bytes are much longer than subword tokens. BLT’s answer is to group bytes into patches so the expensive global transformer runs on a shorter sequence of latent patch representations. Importantly, patches are not a fixed vocabulary (unlike tokens): they are dynamically formed sequences of bytes and encoded into latent vectors via the local encoder. Patches are chosen to control compute while preserving information where it matters.
+
+BLT uses several patching schemes, the most important being entropy patching. A small byte-level entropy model estimates the next-byte entropy under distribution $p_e$ and yields per-byte entropies
+\[
+H(x_i) = \sum_{v \in \mathcal{V}} p_e(x_i\!=\!v \mid \mathbf{x}_{<i}) \log p_e(x_i\!=\!v \mid \mathbf{x}_{<i}).
+\]
+Patch boundaries are placed at bytes with high entropy (above a global threshold or relative jump), so the model allocates more transformer steps where predictions are uncertain and fewer where bytes are predictable.
+
+Two important properties of BLT patching:
+- Patches are incremental: the decision to start a new patch at position $i$ depends only on the prefix $\mathbf{x}_{<i}$, so generation can decide boundaries autoregressively.
+- Patch size (average bytes per patch) is a primary knob for inference cost: larger patches mean fewer global steps and lower flop cost, enabling a trade-off between step count and model size.
+
+With patching decided, the three model parts handle the conversion between bytes and latents and perform global reasoning.
+
+## Component 1 — Local Encoder: bytes to patch latents
+
+The local encoder, denoted $\mathcal{E}$, is a lightweight transformer stack (many fewer layers than the global model). Its job is to map raw byte sequences into expressive latent vectors, one latent per patch.
+
+Key elements of the local encoder:
+
+- Byte embeddings. Each input byte $b_i$ gets an embedding $x_i \in \mathbb{R}^{h_{\mathcal{E}}}$ via a 256-row lookup (one row per byte value).
+- Hash n‑gram embeddings. To give the encoder contextual signal about recent byte sequences without bloating tables, BLT forms byte n‑grams
+  \[
+  g_{i,n}=\{b_{i-n+1},\dots,b_i\}
+  \]
+  for $n\in\{3,\dots,8\}$ (when available), hashes each n‑gram with a rolling polynomial hash, maps it into a fixed-size embedding table $E_n^{\text{hash}}$, and sums those embeddings into the byte embedding:
+  \[
+  e_i = x_i + \sum_{n=3}^8 E_n^{\text{hash}}(\text{Hash}(g_{i,n})).
+  \]
+  This gives the encoder richer local context (subword-like signals) with a compact, fixed memory cost. Empirically these hash n‑grams are important to match tokenized-model performance.
+
+- Local block-causal self-attention. Bytes attend to a fixed, limited window $w_{\mathcal{E}}$ of prior bytes (a local receptive field). This keeps the encoder cheap and focused on local structure that matters to form a good patch representation.
+
+- Cross-attention into patches. After transformer layers produce byte-level hidden states, BLT pools the bytes belonging to each patch (a simple pooling function, e.g., max-pool) to initialize a per-patch query $P_{0,j}$. Then a multi-headed cross-attention module lets each patch query attend to the bytes in its own patch only (keys/values are the corresponding byte hidden states). This cross-attention is repeated across encoder layers: alternating transformer layers on bytes and patch-wise cross-attention blocks gradually build up the patch latents $p_j$. The masking is dynamic: each patch query only queries the bytes inside that patch.
+
+The result: a sequence of patch representations $p_j$ (one per patch) in the dimensionality expected by the global model, ready for higher-level, fewer-step reasoning.
+
+## Component 2 — Latent Global Transformer: the “brain”
+
+The global transformer, denoted $\mathcal{G}$, is the large autoregressive transformer that consumes the patch latents $p_1, p_2, \dots, p_m$ and produces output latents $o_j$.
+
+Two design choices make it effective:
+
+- Block-causal attention. The global model uses a block-causal attention mask: within a document, a patch's latent may attend to all earlier patches and the current patch, but cannot see future patches. This preserves autoregressive generation semantics at the patch level while allowing each global step to reason over an entire patch summary. Compared to byte-level attention, block-causal attention runs far fewer steps because it works on the shorter patch sequence.
+
+- Large capacity focused on global structure. Because patches compress local structure, the global transformer can be much larger (more layers and hidden dim) and be the main consumer of flops. BLT trades off how often that expensive model is invoked by choosing patch size: larger patches -> fewer global steps -> budget freed for a larger global model.
+
+Operationally, the global transformer produces a sequence of output latents $o_j$ that carry the model’s global predictive state for each patch position.
+
+## Component 3 — Local Decoder: patch latents back to bytes
+
+The local decoder, $\mathcal{D}$, mirrors the encoder but in reverse: it maps global patch latents $o_j$ back into byte predictions $y_i$.
+
+Key points of the decoder:
+
+- Cross-attention from bytes to patches. The decoder initializes byte-level representations with the last encoder byte hidden states (so the decoder has access to the original byte context). Each decoder layer begins with a cross-attention where byte queries attend to the patch latents $o_j$ (keys/values). This cross-attention reconstructs byte-level context informed by global latents.
+
+- Local transformer layers on bytes. After cross-attention, lightweight decoder transformer layers operate over the byte sequence (again with a local receptive field), refining byte predictions autoregressively. The decoder predicts raw bytes with a 256-way softmax.
+
+Putting encoder + global + decoder together yields a full end-to-end model that can be trained from raw bytes.
+
+## Cross-attention: the glue that lets bytes and patches cooperate
+
+Cross-attention appears in both directions and is central for information flow:
+
+- Encoder cross-attention: patch queries attend to byte keys/values (only bytes inside the patch). This pools local byte information into patch latents. Implementation detail: queries are initialized by pooling over the bytes of the patch and then projected; keys/values come from the byte-level transformer hidden states.
+
+- Decoder cross-attention: byte queries attend to patch keys/values. This lets the decoder reconstruct byte-level distributions conditioned on global latent context. Decoder cross-attention is particularly effective empirically.
+
+Some practical details from the BLT design:
+- Multi-head cross-attention is used, with pre-LayerNorms and residual connections.
+- No positional embeddings are used inside the cross-attention module; positional structure is primarily handled by the local transformer layers (which use RoPE in self-attention).
+- Because patch membership is dynamic, cross-attention masks are patch-dependent; BLT uses a fused/dynamic attention implementation (FlexAttention) for efficiency.
+
+## Training vs generation: incremental patching and autoregression
+
+Two concerns arise when patches depend on bytes: during generation the model cannot peek at future bytes to decide patch boundaries. BLT enforces incremental patching: the patching function must satisfy
+\[
+f_p(\mathbf{x}_{<i}) = f_p(\mathbf{x})_{<i},
+\]
+so the segmentation up to position $i$ depends only on the prefix. Entropy patching as implemented uses the entropy model conditioned on the prefix only, so it’s compatible with autoregressive generation.
+
+At generation time the system proceeds autoregressively at the byte level but invokes the global latent transformer only when a new patch boundary is emitted. That means:
+- If current byte is not a patch end, the model continues decoding bytes using the local decoder conditioned on the current patch latent.
+- When a patch boundary is reached (decided incrementally), the encoder must produce a new patch latent (which will involve local encoder work) and then the global transformer is invoked to extend the global latent sequence.
+
+This setup keeps generation exact (no future leakage) while controlling when the expensive global model is used.
+
+## Practical efficiency knobs
+
+BLT exposes several levers that directly affect compute and behavior:
+
+- Patch size (average bytes per patch). Larger patches reduce the number of global steps and inference FLOPs; smaller patches increase steps and granularity. Entropy patching produces variable sizes but can be tuned via entropy thresholds to hit a target average patch size.
+
+- Entropy model configuration. The small entropy model that determines boundaries trades cost for boundary quality. BLT experiments show improvements as the entropy model grows up to a point (diminishing returns beyond ~50M params in their ablations).
+
+- Hash n‑gram table sizes. These are compact ways to give the encoder richer sub-byte context. Empirically, using hundreds of thousands of hash buckets helps match tokenizer-based performance; after a point returns diminish.
+
+- Local model depth and decoder design. The encoder can be extremely lightweight (even one layer) when paired with hash n‑gram embeddings; decoder depth tends to matter more for reconstructing bytes.
+
+## What all this buys you
+
+Architecturally, BLT separates local byte-level processing (efficient, parallel, focused) from global reasoning (expensive but short sequence). That partitioning allows:
+
+- Byte-level robustness and character awareness because the model directly sees bytes and uses n‑gram hashes.
+- Dynamically allocated compute via entropy patching: allocate global steps where the next-byte uncertainty is high.
+- A scaling axis not available for tokenized models: you can increase patch size to save inference FLOPs and reallocate compute to grow the global transformer, often yielding better fixed-inference-budget scaling.
+
+Empirically (as reported in the BLT paper), these design decisions let BLT match or exceed tokenizer-based models up to multi-billion parameter scale in flop-controlled experiments and improve robustness on character-level tasks.
+
+## Final notes and caveats
+
+BLT introduces more components than a standard tokenized transformer: an entropy model, local encoder/decoder with dynamic cross-attention, and hash tables. That increases implementation complexity and requires support for dynamic attention masks and careful batching (BLT packs patches to avoid padding the expensive latent transformer). The authors note room for engineering improvements (runtime optimizations and possibly end-to-end learned patching) but show that the architectural split — local bytes with a global brain — is a viable and promising alternative to fixed-token pipelines.
+
+If you want to dig deeper, the BLT paper provides concrete architectural hyperparameters, flop accounting, and ablations for entropy model size, hash vocabulary, patching choices (strided, space, entropy), and cross-attention placements.

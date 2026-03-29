@@ -7,6 +7,7 @@ from typing import Dict, Iterable, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+import numpy.ma as ma
 import torch
 from transformers import AutoModelForCausalLM
 
@@ -17,34 +18,54 @@ from utils.llm_plotting import set_plot_style
 REQUIRED_MODELS = ("base", "source", "para", "aux")
 PROJECTIONS = ("gate", "up", "down")
 METRICS = ("relative_delta_norm", "cosine_distance")
-COMPARISONS = (
+
+# Comparisons for MLP heatmaps.
+MLP_COMPARISONS = (
     ("source_vs_base", "base", "source"),
     ("para_vs_base", "base", "para"),
     ("aux_vs_base", "base", "aux"),
     ("aux_vs_para", "para", "aux"),
     ("aux_vs_source", "source", "aux"),
+    ("para_vs_source", "para", "source"),
 )
+
+# Comparisons for embedding rasters only.
+EMBED_COMPARISONS = (
+    ("source_vs_base", "base", "source"),
+    ("para_vs_base", "base", "para"),
+    ("aux_vs_base", "base", "aux"),
+)
+
 DIFFERENCE_COMPARISONS = (
     ("aux_base_minus_source_base", "aux_vs_base", "source_vs_base"),
+    ("para_base_minus_source_base", "para_vs_base", "source_vs_base"),
 )
+
 COMPARISON_TITLES = {
     "source_vs_base": "Source vs Base",
     "para_vs_base": "Para vs Base",
     "aux_vs_base": "Aux vs Base",
     "aux_vs_para": "Aux vs Para",
     "aux_vs_source": "Aux vs Source",
+    "para_vs_source": "Para vs Source",
     "aux_base_minus_source_base": "Aux-Base minus Source-Base",
+    "para_base_minus_source_base": "Para-Base minus Source-Base",
 }
+
 METRIC_TITLES = {
     "relative_delta_norm": "relative delta norm",
     "cosine_distance": "cosine distance",
 }
+
 EPS = 1e-12
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Plot per-channel FFN weight change heatmaps across checkpoints."
+        description=(
+            "Plot per-channel FFN weight change heatmaps and optional token-embedding "
+            "rasters across checkpoints."
+        )
     )
     parser.add_argument(
         "--manifest",
@@ -56,7 +77,19 @@ def parse_args() -> argparse.Namespace:
         "--output_dir",
         type=str,
         default=os.path.join("plots", "ffn_channel_heatmaps"),
-        help="Directory to save .npy arrays and figures.",
+        help="Root directory to save arrays and figures.",
+    )
+    parser.add_argument(
+        "--mlp_subdir",
+        type=str,
+        default="mlp",
+        help="Subdirectory under output_dir for MLP heatmaps and arrays.",
+    )
+    parser.add_argument(
+        "--embed_subdir",
+        type=str,
+        default="embeddings",
+        help="Subdirectory under output_dir for embedding rasters and arrays.",
     )
     parser.add_argument(
         "--cache_dir",
@@ -82,7 +115,7 @@ def parse_args() -> argparse.Namespace:
         "--clip_percentile",
         type=float,
         default=99.0,
-        help="Upper percentile clip for heatmap color range. Set <=0 to disable clipping.",
+        help="Upper percentile clip for heatmap colour range. Set <=0 to disable clipping.",
     )
     parser.add_argument(
         "--fig_width",
@@ -106,7 +139,7 @@ def parse_args() -> argparse.Namespace:
         "--cmap",
         type=str,
         default="viridis",
-        help="Matplotlib colormap for heatmaps.",
+        help="Matplotlib colormap for unsigned heatmaps.",
     )
     parser.add_argument(
         "--diff_cmap",
@@ -119,6 +152,29 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Forwarded to AutoModelForCausalLM.from_pretrained.",
+    )
+    parser.add_argument(
+        "--skip_embeddings",
+        action="store_true",
+        help="Skip token-embedding raster heatmaps.",
+    )
+    parser.add_argument(
+        "--embedding_raster_cols",
+        type=int,
+        default=1000,
+        help="Reshape vocab-sized metrics to (ceil(V/cols), cols) for 2D heatmaps.",
+    )
+    parser.add_argument(
+        "--embed_fig_width",
+        type=float,
+        default=22.0,
+        help="Figure width (inches) for token-embedding raster plots.",
+    )
+    parser.add_argument(
+        "--embed_fig_height",
+        type=float,
+        default=10.0,
+        help="Figure height (inches) for token-embedding raster plots.",
     )
     return parser.parse_args()
 
@@ -139,7 +195,6 @@ def load_manifest(path: str) -> Dict[str, str]:
     if data is None:
         try:
             import yaml  # type: ignore
-
             data = yaml.safe_load(raw)
         except Exception as exc:
             raise ValueError(
@@ -201,7 +256,6 @@ def load_model(model_ref: str, args: argparse.Namespace) -> AutoModelForCausalLM
 
 
 def _extract_layer_index(param_name: str) -> int:
-    # Usually names look like model.layers.12.mlp.gate_proj.weight.
     matches = re.findall(r"\.(\d+)\.", param_name)
     if not matches:
         raise ValueError(f"Could not parse layer index from parameter name: {param_name}")
@@ -288,6 +342,147 @@ def _vector_metrics_cols(
 
 def _to_float32_cpu(param: torch.nn.Parameter) -> torch.Tensor:
     return param.detach().to(dtype=torch.float32, device="cpu")
+
+
+def resolve_embed_tokens_weight_name(model: AutoModelForCausalLM) -> str:
+    preferred_suffixes = (
+        "model.embed_tokens.weight",
+        "transformer.wte.weight",
+        "embed_tokens.weight",
+        "wte.weight",
+    )
+    candidates: Dict[str, torch.nn.Parameter] = {
+        name: param
+        for name, param in model.named_parameters()
+        if param.ndim == 2
+    }
+    for suffix in preferred_suffixes:
+        for name in candidates:
+            if name.endswith(suffix):
+                return name
+    for name in candidates:
+        if "embed_tokens" in name and name.endswith(".weight"):
+            return name
+    for name in candidates:
+        if name.endswith("wte.weight"):
+            return name
+    raise ValueError(
+        "Could not find input token embeddings (expected *embed_tokens.weight or *wte.weight). "
+        f"Sample 2D parameter names: {list(candidates)[:12]}"
+    )
+
+
+def compute_embedding_metrics(
+    ref_model: AutoModelForCausalLM,
+    cmp_model: AutoModelForCausalLM,
+) -> Dict[str, np.ndarray]:
+    ref_name = resolve_embed_tokens_weight_name(ref_model)
+    cmp_name = resolve_embed_tokens_weight_name(cmp_model)
+    ref_w = _to_float32_cpu(ref_model.get_parameter(ref_name))
+    cmp_w = _to_float32_cpu(cmp_model.get_parameter(cmp_name))
+    if ref_w.shape != cmp_w.shape:
+        raise ValueError(
+            f"Embedding shape mismatch: {ref_name} {ref_w.shape} vs "
+            f"{cmp_name} {cmp_w.shape}"
+        )
+    rel, cos = _vector_metrics_rows(ref_w, cmp_w)
+    return {
+        "relative_delta_norm": rel.astype(np.float32),
+        "cosine_distance": cos.astype(np.float32),
+    }
+
+
+def reshape_vocab_vector_to_grid(vec: np.ndarray, n_cols: int) -> np.ndarray:
+    if n_cols <= 0:
+        raise ValueError("embedding_raster_cols must be positive.")
+    n = int(vec.size)
+    n_rows = int(np.ceil(n / n_cols))
+    padded_len = n_rows * n_cols
+    if padded_len == n:
+        return vec.reshape(n_rows, n_cols).astype(np.float32)
+    out = np.full(padded_len, np.nan, dtype=np.float32)
+    out[:n] = vec.astype(np.float32)
+    return out.reshape(n_rows, n_cols)
+
+
+def save_embedding_metric_arrays(
+    embed_metrics: Dict[str, np.ndarray],
+    comparison_name: str,
+    output_dir: str,
+) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    for metric in METRICS:
+        path = os.path.join(output_dir, f"{comparison_name}_embed_tokens_{metric}.npy")
+        np.save(path, embed_metrics[metric])
+        print(f"Saved array: {path}")
+
+
+def subtract_embed_metric_dicts(
+    minuend: Dict[str, np.ndarray],
+    subtrahend: Dict[str, np.ndarray],
+) -> Dict[str, np.ndarray]:
+    return {
+        metric: (minuend[metric] - subtrahend[metric]).astype(np.float32)
+        for metric in METRICS
+    }
+
+
+def plot_embedding_raster_heatmap(
+    embed_metrics: Dict[str, np.ndarray],
+    comparison_name: str,
+    metric: str,
+    output_dir: str,
+    n_cols: int,
+    clip_percentile: float,
+    fig_width: float,
+    fig_height: float,
+    dpi: int,
+    cmap: str,
+    center_zero: bool = False,
+) -> None:
+    vec = embed_metrics[metric]
+    grid = reshape_vocab_vector_to_grid(vec, n_cols)
+    masked = ma.masked_invalid(grid)
+
+    if center_zero:
+        vmax = _compute_symmetric_vmax([vec], clip_percentile=clip_percentile)
+        vmin = -vmax
+    else:
+        vmax = _compute_vmax([vec], clip_percentile=clip_percentile)
+        vmin = 0.0
+
+    comparison_title = _format_comparison_title(comparison_name)
+    metric_title = _format_metric_title(metric)
+    n_rows = grid.shape[0]
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height), constrained_layout=True)
+    image = ax.imshow(
+        masked,
+        aspect="auto",
+        interpolation="nearest",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+    )
+    ax.set_title(
+        f"{comparison_title} — embed_tokens — {metric_title}\n"
+        f"(raster: token id order, {n_rows}×{n_cols}, padded cells masked)",
+        fontsize=14,
+    )
+    ax.set_xlabel("Column (fixed width raster)")
+    ax.set_ylabel("Row (token index // width)")
+    cbar = fig.colorbar(image, ax=ax, shrink=0.85, pad=0.02)
+    cbar.set_label(metric_title)
+
+    os.makedirs(output_dir, exist_ok=True)
+    file_name = f"{comparison_name}_embed_tokens_{metric}_raster.png"
+    path = os.path.join(output_dir, file_name)
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(
+        f"Saved embedding raster: {path} "
+        f"(vmin={vmin:.6f}, vmax={vmax:.6f}, clip_percentile={clip_percentile})"
+    )
 
 
 def compute_comparison_metrics(
@@ -506,7 +701,12 @@ def plot_grouped_heatmap(
 def main() -> None:
     args = parse_args()
     set_plot_style()
-    os.makedirs(args.output_dir, exist_ok=True)
+
+    mlp_output_dir = os.path.join(args.output_dir, args.mlp_subdir)
+    embed_output_dir = os.path.join(args.output_dir, args.embed_subdir)
+    os.makedirs(mlp_output_dir, exist_ok=True)
+    if not args.skip_embeddings:
+        os.makedirs(embed_output_dir, exist_ok=True)
 
     model_paths = load_manifest(args.manifest)
     print("Resolved model checkpoints:")
@@ -514,8 +714,11 @@ def main() -> None:
         print(f"  - {name}: {model_paths[name]}")
 
     metrics_by_comparison = {}
-    for comparison_name, ref_name, cmp_name in COMPARISONS:
-        print(f"\n=== {comparison_name} ({cmp_name} vs {ref_name}) ===")
+    embed_metrics_by_comparison = {}
+
+    # MLP comparisons: includes direct aux-vs-para and aux-vs-source.
+    for comparison_name, ref_name, cmp_name in MLP_COMPARISONS:
+        print(f"\n=== {comparison_name} ({cmp_name} vs {ref_name}) [MLP] ===")
         ref_model = load_model(model_paths[ref_name], args)
         cmp_model = load_model(model_paths[cmp_name], args)
 
@@ -528,13 +731,13 @@ def main() -> None:
                 torch.cuda.empty_cache()
 
         metrics_by_comparison[comparison_name] = metrics_by_projection
-        save_metric_arrays(metrics_by_projection, comparison_name, args.output_dir)
+        save_metric_arrays(metrics_by_projection, comparison_name, mlp_output_dir)
         for metric in METRICS:
             plot_grouped_heatmap(
                 metrics_by_projection=metrics_by_projection,
                 comparison_name=comparison_name,
                 metric=metric,
-                output_dir=args.output_dir,
+                output_dir=mlp_output_dir,
                 clip_percentile=args.clip_percentile,
                 fig_width=args.fig_width,
                 fig_height=args.fig_height,
@@ -542,22 +745,51 @@ def main() -> None:
                 cmap=args.cmap,
             )
 
+    # Embedding comparisons: base-referenced only.
+    if not args.skip_embeddings:
+        for comparison_name, ref_name, cmp_name in EMBED_COMPARISONS:
+            print(f"\n=== {comparison_name} ({cmp_name} vs {ref_name}) [embeddings] ===")
+            ref_model = load_model(model_paths[ref_name], args)
+            cmp_model = load_model(model_paths[cmp_name], args)
+
+            try:
+                embed_metrics = compute_embedding_metrics(ref_model, cmp_model)
+            finally:
+                del ref_model
+                del cmp_model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            embed_metrics_by_comparison[comparison_name] = embed_metrics
+            save_embedding_metric_arrays(embed_metrics, comparison_name, embed_output_dir)
+            for metric in METRICS:
+                plot_embedding_raster_heatmap(
+                    embed_metrics=embed_metrics,
+                    comparison_name=comparison_name,
+                    metric=metric,
+                    output_dir=embed_output_dir,
+                    n_cols=args.embedding_raster_cols,
+                    clip_percentile=args.clip_percentile,
+                    fig_width=args.embed_fig_width,
+                    fig_height=args.embed_fig_height,
+                    dpi=args.dpi,
+                    cmap=args.cmap,
+                )
+
+    # Signed difference plots for MLP.
     for comparison_name, minuend_name, subtrahend_name in DIFFERENCE_COMPARISONS:
-        print(
-            f"\n=== {comparison_name} "
-            f"({minuend_name} - {subtrahend_name}) ==="
-        )
+        print(f"\n=== {comparison_name} ({minuend_name} - {subtrahend_name}) [MLP] ===")
         metrics_by_projection = subtract_metric_dicts(
             metrics_by_comparison[minuend_name],
             metrics_by_comparison[subtrahend_name],
         )
-        save_metric_arrays(metrics_by_projection, comparison_name, args.output_dir)
+        save_metric_arrays(metrics_by_projection, comparison_name, mlp_output_dir)
         for metric in METRICS:
             plot_grouped_heatmap(
                 metrics_by_projection=metrics_by_projection,
                 comparison_name=comparison_name,
                 metric=metric,
-                output_dir=args.output_dir,
+                output_dir=mlp_output_dir,
                 clip_percentile=args.clip_percentile,
                 fig_width=args.fig_width,
                 fig_height=args.fig_height,
@@ -566,7 +798,34 @@ def main() -> None:
                 center_zero=True,
             )
 
-    print("\nDone. FFN channel heatmaps and arrays saved.")
+    # Signed difference plots for embeddings: only where the ingredients exist.
+    if not args.skip_embeddings:
+        for comparison_name, minuend_name, subtrahend_name in DIFFERENCE_COMPARISONS:
+            embed_diff = subtract_embed_metric_dicts(
+                embed_metrics_by_comparison[minuend_name],
+                embed_metrics_by_comparison[subtrahend_name],
+            )
+            save_embedding_metric_arrays(embed_diff, comparison_name, embed_output_dir)
+            for metric in METRICS:
+                plot_embedding_raster_heatmap(
+                    embed_metrics=embed_diff,
+                    comparison_name=comparison_name,
+                    metric=metric,
+                    output_dir=embed_output_dir,
+                    n_cols=args.embedding_raster_cols,
+                    clip_percentile=args.clip_percentile,
+                    fig_width=args.embed_fig_width,
+                    fig_height=args.embed_fig_height,
+                    dpi=args.dpi,
+                    cmap=args.diff_cmap,
+                    center_zero=True,
+                )
+
+    print("\nDone. MLP heatmaps saved under:")
+    print(f"  {mlp_output_dir}")
+    if not args.skip_embeddings:
+        print("Embedding rasters saved under:")
+        print(f"  {embed_output_dir}")
 
 
 if __name__ == "__main__":
