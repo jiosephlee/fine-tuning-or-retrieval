@@ -41,7 +41,21 @@ def query_llm(prompt, max_tokens=1000, temperature=0, top_p=0, max_try_num=10, m
                     return response.choices[0].message.content.strip(), response.choices[0].logprobs
             return response
         except Exception as e:
-            raise e
+            import openai, time, re as _re
+            if isinstance(e, openai.RateLimitError):
+                curr_try_num += 1
+                # Try to parse wait time from error message (e.g. "Please try again in 573ms")
+                wait_time = 2
+                msg = str(e)
+                ms_match = _re.search(r'try again in (\d+)ms', msg)
+                s_match = _re.search(r'try again in ([\d.]+)s', msg)
+                if ms_match:
+                    wait_time = max(int(ms_match.group(1)) / 1000 + 0.5, 1)
+                elif s_match:
+                    wait_time = max(float(s_match.group(1)) + 0.5, 1)
+                time.sleep(wait_time)
+            else:
+                raise e
     return None
 
 def query_gpt(prompt: str | dict, model: str = 'gpt-4.1-mini', max_tokens: int = 4000, temperature: float = 0, top_p: float = 0, logprobs: bool = False, return_json: bool = False, json_schema = None, system_prompt_included: bool = False, reasoning_effort = 'high', is_hippa: bool = False, debug: bool = False):

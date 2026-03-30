@@ -76,7 +76,7 @@ def parse_paper_structure(text):
     
     return pd.DataFrame(sections)
 
-def generate_questions(text: str, model: str = 'gpt-5-mini', reasoning_effort: str = 'medium') -> List[Dict[str, Any]]:
+def generate_questions(text: str, model: str = 'gpt-5.4-mini', reasoning_effort: str = 'medium') -> List[Dict[str, Any]]:
     """Generates inference questions from the text using an LLM."""
     system_prompt = """You will be given an academic paper. Your task is to generate questions to test a reader's true comprehension and understanding of the text, particularly regarding the paper's novel contributions. Specifically, your objective is to assess whether the reader can integrate, synthesize, and generalize the implications of the text beyond what's been stated i.e. testing the reader's ability to generalize the knowledge. Academic papers often already provide analysis, interpretation, and discourse of the knowledge in the paper. Thus, aim to write questions that require the reader to build upon the knowledge in the paper, and (1) make a leap of reasoning or (2) integrate and apply the knowledge in different settings. Be creative in your question formulation.
     
@@ -95,7 +95,7 @@ Here is a non-exhaustive list of types and subtypes of inference that you should
 Please cover all of the above types of inference, and feel free to add more types of inference that are relevant.
 
 Here as some specific guidelines you should follow as you write the questions:
-- The question can be as long as needed, but the answer must be a coherent phrase that is 1-5 words long. 
+- The question can be as long as needed, but the answer MUST be a verbatim word or phrase (1-5 words) copied exactly from the paper. Do not paraphrase, rephrase, or synthesize the answer — it must appear as an exact substring of the paper text. You may strip leading determiners such as "some", "a", "an", or "the".
 - For phrasing the answer, prefer simpler language so that we are measuring the reader's ability to understand the paper's content, not their ability to know jargon.
 - The questions should NOT be yes/no questions.
 - The questions should NOT require external jargon, expertise, or terminology beyond what is explicitly stated and explained in the paper itself. Answering the question should only require understanding the paper's content, not prior domain knowledge.
@@ -150,7 +150,7 @@ def convert_to_cloze(question: Dict[str, Any]) -> Tuple[str, str] | None:
         'system': FACT_PROBE_CLOZE_PROMPT_SYSTEM_TWO,
         'user': user_prompt
     }
-    response = utils.query_llm(cloze_prompt, model='gpt-5-mini', reasoning_effort='low', system_prompt_included=True, return_json=True, max_tokens=1000)
+    response = utils.query_llm(cloze_prompt, model='gpt-5.4-mini', reasoning_effort='low', system_prompt_included=True, return_json=True, max_tokens=1000)
     try:
         data = json.loads(response) if isinstance(response, str) else response
         answer = data.get('answer')
@@ -199,7 +199,7 @@ Provide a JSON object with a single key "pair", which is the refined [answer, st
 """,
         'user': f"### Paper Context\n{context}\n### Title\n{title}\n### Cloze Pair\n{json.dumps(cloze_pair)}\n"
     }
-    response = utils.query_llm(quality_control_prompt, model='gpt-5-mini', reasoning_effort='high', system_prompt_included=True, return_json=True, max_tokens=1000)
+    response = utils.query_llm(quality_control_prompt, model='gpt-5.4-mini', reasoning_effort='high', system_prompt_included=True, return_json=True, max_tokens=1000)
     try:
         data = json.loads(response) if isinstance(response, str) else response
         pair = data.get('pair')
@@ -230,7 +230,7 @@ Provide your decision as a JSON object with a single boolean key: `{"keep": true
         'user': f"""### Answer\n{cloze_pair[0]}\n\n### Statement\n{cloze_pair[1].replace(cloze_pair[0], '___')}"""
     }
     
-    response = utils.query_llm(prompt, model='gpt-5-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True)
+    response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True)
     try:
         parsed_response = json.loads(response) if isinstance(response, str) else response
         return parsed_response.get('keep', False)
@@ -253,7 +253,7 @@ def process_paper(paper_name: str, paper_content: str, add_on_mode: bool = False
         # Process entire paper at once with GPT-5 and medium reasoning
         print(f"Processing entire paper {paper_name} for inference probes...")
         document_chunks = [paper_content]
-        model = 'gpt-5'
+        model = 'gpt-5.4'
         reasoning_effort = 'medium'
     else:
         # Original behavior: split into halves and duplicate
@@ -281,7 +281,7 @@ def process_paper(paper_name: str, paper_content: str, add_on_mode: bool = False
                 document_halves.append("\n\n".join(section_texts))
 
         document_chunks = [half for half in document_halves for _ in range(2)]
-        model = 'gpt-5-mini'
+        model = 'gpt-5.4-mini'
         reasoning_effort = 'medium'
 
     print(f"Generating inference questions for {len(document_chunks)} {'paper(s)' if add_on_mode else 'document halves'} in parallel...")
@@ -408,11 +408,38 @@ def process_paper(paper_name: str, paper_content: str, add_on_mode: bool = False
 
     save_df_for_debugging(cloze_df, '05_final_probes.txt', 'inference', paper_name, ['probe', 'target', 'fact', 'question', 'text_sentences', 'inference_type'])
 
+    # Filter probes where the target does not appear verbatim in the paper
+    total_before_verbatim = len(cloze_df)
+    verbatim_mask = cloze_df['target'].apply(
+        lambda t: t.strip() in paper_content
+    )
+    cloze_df_not_verbatim = cloze_df[~verbatim_mask].copy()
+    cloze_df = cloze_df[verbatim_mask].copy()
+    total_after_verbatim = len(cloze_df)
+    filtered_verbatim = total_before_verbatim - total_after_verbatim
+
+    print(f"\nVerbatim filtering results:")
+    print(f"  Before filtering: {total_before_verbatim} probes")
+    print(f"  After filtering: {total_after_verbatim} probes")
+    print(f"  Filtered out: {filtered_verbatim} probes whose target is not verbatim in the paper")
+
+    save_df_for_debugging(cloze_df_not_verbatim, '06_verbatim_filtered_out.txt', 'inference', paper_name, ['probe', 'target', 'fact', 'question'])
+
     tokenizer = AutoTokenizer.from_pretrained("allenai/OLMo-2-0425-1B")
     check_tokenizer_consistency(cloze_df, tokenizer)
 
     output_dir = f'../../data/probes/inference/{paper_name}/'
     os.makedirs(output_dir, exist_ok=True)
+
+    # Save filtering metrics report
+    metrics_path = os.path.join(output_dir, 'filtering_metrics_v8.txt')
+    with open(metrics_path, 'w') as f:
+        f.write(f"Inference Probe Pipeline v8 - Filtering Metrics for {paper_name}\n")
+        f.write(f"{'='*60}\n")
+        f.write(f"Total probes before verbatim filter: {total_before_verbatim}\n")
+        f.write(f"Probes filtered (target not verbatim in paper): {filtered_verbatim}\n")
+        f.write(f"Total probes after verbatim filter: {total_after_verbatim}\n")
+    print(f"Saved filtering metrics to {metrics_path}")
 
     if add_on_mode:
         # Load existing probes from source version and combine
@@ -423,16 +450,16 @@ def process_paper(paper_name: str, paper_content: str, add_on_mode: bool = False
             cloze_df = pd.concat([source_df, cloze_df], ignore_index=True)
             print(f"Combined to create {len(cloze_df)} total probes")
         else:
-            print(f"No existing {source_version} found for {paper_name}, creating new v7")
+            print(f"No existing {source_version} found for {paper_name}, creating new v8")
         
-        # Save as v7
-        output_path = os.path.join(output_dir, 'probes_v7.csv')
+        # Save as v8
+        output_path = os.path.join(output_dir, 'probes_v8.csv')
         cloze_df.to_csv(output_path, index=False)
         print(f"Saved {len(cloze_df)} cloze probes to {output_path}")
         return None
     else:
-        # Original behavior: save to paper-specific directory as v6
-        output_path = os.path.join(output_dir, 'probes_v6.csv')
+        # Original behavior: save to paper-specific directory as v8
+        output_path = os.path.join(output_dir, 'probes_v8.csv')
         cloze_df.to_csv(output_path, index=False)
         print(f"Saved {len(cloze_df)} cloze probes to {output_path}")
         return None
@@ -440,18 +467,18 @@ def process_paper(paper_name: str, paper_content: str, add_on_mode: bool = False
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--filter", type=str, default=None, help="Only process papers containing this string in their filename.")
-    parser.add_argument("--add_on_to_v6", action='store_true', help="Add new probes to existing v6 probes and save as v7 for each paper.")
-    parser.add_argument("--add_on_to_v7", action='store_true', help="Add new probes to existing v7 probes and save as v7 for each paper.")
+    parser.add_argument("--add_on_to_v7", action='store_true', help="Add new probes to existing v7 probes and save as v8 for each paper.")
+    parser.add_argument("--add_on_to_v8", action='store_true', help="Add new probes to existing v8 probes and save as v8 for each paper.")
     args = parser.parse_args()
     
-    if args.add_on_to_v6 and args.add_on_to_v7:
-        print("Error: Cannot use both --add_on_to_v6 and --add_on_to_v7 at the same time.")
+    if args.add_on_to_v7 and args.add_on_to_v8:
+        print("Error: Cannot use both --add_on_to_v7 and --add_on_to_v8 at the same time.")
         sys.exit(1)
-    
-    if args.add_on_to_v6 or args.add_on_to_v7:
+
+    if args.add_on_to_v7 or args.add_on_to_v8:
         # Determine source version
-        source_version = 'v6' if args.add_on_to_v6 else 'v7'
-        print(f"Processing papers with add-on mode: loading from {source_version}, saving as v7")
+        source_version = 'v7' if args.add_on_to_v7 else 'v8'
+        print(f"Processing papers with add-on mode: loading from {source_version}, saving as v8")
         
         # Define wrapper to pass source_version to process_paper
         def process_with_addon(paper_name: str, paper_content: str, **kwargs):

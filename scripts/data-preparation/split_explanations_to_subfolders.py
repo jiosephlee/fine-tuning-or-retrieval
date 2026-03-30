@@ -42,10 +42,10 @@ def split_textbook(explanations_dir):
     # Split by finding chapter title occurrences in the text
     chapters = []
     if chapter_titles:
-        # Build regex that matches any chapter title as a line
         for i, title in enumerate(chapter_titles):
             escaped = re.escape(title)
-            pattern = escaped
+            # Match title with optional leading markdown header (e.g., "# " or "## ")
+            pattern = r'(?:#+ )?' + escaped
             # Find position of this title in the content
             match = re.search(r'\n' + pattern + r'\n', content)
             if match:
@@ -67,7 +67,11 @@ def split_textbook(explanations_dir):
     out_dir = os.path.join(explanations_dir, "textbooks")
     os.makedirs(out_dir, exist_ok=True)
     for i, ch in enumerate(chapter_contents):
-        chapter_text = f"{title_line}\n\nChapter {i+1}: {ch}"
+        ch = ch.strip()
+        if title_line:
+            chapter_text = f"{title_line}\n\nChapter {i+1}: {ch}"
+        else:
+            chapter_text = f"Chapter {i+1}: {ch}"
         path = os.path.join(out_dir, f"chapter_{i+1}.txt")
         with open(path, "w") as f:
             f.write(chapter_text)

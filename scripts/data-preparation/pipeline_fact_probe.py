@@ -129,7 +129,7 @@ Here are guidelines as you segment the text:
             prompt = {}
             prompt['system'] = extraction_prompt
             prompt['user'] = f"""{subsection_text}"""
-            return utils.query_llm(prompt, model='gpt-5', reasoning_effort='low')
+            return utils.query_llm(prompt, model='gpt-5.4', reasoning_effort='low')
         
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
@@ -266,8 +266,8 @@ Here are guidelines as you segment the text:
         # Apply the filter
         paper_df_validated['latex_percentage'] = paper_df_validated['raw_knowledge_statement'].apply(calculate_latex_percentage)
 
-        # Filter out statements with more than 50% LaTeX
-        latex_threshold = 75
+        # Filter out statements with more than 85% LaTeX
+        latex_threshold = 85
         high_latex_statements = paper_df_validated[paper_df_validated['latex_percentage'] > latex_threshold].copy()
         paper_df_filtered = paper_df_validated[paper_df_validated['latex_percentage'] <= latex_threshold].copy()
 
@@ -407,7 +407,7 @@ Respond with JSON format with the following key:
                 'user': user_prompt
             }
             
-            result = utils.query_llm(full_prompt, model='gpt-5-mini', reasoning_effort='low', return_json=True, max_tokens=100)
+            result = utils.query_llm(full_prompt, model='gpt-5.4-mini', reasoning_effort='low', return_json=True, max_tokens=100)
             result = json.loads(result)
             is_knowledge = result['is_knowledge']
             
@@ -458,25 +458,34 @@ Respond with JSON format with the following key:
     """Given the original, source sentences from the paper, we break each sentence into the parts that presents a new fact."""
 
     def extract_context_and_sentence(row):
-        # Extract context similar to the previous approach
+        # Extract context: everything before the sentence + the sentence's paragraph
+        # + one additional paragraph after for surrounding context
         parts = row['subsection_text'].strip().split(row['raw_knowledge_statement'].strip())
         context_before = parts[0]
-        
+
         if len(parts) > 1:
             remaining_text = parts[1]
+            # Include the rest of the current paragraph
             paragraph_end = remaining_text.find('\n\n')
             if paragraph_end != -1:
                 rest_of_paragraph = remaining_text[:paragraph_end]
+                # Also include one more paragraph after for additional context
+                after_paragraph = remaining_text[paragraph_end:].lstrip('\n')
+                next_paragraph_end = after_paragraph.find('\n\n')
+                if next_paragraph_end != -1:
+                    extra_context = after_paragraph[:next_paragraph_end]
+                else:
+                    extra_context = after_paragraph
+                context = context_before + row['raw_knowledge_statement'].strip() + rest_of_paragraph + '\n\n' + extra_context
             else:
                 rest_of_paragraph = remaining_text
-            context = context_before + row['raw_knowledge_statement'].strip() + rest_of_paragraph
+                context = context_before + row['raw_knowledge_statement'].strip() + rest_of_paragraph
         else:
             context = context_before
-        
+
         # Remove title line if present
         if context.startswith('\\title{'):
             lines = context.split('\n')
-            # Find the end of the title (could span multiple lines)
             title_end = 0
             for i, line in enumerate(lines):
                 if '}' in line:
@@ -488,20 +497,31 @@ Respond with JSON format with the following key:
     def extract_atomic_facts(first_row):
         """Extract atomic facts from a paragraph using LLM."""
         prompt = {}
-        prompt['system'] = r"""You will be given two inputs, a section of an academic paper for context and a single sentence drawn from that section. Papers often interweave various pieces of knowledge together in academic writing. While each sentence is interwoven with others, there is atomic knowledge that can be extracted from a particular sentence. Write questions that tests for this atomic knowledge. Specifically, your task is to extract questions from the provided sentence with clear answers, each 1 to 4 words long. 
+        prompt['system'] = r"""You will be given two inputs, a section of an academic paper for context and a single sentence drawn from that section. Papers often interweave various pieces of knowledge together in academic writing. While each sentence is interwoven with others, there is atomic knowledge that can be extracted from a particular sentence. Write questions that tests for this atomic knowledge. Specifically, your task is to extract questions from the provided sentence with clear answers. 
    
 Extract 1-3 questions from the sentence. 
   
 ### Detailed Instructions
 Consider these instructions as you extract each question:
 - The question should be natural and meaningful, in which the answer is considered a main fact presented by the sentence.
-- The answer should be non-trivial and non-obvious. It should not be deducible from the sentence itself.
-- The answer to the question should be a meaningful, coherent phrase, 1-4 words long, taken from the sentence. Simplify the answer by stripping determiners such as "some" or "a" or "an" or "the" from the answer. Feel free to adjust the answer to fit the question, but the meaning should be the same.
-- The answer must *NOT* involve any *special characters* or *mathematical notation*. Again, any question with an answer that contains mathematical notation should not be used.
-- The question should have a a clear, single answer and *NOT* multiple valid answers. 
-- Each question should be written separately and independently of the other questions, so don't reference other questions in the same question.
+- The answer should be non-trivial and non-obvious. It should not be plainly obvious from the question for someone who has no relevant knowledge.
+- The answer to the question MUST be a verbatim word, phrase (2-5 words), or a mathematical expression copied exactly from the sentence. Do not paraphrase, rephrase, or adjust the answer — it must appear as an exact substring of the sentence. You should strip leading determiners such as "some", "a", "an", or "the" from the answer.
+- The question should have a a clear, single answer and *NOT* multiple valid answers.
+- Each question should be written separately and independently of the other questions, so don’t reference other questions in the same question.
 
-### Demonstration 1
+### Handling Mathematical Sentences
+Many sentences in academic papers contain equations, variables, or mathematical notation. These sentences still contain important knowledge, but you must extract it carefully:
+- Do NOT extract partial equations or incomplete equation fragments as answers. For example, "$\pi_{\theta}(y\mid x" is NOT a valid answer because it is a broken fragment.
+- If the answer is a mathematical expression, it MUST be a complete, self-contained expression exactly as written in the source. Valid examples: "$\beta$", "$Z(x)$", "$\pi_\theta$", "$\mathcal{L}_\text{DPO}$". Invalid examples: "$\pi_{\theta}(y\mid x", "$\frac{\exp(r^*(x, y_1))}{\exp(r^*(x, y_1)) + \exp(r^*(x, y_2".
+- For equation-heavy sentences, prefer questions that test conceptual understanding over equation completion:
+    - What a symbol or term REPRESENTS (e.g., "what does $\beta$ control?")
+    - What ROLE a component plays in an equation (e.g., "what prevents the policy from diverging?")
+    - What two things are being RELATED by an equation
+    - What a named result or equation DEFINES
+- Prefer natural language answers when they capture the same knowledge as a mathematical answer. For example, prefer "the partition function" over "$Z(x)$" if both are valid.
+- Preserve the original LaTeX formatting exactly. Use $...$ delimiters as they appear in the source. Do NOT convert to \(...\) or other formats.
+
+### Demonstration 1: Natural Language Sentence
 Context: "\\title{Direct Preference Optimization: Your Language Model is Secretly a Reward Model}\n\\subsection{Can DPO scale to real preference datasets?}\nNext, we evaluate fine-tuning performance of DPO on summarization and single-turn dialogue. For summarization, automatic evaluation metrics such as ROUGE can be poorly correlated with human preferences~\citep{stiennon2022learning}, and prior work has found that fine-tuning LMs using PPO on human preferences to provide more effective summaries. We evaluate different methods by sampling completions on the test split of TL;DR summarization dataset, and computing the average win rate against reference completions in the test set."
 
 Sentence: "We evaluate different methods by sampling completions on the test split of TL;DR summarization dataset, and computing the average win rate against reference completions in the test set."
@@ -510,16 +530,27 @@ Questions:
 - "The authors evaluate DPO’s fine-tuning performance against other methods on summarization by sampling completions on the test split of what dataset?", Answer: "TL;DR summarization"
 - "The fine-tuning performance of DPO and other methods on summarization are evaluated by sampling completions on the test split of the TL;DR summarization dataset and computing the average win rate against what?", Answer: "reference completions"
 
-### Demonstration 2
+### Demonstration 2: Natural Language Sentence
 Context: "\title{Direct Preference Optimization: Your Language Model is Secretly a Reward Model}\nWhile large-scale unsupervised language models (LMs) learn broad world knowledge and some reasoning skills, achieving precise control of their behavior is difficult due to the completely unsupervised nature of their training. Existing methods for gaining such steerability collect human labels of the relative quality of model generations and fine-tune the unsupervised LM to align with these preferences, often with reinforcement learning from human feedback (RLHF)."
 
 Sentence: "Existing methods for gaining such steerability collect human labels of the relative quality of model generations and fine-tune the unsupervised LM to align with these preferences, often with reinforcement learning from human feedback (RLHF)."
 
 Questions:
-- "What do existing methods collect to steer unsupervised language models, ?", Answer: "human labels"
-- "Existing methods for steering unsupervised language models collect human labels of the quality of what?", Answer: "relative quality of model generations"
+- "What do existing methods collect to steer unsupervised language models?", Answer: "human labels"
+- "Existing methods for steering unsupervised language models collect human labels of the quality of what?", Answer: "model generations"
 - "Existing methods align unsupervised language models by fine-tuning on what?", Answer: "human preferences"
 - "Existing methods for steering unsupervised language models via fine-tuning on human preferences often use what?", Answer: "RLHF"
+
+### Demonstration 3: Mathematical Sentence
+Context: "\title{Direct Preference Optimization: Your Language Model is Secretly a Reward Model}\nFollowing prior works, the optimization is formulated as\n\\begin{equation}\n\\max_{\\pi_{\\theta}}  \\mathbb{E}_{x\\sim \\mathcal{D}, y\\sim \\pi_{\\theta}(y \\mid x)}\\bigl[r_{\\phi}(x, y)\\bigr] - \\beta\\mathbb{D}_{\\textrm{KL}}\\bigl[\\pi_{\\theta}(y\\mid x)\\mid \\mid \\pi_\\text{ref}(y\\mid x)\\bigr],\n\\end{equation}\nwhere $\\beta$ is a parameter controlling the deviation from the base reference policy $\\pi_\\text{ref}$, namely the initial SFT model $\\pi^\\text{SFT}$."
+
+Sentence: "where $\\beta$ is a parameter controlling the deviation from the base reference policy $\\pi_\\text{ref}$, namely the initial SFT model $\\pi^\\text{SFT}$."
+
+Questions:
+- "In the RL fine-tuning objective, what does the parameter $\\beta$ control?", Answer: "deviation from the base reference policy"
+- "In the RL fine-tuning objective, the base reference policy $\\pi_\\text{ref}$ is the initial model trained with what method?", Answer: "SFT"
+
+Note: A BAD question here would be "The expectation is taken under what distribution?", Answer: "$\\pi_{\\theta}(y\\mid x" — this is a broken LaTeX fragment and tests notation recall, not understanding.
 """
         contextualize_prompt = {}
         contextualize_prompt['system'] = r"""You will be given two inputs, a section of an academic paper for context, a single sentence drawn from that section, and a question extracted from the sentence as well as its corresponding answer. Your task is to then turn the question into a self-contained, precise question. Approach this task step-by-step as outlined below.
@@ -530,14 +561,14 @@ While you should use your expertise on this domain to handle and understand thes
 The overall goal of this task is to make the questions clear by incorporating the relevant context. This ensures the question is unambiguous and doesn't require looking back to the source material.
 
 For each question:
-1.  Rewrite the question so that it starts with one of the following templates. 
-    - "In the paper '{title}', ..."
-    - "According to the paper '{title}',..."
-    - "In the paper '{title}', the authors remark that..."
-    - "In the paper '{title}', the authors state that..."
-    - "According to the paper '{title}', prior work has..."
-    - "In the theoretical analysis of the paper "{title}"..."
-    - "In the paper '{title}', the results suggest that..."
+1.  Rewrite the question so that it starts with one of the following templates. Always wrap the paper title in double quotes — never use single quotes, asterisks, or underscores around the title.
+    - "In the paper \"{title}\", ..."
+    - "According to the paper \"{title}\", ..."
+    - "In the paper \"{title}\", the authors remark that..."
+    - "In the paper \"{title}\", the authors state that..."
+    - "According to the paper \"{title}\", prior work has..."
+    - "In the theoretical analysis of the paper \"{title}\", ..."
+    - "In the paper \"{title}\", the results suggest that..."
     This is a non-exhaustive list of templates, and you should use your own judgement to choose the most appropriate template or modify the template to fit the sentence.
 2.  Add sufficient context. Specifically, use the *provided context* to supply whatever information is needed to make the question self-contained and unambiguous. For instance, "Do humans and GPT4 agree often with each other?" should be clarified into "In the paper '...', did humans and GPT4 often agree or disagree with each other during the evaluation of DPO?" if this notion was in the context of evaluating DPO in an academic paper. The goal is to ensure someone reading just the question would understand exactly what is being asked without needing additional context.
 3.  Clarify pronouns and referential terms. Check the sentence for pronouns (it, this, that, these, those) or demonstrative phrases (this equation, that method, these results) that refer to entities not explicitly defined within the sentence itself. Search the surrounding context to identify what these terms reference, then incorporate that clarifying information into the question to make it self-contained.
@@ -549,6 +580,7 @@ For each question:
 9.  Do not change the answer. Minor grammatical adjustments to the answer are allowed only if necessary to fit the restructured question (e.g., adjusting verb tense, determiners like "the").
 10. Avoid quoting the source sentence directly in the question.
 11. Refine Question. The rewritten question can be broken up into multiple sentences if the question becomes verbose. Make sure the question is written clearly and grammatically correct. Do not put any of the context in parenthesis or followed after an "i.e.".
+12. Preserve LaTeX formatting. When the question or answer contains mathematical notation, preserve the exact LaTeX syntax from the source, including delimiters. Use $...$ as they appear in the original — do NOT convert to \(...\) or other formats.
 
 Think carefully and critically through this task, following the step-by-step instructions outlined above. Then, provide the final output, listing each question and its corresponding answer."""
         cloze_prompt = {}
@@ -560,11 +592,11 @@ Think carefully and critically through this task, following the step-by-step ins
         
         context = extract_context_and_sentence(first_row)
         prompt['user'] = f"""### Title\n{first_row['title']}\n### Context\n{context}\n\n### Sentence\n{first_row['raw_knowledge_statement'].strip()}"""
-        output1 = utils.query_llm(prompt, model='gpt-5-mini', reasoning_effort='medium')   
+        output1 = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='medium')   
 
         json_parse_prompt['user'] = output1
         try:
-            json_output = utils.query_llm(json_parse_prompt, model='gpt-5-nano', return_json=True, reasoning_effort='low')
+            json_output = utils.query_llm(json_parse_prompt, model='gpt-5.4-nano', return_json=True, reasoning_effort='low')
             qa_pairs_data = json.loads(json_output)
             qa_pairs = qa_pairs_data.get('list_of_questions')
             if qa_pairs is None:
@@ -590,11 +622,11 @@ Think carefully and critically through this task, following the step-by-step ins
             single_qa_string = f'### Question\n"{question}\n\n###Answer\n"{answer}"'
 
             contextualize_prompt['user'] = f"""### Title\n{first_row['title']}\n### Context\n{context}\n\n### Sentence\n{first_row['raw_knowledge_statement'].strip()}\n\n{single_qa_string}"""
-            output2_individual = utils.query_llm(contextualize_prompt, model='gpt-5-mini', reasoning_effort='medium')
+            output2_individual = utils.query_llm(contextualize_prompt, model='gpt-5.4-mini', reasoning_effort='medium')
             all_contextualized.append(output2_individual)
 
             cloze_prompt['user'] = f"""### Question and Answer\n{output2_individual}"""
-            output3_individual = utils.query_gpt(cloze_prompt, system_prompt_included=True, model='gpt-5', reasoning_effort='low', return_json=True)
+            output3_individual = utils.query_llm(cloze_prompt, system_prompt_included=True, model='gpt-5.4', reasoning_effort='medium', return_json=True)
             try:
                 cloze_pair = json.loads(output3_individual)
                 if isinstance(cloze_pair, dict) and 'answer' in cloze_pair and 'statement' in cloze_pair:
@@ -604,7 +636,7 @@ Think carefully and critically through this task, following the step-by-step ins
 
         return output1, all_contextualized, all_clozes
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         raw_extracted_facts = list(tqdm(executor.map(extract_atomic_facts, [paper_df_knowledge.iloc[i] for i in range(len(paper_df_knowledge))]), total=len(paper_df_knowledge)))
 
     # Separate the three outputs into different columns
@@ -651,7 +683,7 @@ For any rewriting, do not change the structure, content, or shape of the stateme
 ### Output Format
 After your review, if the pair passes all checks (with any necessary refinements), provide the refined pair as a JSON object with two keys: "answer" and "statement"."""
         prompt['user'] = f"""### Answer\n{row['answer']}\n\n### Statement\n{row['statement']}"""
-        response = utils.query_gpt(prompt, model='gpt-5-mini', reasoning_effort='medium',system_prompt_included=True, return_json=True)
+        response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True)
         try:
             parsed_response = json.loads(response)
             if parsed_response and 'answer' in parsed_response and 'statement' in parsed_response:
@@ -681,9 +713,11 @@ Based on the checklist, decide if the pair should be kept. Drop the pair if fail
 
 ### Output Format
 Provide your decision as a JSON object with a single boolean key: `{"keep": true}` or `{"keep": false}`."""
+        if validated_pair['statement'] is None or validated_pair['answer'] is None:
+            return False
         prompt['user'] = f"""### Answer\n{validated_pair['answer']}\n\n### Statement\n{validated_pair['statement'].replace(str(validated_pair['answer']), '___')}"""
         
-        response = utils.query_gpt(prompt, model='gpt-5-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True)
+        response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True)
         try:
             parsed_response = json.loads(response)
             return parsed_response.get('keep', False)
@@ -718,7 +752,7 @@ Provide your decision as a JSON object with a single boolean key: `{"keep": true
 
     # Process all rows in parallel
     if not paper_df_exploded.empty:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             validated_results = list(tqdm(
                 executor.map(validate_atomic_facts, [row for _, row in paper_df_exploded.iterrows()]),
                 total=len(paper_df_exploded)
@@ -760,7 +794,7 @@ Provide your decision as a JSON object with a single boolean key: `{"keep": true
 
     # 4.5 Filter step after refinement
     if not paper_df_qc_kept.empty:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             keep_results = list(tqdm(
                 executor.map(filter_refined_pair, [row for _, row in paper_df_qc_kept.iterrows()]),
                 total=len(paper_df_qc_kept),
@@ -885,12 +919,118 @@ Provide your decision as a JSON object with a single boolean key: `{"keep": true
 
     check_tokenizer_consistency(paper_df_probes_valid, tokenizer)
 
-    # 7. save probes 
+    # 7. Filter probes where the target does not appear verbatim in the paper
 
-    paper_df_probes_valid.reset_index(drop=True, inplace=True)
+    total_before_verbatim = len(paper_df_probes_valid)
+    verbatim_mask = paper_df_probes_valid['target'].apply(
+        lambda t: t.strip() in paper
+    )
+    paper_df_not_verbatim = paper_df_probes_valid[~verbatim_mask].copy()
+    paper_df_probes_valid = paper_df_probes_valid[verbatim_mask].copy()
+    total_after_verbatim = len(paper_df_probes_valid)
+    filtered_verbatim = total_before_verbatim - total_after_verbatim
+
+    print(f"\nVerbatim filtering results:")
+    print(f"  Before filtering: {total_before_verbatim} probes")
+    print(f"  After filtering: {total_after_verbatim} probes")
+    print(f"  Filtered out: {filtered_verbatim} probes whose target is not verbatim in the paper")
+
+    save_df_for_debugging(paper_df_not_verbatim, '12_verbatim_filtered_out.txt', 'facts', paper_name, ['raw_knowledge_statement', 'fact', 'target', 'probe'])
+
+    # 7.5 Recovery: ask LLM to fix non-verbatim probes
+
+    def recover_verbatim_probe(row):
+        """Ask the LLM to replace the answer with a verbatim phrase from the source sentence."""
+        prompt = {}
+        prompt['system'] = r"""You are given a cloze-style probe statement and its answer, both derived from a sentence in an academic paper. The answer does not appear verbatim in the original sentence — often because LaTeX delimiters were changed (e.g. $...$ became \(...\)) or the phrasing was slightly altered.
+
+Your task:
+1. Find a verbatim substring from the original sentence that captures the same knowledge as the current answer.
+2. Minimally adjust the statement so that it ends with this new verbatim answer and reads naturally.
+3. The new answer MUST be an exact, character-for-character substring of the original sentence (including any LaTeX formatting like $, \begin{}, etc.).
+4. If there is no way to naturally produce a statement ending with a verbatim answer from the sentence, return {"success": false}.
+
+### Output Format
+Return a JSON object:
+- On success: {"success": true, "answer": "...", "statement": "..."}
+- On failure: {"success": false}"""
+        prompt['user'] = f"""### Original Sentence
+{row['raw_knowledge_statement']}
+
+### Current Statement
+{row['fact']}
+
+### Current Answer (not verbatim)
+{row['target']}"""
+        response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True)
+        try:
+            parsed = json.loads(response)
+            return parsed
+        except (json.JSONDecodeError, TypeError):
+            return {'success': False}
+
+    if not paper_df_not_verbatim.empty:
+        print(f"\nAttempting to recover {len(paper_df_not_verbatim)} non-verbatim probes...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            recovery_results = list(tqdm(
+                executor.map(recover_verbatim_probe, [row for _, row in paper_df_not_verbatim.iterrows()]),
+                total=len(paper_df_not_verbatim),
+                desc="Recovering non-verbatim probes"
+            ))
+
+        recovered_rows = []
+        failed_rows = []
+        for (idx, row), result in zip(paper_df_not_verbatim.iterrows(), recovery_results):
+            if result.get('success') and 'answer' in result and 'statement' in result:
+                new_answer = result['answer']
+                # Verify the recovered answer is actually verbatim in the paper
+                if new_answer.strip() in paper:
+                    new_row = row.copy()
+                    new_row['target'] = ' ' + new_answer.strip()
+                    new_row['fact'] = result['statement']
+                    # Rebuild probe by removing target from end of fact
+                    fact_cleaned = new_row['fact'].rstrip(string.punctuation + string.whitespace)
+                    target_cleaned = ' ' + new_answer.strip().rstrip(string.punctuation + string.whitespace)
+                    last_index = fact_cleaned.rfind(target_cleaned)
+                    if last_index != -1:
+                        new_row['probe'] = fact_cleaned[:last_index].strip()
+                        recovered_rows.append(new_row)
+                        continue
+            failed_rows.append(row)
+
+        recovered_count = len(recovered_rows)
+        failed_count = len(failed_rows)
+        print(f"  Recovered: {recovered_count} probes")
+        print(f"  Failed: {failed_count} probes")
+
+        if recovered_rows:
+            paper_df_recovered = pd.DataFrame(recovered_rows)
+            save_df_for_debugging(paper_df_recovered, '12b_verbatim_recovered.txt', 'facts', paper_name, ['raw_knowledge_statement', 'fact', 'target', 'probe'])
+            paper_df_probes_valid = pd.concat([paper_df_probes_valid, paper_df_recovered], ignore_index=True)
+
+        if failed_rows:
+            paper_df_failed = pd.DataFrame(failed_rows)
+            save_df_for_debugging(paper_df_failed, '12c_verbatim_unrecoverable.txt', 'facts', paper_name, ['raw_knowledge_statement', 'fact', 'target', 'probe'])
+
+        total_after_recovery = len(paper_df_probes_valid)
+        print(f"  Total probes after recovery: {total_after_recovery}")
+
+    # Save filtering metrics report
     output_dir = f'../../data/probes/facts/{paper_name}/'
     os.makedirs(output_dir, exist_ok=True)
-    paper_df_probes_valid.to_csv(os.path.join(output_dir, 'probes_v9.csv'), index=False)
+    metrics_path = os.path.join(output_dir, 'filtering_metrics_v10.txt')
+    with open(metrics_path, 'w') as f:
+        f.write(f"Fact Probe Pipeline v10 - Filtering Metrics for {paper_name}\n")
+        f.write(f"{'='*60}\n")
+        f.write(f"Total probes before verbatim filter: {total_before_verbatim}\n")
+        f.write(f"Probes filtered (target not verbatim in paper): {filtered_verbatim}\n")
+        f.write(f"Total probes after verbatim filter: {total_after_verbatim}\n")
+    print(f"Saved filtering metrics to {metrics_path}")
+
+    # 8. save probes
+
+    paper_df_probes_valid.reset_index(drop=True, inplace=True)
+    paper_df_probes_valid.to_csv(os.path.join(output_dir, 'probes_v10.csv'), index=False)
 
 
 if __name__ == "__main__":
