@@ -171,6 +171,8 @@ def prepare_training_mix(
     # ... [Args extraction remains the same] ...
     test_script = strategy_args.get("test_script", False)
     specific_explanation_type = strategy_args.get("with_specific_explanation", None)
+    if isinstance(specific_explanation_type, list) and len(specific_explanation_type) == 1:
+        specific_explanation_type = specific_explanation_type[0]
     times_explanations = strategy_args.get("times_explanations", 1) # Legacy mode, not used
     semi_cleaned_version = strategy_args.get("semi_cleaned", None)
     use_raw = strategy_args.get("use_raw", False)
@@ -179,11 +181,13 @@ def prepare_training_mix(
     shuffle_seed = strategy_args.get("shuffle_seed", 42)
     explanations_cycle = strategy_args.get("explanations_cycle", 0)
     double_cycle = strategy_args.get("double_cycle", False)
-    granular_explanation_analysis = strategy_args.get("granular_explanation_analysis", True)
+    explanations_insertion_strategy = strategy_args.get("explanations_insertion_strategy", "granular")
+    explanations_insert_every_n = int(strategy_args.get("explanations_insert_every_n", 1))
     fill_chunk_gaps = strategy_args.get("fill_chunk_gaps", True)
     chunk_gap_threshold = strategy_args.get("fill_chunk_gap_threshold", 1000)
     pretraining_separators = int(strategy_args.get("separate_batches_with_pretraining", 0))
     fill_with_pretraining = strategy_args.get("fill_batches_with_pretraining", True)
+    domain_data_sources = strategy_args.get("domain_data_sources", {}) or {}
 
     # --- Helper Functions ---
     def _chunk(text: str) -> List[str]:
@@ -203,6 +207,74 @@ def prepare_training_mix(
         )
         return chunks
 
+    def _first_existing_path(candidates: List[str]) -> Optional[str]:
+        for cand in candidates:
+            if os.path.exists(cand):
+                return cand
+        return None
+
+    def _source_document_root(source: str) -> str:
+        if use_raw:
+            return f'../../data/{source}/raw'
+        if semi_cleaned_version:
+            semicleaned_root = f'../../data/{source}/semicleaned_{semi_cleaned_version}'
+            if os.path.isdir(semicleaned_root):
+                return semicleaned_root
+        return f'../../data/{source}/cleaned'
+
+    def _discover_domains_for_source(source: str) -> List[str]:
+        root = _source_document_root(source)
+        if not os.path.isdir(root):
+            return []
+        return sorted(
+            os.path.splitext(name)[0]
+            for name in os.listdir(root)
+            if os.path.isfile(os.path.join(root, name)) and name.endswith(('.txt', '.tex'))
+        )
+
+    def _active_shuffle_suffixes() -> List[str]:
+        suffixes: List[str] = []
+        if word_shuffled:
+            suffixes.append('_shuffle_words')
+        if sentence_shuffled:
+            suffixes.append('_shuffle_sentences')
+        if paragraph_shuffled:
+            suffixes.append('_shuffle_paragraphs')
+        if shuffled_papers:
+            suffixes.append('_shuffle')
+        return suffixes
+
+    def _find_shuffled_source_path(source: str, domain: str) -> Optional[str]:
+        suffixes = _active_shuffle_suffixes()
+        if not suffixes:
+            return None
+        shuffled_root = f'../../data/{source}/shuffled'
+        candidates = [
+            os.path.join(shuffled_root, 'cleaned', f'{domain}{suffix}{ext}')
+            for suffix in suffixes
+            for ext in ('.tex', '.txt')
+        ]
+        return _first_existing_path(candidates)
+
+    def _find_standard_source_path(source: str, domain: str) -> Optional[str]:
+        root = _source_document_root(source)
+        return _first_existing_path([
+            os.path.join(root, f'{domain}.tex'),
+            os.path.join(root, f'{domain}.txt'),
+        ])
+
+    def _find_shuffled_paraphrase_path(source: str, domain: str, idx: int, paraphrased_dir: str) -> Optional[str]:
+        suffixes = _active_shuffle_suffixes()
+        if not suffixes:
+            return None
+        shuffled_root = f'../../data/{source}/shuffled'
+        candidates = []
+        for suffix in suffixes:
+            for ext in ('.tex', '.txt'):
+                candidates.append(os.path.join(shuffled_root, 'paraphrased', domain, f'{idx}{suffix}{ext}'))
+                candidates.append(os.path.join(paraphrased_dir, f'{idx}{suffix}{ext}'))
+        return _first_existing_path(candidates)
+
     # --- 1. Load Domains & Documents ---
     domains = strategy_args.get("override_domains", None)
     # Legacy flag and new more specific flags
@@ -211,12 +283,24 @@ def prepare_training_mix(
     sentence_shuffled = strategy_args.get("sentence_shuffled_papers", False)
     paragraph_shuffled = strategy_args.get("paragraph_shuffled_papers", False)
     if domains is None:
-        if use_raw: cleaned_dir = '../../data/arxiv/raw'
-        elif semi_cleaned_version: cleaned_dir = f'../../data/arxiv/semicleaned_{semi_cleaned_version}'
-        else: cleaned_dir = '../../data/arxiv/cleaned'
-        domains = [f.replace('.tex', '') for f in os.listdir(cleaned_dir) if f.endswith('.tex')]
+        domains = []
+        domain_data_sources = {}
+        for source in ("arxiv", "legal", "medical"):
+            discovered = _discover_domains_for_source(source)
+            for domain in discovered:
+                if domain in domain_data_sources and domain_data_sources[domain] != source:
+                    log.warning(
+                        f"Domain '{domain}' appears in both '{domain_data_sources[domain]}' and '{source}'. "
+                        "Keeping first occurrence."
+                    )
+                    continue
+                domain_data_sources[domain] = source
+                domains.append(domain)
+    else:
+        domain_data_sources = {domain: domain_data_sources.get(domain, "arxiv") for domain in domains}
     
     log.info(f"Processing domains: {domains}")
+    log.info(f"Domain data sources: {domain_data_sources}")
     
     num_paraphrased_texts = strategy_args.get("num_paraphrased_texts", 0)
     with_explanations = "WithExplanations" in strategy_name
@@ -224,103 +308,48 @@ def prepare_training_mix(
     unique_document_batches = [[] for _ in range(1 + num_paraphrased_texts)]
     unique_document_batches_with_explanations = None
     
-    # Structure: List of Domains -> List of Tracks -> List of Chunks
+    # Granular strategy structure: List of Domains -> List of Tracks -> List of Chunks
     domain_explanation_tracks = [] 
+    # Whole strategy structure: List of Domains -> Explanation-only batch chunks
+    domain_whole_explanation_batches = []
 
     for domain in domains:
         log.info(f"Loading data for domain: {domain}")
+        domain_source = domain_data_sources.get(domain, "arxiv")
         
         # Load Source
-        # Prefer shuffled versions when requested. Priority: word_shuffled -> sentence_shuffled -> legacy shuffled -> original
-        source_path = None
-
-        # For PriorKnowledge, use the prior_knowledge textbook directly instead of the Arxiv paper .tex
         if strategy_name == "PriorKnowledge":
-            source_path = f'../../data/arxiv/prior_knowledge/{domain}/textbook.txt'
+            source_path = _first_existing_path([
+                f'../../data/{domain_source}/prior_knowledge/{domain}/textbook.txt'
+            ])
         else:
-            shuffled_root = '../../data/arxiv/shuffled'
-
-            # check shuffled/cleaned first
-            if word_shuffled:
-                cand = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle_words.tex')
-                if os.path.exists(cand):
-                    source_path = cand
-            if source_path is None and sentence_shuffled:
-                cand = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle_sentences.tex')
-                if os.path.exists(cand):
-                    source_path = cand
-            if source_path is None and paragraph_shuffled:
-                cand = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle_paragraphs.tex')
-                if os.path.exists(cand):
-                    source_path = cand
-            if source_path is None and shuffled_papers:
-                cand = os.path.join(shuffled_root, 'cleaned', f'{domain}_shuffle.tex')
-                if os.path.exists(cand):
-                    source_path = cand
-
-            # fallback to original cleaned/paraphrased/raw locations
+            source_path = _find_shuffled_source_path(domain_source, domain)
             if source_path is None:
-                if use_raw:
-                    source_path = f'../../data/arxiv/raw/{domain}.tex'
-                elif semi_cleaned_version:
-                    source_path = f'../../data/arxiv/semicleaned_{semi_cleaned_version}/{domain}.tex'
-                else:
-                    source_path = f'../../data/arxiv/cleaned/{domain}.tex'
+                source_path = _find_standard_source_path(domain_source, domain)
 
+        if not source_path:
+            log.warning(f"Missing source document for domain '{domain}' in source '{domain_source}'. Skipping.")
+            continue
         try:
             with open(source_path, 'r', encoding='utf-8') as f: source_text = f.read()
-        except FileNotFoundError: continue
+        except FileNotFoundError: 
+            log.warning(f"Source file not found at {source_path}. Skipping.")
+            continue
         source_chunks = _chunk(source_text)
 
         # Load Paraphrases
         paraphrased_chunks_by_doc = []
         if num_paraphrased_texts > 0:
-            paraphrased_dir = f'../../data/arxiv/paraphrased/{domain}/'
+            paraphrased_dir = f'../../data/{domain_source}/paraphrased/{domain}/'
             if os.path.isdir(paraphrased_dir):
                 for i in range(num_paraphrased_texts):
-                    # prefer specific shuffle variants when requested. Priority: word -> sentence -> legacy
-                    picked = None
-                    shuffled_root = '../../data/arxiv/shuffled'
-                    # look inside shuffled/paraphrased/<domain>/ first
-                    if word_shuffled:
-                        cand = os.path.join(shuffled_root, 'paraphrased', domain, f'{i}_shuffle_words.tex')
-                        if os.path.exists(cand):
-                            picked = cand
-                    if picked is None and sentence_shuffled:
-                        cand = os.path.join(shuffled_root, 'paraphrased', domain, f'{i}_shuffle_sentences.tex')
-                        if os.path.exists(cand):
-                            picked = cand
-                    if picked is None and paragraph_shuffled:
-                        cand = os.path.join(shuffled_root, 'paraphrased', domain, f'{i}_shuffle_paragraphs.tex')
-                        if os.path.exists(cand):
-                            picked = cand
-                    if picked is None and shuffled_papers:
-                        cand = os.path.join(shuffled_root, 'paraphrased', domain, f'{i}_shuffle.tex')
-                        if os.path.exists(cand):
-                            picked = cand
-                    # legacy: check paraphrased_dir for shuffle files
-                    if picked is None and word_shuffled:
-                        cand = os.path.join(paraphrased_dir, f'{i}_shuffle_words.tex')
-                        if os.path.exists(cand):
-                            picked = cand
-                    if picked is None and sentence_shuffled:
-                        cand = os.path.join(paraphrased_dir, f'{i}_shuffle_sentences.tex')
-                        if os.path.exists(cand):
-                            picked = cand
-                    if picked is None and paragraph_shuffled:
-                        cand = os.path.join(paraphrased_dir, f'{i}_shuffle_paragraphs.tex')
-                        if os.path.exists(cand):
-                            picked = cand
-                    if picked is None and shuffled_papers:
-                        cand = os.path.join(paraphrased_dir, f'{i}_shuffle.tex')
-                        if os.path.exists(cand):
-                            picked = cand
-                    if picked is not None:
-                        with open(picked, 'r', encoding='utf-8') as f:
-                            paraphrased_chunks_by_doc.append(_chunk(f.read()))
-                        continue
-                    para_path = os.path.join(paraphrased_dir, f'{i}.tex')
-                    if os.path.exists(para_path):
+                    para_path = _find_shuffled_paraphrase_path(domain_source, domain, i, paraphrased_dir)
+                    if para_path is None:
+                        para_path = _first_existing_path([
+                            os.path.join(paraphrased_dir, f'{i}.tex'),
+                            os.path.join(paraphrased_dir, f'{i}.txt'),
+                        ])
+                    if para_path:
                         with open(para_path, 'r', encoding='utf-8') as f:
                             paraphrased_chunks_by_doc.append(_chunk(f.read()))
         
@@ -331,14 +360,16 @@ def prepare_training_mix(
                 unique_document_batches[i].extend(chunks)
 
         # --- 2. Load Explanations ---
-        current_domain_tracks = [] # We will append 1 or 2 tracks here (Main + Offset)
+        current_domain_tracks = [] # Granular strategy only
+        current_domain_whole_batch = [] # Whole strategy only
         
         if with_explanations:
-            explanation_dir = f'../../data/arxiv/explanations/{domain}/'
+            explanation_dir = f'../../data/{domain_source}/explanations/{domain}/'
             files_to_load = {}
+            use_subfolder_loading = explanations_insertion_strategy == "granular"
 
             # Identify files
-            if granular_explanation_analysis and specific_explanation_type:
+            if use_subfolder_loading and specific_explanation_type:
                 explanation_types = specific_explanation_type if isinstance(specific_explanation_type, list) else [specific_explanation_type]
                 for expl_type in explanation_types:
                     subfolder_path = os.path.join(explanation_dir, expl_type)
@@ -349,66 +380,35 @@ def prepare_training_mix(
                         else: type_files = []
                         files_to_load[expl_type] = type_files
             else:
-                default_files = [f"{specific_explanation_type}.txt"] if specific_explanation_type else ['blogs.txt', 'stackexchange.txt', 'textbook.txt']
+                # Whole + legacy use flat explanation files in the domain root.
+                # Normalize common aliases so "textbooks" maps to "textbook.txt".
+                alias_to_flat = {
+                    "textbook": "textbook",
+                    "textbooks": "textbook",
+                    "blog": "blogs",
+                    "blogs": "blogs",
+                    "stackexchange": "stackexchange",
+                    "stack": "stackexchange",
+                }
+                if specific_explanation_type:
+                    raw_types = specific_explanation_type if isinstance(specific_explanation_type, list) else [specific_explanation_type]
+                    normalized = []
+                    for expl_type in raw_types:
+                        key = alias_to_flat.get(expl_type, expl_type)
+                        if key.endswith(".txt"):
+                            normalized.append(key)
+                        else:
+                            normalized.append(f"{key}.txt")
+                    default_files = normalized
+                else:
+                    default_files = ['blogs.txt', 'stackexchange.txt', 'textbook.txt']
                 if os.path.isdir(explanation_dir):
                     avail = set(os.listdir(explanation_dir))
                     actual_files = [f for f in default_files if f in avail]
                     actual_files.sort()
                     files_to_load["default"] = actual_files
 
-            use_track_method = granular_explanation_analysis or (explanations_cycle == "full" or (isinstance(explanations_cycle, int) and explanations_cycle > 0))
-
-            if use_track_method:
-                # >> TRACK METHOD <<
-                if files_to_load:
-                    # Build base objects {type: [(filename, chunks)]}
-                    type_objects = {} 
-                    for expl_type, file_list in files_to_load.items():
-                        objs = []
-                        for filename in file_list:
-                            file_path = os.path.join(explanation_dir, filename)
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                file_chunks = _chunk_explanation(f.read())
-                            if times_explanations > 1 and file_chunks:
-                                file_chunks = file_chunks * times_explanations
-                            objs.append((filename, file_chunks))
-                        type_objects[expl_type] = objs
-
-                    # Helper to flatten objects into a pool
-                    def create_pool_from_objects(obj_dict):
-                        pool = []
-                        max_len = max([len(x) for x in obj_dict.values()]) if obj_dict else 0
-                        for idx in range(max_len):
-                            step_chunks = []
-                            for e_type, e_list in obj_dict.items():
-                                if not e_list: continue
-                                _, ch = e_list[idx % len(e_list)]
-                                step_chunks.extend(ch)
-                            if step_chunks: pool.append(step_chunks)
-                        return pool
-
-                    # Track 1: Main
-                    main_pool = create_pool_from_objects(type_objects)
-                    if main_pool:
-                        current_domain_tracks.append(main_pool)
-
-                    # Track 2: Offset (Sequential Addition)
-                    if double_cycle:
-                        offset_objects = {}
-                        for e_type, e_list in type_objects.items():
-                            if not e_list: 
-                                offset_objects[e_type] = []
-                                continue
-                            offset = len(e_list) // 2
-                            rotated_list = e_list[offset:] + e_list[:offset]
-                            offset_objects[e_type] = rotated_list
-                        
-                        offset_pool = create_pool_from_objects(offset_objects)
-                        if offset_pool:
-                            log.info(f"Domain {domain}: Adding OFFSET track (size {len(offset_pool)}).")
-                            current_domain_tracks.append(offset_pool)
-
-            elif not use_track_method:
+            if explanations_insertion_strategy == "legacy":
                 # >> LEGACY METHOD (Splice) <<
                 legacy_expl_chunks = []
                 if "default" in files_to_load:
@@ -439,11 +439,72 @@ def prepare_training_mix(
                             unique_document_batches_with_explanations[i].extend(new_c)
                             to_insert = []
                 else:
-                     for i in range(1, len(unique_document_batches)):
+                    for i in range(1, len(unique_document_batches)):
                         unique_document_batches_with_explanations[i].extend(unique_document_batches[i][-len(paraphrased_chunks_by_doc[i-1]):])
+            elif explanations_insertion_strategy in ("granular", "whole"):
+                # Build base objects {type: [(filename, chunks)]}
+                type_objects = {}
+                for expl_type, file_list in files_to_load.items():
+                    objs = []
+                    for filename in file_list:
+                        file_path = os.path.join(explanation_dir, filename)
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            file_chunks = _chunk_explanation(f.read())
+                        if times_explanations > 1 and file_chunks:
+                            file_chunks = file_chunks * times_explanations
+                        objs.append((filename, file_chunks))
+                    type_objects[expl_type] = objs
 
-        # Append the list of tracks for this domain
+                if explanations_insertion_strategy == "granular":
+                    # Helper to flatten objects into a pool
+                    def create_pool_from_objects(obj_dict):
+                        pool = []
+                        max_len = max([len(x) for x in obj_dict.values()]) if obj_dict else 0
+                        for idx in range(max_len):
+                            step_chunks = []
+                            for _, e_list in obj_dict.items():
+                                if not e_list:
+                                    continue
+                                _, ch = e_list[idx % len(e_list)]
+                                step_chunks.extend(ch)
+                            if step_chunks:
+                                pool.append(step_chunks)
+                        return pool
+
+                    # Track 1: Main
+                    main_pool = create_pool_from_objects(type_objects)
+                    if main_pool:
+                        current_domain_tracks.append(main_pool)
+
+                    # Track 2: Offset (Sequential Addition)
+                    if double_cycle:
+                        offset_objects = {}
+                        for e_type, e_list in type_objects.items():
+                            if not e_list:
+                                offset_objects[e_type] = []
+                                continue
+                            offset = len(e_list) // 2
+                            rotated_list = e_list[offset:] + e_list[:offset]
+                            offset_objects[e_type] = rotated_list
+
+                        offset_pool = create_pool_from_objects(offset_objects)
+                        if offset_pool:
+                            log.info(f"Domain {domain}: Adding OFFSET track (size {len(offset_pool)}).")
+                            current_domain_tracks.append(offset_pool)
+                else:
+                    # Whole strategy: use all selected explanation chunks as one standalone insertion batch.
+                    for _, e_list in type_objects.items():
+                        for _, ch in e_list:
+                            current_domain_whole_batch.extend(ch)
+            else:
+                raise ValueError(
+                    f"Unsupported explanations_insertion_strategy: {explanations_insertion_strategy}. "
+                    "Expected one of: granular, whole, legacy."
+                )
+
+        # Append explanation structures for this domain
         domain_explanation_tracks.append(current_domain_tracks)
+        domain_whole_explanation_batches.append(current_domain_whole_batch)
 
     # --- 3. Replay & Replications ---
     data_replay = None
@@ -460,8 +521,26 @@ def prepare_training_mix(
 
     final_chunks = []
     has_track_explanations = any(len(tracks) > 0 for tracks in domain_explanation_tracks)
+    has_whole_explanations = any(len(chunks) > 0 for chunks in domain_whole_explanation_batches)
 
-    if has_track_explanations:
+    if explanations_insertion_strategy == "whole" and has_whole_explanations:
+        if explanations_insert_every_n <= 0:
+            raise ValueError("--explanations_insert_every_n must be a positive integer when using strategy 'whole'.")
+        log.info("Using WHOLE Method (Insert explanation-only batch every N document batches).")
+        final_chunks = replicate_and_interleave_whole_insert_every_n(
+            doc_batches=unique_document_batches,
+            domain_whole_explanation_batches=domain_whole_explanation_batches,
+            insertion_every_n=explanations_insert_every_n,
+            replication_factor=replication_factor,
+            data_replay=data_replay,
+            pretraining_separators=pretraining_separators,
+            train_cfg=train_cfg,
+            tokenizer=tokenizer,
+            log=log,
+            test_script=test_script,
+            fill_with_pretraining=fill_with_pretraining,
+        )
+    elif has_track_explanations:
         log.info("Using NEW Track Method (Independent Domain Tracks).")
         final_chunks = replicate_and_interleave_tracks(
             doc_batches=unique_document_batches,
@@ -634,4 +713,74 @@ def replicate_and_interleave_legacy(
                 )
                 final_chunks.extend(pretraining_fill)
                 
+    return final_chunks
+
+def replicate_and_interleave_whole_insert_every_n(
+    doc_batches: List[List[str]],
+    domain_whole_explanation_batches: List[List[str]],
+    insertion_every_n: int,
+    replication_factor: int,
+    data_replay: PretrainingDataReplay,
+    pretraining_separators: int,
+    train_cfg: TrainingConfig,
+    tokenizer,
+    log,
+    test_script: bool = False,
+    fill_with_pretraining: bool = False,
+) -> List[str]:
+    """
+    Whole strategy:
+    - Keep document batches as-is.
+    - Insert a standalone explanation-only batch every N document batches.
+    """
+    if insertion_every_n <= 0:
+        raise ValueError("insertion_every_n must be a positive integer.")
+
+    effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
+    total_doc_batches = len(doc_batches) * replication_factor
+    if total_doc_batches == 0:
+        return []
+
+    replicated_doc_batches = []
+    for _ in range(replication_factor):
+        replicated_doc_batches.extend([list(b) for b in doc_batches])
+
+    combined_explanation_batch = []
+    for domain_batch in domain_whole_explanation_batches:
+        combined_explanation_batch.extend(domain_batch)
+
+    scheduled_batches = []
+    inserted_explanation_batches = 0
+    for doc_idx, doc_batch in enumerate(replicated_doc_batches):
+        scheduled_batches.append(doc_batch)
+        if combined_explanation_batch and ((doc_idx + 1) % insertion_every_n == 0):
+            scheduled_batches.append(list(combined_explanation_batch))
+            inserted_explanation_batches += 1
+
+    log.info(
+        f"Whole strategy scheduled {len(replicated_doc_batches)} document batches and "
+        f"{inserted_explanation_batches} explanation-only batches (every {insertion_every_n} steps)."
+    )
+
+    final_chunks = []
+    for batch_idx, batch in enumerate(scheduled_batches):
+        current_batch = list(batch)
+
+        if fill_with_pretraining:
+            current_batch = fill_up_batch_with_pretraining_chunks(
+                current_batch, data_replay, effective_batch_size, train_cfg.context_length, tokenizer
+            )
+
+        final_chunks.extend(current_batch)
+
+        if pretraining_separators > 0 and batch_idx < len(scheduled_batches) - 1:
+            pretraining_fill = get_pretraining_batches(
+                data_replay,
+                pretraining_separators,
+                effective_batch_size,
+                train_cfg.context_length,
+                tokenizer,
+            )
+            final_chunks.extend(pretraining_fill)
+
     return final_chunks

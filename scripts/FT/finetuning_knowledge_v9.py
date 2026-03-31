@@ -29,6 +29,7 @@ DOMAIN_OVERRIDE_ARG_BY_SOURCE = {
     "medical": "override_medical_domain",
 }
 DEFAULT_WANDB_PROJECT = "fine_tuning_study_v9"
+DEFAULT_WANDB_PANEL_SOURCES = ("legal", "arxiv", "medical")
 
 
 def _domain_catalog_root(source: str, args) -> str:
@@ -257,7 +258,7 @@ def construct_experiment_name(args):
 
 
 
-def continue_pretraining(model, tokenizer, log, args):
+def continue_pretraining(model, tokenizer, log, args, train: bool = True):
     assert args.effective_batch_size_for_cpt % args.device_batch_size == 0, \
         "Effective batch size for CPT must be divisible by device batch size."
     grad_accum_steps = args.effective_batch_size_for_cpt // args.device_batch_size
@@ -367,18 +368,21 @@ def continue_pretraining(model, tokenizer, log, args):
             strategy_args=strategy_args,
             output_dir_for_debug=output_dir_for_debug,
             callbacks=callbacks_to_use,
-            train=True,
+            train=train,
             full_debug=args.full_debug,
         **chunking_args
         )
 
-    # --- Save Metrics and Generate Plots ---
-    experiment_utils.save_probe_results(callbacks_to_use, log, args)
+    if train:
+        # --- Save Metrics and Generate Plots ---
+        experiment_utils.save_probe_results(callbacks_to_use, log, args)
 
-    # --- Generate Plots ---
-    # Note: Plotting logic is removed as it's complex with multiple domains. 
-    # Please use regenerate_plots.py script or add custom plotting logic.
-    log.info("Finished training and saving all probe results.")
+        # --- Generate Plots ---
+        # Note: Plotting logic is removed as it's complex with multiple domains. 
+        # Please use regenerate_plots.py script or add custom plotting logic.
+        log.info("Finished training and saving all probe results.")
+    else:
+        log.info("Dataloader debug-only mode complete (no fine-tuning performed).")
     return model, tokenizer
 
 
@@ -426,8 +430,7 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
     lima_training_config = llm_configs.TrainingConfig(**lima_training_config_kwargs)
 
     # --- Load Probes ---
-    # Note 1: We track the DPO knowledge probes, DPO inference probes in OG & Q&A format, and generative recall in Q&A format
-    # NOte 2: Since we are retracking some of the same probes, we need to make sure they are in separate folders and different prefixes for WandDB
+    # v9 default: inference probes off; W&B per-paper metrics focus on log_prob + hits@1/10/100.
     callbacks = experiment_utils.setup_callbacks(
         domains=args.resolved_domains,
         tokenizer=tokenizer, 
@@ -502,6 +505,16 @@ if __name__ == "__main__":
     parser.add_argument("--override_experiment_name", type=str, default="", help="Override experiment name")
     parser.add_argument("--model_id", type=str, default="allenai/OLMo-2-0425-1B") # allenai/OLMo-2-1124-7B
     parser.add_argument("--num_train_epochs", type=int, default=1)
+    parser.add_argument(
+        "--debug_dataloader_only",
+        action="store_true",
+        help="Run data-mixing and dataloader verification only; skip fine-tuning.",
+    )
+    parser.add_argument(
+        "--full_debug",
+        action="store_true",
+        help="Write full decoded non-padded sequences in debug_run_*.txt instead of truncated previews.",
+    )
     parser.add_argument("--full_finetuning", default=False, action="store_true")
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--constant_lr", action="store_true", help="Use constant learning rate instead of a scheduler (with minimal warmup)")
@@ -514,6 +527,26 @@ if __name__ == "__main__":
         default="all",
         choices=["all", "test", "type_split_test"],
         help="Subset of inference probes to use for domain 1_58 when using v7 probes.",
+    )
+    parser.add_argument(
+        "--enable_wandb_source_panels",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable source-level W&B panels (arxiv/legal/medical).",
+    )
+    parser.add_argument(
+        "--wandb_panel_sources",
+        type=str,
+        nargs='+',
+        default=list(DEFAULT_WANDB_PANEL_SOURCES),
+        choices=list(SUPPORTED_HIGH_LEVEL_DOMAINS),
+        help="High-level source panels to log in W&B.",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default=DEFAULT_WANDB_PROJECT,
+        help="W&B project name to use for this script.",
     )
     parser.add_argument("--num_paraphrased_texts", type=int, default=9, help="Number of paraphrased texts to use for training (0-9)")
     parser.add_argument("--lima_afterwards", default=False, action="store_true", help="LIMA-based instruction tuning after continued pretraining")
@@ -532,11 +565,6 @@ if __name__ == "__main__":
     parser.add_argument("--times_explanations", type=int, default=1, help="Number of times to repeat the explanation texts.")
     parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
     parser.add_argument("--test_script", action="store_true", help="Run in test mode with a small model and minimal epochs.")
-    parser.add_argument(
-        "--full_debug",
-        action="store_true",
-        help="Write full decoded non-padded sequences in debug_run_*.txt instead of truncated previews.",
-    )
     parser.add_argument("--explanation_every_round", action="store_true", help="Inject explanations for every round/replication instead of alternating.")
     parser.add_argument("--shuffle_chunks", action="store_true", help="Shuffle constructed training chunks with seed 42 before training.")
     parser.add_argument("--shuffle_seed", type=int, default=42, help="Seed to use when shuffling training chunks.")
@@ -632,6 +660,21 @@ if __name__ == "__main__":
     parser.add_argument("--parcc", action="store_true", help="Use /vast/projects/myatskar/design-documents as cache directory for model and dataset loading operations")
 
     args = parser.parse_args()
+    args.wandb_panel_sources = list(dict.fromkeys(args.wandb_panel_sources))
+
+    # v9 built-ins (not exposed as CLI options):
+    # - no inference probes
+    # - no perplexity-related W&B logging
+    # - probe W&B logging limited to log_prob + hits@1/10/100
+    args.disable_inference_probes = True
+    args.wandb_probe_metric_allowlist = [
+        "log_prob",
+        "hit_accuracy_at_1",
+        "hit_accuracy_at_10",
+        "hit_accuracy_at_100",
+    ]
+    args.disable_corpus_perplexity_wandb = True
+    args.disable_training_loss_perplexity_wandb = True
 
     # Set cache_dir based on --parcc flag
     if args.parcc:
@@ -723,8 +766,15 @@ if __name__ == "__main__":
         args.num_train_epochs = 1
         args.base_results_dir = os.path.join("../../results", "tests")
     else: 
-        os.environ["WANDB_PROJECT"] = DEFAULT_WANDB_PROJECT
+        os.environ["WANDB_PROJECT"] = args.wandb_project
         args.base_results_dir = os.path.join("../../results", "FT")
+
+    log.info("Inference probes are disabled.")
+    if args.enable_wandb_source_panels:
+        log.info(
+            f"W&B source panels enabled for: {args.wandb_panel_sources}. "
+            f"Per-paper metrics: log_prob_average, hits_1, hits_10, hits_100. MCQA metrics TODO."
+        )
 
     args.resolved_domains, args.domain_data_sources = resolve_domains_and_sources(args, log)
 
@@ -780,15 +830,17 @@ if __name__ == "__main__":
         model.print_trainable_parameters()
 
     # Model compilation is handled by TrainingArguments via compile flag in TrainingConfig
-    # --- Continue Pretraining (we also evaluate our probes during this) ---
-    if args.num_train_epochs > 0:
-        model, tokenizer = continue_pretraining(model, tokenizer, log, args)
-        if args.save_local_model:
+    # --- Continue Pretraining / Debug-only dataloader check ---
+    run_cpt = args.num_train_epochs > 0 or args.debug_dataloader_only
+    if run_cpt:
+        train_cpt = not args.debug_dataloader_only
+        model, tokenizer = continue_pretraining(model, tokenizer, log, args, train=train_cpt)
+        if train_cpt and args.save_local_model:
             cpt_save_path = os.path.join(args.experiment_dir, args.cpt_model_subdir)
             llm_training.save_model(model, tokenizer, log, cpt_save_path)
             log.info(f"CPT checkpoint saved to {cpt_save_path}")
         # Optionally push CPT model snapshot to hub
-        if args.push_to_hub_cpt_id:
+        if train_cpt and args.push_to_hub_cpt_id:
             log.info(f"Pushing CPT model to hub: {args.push_to_hub_cpt_id}")
             model.push_to_hub(args.push_to_hub_cpt_id)
             tokenizer.push_to_hub(args.push_to_hub_cpt_id)

@@ -39,8 +39,14 @@ def load_model_for_training(config: ModelConfig, log, use_cpu_and_gpu = False, a
     """
     log.info(f"Loading model '{config.id}' for training...")
 
-    # Determine torch dtype
-    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    # Determine torch dtype and device map.
+    if torch.cuda.is_available():
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    else:
+        # CPU execution should use float32 for broad operator compatibility.
+        dtype = torch.float32
+    device_map = 'auto' if use_cpu_and_gpu else ("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"Model load config: dtype={dtype}, device_map={device_map}")
 
     quant_config = None
     if config.quantization.mode == "4bit":
@@ -58,18 +64,20 @@ def load_model_for_training(config: ModelConfig, log, use_cpu_and_gpu = False, a
             config.id,
             trust_remote_code=True,
             torch_dtype=dtype,
-            device_map='auto' if use_cpu_and_gpu else "cuda",
+            device_map=device_map,
             attn_implementation=config.attn_implementation,
             cache_dir=cache_dir,
         )
     else:
+        if not torch.cuda.is_available():
+            raise ValueError("4bit/8bit quantization requires CUDA. Disable quantization for CPU-only runs.")
         print("...Quantizing...")
         model = AutoModelForCausalLM.from_pretrained(
         config.id,
         trust_remote_code=True,
         torch_dtype=dtype,
         quantization_config=quant_config,
-        device_map='auto' if use_cpu_and_gpu else "cuda", #Assume we're operating in a low VRAM environment since we're quantizing
+        device_map=device_map, # Assume low VRAM when quantizing
         attn_implementation=config.attn_implementation,
         cache_dir=cache_dir,
     )

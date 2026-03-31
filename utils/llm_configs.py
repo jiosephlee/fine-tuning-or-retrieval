@@ -75,6 +75,7 @@ class TrainingConfig(BaseModel):
 
     def to_training_args(self) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
+        use_cuda = torch.cuda.is_available()
         return TrainingArguments(
             max_length = self.context_length,
             per_device_train_batch_size=self.per_device_train_batch_size,
@@ -88,9 +89,9 @@ class TrainingConfig(BaseModel):
             warmup_steps=self.warmup_steps, # Handle warmup_steps if ratio is not desired (LIMA case)
             # evaluation_strategy = self.evaluation_strategy,
             # max_grad_norm=self.max_grad_norm,
-            bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
-            fp16=not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) and torch.cuda.is_available(),
-            use_liger_kernel=self.use_liger_kernel,
+            bf16=use_cuda and torch.cuda.is_bf16_supported(),
+            fp16=use_cuda and (not torch.cuda.is_bf16_supported()),
+            use_liger_kernel=self.use_liger_kernel and use_cuda,
             gradient_checkpointing=self.gradient_checkpointing,
             torch_compile=self.compile,
             seed=self.seed,
@@ -106,13 +107,15 @@ class TrainingConfig(BaseModel):
         )
     def to_sft_training_args(self) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
+        use_cuda = torch.cuda.is_available()
         return SFTConfig(
             dataset_text_field=self.dataset_text_field,
             packing = self.packing,
             padding_free = self.padding_free, # This saves VRAM (Requires Flash Attention 2)
             max_length = self.context_length,
             completion_only_loss = self.completion_only_loss,
-            activation_offloading = self.activation_offloading,
+            # Activation offloading in TRL uses CUDA stream helpers; disable on CPU-only setups.
+            activation_offloading = self.activation_offloading and use_cuda,
 
             # Training Arguments
             per_device_train_batch_size=self.per_device_train_batch_size,
@@ -129,10 +132,10 @@ class TrainingConfig(BaseModel):
 
             # evaluation_strategy=self.evaluation_strategy,
             # max_grad_norm=self.max_grad_norm,
-            bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
-            fp16=not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) and torch.cuda.is_available(),
+            bf16=use_cuda and torch.cuda.is_bf16_supported(),
+            fp16=use_cuda and (not torch.cuda.is_bf16_supported()),
             gradient_checkpointing=self.gradient_checkpointing,
-            use_liger_kernel=self.use_liger_kernel,
+            use_liger_kernel=self.use_liger_kernel and use_cuda,
             torch_compile=self.compile,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,

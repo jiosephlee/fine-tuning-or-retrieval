@@ -1,6 +1,6 @@
 import torch
 from transformers import TrainerCallback, AutoTokenizer
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import pandas as pd
 import os
 import wandb
@@ -50,7 +50,8 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                  output_dir="",
                  log_prefix="probe_eval",
                  report_to_wandb: bool = True,
-                 sparse_eval: bool = False):
+                 sparse_eval: bool = False,
+                 wandb_metric_allowlist: Optional[List[str]] = None):
         
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
@@ -67,6 +68,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         self.logger = logger
         self.log_prefix = log_prefix
         self.report_to_wandb = report_to_wandb
+        self.wandb_metric_allowlist = set(wandb_metric_allowlist) if wandb_metric_allowlist else None
         self.excluded_report_columns = ['section', 'subsection', 'section_text', 'subsection_text', 'subsection_text_paraphrased', 'section_text_paraphrased']
 
         self.initial_metrics = {}
@@ -173,13 +175,18 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         for metric_name, values in self.initial_metrics.items():
             if values is not None:
                 self.history[metric_name].append({'step': step, 'values': values.cpu().tolist()})
-                
-                # Log overall average
-                valid_mask = ~torch.isinf(values) & ~torch.isnan(values)
-                if valid_mask.any():
-                    log_data[f"{self.log_prefix}/{metric_name}_avg"] = values[valid_mask].mean().item()
+                should_log_metric = (
+                    self.wandb_metric_allowlist is None
+                    or metric_name in self.wandb_metric_allowlist
+                )
+                if should_log_metric:
+                    # Log overall average
+                    valid_mask = ~torch.isinf(values) & ~torch.isnan(values)
+                    if valid_mask.any():
+                        log_data[f"{self.log_prefix}/{metric_name}_avg"] = values[valid_mask].mean().item()
 
-            self._log_inference_type_metrics(values, metric_name, log_data)
+                if should_log_metric:
+                    self._log_inference_type_metrics(values, metric_name, log_data)
 
         # Log to wandb if available
         if state.is_world_process_zero and log_data:
@@ -213,12 +220,17 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
 
             # Log the metrics to local history
             self.history[metric_name].append({'step': step, 'values': values.cpu().tolist()})
-            
-            valid_mask = ~torch.isinf(values) & ~torch.isnan(values)
-            if valid_mask.any():
-                log_data[f"{self.log_prefix}/{metric_name}_avg"] = values[valid_mask].mean().item()
 
-            self._log_inference_type_metrics(values, metric_name, log_data)
+            should_log_metric = (
+                self.wandb_metric_allowlist is None
+                or metric_name in self.wandb_metric_allowlist
+            )
+            if should_log_metric:
+                valid_mask = ~torch.isinf(values) & ~torch.isnan(values)
+                if valid_mask.any():
+                    log_data[f"{self.log_prefix}/{metric_name}_avg"] = values[valid_mask].mean().item()
+
+                self._log_inference_type_metrics(values, metric_name, log_data)
 
         if state.is_world_process_zero and log_data:
             if self.report_to_wandb and wandb.run:
@@ -759,6 +771,133 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         output_path = os.path.join(output_dir, f'{self.log_prefix}_metrics.csv')
         final_df.to_csv(output_path, index=False)
         print(f" > Saved consolidated metrics to '{output_path}' with {len(final_df)} rows.")
+
+
+class WandbSourcePanelsCallback(TrainerCallback):
+    """
+    Logs source-scoped metrics for W&B workspace panels:
+    - panel/<source>/factual_probes_avg
+    - panel/<source>/papers/<domain>/log_prob_average
+    - panel/<source>/papers/<domain>/hits_1
+    - panel/<source>/papers/<domain>/hits_10
+    - panel/<source>/papers/<domain>/hits_100
+    - panel/<source>/papers/<domain>/mcqa (TODO placeholder namespace only)
+    """
+    PAPER_METRICS = (
+        ("log_prob", "log_prob_average"),
+        ("hit_accuracy_at_1", "hits_1"),
+        ("hit_accuracy_at_10", "hits_10"),
+        ("hit_accuracy_at_100", "hits_100"),
+    )
+
+    def __init__(
+        self,
+        knowledge_callbacks: List[BaseKnowledgeProbeCallBack],
+        domain_sources: Optional[Dict[str, str]] = None,
+        panel_sources: Optional[List[str]] = None,
+        report_to_wandb: bool = True,
+    ):
+        self.knowledge_callbacks = knowledge_callbacks
+        self.domain_sources = domain_sources or {}
+        self.panel_sources = panel_sources or ["legal", "arxiv", "medical"]
+        self.report_to_wandb = report_to_wandb
+        self._mcqa_metric_defined = False
+
+    @staticmethod
+    def _valid_number(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, float):
+            return math.isfinite(value)
+        return True
+
+    @staticmethod
+    def _safe_average(values: List[float]) -> Optional[float]:
+        finite = [v for v in values if isinstance(v, (int, float)) and math.isfinite(v)]
+        if not finite:
+            return None
+        return float(sum(finite) / len(finite))
+
+    def _source_for_domain(self, domain: str) -> str:
+        source = self.domain_sources.get(domain, "arxiv")
+        return source if source in self.panel_sources else "arxiv"
+
+    def _domain_from_knowledge_prefix(self, log_prefix: str) -> Optional[str]:
+        suffix = "_knowledge_probe"
+        if not log_prefix.endswith(suffix):
+            return None
+        return log_prefix[: -len(suffix)]
+
+    @staticmethod
+    def _entry_for_step(entries: List[Dict[str, Any]], step: int) -> Optional[Dict[str, Any]]:
+        for entry in reversed(entries):
+            if entry.get("step") == step:
+                return entry
+        return None
+
+    def _collect_paper_metrics_by_domain(self, step: int) -> Dict[str, Dict[str, float]]:
+        per_domain: Dict[str, Dict[str, float]] = {}
+        for callback in self.knowledge_callbacks:
+            domain = self._domain_from_knowledge_prefix(getattr(callback, "log_prefix", ""))
+            if not domain:
+                continue
+            domain_metrics: Dict[str, float] = {}
+            for history_name, panel_name in self.PAPER_METRICS:
+                metric_entries = callback.history.get(history_name, [])
+                entry = self._entry_for_step(metric_entries, step)
+                if not entry:
+                    continue
+                avg = self._safe_average(entry.get("values", []))
+                if self._valid_number(avg):
+                    domain_metrics[panel_name] = float(avg)
+            if domain_metrics:
+                per_domain[domain] = domain_metrics
+        return per_domain
+
+    def _build_logs_for_step(self, step: int) -> Dict[str, float]:
+        logs: Dict[str, float] = {}
+        paper_metrics_by_domain = self._collect_paper_metrics_by_domain(step)
+
+        factual_by_source: Dict[str, List[float]] = {src: [] for src in self.panel_sources}
+
+        for domain, domain_metrics in paper_metrics_by_domain.items():
+            source = self._source_for_domain(domain)
+            for metric_name, metric_value in domain_metrics.items():
+                logs[f"panel/{source}/papers/{domain}/{metric_name}"] = metric_value
+            if "log_prob_average" in domain_metrics:
+                factual_by_source[source].append(domain_metrics["log_prob_average"])
+
+        for source, values in factual_by_source.items():
+            factual_avg = self._safe_average(values)
+            if self._valid_number(factual_avg):
+                logs[f"panel/{source}/factual_probes_avg"] = float(factual_avg)
+
+        return logs
+
+    def _define_mcqa_placeholder_metrics(self):
+        if self._mcqa_metric_defined or not self.report_to_wandb or not wandb.run:
+            return
+        # TODO: Wire real MCQA values when MCQA callback lands.
+        for domain, source in self.domain_sources.items():
+            if source in self.panel_sources:
+                wandb.define_metric(f"panel/{source}/papers/{domain}/mcqa")
+        self._mcqa_metric_defined = True
+
+    def on_train_begin(self, args, state, control, model, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        self._define_mcqa_placeholder_metrics()
+        logs = self._build_logs_for_step(0)
+        if self.report_to_wandb and wandb.run and logs:
+            wandb.log(logs, step=0)
+
+    def on_step_end(self, args, state, control, model, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        self._define_mcqa_placeholder_metrics()
+        logs = self._build_logs_for_step(state.global_step)
+        if self.report_to_wandb and wandb.run and logs:
+            wandb.log(logs, step=state.global_step)
 
 
 class GenerationProbeCallback(TrainerCallback):

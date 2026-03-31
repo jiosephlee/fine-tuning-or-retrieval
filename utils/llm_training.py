@@ -197,6 +197,7 @@ def fine_tune(
     output_dir_for_debug: str,
     callbacks: Optional[List[TrainerCallback]] = None,
     train: bool = True,
+    full_debug: bool = False,
     **chunking_args,
 ):
     """
@@ -235,10 +236,15 @@ def fine_tune(
     # --- Debugging Sequential Sampling ---
     os.makedirs(output_dir_for_debug, exist_ok=True)
     
-    def get_dataloader_content(dataloader, debug=False):
+    def get_dataloader_content(dataloader, debug=False, full_debug=False):
         content = []
         eos_token_id = tokenizer.eos_token_id
         for i, batch in enumerate(dataloader):
+            input_shape = tuple(batch["input_ids"].shape)
+            attention_shape = tuple(batch["attention_mask"].shape)
+            content.append(
+                f"===== NEW BATCH {i + 1} | input_ids shape={input_shape} | attention_mask shape={attention_shape} ====="
+            )
             # Assuming 'input_ids' is the key for tokenized text
             # and we decode it back to string for inspection.
             # Process each sequence in the batch
@@ -251,22 +257,29 @@ def fine_tune(
                 if last_token == eos_token_id and debug:
                     #log.warning(f"CPT batch {i}, sequence {j} ends with an EOS token, which is expected for the last batch of the unique document.")
                     pass
-                first_50 = tokenizer.decode(input_ids[:50])
-                last_50 = tokenizer.decode(input_ids[-50:])
-                text_sample = first_50+ "..." + last_50
+                valid_ids = input_ids[:last_valid_idx + 1]
+                if full_debug:
+                    text_sample = tokenizer.decode(valid_ids, skip_special_tokens=False)
+                else:
+                    if len(valid_ids) <= 100:
+                        text_sample = tokenizer.decode(valid_ids, skip_special_tokens=False)
+                    else:
+                        first_50 = tokenizer.decode(valid_ids[:50], skip_special_tokens=False)
+                        last_50 = tokenizer.decode(valid_ids[-50:], skip_special_tokens=False)
+                        text_sample = first_50 + "..." + last_50
                 content.append(text_sample)
         return content
 
     log.info("Running first dataloader pass for debugging and verification...")
     dataloader1 = trainer.get_train_dataloader()
-    log.info(f"Dataloader has a batch size of {len(dataloader1)} chunks...")
-    content1 = get_dataloader_content(dataloader1, debug=True)
+    log.info(f"Dataloader has {len(dataloader1)} batches...")
+    content1 = get_dataloader_content(dataloader1, debug=True, full_debug=full_debug)
     with open(os.path.join(output_dir_for_debug, "debug_run_1.txt"), "w") as f:
         f.write("\n------\n".join(content1))
         
     log.info("Running second dataloader pass for debugging...")
     dataloader2 = trainer.get_train_dataloader()
-    content2 = get_dataloader_content(dataloader2)
+    content2 = get_dataloader_content(dataloader2, full_debug=full_debug)
     with open(os.path.join(output_dir_for_debug, "debug_run_2.txt"), "w") as f:
         f.write("\n------\n".join(content2))
 
