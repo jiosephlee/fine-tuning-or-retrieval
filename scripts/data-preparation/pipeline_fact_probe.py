@@ -267,7 +267,7 @@ Here are guidelines as you segment the text:
         paper_df_validated['latex_percentage'] = paper_df_validated['raw_knowledge_statement'].apply(calculate_latex_percentage)
 
         # Filter out statements with more than 85% LaTeX
-        latex_threshold = 85
+        latex_threshold = 75
         high_latex_statements = paper_df_validated[paper_df_validated['latex_percentage'] > latex_threshold].copy()
         paper_df_filtered = paper_df_validated[paper_df_validated['latex_percentage'] <= latex_threshold].copy()
 
@@ -499,25 +499,22 @@ Respond with JSON format with the following key:
         prompt = {}
         prompt['system'] = r"""You will be given two inputs, a section of an academic paper for context and a single sentence drawn from that section. Papers often interweave various pieces of knowledge together in academic writing. While each sentence is interwoven with others, there is atomic knowledge that can be extracted from a particular sentence. Write questions that tests for this atomic knowledge. Specifically, your task is to extract questions from the provided sentence with clear answers. 
    
-Extract 1-3 questions from the sentence. 
+Extract 1-2 questions from the sentence. If the sentence truly has lots of facts, extract up to 3 questions.
   
 ### Detailed Instructions
 Consider these instructions as you extract each question:
-- The question should be natural and meaningful, in which the answer is considered a main fact presented by the sentence.
-- The answer should be non-trivial and non-obvious. It should not be plainly obvious from the question for someone who has no relevant knowledge.
-- The answer to the question MUST be a verbatim word, phrase (2-5 words), or a mathematical expression copied exactly from the sentence. Do not paraphrase, rephrase, or adjust the answer — it must appear as an exact substring of the sentence. You should strip leading determiners such as "some", "a", "an", or "the" from the answer.
-- The question should have a a clear, single answer and *NOT* multiple valid answers.
-- Each question should be written separately and independently of the other questions, so don’t reference other questions in the same question.
+- The question should be meaningful, focused on a main fact in the sentence, not a minor detail.
+- The question should be non-trivial and non-obvious. It should not be plainly obvious from the question for someone with no relevant knowledge.
+- The answer to the question MUST be a verbatim word, phrase (2-4 words), or a mathematical expression copied exactly from the sentence. Capitlization can be adjusted appropriately. Otherwise, do not paraphrase, rephrase, or adjust the answer; it must appear as an exact substring of the sentence.
+- The question should have a clear, single answer and *NOT* multiple valid answers.
+- Prefer shorter answers.
+- Each question should be written separately and independently of the other questions; do not reference other questions in the same question.
 
 ### Handling Mathematical Sentences
 Many sentences in academic papers contain equations, variables, or mathematical notation. These sentences still contain important knowledge, but you must extract it carefully:
-- Do NOT extract partial equations or incomplete equation fragments as answers. For example, "$\pi_{\theta}(y\mid x" is NOT a valid answer because it is a broken fragment.
-- If the answer is a mathematical expression, it MUST be a complete, self-contained expression exactly as written in the source. Valid examples: "$\beta$", "$Z(x)$", "$\pi_\theta$", "$\mathcal{L}_\text{DPO}$". Invalid examples: "$\pi_{\theta}(y\mid x", "$\frac{\exp(r^*(x, y_1))}{\exp(r^*(x, y_1)) + \exp(r^*(x, y_2".
-- For equation-heavy sentences, prefer questions that test conceptual understanding over equation completion:
-    - What a symbol or term REPRESENTS (e.g., "what does $\beta$ control?")
-    - What ROLE a component plays in an equation (e.g., "what prevents the policy from diverging?")
-    - What two things are being RELATED by an equation
-    - What a named result or equation DEFINES
+- Do NOT extract partial equations or incomplete equation fragments as answers.
+- If the answer is a mathematical expression, it MUST be a complete, self-contained expression exactly as written in the source.
+- Do not ask simple notation questions like "What is the variable that represents the reward?"
 - Prefer natural language answers when they capture the same knowledge as a mathematical answer. For example, prefer "the partition function" over "$Z(x)$" if both are valid.
 - Preserve the original LaTeX formatting exactly. Use $...$ delimiters as they appear in the source. Do NOT convert to \(...\) or other formats.
 
@@ -542,15 +539,10 @@ Questions:
 - "Existing methods for steering unsupervised language models via fine-tuning on human preferences often use what?", Answer: "RLHF"
 
 ### Demonstration 3: Mathematical Sentence
-Context: "\title{Direct Preference Optimization: Your Language Model is Secretly a Reward Model}\nFollowing prior works, the optimization is formulated as\n\\begin{equation}\n\\max_{\\pi_{\\theta}}  \\mathbb{E}_{x\\sim \\mathcal{D}, y\\sim \\pi_{\\theta}(y \\mid x)}\\bigl[r_{\\phi}(x, y)\\bigr] - \\beta\\mathbb{D}_{\\textrm{KL}}\\bigl[\\pi_{\\theta}(y\\mid x)\\mid \\mid \\pi_\\text{ref}(y\\mid x)\\bigr],\n\\end{equation}\nwhere $\\beta$ is a parameter controlling the deviation from the base reference policy $\\pi_\\text{ref}$, namely the initial SFT model $\\pi^\\text{SFT}$."
-
-Sentence: "where $\\beta$ is a parameter controlling the deviation from the base reference policy $\\pi_\\text{ref}$, namely the initial SFT model $\\pi^\\text{SFT}$."
+Sentence: "Following prior works, the optimization is formulated as\n\\begin{equation}\n\\max_{\\pi_{\\theta}}  \\mathbb{E}_{x\\sim \\mathcal{D}, y\\sim \\pi_{\\theta}(y \\mid x)}\\bigl[r_{\\phi}(x, y)\\bigr] - \\beta\\mathbb{D}_{\\textrm{KL}}\\bigl[\\pi_{\\theta}(y\\mid x)\\mid \\mid \\pi_\\text{ref}(y\\mid x)\\bigr],\n\\end{equation}\nwhere $\\beta$ is a parameter controlling the deviation from the base reference policy $\\pi_\\text{ref}$, namely the initial SFT model $\\pi^\\text{SFT}$."
 
 Questions:
 - "In the RL fine-tuning objective, what does the parameter $\\beta$ control?", Answer: "deviation from the base reference policy"
-- "In the RL fine-tuning objective, the base reference policy $\\pi_\\text{ref}$ is the initial model trained with what method?", Answer: "SFT"
-
-Note: A BAD question here would be "The expectation is taken under what distribution?", Answer: "$\\pi_{\\theta}(y\\mid x" — this is a broken LaTeX fragment and tests notation recall, not understanding.
 """
         contextualize_prompt = {}
         contextualize_prompt['system'] = r"""You will be given two inputs, a section of an academic paper for context, a single sentence drawn from that section, and a question extracted from the sentence as well as its corresponding answer. Your task is to then turn the question into a self-contained, precise question. Approach this task step-by-step as outlined below.
@@ -592,7 +584,7 @@ Think carefully and critically through this task, following the step-by-step ins
         
         context = extract_context_and_sentence(first_row)
         prompt['user'] = f"""### Title\n{first_row['title']}\n### Context\n{context}\n\n### Sentence\n{first_row['raw_knowledge_statement'].strip()}"""
-        output1 = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='medium')   
+        output1 = utils.query_llm(prompt, model='gpt-5.4', reasoning_effort='medium')   
 
         json_parse_prompt['user'] = output1
         try:
@@ -636,7 +628,7 @@ Think carefully and critically through this task, following the step-by-step ins
 
         return output1, all_contextualized, all_clozes
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         raw_extracted_facts = list(tqdm(executor.map(extract_atomic_facts, [paper_df_knowledge.iloc[i] for i in range(len(paper_df_knowledge))]), total=len(paper_df_knowledge)))
 
     # Separate the three outputs into different columns
@@ -683,7 +675,7 @@ For any rewriting, do not change the structure, content, or shape of the stateme
 ### Output Format
 After your review, if the pair passes all checks (with any necessary refinements), provide the refined pair as a JSON object with two keys: "answer" and "statement"."""
         prompt['user'] = f"""### Answer\n{row['answer']}\n\n### Statement\n{row['statement']}"""
-        response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True)
+        response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='low', system_prompt_included=True, return_json=True)
         try:
             parsed_response = json.loads(response)
             if parsed_response and 'answer' in parsed_response and 'statement' in parsed_response:
@@ -717,7 +709,7 @@ Provide your decision as a JSON object with a single boolean key: `{"keep": true
             return False
         prompt['user'] = f"""### Answer\n{validated_pair['answer']}\n\n### Statement\n{validated_pair['statement'].replace(str(validated_pair['answer']), '___')}"""
         
-        response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True)
+        response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='low', system_prompt_included=True, return_json=True)
         try:
             parsed_response = json.loads(response)
             return parsed_response.get('keep', False)
@@ -752,7 +744,7 @@ Provide your decision as a JSON object with a single boolean key: `{"keep": true
 
     # Process all rows in parallel
     if not paper_df_exploded.empty:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             validated_results = list(tqdm(
                 executor.map(validate_atomic_facts, [row for _, row in paper_df_exploded.iterrows()]),
                 total=len(paper_df_exploded)
@@ -794,7 +786,7 @@ Provide your decision as a JSON object with a single boolean key: `{"keep": true
 
     # 4.5 Filter step after refinement
     if not paper_df_qc_kept.empty:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             keep_results = list(tqdm(
                 executor.map(filter_refined_pair, [row for _, row in paper_df_qc_kept.iterrows()]),
                 total=len(paper_df_qc_kept),
@@ -887,14 +879,14 @@ Provide your decision as a JSON object with a single boolean key: `{"keep": true
         fact = str(row['fact']).strip()
         target = str(row['target']).strip()
         
-        # Clean fact and target by removing punctuation from the end
-        fact_cleaned = fact.rstrip(string.punctuation + string.whitespace)
-        target_cleaned = ' ' + target.rstrip(string.punctuation + string.whitespace)
+        fact_cleaned = fact
+        target_cleaned = ' ' + target
         
         
         last_index = fact_cleaned.rfind(target_cleaned)
         if last_index != -1:
             probe = fact_cleaned[:last_index].strip()
+            target_cleaned = fact_cleaned[last_index:]  # include any trailing punctuation
             probes.append(probe)
             cleaned_facts.append(fact_cleaned)
             cleaned_targets.append(target_cleaned)
@@ -971,7 +963,7 @@ Return a JSON object:
 
     if not paper_df_not_verbatim.empty:
         print(f"\nAttempting to recover {len(paper_df_not_verbatim)} non-verbatim probes...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             recovery_results = list(tqdm(
                 executor.map(recover_verbatim_probe, [row for _, row in paper_df_not_verbatim.iterrows()]),
                 total=len(paper_df_not_verbatim),
@@ -1031,6 +1023,13 @@ Return a JSON object:
 
     paper_df_probes_valid.reset_index(drop=True, inplace=True)
     paper_df_probes_valid.to_csv(os.path.join(output_dir, 'probes_v10.csv'), index=False)
+
+    # Save readable version
+    readable_path = os.path.join(output_dir, 'probes_v10_readable.txt')
+    with open(readable_path, 'w') as f:
+        for _, row in paper_df_probes_valid.iterrows():
+            f.write(f"{row['probe']}: {row['target'].lstrip()}\n")
+    print(f"Saved readable probes to {readable_path}")
 
 
 if __name__ == "__main__":

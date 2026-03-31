@@ -4,11 +4,16 @@ Pipeline: Convert Existing Probes to MCQA Format (v1)
 Takes existing fact probe CSVs (e.g. probes_v9.csv) and generates MCQA versions
 by creating hard distractors for each probe. Works across all domains.
 
+Step 0 (default): GPT-5.4-mini pre-filters probes that are unsuitable for MCQA
+(e.g. numeric targets, binary answers, trivially short targets). Use --skip_filtering
+to bypass this step.
+
 Usage:
     cd scripts/data-preparation
     python pipeline_mcqa_difficulty.py --probe_type facts --probe_version v9
     python pipeline_mcqa_difficulty.py --probe_type facts --probe_version v9 --filter OFT
     python pipeline_mcqa_difficulty.py --probe_type inference --probe_version v7
+    python pipeline_mcqa_difficulty.py --probe_type facts --probe_version v9 --skip_filtering
 """
 
 import os
@@ -23,6 +28,56 @@ import argparse
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 import utils.utils as utils
 from utils.pipeline import save_debug_file
+
+# ─────────────────────────────────────────────────────────────
+# Step 0: Filter probes for MCQA suitability
+# ─────────────────────────────────────────────────────────────
+
+MCQA_FILTER_PROMPT = r"""You are evaluating whether a knowledge probe is suitable for conversion into a multiple-choice question (MCQA).
+
+Some probes work poorly as MCQAs because:
+- The target is a number, date, or proper name where meaningful distractors are hard to construct (e.g. "The experiment was conducted in ___" → 2019).
+- The target is extremely long or is a full sentence — MCQ options should be concise.
+- The target is a trivial word (e.g. "the", "is", "a") that was extracted incorrectly.
+- The probe is too vague without context to distinguish among plausible options.
+- The answer space is binary or near-binary (yes/no, true/false, increase/decrease) making 4 distinct options unnatural.
+- The target is a list of items where partial overlap with distractors would create ambiguity.
+
+A probe IS suitable when:
+- The target is a concept, method, technique, term, or short descriptive phrase.
+- There exist related-but-wrong concepts in the same field that make plausible distractors.
+- A knowledgeable reader could meaningfully reason among 4 options.
+
+You will be given the probe (cloze statement), the target (correct completion), and the source fact.
+
+### Output Format
+Provide a JSON object:
+- "suitable": (boolean) true if this probe can naturally support 4 meaningful MCQA options
+- "reason": (string) one-sentence explanation"""
+
+
+def filter_probe_for_mcqa(row: pd.Series) -> dict:
+    """Check whether a single probe is suitable for MCQA conversion."""
+    target = str(row['target']).strip()
+    probe = str(row['probe']).strip()
+    source = str(row.get('raw_knowledge_statement', row.get('fact', ''))).strip()
+
+    prompt = {
+        'system': MCQA_FILTER_PROMPT,
+        'user': (f"### Probe Statement\n{probe}\n\n"
+                 f"### Correct Answer\n{target}\n\n"
+                 f"### Source Fact\n{source}")
+    }
+
+    try:
+        response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='low',
+                                    system_prompt_included=True, return_json=True, max_tokens=200)
+        data = json.loads(response) if isinstance(response, str) else response
+        return {'suitable': data.get('suitable', False), 'reason': data.get('reason', '')}
+    except Exception as e:
+        print(f"Filter error: {e}")
+        return {'suitable': False, 'reason': f'LLM call failed: {e}'}
+
 
 # ─────────────────────────────────────────────────────────────
 # Step 1: Generate distractors
@@ -152,7 +207,8 @@ def format_mcqa_row(row: pd.Series, distractors: list) -> dict:
 # Main pipeline
 # ─────────────────────────────────────────────────────────────
 
-def process_domain(domain: str, probe_type: str, probe_version: str, paper_content: str):
+def process_domain(domain: str, probe_type: str, probe_version: str, paper_content: str,
+                   skip_filtering: bool = False):
     """Convert probes for a single domain to MCQA."""
     base = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
     input_path = os.path.join(base, f'data/probes/{probe_type}/{domain}/probes_{probe_version}.csv')
@@ -163,6 +219,52 @@ def process_domain(domain: str, probe_type: str, probe_version: str, paper_conte
 
     df = pd.read_csv(input_path)
     print(f"Loaded {len(df)} probes from {input_path}")
+
+    # Step 0: Filter probes for MCQA suitability
+    if not skip_filtering:
+        print("Filtering probes for MCQA suitability...")
+        filter_results = [None] * len(df)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            future_to_idx = {
+                executor.submit(filter_probe_for_mcqa, row): idx
+                for idx, (_, row) in enumerate(df.iterrows())
+            }
+            for future in tqdm(concurrent.futures.as_completed(future_to_idx),
+                               total=len(df), desc="Filtering"):
+                idx = future_to_idx[future]
+                try:
+                    filter_results[idx] = future.result()
+                except Exception as e:
+                    print(f"Filter error at index {idx}: {e}")
+                    filter_results[idx] = {'suitable': False, 'reason': f'Exception: {e}'}
+
+        suitable_mask = [r['suitable'] if r else False for r in filter_results]
+        rejected = [(i, r['reason']) for i, r in enumerate(filter_results) if r and not r['suitable']]
+
+        output_dir = os.path.join(base, f'data/probes/{probe_type}/{domain}/')
+        os.makedirs(output_dir, exist_ok=True)
+        filter_debug_path = os.path.join(output_dir, f'mcqa_filter_{probe_version}.txt')
+        with open(filter_debug_path, 'w') as f:
+            f.write(f"MCQA Suitability Filter — {domain} ({probe_type} {probe_version})\n")
+            f.write(f"{'='*60}\n")
+            f.write(f"Total probes: {len(df)}\n")
+            f.write(f"Suitable: {sum(suitable_mask)}\n")
+            f.write(f"Rejected: {len(rejected)}\n\n")
+            for idx, reason in rejected:
+                row = df.iloc[idx]
+                f.write(f"--- Probe {idx} ---\n")
+                f.write(f"Probe: {str(row['probe']).strip()}\n")
+                f.write(f"Target: {str(row['target']).strip()}\n")
+                f.write(f"Reason: {reason}\n\n")
+        print(f"Saved filter debug to {filter_debug_path}")
+
+        df = df[suitable_mask].reset_index(drop=True)
+        print(f"After filtering: {len(df)} suitable probes (rejected {len(rejected)})")
+
+        if len(df) == 0:
+            print("No probes passed MCQA suitability filter. Exiting.")
+            return
 
     # Step 1: Generate distractors in parallel
     print("Generating distractors...")
@@ -230,7 +332,7 @@ def process_domain(domain: str, probe_type: str, probe_version: str, paper_conte
     with open(metrics_path, 'w') as f:
         f.write(f"MCQA Conversion Metrics - {domain} ({probe_type} {probe_version})\n")
         f.write(f"{'='*60}\n")
-        f.write(f"Input probes: {len(df)}\n")
+        f.write(f"Probes after MCQA filter: {len(df)}\n")
         f.write(f"Distractors generated: {len(valid_pairs)}\n")
         f.write(f"Passed verification: {len(verified_pairs)}\n")
         f.write(f"Conversion rate: {100*len(verified_pairs)/len(df):.1f}%\n")
@@ -260,6 +362,8 @@ if __name__ == '__main__':
                         help='Probe version (e.g., v9, v7)')
     parser.add_argument('--filter', type=str, default=None,
                         help='Only process domains containing this string.')
+    parser.add_argument('--skip_filtering', action='store_true',
+                        help='Skip MCQA suitability pre-filtering step.')
     args = parser.parse_args()
 
     base = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -283,4 +387,5 @@ if __name__ == '__main__':
     for domain in domains:
         print(f"\n{'='*20} {domain} {'='*20}")
         paper_content = load_paper_content(domain)
-        process_domain(domain, args.probe_type, args.probe_version, paper_content)
+        process_domain(domain, args.probe_type, args.probe_version, paper_content,
+                       skip_filtering=args.skip_filtering)

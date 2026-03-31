@@ -144,46 +144,101 @@ def generate_case_textbook(case_name):
     with open(CASE_FILE_PATH, 'r') as f:
         case_content = f.read()
 
-    # Single call — one case = one chapter, no need for outline → parallel expansion
-    print("Generating case-based textbook chapter...")
-    prompt = {
+    # --- 1. Generate section outline for one chapter ---
+    print("Generating textbook section outline...")
+    prompt_outline = {
         'system': """### Instructions
-You will be given a clinical case report. Write a single, comprehensive textbook chapter in the style of Lange Case Files or Harrison's Principles of Internal Medicine that uses this case to teach the underlying medicine.
+You will be given a clinical case report. Your task is to create an outline of sections for a single textbook chapter in the style of Lange Case Files or Harrison's Principles of Internal Medicine. The chapter uses this case to teach the underlying medicine.
 
-This is NOT a StatPearls reference article or a case summary. It is a pedagogical textbook chapter that teaches through the case, like what a medical student would read to deeply understand the clinical problem.
+This is one chapter with 5-6 sections — NOT multiple chapters. Think of it like the sections within a single Case Files case (e.g., Clinical Approach, Pathophysiology, Differential Diagnosis, Diagnostic Workup, Management, Clinical Pearls). Keep it to 5-6 substantial sections, not 10+.
 
-The chapter should cover:
-- Clinical approach: what this presentation suggests, how to build a differential, what findings narrow it
-- Pathophysiology and disease mechanism in depth — teach the biology, not just name the disease
-- Diagnostic workup: what tests to order, what criteria to apply, and why
-- Management principles and their rationale
-- Clinical pearls and take-home teaching points
+For each section, provide:
+- A title
+- A description of what the section covers
+- A list of key points to address
 
-Writing guidelines:
-- Write in authoritative but accessible medical prose, aimed at medical students and residents
-- Teach the underlying medicine through the case — the case is the vehicle, not the destination
-- Write in full prose paragraphs — this is a textbook, not an outline or reference card
-- Be comprehensive, dedicating multiple paragraphs to pathophysiology and clinical reasoning
-- Stay grounded in the case report for case-specific claims, but explain broader medical context
-
-Start with the chapter title as a '#' header. Use '##' for major sections within the chapter.""",
+### Output Format
+Provide the output as a JSON object with a single key "sections", which is a list of section objects. Each section object must have:
+- "section_title": A string for the section title
+- "description": A string describing the section's content
+- "key_points": A list of strings, each a key point to cover""",
         'user': f"### Clinical Case Report\n{case_content}"
     }
 
-    chapter_content = utils.query_llm(
-        prompt,
+    response_outline_str = utils.query_llm(
+        prompt_outline,
         model='gpt-5',
         system_prompt_included=True,
-        max_tokens=8000
+        return_json=True,
+        max_tokens=4000
     )
 
-    if chapter_content is None:
-        print(f"WARNING: LLM returned None for textbook chapter on {case_name}, skipping")
+    if response_outline_str is None:
+        print(f"WARNING: LLM returned None for textbook outline on {case_name}, skipping")
         return
+
+    outline_log_path = os.path.join(OUTPUT_DIR, "textbook_outline.json")
+    with open(outline_log_path, 'w') as f:
+        f.write(response_outline_str)
+    print(f"Saved textbook outline to {outline_log_path}")
+
+    outline_data = json.loads(response_outline_str)
+    sections = outline_data['sections']
+    print(f"Parsed outline with {len(sections)} sections.")
+
+    # --- 2. Write each section in parallel ---
+    print("Writing textbook sections...")
+
+    def write_section(section_info):
+        section_title = section_info['section_title']
+        print(f"Writing section: {section_title}...")
+
+        section_outline_text = f"### Section Title\n\n{section_info['section_title']}\n"
+        section_outline_text += f"## Description\n\n{section_info['description']}\n"
+        section_outline_text += "## Key Points\n"
+        for point in section_info['key_points']:
+            section_outline_text += f"- {point}\n"
+
+        prompt_section = {
+            'system': """### Instructions
+You will be given a section title, description, and key points for a section within a case-based medical textbook chapter. Write this section as it would appear in a Lange Case Files or Harrison's-style textbook.
+
+The section should:
+- Be written in authoritative but accessible medical prose, aimed at medical students and residents
+- Teach the underlying medicine through the case — the case is the vehicle, not the destination
+- Explain clinical concepts with enough depth that a student could apply them to new patients
+- Write in full prose paragraphs — this is a textbook, not an outline or reference card
+- Be comprehensive, dedicating multiple paragraphs where the topic warrants it
+- Stay grounded in the case report for case-specific claims, but explain broader medical context
+
+Start with the section title as a '##' header.""",
+            'user': f"""### Clinical Case Report
+{case_content}
+
+### Section to Write
+{section_outline_text}"""
+        }
+
+        section_content = utils.query_llm(
+            prompt_section,
+            model='gpt-5-mini',
+            reasoning_effort="medium",
+            system_prompt_included=True,
+            max_tokens=4000
+        )
+        return section_content
+
+    with ThreadPoolExecutor() as executor:
+        section_contents = list(tqdm(executor.map(write_section, sections), total=len(sections), desc="Writing textbook sections"))
+
+    # --- 3. Concatenate and save ---
+    print("Assembling textbook chapter...")
+    full_content = "\n\n".join(section_contents)
+    full_textbook = f"# Case-Based Textbook Chapter: {case_name}\n\n{full_content}"
 
     output_file = os.path.join(OUTPUT_DIR, "textbook.txt")
     with open(output_file, 'w') as f:
-        f.write(chapter_content)
+        f.write(full_textbook)
 
     print(f"Saved textbook chapter to {output_file}")
 
