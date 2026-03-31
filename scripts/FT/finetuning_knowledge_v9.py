@@ -173,8 +173,8 @@ def construct_experiment_name(args):
                 elif isinstance(args.explanations_cycle, int) and args.explanations_cycle > 0:
                     data_mix += f"_cycle{args.explanations_cycle}"
 
-                if args.double_cycle:
-                    data_mix += "_double"
+                if args.explanations_num_tracks > 1:
+                    data_mix += f"_tracks{args.explanations_num_tracks}"
 
             if args.explanations_insertion_strategy != "granular":
                 data_mix += f"_ins{args.explanations_insertion_strategy}"
@@ -336,7 +336,7 @@ def continue_pretraining(model, tokenizer, log, args, train: bool = True):
             "shuffle_chunks": args.shuffle_chunks,
             "shuffle_seed": args.shuffle_seed,
             "explanations_cycle": args.explanations_cycle,
-            "double_cycle": args.double_cycle,
+            "explanations_num_tracks": args.explanations_num_tracks,
             "explanations_insertion_strategy": args.explanations_insertion_strategy,
             "explanations_insert_every_n": args.explanations_insert_every_n,
         }
@@ -582,7 +582,13 @@ if __name__ == "__main__":
         default=1,
         help="For --explanations_insertion_strategy whole: insert explanation-only batches every N document steps.",
     )
-    parser.add_argument("--double_cycle", action="store_true", help="Create a second cycle offset by half the number of files (e.g., 10 chapters -> 2nd cycle starts at chapter 5).")
+    parser.add_argument(
+        "--explanations_num_tracks",
+        type=int,
+        default=1,
+        help="Granular strategy only: number of explanation tracks to build. Track i uses an offset of floor(i * num_files / N). "
+             "Default is 1.",
+    )
     # Deprecated compatibility flag; prefer --explanations_insertion_strategy granular.
     parser.add_argument("--granular_explanation_analysis", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--shuffled_papers", action="store_true", help="Legacy: use shuffled versions of papers (files ending with _shuffle.tex) when available.")
@@ -720,8 +726,17 @@ if __name__ == "__main__":
     if args.explanations_insertion_strategy == "whole" and args.explanations_insert_every_n <= 0:
         raise ValueError("--explanations_insert_every_n must be a positive integer when strategy is 'whole'.")
 
-    if args.explanations_insertion_strategy != "granular" and args.double_cycle:
-        raise ValueError("--double_cycle is only supported with --explanations_insertion_strategy granular.")
+    if args.explanations_num_tracks <= 0:
+        raise ValueError("--explanations_num_tracks must be a positive integer.")
+
+    if (
+        args.explanations_insertion_strategy != "granular"
+        and args.explanations_num_tracks != 1
+    ):
+        raise ValueError(
+            "--explanations_num_tracks is only supported with --explanations_insertion_strategy granular "
+            "(set it to 1 for whole/legacy)."
+        )
 
     if args.explanations_insertion_strategy != "granular" and args.explanations_cycle != 0:
         raise ValueError(

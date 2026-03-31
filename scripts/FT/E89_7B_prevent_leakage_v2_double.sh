@@ -17,7 +17,7 @@ python -s finetuning_knowledge_v8.py \
     --effective_batch_size_for_cpt 96 \
     --fill_batches_with_pretraining \
     --with_specific_explanation fruit_textbooks_v3 fruit_blogs_v3 fruit_stackexchange_v3 \
-    --double_cycle \
+    --explanations_num_tracks 2 \
     --explanations_cycle full \
     --granular_explanation_analysis \
     --num_train_epochs $num_epochs \

@@ -68,7 +68,12 @@ def fill_up_batch_with_pretraining_chunks(
     Fills up a batch list with pretraining chunks if it's smaller than the effective batch size.
     """
     num_chunks_needed = batch_size - len(batch)
-    if num_chunks_needed <= 0:
+    if num_chunks_needed < 0:
+        raise ValueError(
+            f"Constructed batch has {len(batch)} chunks, which exceeds effective_batch_size={batch_size}. "
+            "Reduce aux/explanation chunks per insertion or increase --effective_batch_size_for_cpt."
+        )
+    if num_chunks_needed == 0:
         return batch
 
     num_tokens_needed = num_chunks_needed * chunk_size
@@ -180,7 +185,14 @@ def prepare_training_mix(
     shuffle_chunks_flag = strategy_args.get("shuffle_chunks", False)
     shuffle_seed = strategy_args.get("shuffle_seed", 42)
     explanations_cycle = strategy_args.get("explanations_cycle", 0)
-    double_cycle = strategy_args.get("double_cycle", False)
+    try:
+        explanations_num_tracks = int(strategy_args.get("explanations_num_tracks", 1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"--explanations_num_tracks must be a positive integer, got: {strategy_args.get('explanations_num_tracks')}"
+        ) from exc
+    if explanations_num_tracks <= 0:
+        raise ValueError(f"--explanations_num_tracks must be a positive integer, got: {explanations_num_tracks}")
     explanations_insertion_strategy = strategy_args.get("explanations_insertion_strategy", "granular")
     explanations_insert_every_n = int(strategy_args.get("explanations_insert_every_n", 1))
     fill_chunk_gaps = strategy_args.get("fill_chunk_gaps", True)
@@ -471,26 +483,32 @@ def prepare_training_mix(
                                 pool.append(step_chunks)
                         return pool
 
-                    # Track 1: Main
-                    main_pool = create_pool_from_objects(type_objects)
-                    if main_pool:
-                        current_domain_tracks.append(main_pool)
-
-                    # Track 2: Offset (Sequential Addition)
-                    if double_cycle:
-                        offset_objects = {}
+                    # Generalized Track Construction:
+                    # track_idx=0 is the main cycle, and subsequent tracks are phase-offset cycles.
+                    # Offset rule is floor(track_idx * len(type_files) / num_tracks), so:
+                    # - num_tracks=2 -> offset by half
+                    # - num_tracks=3 -> offsets around one-third and two-thirds
+                    for track_idx in range(explanations_num_tracks):
+                        track_objects = {}
                         for e_type, e_list in type_objects.items():
                             if not e_list:
-                                offset_objects[e_type] = []
+                                track_objects[e_type] = []
                                 continue
-                            offset = len(e_list) // 2
-                            rotated_list = e_list[offset:] + e_list[:offset]
-                            offset_objects[e_type] = rotated_list
 
-                        offset_pool = create_pool_from_objects(offset_objects)
-                        if offset_pool:
-                            log.info(f"Domain {domain}: Adding OFFSET track (size {len(offset_pool)}).")
-                            current_domain_tracks.append(offset_pool)
+                            offset = (track_idx * len(e_list)) // explanations_num_tracks
+                            if offset == 0:
+                                track_objects[e_type] = e_list
+                            else:
+                                track_objects[e_type] = e_list[offset:] + e_list[:offset]
+
+                        track_pool = create_pool_from_objects(track_objects)
+                        if track_pool:
+                            if track_idx > 0:
+                                log.info(
+                                    f"Domain {domain}: Adding OFFSET track {track_idx + 1}/{explanations_num_tracks} "
+                                    f"(size {len(track_pool)})."
+                                )
+                            current_domain_tracks.append(track_pool)
                 else:
                     # Whole strategy: use all selected explanation chunks as one standalone insertion batch.
                     for _, e_list in type_objects.items():

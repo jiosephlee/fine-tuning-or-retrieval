@@ -46,7 +46,7 @@ strategy_args = {
     "shuffle_chunks": False,
     "shuffle_seed": 42,
     "explanations_cycle": "full",  # Use 3 files from each type
-    "double_cycle": True,
+    "explanations_num_tracks": 2,
     "granular_explanation_analysis": True,
 }
 
