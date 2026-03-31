@@ -4,16 +4,21 @@ Pipeline: Convert Existing Probes to MCQA Format (v1)
 Takes existing fact probe CSVs (e.g. probes_v9.csv) and generates MCQA versions
 by creating hard distractors for each probe. Works across all domains.
 
-Step 0 (default): GPT-5.4-mini pre-filters probes that are unsuitable for MCQA
-(e.g. numeric targets, binary answers, trivially short targets). Use --skip_filtering
-to bypass this step.
+Step 0 (default): GPT-5.4-mini pre-filters probes unsuitable for MCQA, rejecting:
+tautological/circular probes, targets that appear verbatim in the probe, trivially
+short targets, complex LaTeX formula targets, specific percentages/numeric results,
+and binary answer spaces. Use --skip_filtering to bypass.
+
+Outputs:
+- probes_{output_version}.csv: input probes filtered to only MCQA-suitable ones
+- probes_{output_version}_mcqa.csv: the MCQA formatted version with distractors
+- probes_{output_version}_readable.txt: human-readable filtered probes
 
 Usage:
     cd scripts/data-preparation
-    python pipeline_mcqa_difficulty.py --probe_type facts --probe_version v9
-    python pipeline_mcqa_difficulty.py --probe_type facts --probe_version v9 --filter OFT
-    python pipeline_mcqa_difficulty.py --probe_type inference --probe_version v7
-    python pipeline_mcqa_difficulty.py --probe_type facts --probe_version v9 --skip_filtering
+    python pipeline_mcqa_difficulty.py --probe_type facts --probe_version v10 --output_version v11
+    python pipeline_mcqa_difficulty.py --probe_type facts --probe_version v10 --output_version v11 --filter DPO
+    python pipeline_mcqa_difficulty.py --probe_type facts --probe_version v10 --output_version v11 --skip_filtering
 """
 
 import os
@@ -35,25 +40,24 @@ from utils.pipeline import save_debug_file
 
 MCQA_FILTER_PROMPT = r"""You are evaluating whether a knowledge probe is suitable for conversion into a multiple-choice question (MCQA).
 
-Some probes work poorly as MCQAs because:
-- The target is a number, date, or proper name where meaningful distractors are hard to construct (e.g. "The experiment was conducted in ___" → 2019).
-- The target is extremely long or is a full sentence — MCQ options should be concise.
-- The target is a trivial word (e.g. "the", "is", "a") that was extracted incorrectly.
-- The probe is too vague without context to distinguish among plausible options.
-- The answer space is binary or near-binary (yes/no, true/false, increase/decrease) making 4 distinct options unnatural.
-- The target is a list of items where partial overlap with distractors would create ambiguity.
+A probe is UNSUITABLE for MCQA if ANY of these apply:
+1. **Tautological / circular**: The target simply restates or paraphrases something already stated in the probe. E.g. probe says "The models described as being trained on very large datasets are:" and target is "large unsupervised language models" — the answer is just the probe reworded.
+2. **Target appears verbatim in the probe**: The answer is already written out in the probe text itself.
+3. **Trivially short / obvious target**: The target is a single common word like "humans", "the LM", "a model" where there is no conceptual depth to distinguish among 5 options.
+4. **Hard to construct meaningful distractors**: The answer is yes/no, true/false, increase/decrease, etc. — 5 distinct options are unnatural.
 
 A probe IS suitable when:
-- The target is a concept, method, technique, term, or short descriptive phrase.
+- The target is a concept, method, technique, algorithm name, dataset name, model name, or short descriptive phrase.
 - There exist related-but-wrong concepts in the same field that make plausible distractors.
-- A knowledgeable reader could meaningfully reason among 4 options.
+- A knowledgeable reader could meaningfully reason among 5 options.
+- Dates, numbers, and proper nouns ARE fine if there are plausible alternatives.
 
 You will be given the probe (cloze statement), the target (correct completion), and the source fact.
 
 ### Output Format
 Provide a JSON object:
-- "suitable": (boolean) true if this probe can naturally support 4 meaningful MCQA options
-- "reason": (string) one-sentence explanation"""
+- "suitable": (boolean) true if this probe can naturally support 5 meaningful MCQA options
+- "reason": (string) one-sentence explanation citing which criterion (1-6) it fails, or why it is suitable"""
 
 
 def filter_probe_for_mcqa(row: pd.Series) -> dict:
@@ -89,30 +93,33 @@ You will be given:
 - A cloze-style statement (the "probe") that ends right before the answer.
 - The correct answer (the "target").
 - The source sentence from the paper.
+- The subsection of the paper where this fact appears (for sourcing plausible in-context distractors).
 
-Your task: generate 3 plausible but incorrect distractors.
+Your task: generate 4 plausible but incorrect distractors.
 
 ### Distractor Design Principles
 - Each distractor should be a plausible completion of the probe statement.
 - Distractors should represent *common misunderstandings* or *closely related concepts* that someone with surface-level knowledge might confuse with the correct answer.
-- At least one distractor should come from the same paper/text (a real concept mentioned elsewhere, but wrong in this context).
+- At least one distractor should come from the provided subsection text (a real concept mentioned in context, but wrong for this specific probe).
+- At least one distractor should come from the broader field but outside the subsection.
 - Distractors should be similar in length, style, and specificity to the correct answer.
 - Do NOT include obviously wrong or unrelated answers.
 - Ensure there is exactly ONE correct answer — no distractor should be arguably correct.
 
 ### Output Format
-Provide a JSON object with a single key "distractors" containing a list of exactly 3 strings."""
+Provide a JSON object with a single key "distractors" containing a list of exactly 4 strings."""
 
 
-def generate_distractors(row: pd.Series, paper_content: str) -> list | None:
-    """Generate 3 hard distractors for a single probe."""
+def generate_distractors(row: pd.Series) -> list | None:
+    """Generate 4 hard distractors for a single probe using subsection context."""
     target = str(row['target']).strip()
     probe = str(row['probe']).strip()
     source = str(row.get('raw_knowledge_statement', row.get('fact', ''))).strip()
+    subsection = str(row.get('subsection_text', '')).strip()
 
     prompt = {
         'system': DISTRACTOR_PROMPT,
-        'user': (f"### Paper Text (for sourcing plausible distractors)\n{paper_content}\n\n"
+        'user': (f"### Subsection Text (for sourcing plausible distractors)\n{subsection}\n\n"
                  f"### Probe Statement\n{probe}\n\n"
                  f"### Correct Answer\n{target}\n\n"
                  f"### Source Sentence\n{source}")
@@ -120,11 +127,11 @@ def generate_distractors(row: pd.Series, paper_content: str) -> list | None:
 
     try:
         response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='medium',
-                                    system_prompt_included=True, return_json=True, max_tokens=500)
+                                    system_prompt_included=True, return_json=True, max_tokens=600)
         data = json.loads(response) if isinstance(response, str) else response
         distractors = data.get('distractors', [])
-        if isinstance(distractors, list) and len(distractors) >= 3:
-            return distractors[:3]
+        if isinstance(distractors, list) and len(distractors) >= 4:
+            return distractors[:4]
     except Exception as e:
         print(f"Error generating distractors: {e}")
     return None
@@ -134,7 +141,7 @@ def generate_distractors(row: pd.Series, paper_content: str) -> list | None:
 # Step 2: Verify single correct answer
 # ─────────────────────────────────────────────────────────────
 
-VERIFY_PROMPT = r"""You will be given a fill-in-the-blank statement and 4 answer options (A-D). One is the intended correct answer.
+VERIFY_PROMPT = r"""You will be given a fill-in-the-blank statement and 5 answer options (A-E). One is the intended correct answer.
 
 Check:
 1. Is the intended answer clearly correct given the statement?
@@ -151,7 +158,7 @@ def verify_mcqa(probe: str, target: str, distractors: list) -> bool:
     """Verify the MCQA has exactly one correct answer."""
     options = [target] + distractors
     random.shuffle(options)
-    labels = ['(A)', '(B)', '(C)', '(D)']
+    labels = ['(A)', '(B)', '(C)', '(D)', '(E)']
     formatted = probe + '\n' + '\n'.join(f"{labels[i]} {opt}" for i, opt in enumerate(options))
 
     correct_label = labels[options.index(target)]
@@ -181,7 +188,7 @@ def format_mcqa_row(row: pd.Series, distractors: list) -> dict:
 
     options = [target] + distractors
     random.shuffle(options)
-    labels = ['(A)', '(B)', '(C)', '(D)']
+    labels = ['(A)', '(B)', '(C)', '(D)', '(E)']
 
     correct_label = labels[options.index(target)]
     formatted_options = [f"{labels[i]} {opt}" for i, opt in enumerate(options)]
@@ -196,6 +203,7 @@ def format_mcqa_row(row: pd.Series, distractors: list) -> dict:
         'option_b': options[1],
         'option_c': options[2],
         'option_d': options[3],
+        'option_e': options[4],
         'distractors': json.dumps(distractors),
         'fact': row.get('fact', ''),
         'raw_knowledge_statement': row.get('raw_knowledge_statement', ''),
@@ -207,8 +215,8 @@ def format_mcqa_row(row: pd.Series, distractors: list) -> dict:
 # Main pipeline
 # ─────────────────────────────────────────────────────────────
 
-def process_domain(domain: str, probe_type: str, probe_version: str, paper_content: str,
-                   skip_filtering: bool = False):
+def process_domain(domain: str, probe_type: str, probe_version: str,
+                   output_version: str, skip_filtering: bool = False):
     """Convert probes for a single domain to MCQA."""
     base = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
     input_path = os.path.join(base, f'data/probes/{probe_type}/{domain}/probes_{probe_version}.csv')
@@ -218,7 +226,11 @@ def process_domain(domain: str, probe_type: str, probe_version: str, paper_conte
         return
 
     df = pd.read_csv(input_path)
-    print(f"Loaded {len(df)} probes from {input_path}")
+    total_input = len(df)
+    print(f"Loaded {total_input} probes from {input_path}")
+
+    output_dir = os.path.join(base, f'data/probes/{probe_type}/{domain}/')
+    os.makedirs(output_dir, exist_ok=True)
 
     # Step 0: Filter probes for MCQA suitability
     if not skip_filtering:
@@ -242,11 +254,9 @@ def process_domain(domain: str, probe_type: str, probe_version: str, paper_conte
         suitable_mask = [r['suitable'] if r else False for r in filter_results]
         rejected = [(i, r['reason']) for i, r in enumerate(filter_results) if r and not r['suitable']]
 
-        output_dir = os.path.join(base, f'data/probes/{probe_type}/{domain}/')
-        os.makedirs(output_dir, exist_ok=True)
-        filter_debug_path = os.path.join(output_dir, f'mcqa_filter_{probe_version}.txt')
+        filter_debug_path = os.path.join(output_dir, f'mcqa_filter_{output_version}.txt')
         with open(filter_debug_path, 'w') as f:
-            f.write(f"MCQA Suitability Filter — {domain} ({probe_type} {probe_version})\n")
+            f.write(f"MCQA Suitability Filter — {domain} ({probe_type} {probe_version} → {output_version})\n")
             f.write(f"{'='*60}\n")
             f.write(f"Total probes: {len(df)}\n")
             f.write(f"Suitable: {sum(suitable_mask)}\n")
@@ -266,13 +276,24 @@ def process_domain(domain: str, probe_type: str, probe_version: str, paper_conte
             print("No probes passed MCQA suitability filter. Exiting.")
             return
 
+    # Save filtered probes as the new version
+    filtered_path = os.path.join(output_dir, f'probes_{output_version}.csv')
+    df.to_csv(filtered_path, index=False)
+    print(f"Saved {len(df)} filtered probes to {filtered_path}")
+
+    readable_path = os.path.join(output_dir, f'probes_{output_version}_readable.txt')
+    with open(readable_path, 'w') as f:
+        for _, row in df.iterrows():
+            f.write(f"{row['probe']}: {str(row['target']).lstrip()}\n")
+    print(f"Saved readable probes to {readable_path}")
+
     # Step 1: Generate distractors in parallel
     print("Generating distractors...")
     distractor_results = [None] * len(df)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
         future_to_idx = {
-            executor.submit(generate_distractors, row, paper_content): idx
+            executor.submit(generate_distractors, row): idx
             for idx, (_, row) in enumerate(df.iterrows())
         }
         for future in tqdm(concurrent.futures.as_completed(future_to_idx),
@@ -320,46 +341,32 @@ def process_domain(domain: str, probe_type: str, probe_version: str, paper_conte
 
     mcqa_df = pd.DataFrame(mcqa_rows)
 
-    # Save
-    output_dir = os.path.join(base, f'data/probes/{probe_type}/{domain}/')
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, f'probes_{probe_version}_mcqa.csv')
+    # Save MCQA
+    output_path = os.path.join(output_dir, f'probes_{output_version}_mcqa.csv')
     mcqa_df.to_csv(output_path, index=False)
     print(f"Saved {len(mcqa_df)} MCQA probes to {output_path}")
 
     # Save metrics
-    metrics_path = os.path.join(output_dir, f'mcqa_metrics_{probe_version}.txt')
+    metrics_path = os.path.join(output_dir, f'mcqa_metrics_{output_version}.txt')
     with open(metrics_path, 'w') as f:
-        f.write(f"MCQA Conversion Metrics - {domain} ({probe_type} {probe_version})\n")
+        f.write(f"MCQA Conversion Metrics - {domain} ({probe_type} {probe_version} → {output_version})\n")
         f.write(f"{'='*60}\n")
-        f.write(f"Probes after MCQA filter: {len(df)}\n")
+        f.write(f"Input probes ({probe_version}): {total_input}\n")
+        f.write(f"Probes after MCQA filter ({output_version}): {len(df)}\n")
         f.write(f"Distractors generated: {len(valid_pairs)}\n")
         f.write(f"Passed verification: {len(verified_pairs)}\n")
         f.write(f"Conversion rate: {100*len(verified_pairs)/len(df):.1f}%\n")
     print(f"Saved metrics to {metrics_path}")
 
 
-def load_paper_content(domain: str) -> str:
-    """Load the source paper/document for a domain."""
-    base = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-
-    # Try arxiv first, then legal, then medical
-    for subdir, ext in [('arxiv/cleaned', '.tex'), ('legal/cleaned', '.txt'), ('medical/cleaned', '.txt')]:
-        path = os.path.join(base, f'data/{subdir}/{domain}{ext}')
-        if os.path.exists(path):
-            with open(path, 'r', encoding='utf-8') as f:
-                return f.read()
-
-    print(f"Warning: could not find source text for domain '{domain}'")
-    return ""
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Convert existing probes to MCQA format.')
     parser.add_argument('--probe_type', type=str, default='facts',
                         help='Probe type directory (e.g., facts, inference)')
-    parser.add_argument('--probe_version', type=str, default='v9',
-                        help='Probe version (e.g., v9, v7)')
+    parser.add_argument('--probe_version', type=str, default='v10',
+                        help='Input probe version (e.g., v10, v9)')
+    parser.add_argument('--output_version', type=str, default='v11',
+                        help='Output version for filtered probes and MCQA (e.g., v11)')
     parser.add_argument('--filter', type=str, default=None,
                         help='Only process domains containing this string.')
     parser.add_argument('--skip_filtering', action='store_true',
@@ -386,6 +393,6 @@ if __name__ == '__main__':
 
     for domain in domains:
         print(f"\n{'='*20} {domain} {'='*20}")
-        paper_content = load_paper_content(domain)
-        process_domain(domain, args.probe_type, args.probe_version, paper_content,
+        process_domain(domain, args.probe_type, args.probe_version,
+                       output_version=args.output_version,
                        skip_filtering=args.skip_filtering)

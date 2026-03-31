@@ -117,21 +117,22 @@ def check_tokenizer_consistency(df: pd.DataFrame, tokenizer: PreTrainedTokenizer
     print(f"Total samples: {len(contexts)}")
     return string_mismatches == 0 and token_mismatches == 0
 
-def process_papers(process_function, paper_directory: str, file_filter: str = None, **kwargs):
+def process_papers(process_function, paper_directory: str, file_filter: str = None, extension: str = '.tex', **kwargs):
     """
     Iterates through cleaned papers in a directory and runs a processing function on each.
-    
+
     Args:
         process_function: A function that takes (paper_name, paper_content, **kwargs) as arguments.
-        paper_directory: The directory containing the .tex files.
+        paper_directory: The directory containing the source files.
         file_filter: An optional string. If provided, only filenames containing this string will be processed.
+        extension: File extension to look for (default: '.tex'). Use '.txt' for legal/medical domains.
         **kwargs: Additional keyword arguments to pass to the process_function.
     """
     for filename in sorted(os.listdir(paper_directory)):
-        if filename.endswith(".tex"):
+        if filename.endswith(extension):
             if file_filter and file_filter not in filename:
                 continue
-            paper_name = filename.replace('.tex', '')
+            paper_name = filename.replace(extension, '')
             print(f"\n{'='*20} Processing {paper_name} {'='*20}")
             file_path = os.path.join(paper_directory, filename)
             with open(file_path, 'r', encoding='utf-8') as f:

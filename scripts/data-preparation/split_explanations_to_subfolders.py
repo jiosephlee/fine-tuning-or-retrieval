@@ -32,9 +32,13 @@ def split_textbook(explanations_dir):
         import json
         with open(outline_path) as f:
             outline = json.load(f)
-        if isinstance(outline, dict) and "outline" in outline:
-            outline = outline["outline"]
-        chapter_titles = [ch["chapter_title"] for ch in outline]
+        if isinstance(outline, dict):
+            if "outline" in outline:
+                outline = outline["outline"]
+            elif "sections" in outline:
+                outline = outline["sections"]
+        # Support both chapter_title (arxiv/legal) and section_title (medical)
+        chapter_titles = [ch.get("chapter_title") or ch.get("section_title") for ch in outline]
     else:
         # Fallback: find lines that look like chapter titles (non-# lines between sections)
         chapter_titles = []

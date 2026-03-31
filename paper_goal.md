@@ -48,7 +48,7 @@ The paper uses a controlled domain-adaptation setup based on recent arXiv papers
 
 ### Domains
 
-The main domains in this repo are six CS papers:
+The original domains in this repo are six CS papers:
 
 - `DPO`
 - `1_58`
@@ -58,6 +58,13 @@ The main domains in this repo are six CS papers:
 - `QLoRA`
 
 These papers are treated as compact, self-contained knowledge domains.
+
+The project has since expanded beyond CS to include two additional domains:
+
+- **Legal** — Appellate opinions from U.S. Courts of Appeals (12 opinions). Source documents are plain text (not LaTeX).
+- **Medical** — Medical case reports. Source documents are plain text (not LaTeX).
+
+The legal and medical domains follow the same experimental methodology (auxiliary views, probes, CPT) but use domain-adapted data pipelines that remove LaTeX-specific processing steps and use domain-appropriate prompts and document structure parsing.
 
 ### Training Materials Per Domain
 

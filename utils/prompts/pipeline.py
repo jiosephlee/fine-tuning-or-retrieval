@@ -11,7 +11,7 @@ FACT_PROBE_CLOZE_PROMPT_SYSTEM = r"""You will be given a question and its corres
     - Again, please preserve all of the context that was present in the original question. 
     - Again, feel free to use multiple sentences to preserve the context to avoid overly verbose sentences.
 - Do not leak the answer in the middle of the statement. The answer should only appear once, at the very end.
-- Double check that the statement flows well and consider restructuring the statement if it doesn’t.
+- Double check that the statement flows well and restructure the statement if it doesn’t.
 
 ### Demonstration
 Question: Within the theoretical section of the paper "...", the projection operator f normalizes the reward function by subtracting a term involving the policy’s partition function. Which function is used for this normalization?

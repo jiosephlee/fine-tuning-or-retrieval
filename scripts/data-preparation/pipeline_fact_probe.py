@@ -129,7 +129,7 @@ Here are guidelines as you segment the text:
             prompt = {}
             prompt['system'] = extraction_prompt
             prompt['user'] = f"""{subsection_text}"""
-            return utils.query_llm(prompt, model='gpt-5.4', reasoning_effort='low')
+            return utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='medium')
         
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
@@ -458,48 +458,34 @@ Respond with JSON format with the following key:
     """Given the original, source sentences from the paper, we break each sentence into the parts that presents a new fact."""
 
     def extract_context_and_sentence(row):
-        # Extract context: everything before the sentence + the sentence's paragraph
-        # + one additional paragraph after for surrounding context
-        parts = row['subsection_text'].strip().split(row['raw_knowledge_statement'].strip())
-        context_before = parts[0]
+        full_text = row['subsection_text'].strip()
+        statement = row['raw_knowledge_statement'].strip()
+        idx = full_text.find(statement)
 
-        if len(parts) > 1:
-            remaining_text = parts[1]
-            # Include the rest of the current paragraph
-            paragraph_end = remaining_text.find('\n\n')
-            if paragraph_end != -1:
-                rest_of_paragraph = remaining_text[:paragraph_end]
-                # Also include one more paragraph after for additional context
-                after_paragraph = remaining_text[paragraph_end:].lstrip('\n')
-                next_paragraph_end = after_paragraph.find('\n\n')
-                if next_paragraph_end != -1:
-                    extra_context = after_paragraph[:next_paragraph_end]
-                else:
-                    extra_context = after_paragraph
-                context = context_before + row['raw_knowledge_statement'].strip() + rest_of_paragraph + '\n\n' + extra_context
-            else:
-                rest_of_paragraph = remaining_text
-                context = context_before + row['raw_knowledge_statement'].strip() + rest_of_paragraph
-        else:
-            context = context_before
+        if idx == -1:
+            return statement
 
-        # Remove title line if present
-        if context.startswith('\\title{'):
-            lines = context.split('\n')
-            title_end = 0
-            for i, line in enumerate(lines):
-                if '}' in line:
-                    title_end = i + 1
-                    break
-            context = '\n'.join(lines[title_end:]).strip()
+        text_before = full_text[:idx]
+        text_after = full_text[idx + len(statement):]
+
+        words_before = text_before.split()
+        prev_words = ' '.join(words_before[-50:]) if len(words_before) > 50 else ' '.join(words_before)
+
+        words_after = text_after.split()
+        next_words = ' '.join(words_after[:50]) if len(words_after) > 50 else ' '.join(words_after)
+
+        context = prev_words + ' ' + statement + ' ' + next_words
+        context = context.strip()
+        context = '... ' + context + ' ...'
+
         return context
     
     def extract_atomic_facts(first_row):
         """Extract atomic facts from a paragraph using LLM."""
         prompt = {}
-        prompt['system'] = r"""You will be given two inputs, a section of an academic paper for context and a single sentence drawn from that section. Papers often interweave various pieces of knowledge together in academic writing. While each sentence is interwoven with others, there is atomic knowledge that can be extracted from a particular sentence. Write questions that tests for this atomic knowledge. Specifically, your task is to extract questions from the provided sentence with clear answers. 
+        prompt['system'] = r"""You will be given two inputs, a section of an academic paper for context and a single sentence drawn from that section. Papers often interweave various pieces of knowledge together in academic writing. While each sentence is interwoven with others, there is atomic knowledge that can be extracted from a particular sentence. Write questions that tests for this atomic knowledge.
    
-Extract 1-2 questions from the sentence. If the sentence truly has lots of facts, extract up to 3 questions.
+Extract 1-2 questions from the sentence. If the sentence has lots of facts, extract up to 3 questions.
   
 ### Detailed Instructions
 Consider these instructions as you extract each question:
@@ -584,7 +570,7 @@ Think carefully and critically through this task, following the step-by-step ins
         
         context = extract_context_and_sentence(first_row)
         prompt['user'] = f"""### Title\n{first_row['title']}\n### Context\n{context}\n\n### Sentence\n{first_row['raw_knowledge_statement'].strip()}"""
-        output1 = utils.query_llm(prompt, model='gpt-5.4', reasoning_effort='medium')   
+        output1 = utils.query_llm(prompt, model='gpt-5.4', reasoning_effort='low')   
 
         json_parse_prompt['user'] = output1
         try:
@@ -618,7 +604,7 @@ Think carefully and critically through this task, following the step-by-step ins
             all_contextualized.append(output2_individual)
 
             cloze_prompt['user'] = f"""### Question and Answer\n{output2_individual}"""
-            output3_individual = utils.query_llm(cloze_prompt, system_prompt_included=True, model='gpt-5.4', reasoning_effort='medium', return_json=True)
+            output3_individual = utils.query_llm(cloze_prompt, system_prompt_included=True, model='gpt-5.4-mini', reasoning_effort='medium', return_json=True)
             try:
                 cloze_pair = json.loads(output3_individual)
                 if isinstance(cloze_pair, dict) and 'answer' in cloze_pair and 'statement' in cloze_pair:
