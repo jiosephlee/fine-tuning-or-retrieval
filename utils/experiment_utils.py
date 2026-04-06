@@ -7,8 +7,8 @@ from utils import llm_configs
 from utils import probe_paths
 
 
-def get_all_domains(facts_root: str = '../../data/probes/facts') -> List[str]:
-    if facts_root != '../../data/probes/facts':
+def get_all_domains(facts_root: str | None = None) -> List[str]:
+    if facts_root is not None:
         if not os.path.isdir(facts_root):
             return []
         return [name for name in os.listdir(facts_root) if os.path.isdir(os.path.join(facts_root, name))]

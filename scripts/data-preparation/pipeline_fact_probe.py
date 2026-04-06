@@ -16,12 +16,13 @@ import os
 import argparse
 from utils.pipeline import save_df_for_debugging, is_text_in_document, check_tokenizer_consistency, process_papers
 from utils.prompts.pipeline import FACT_PROBE_CLOZE_PROMPT_SYSTEM
+from utils import probe_paths
 
 
 def generate_probes_for_paper(paper_name, paper_content, sample=False):
     paper = paper_content
 
-    checkpoint_dir = f'../../data/probes/facts/{paper_name}/checkpoints/'
+    checkpoint_dir = str(probe_paths.resolve_probe_dir('facts', paper_name) / 'checkpoints')
     checkpoint_path = os.path.join(checkpoint_dir, '07_knowledge_kept.csv')
 
     if os.path.exists(checkpoint_path):
@@ -994,7 +995,7 @@ Return a JSON object:
         print(f"  Total probes after recovery: {total_after_recovery}")
 
     # Save filtering metrics report
-    output_dir = f'../../data/probes/facts/{paper_name}/'
+    output_dir = str(probe_paths.resolve_probe_dir('facts', paper_name))
     os.makedirs(output_dir, exist_ok=True)
     metrics_path = os.path.join(output_dir, 'filtering_metrics_v10.txt')
     with open(metrics_path, 'w') as f:

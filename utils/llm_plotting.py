@@ -6,6 +6,7 @@ import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 import textwrap
 import re
+from utils import probe_paths
 
 
 def set_plot_style():
@@ -65,15 +66,13 @@ def generate_revamped_plots(domain: str, knowledge_probes_version: str, inferenc
     loss_df = pd.read_csv(training_loss_path) if os.path.exists(training_loss_path) else pd.DataFrame()
 
     # Knowledge Probes CSV for facts and sections
-    if knowledge_probes_version == 'v8' or knowledge_probes_version == 'v9':
-        knowledge_probes_path = f'../../data/probes/facts/{domain}/probes_{knowledge_probes_version}.csv'
-    else:
-        knowledge_probes_path = f'../../data/probes/facts/{domain}/{domain}_knowledge_probes_{knowledge_probes_version}.csv'
+    knowledge_probes_path = str(probe_paths.resolve_knowledge_probe_path(domain, knowledge_probes_version))
     knowledge_probes_csv = pd.read_csv(knowledge_probes_path) if os.path.exists(knowledge_probes_path) else pd.DataFrame()
     
     # Inference Probes CSV for facts
-    path1 = f'../../data/probes/inference/{domain}/probes_{inference_probes_version}.csv'
-    path2 = f'../../data/probes/inference/{domain}/{domain.lower()}_high_level_probes_{inference_probes_version}.csv'
+    path1, path2 = [
+        str(path) for path in probe_paths.resolve_inference_probe_candidates(domain, inference_probes_version)
+    ]
     if os.path.exists(path1):
         inference_probes_path = path1
     elif os.path.exists(path2):

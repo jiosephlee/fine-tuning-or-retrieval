@@ -4,10 +4,11 @@ import pandas as pd
 import string
 from transformers import PreTrainedTokenizer
 import difflib
+from utils import probe_paths
 
 def get_debug_dir(probe_type: str, paper_name: str) -> str:
     """Constructs the path to the debugging directory for a given probe type and paper."""
-    return f'../../data/probes/{probe_type}/{paper_name}/debugging'
+    return str(probe_paths.resolve_probe_dir(probe_type, paper_name) / 'debugging')
 
 def save_df_for_debugging(df: pd.DataFrame, filename: str, probe_type: str, paper_name: str, columns_to_save: list):
     """Saves specified columns of a DataFrame to a text file for debugging."""

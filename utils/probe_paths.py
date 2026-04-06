@@ -6,8 +6,12 @@ from typing import Iterable, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_PROBES_ROOT = PROJECT_ROOT / "probes"
-LEGACY_PROBES_ROOT = PROJECT_ROOT / "data" / "probes"
 SUPPORTED_SOURCES = ("arxiv", "legal", "medical")
+
+
+def _version_number(version: str) -> int:
+    digits = "".join(ch for ch in version if ch.isdigit())
+    return int(digits) if digits else 0
 
 
 def _candidate_domain_locations(source: str, domain: str) -> Iterable[Path]:
@@ -35,15 +39,8 @@ def canonical_probe_dir(probe_kind: str, domain: str, domain_source: Optional[st
     return CANONICAL_PROBES_ROOT / source / domain / probe_kind
 
 
-def legacy_probe_dir(probe_kind: str, domain: str) -> Path:
-    return LEGACY_PROBES_ROOT / probe_kind / domain
-
-
 def resolve_probe_dir(probe_kind: str, domain: str, domain_source: Optional[str] = None) -> Path:
-    canonical = canonical_probe_dir(probe_kind, domain, domain_source)
-    if canonical.exists():
-        return canonical
-    return legacy_probe_dir(probe_kind, domain)
+    return canonical_probe_dir(probe_kind, domain, domain_source)
 
 
 def get_all_domains_from_probe_kind(probe_kind: str = "facts") -> List[str]:
@@ -58,18 +55,12 @@ def get_all_domains_from_probe_kind(probe_kind: str = "facts") -> List[str]:
                 if (domain_dir / probe_kind).exists():
                     domains.add(domain_dir.name)
 
-    legacy_root = LEGACY_PROBES_ROOT / probe_kind
-    if legacy_root.exists():
-        for domain_dir in legacy_root.iterdir():
-            if domain_dir.is_dir():
-                domains.add(domain_dir.name)
-
     return sorted(domains)
 
 
 def resolve_knowledge_probe_path(domain: str, version: str, domain_source: Optional[str] = None) -> Path:
     base_dir = resolve_probe_dir("facts", domain, domain_source)
-    if version[-1].isdigit() and int(version[-1]) >= 8:
+    if _version_number(version) >= 8:
         return base_dir / f"probes_{version}.csv"
     return base_dir / f"{domain}_knowledge_probes_{version}.csv"
 

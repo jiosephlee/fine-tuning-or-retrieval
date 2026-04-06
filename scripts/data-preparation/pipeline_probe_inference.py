@@ -15,6 +15,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 import utils.utils as utils
 from utils.pipeline import save_df_for_debugging, save_debug_file, is_text_in_document, process_papers, check_tokenizer_consistency
 from utils.prompts.pipeline import FACT_PROBE_CLOZE_PROMPT_SYSTEM_TWO
+from utils import probe_paths
 
 def parse_paper_structure(text):
     """Parse paper into sections, subsections and paragraphs with metadata."""
@@ -428,7 +429,7 @@ def process_paper(paper_name: str, paper_content: str, add_on_mode: bool = False
     tokenizer = AutoTokenizer.from_pretrained("allenai/OLMo-2-0425-1B")
     check_tokenizer_consistency(cloze_df, tokenizer)
 
-    output_dir = f'../../data/probes/inference/{paper_name}/'
+        output_dir = str(probe_paths.resolve_probe_dir('inference', paper_name))
     os.makedirs(output_dir, exist_ok=True)
 
     # Save filtering metrics report
