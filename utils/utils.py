@@ -22,6 +22,21 @@ else:
     client_safe = None
 
 
+def _sanitize_for_json_payload(value):
+    """Recursively sanitize values before sending to the OpenAI JSON payload."""
+    if isinstance(value, str):
+        # Remove null bytes and unpaired surrogate code points that can break JSON parsing.
+        return "".join(
+            ch for ch in value
+            if ch != "\x00" and not (0xD800 <= ord(ch) <= 0xDFFF)
+        )
+    if isinstance(value, list):
+        return [_sanitize_for_json_payload(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _sanitize_for_json_payload(v) for k, v in value.items()}
+    return value
+
+
 def query_llm(prompt, max_tokens=1000, temperature=0, top_p=0, max_try_num=10, model="gpt-4o-mini", debug=False, return_json=False, json_schema=None, logprobs=False, system_prompt_included=True, is_hippa=False, reasoning_effort=None):
     if debug:
         if system_prompt_included:
@@ -75,6 +90,7 @@ def query_gpt(prompt: str | dict, model: str = 'gpt-4.1-mini', max_tokens: int =
         ]
     else:
         messages = [{"role": "user", "content": prompt}]
+    messages = _sanitize_for_json_payload(messages)
     if 'gpt-5' in model:
         api_params = {
             "model": model,

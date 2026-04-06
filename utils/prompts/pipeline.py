@@ -23,6 +23,50 @@ Statement: Within the theoretical section of the paper "...", the projection ope
 Return a single JSON object with two keys: "answer" (must be unchanged from the input) and "statement".
 e.g. {"answer": "...", "statement": "..."}"""
 
+FACT_PROBE_CLOZE_PROMPT_SYSTEM_MEDICAL = r"""You will be given a question and its corresponding answer from a medical case report. Convert them into a single declarative cloze statement where the answer appears only at the very end.
+
+### Instructions
+- The statement should be declarative (not a question) and should read naturally.
+- Keep all clinically relevant context from the question (timepoint, test, treatment phase, diagnosis context).
+- Preserve medical detail exactly (units, abbreviations, value formatting, day numbers, qualifiers).
+- Do NOT infer, correct, or add medical facts beyond the provided question/answer.
+- Keep the answer unchanged and place it only once, at the very end of the statement.
+- Do not leak the answer earlier in the statement.
+- If the question wording is awkward, rewrite for clarity while preserving meaning.
+
+### Demonstration
+Question: According to the case report "...", what was the patient's serum sodium level on initial laboratory testing?
+Answer: 124 mmol/L
+
+Statement: According to the case report "...", the patient's serum sodium level on initial laboratory testing was 124 mmol/L.
+
+### Output Format
+Return a single JSON object with two keys: "answer" and "statement".
+"answer" must be exactly unchanged from input.
+e.g. {"answer": "...", "statement": "..."}"""
+
+FACT_PROBE_CLOZE_PROMPT_SYSTEM_LEGAL = r"""You will be given a question and its corresponding answer from a legal opinion/case text. Convert them into a single declarative cloze statement where the answer appears only at the very end.
+
+### Instructions
+- The statement should be declarative (not a question) and should read naturally.
+- Preserve legal context needed for disambiguation (court level, procedural posture, issue framing, standard, holding context).
+- Preserve legal text details exactly (party names, doctrine labels, section numbers, citation-like tokens, dates).
+- Do NOT infer, reinterpret, or add legal conclusions beyond the provided question/answer.
+- Keep the answer unchanged and place it only once, at the very end of the statement.
+- Do not leak the answer earlier in the statement.
+- If the question wording is awkward, rewrite for clarity while preserving meaning.
+
+### Demonstration
+Question: In the opinion "...", what standard of review did the court apply to the district court's factual findings?
+Answer: clear error
+
+Statement: In the opinion "...", the standard of review the court applied to the district court's factual findings was clear error.
+
+### Output Format
+Return a single JSON object with two keys: "answer" and "statement".
+"answer" must be exactly unchanged from input.
+e.g. {"answer": "...", "statement": "..."}"""
+
 FACT_PROBE_CLOZE_PROMPT_SYSTEM_TWO = r"""You will be given a question and its corresponding answer. Your task is to convert the question and answer into a cloze statement where the answer appears only at the very end.
 
 ### Instructions

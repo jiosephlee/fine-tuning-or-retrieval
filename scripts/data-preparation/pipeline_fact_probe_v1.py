@@ -562,7 +562,7 @@ For each question:
 10. Refine Question. The rewritten question can be broken up into multiple sentences if the question becomes verbose. Make sure the question is written clearly and grammatically correct. Do not put any of the context in parenthesis or followed after an "i.e.".
 11. Preserve LaTeX formatting. When the question or answer contains mathematical notation, preserve the exact LaTeX syntax from the source, including delimiters. Use $...$ as they appear in the original — do NOT convert to \(...\) or other formats.
 
-Think carefully and critically through this task. Then, provide the final output, listing each question and its corresponding answer."""
+Think carefully and critically through this task. Then, provide the final output, listing the question and its corresponding answer. Make sure to output both."""
         cloze_prompt = {}
         cloze_prompt['system'] = FACT_PROBE_CLOZE_PROMPT_SYSTEM
         json_parse_prompt = {
@@ -655,8 +655,9 @@ For each '(answer, statement)' pair, check the following:
 - Do *NOT* use unnecessary styling commands like '\\displaystyle'.
 - Ensure LaTeX syntax matches the style of the original context (e.g., '( ... )' or '$ ... $').
 
-2. Declarative
+2. Easy to Read & Declarative
 - The statement should be written like a declarative sentence without question marks.
+- The statement should not be overly verbose. It should be concise, without losing any of the context, and flow naturally.
 
 3. Answer Placement
 - The statement must be a COMPLETE sentence that ENDS WITH the answer as its final words.
@@ -666,14 +667,15 @@ For each '(answer, statement)' pair, check the following:
 3. Answer Leakage
 - If the answer appears ONLY ONCE in the statement and it is at the end, there is NO leakage — this is correct.
 - Leakage occurs when the answer, or a semantically equivalent paraphrase of the answer, appears earlier in the statement, giving away the answer before the reader reaches the end.
+- This one is particularly important; please double check that the answer is not leaked earlier in the statement.
 
 ### Output Format (JSON)
 - If the pair already passes ALL checks with no changes needed, return: {"change": false}
-- If any refinement is needed, minimally rewrite and return: {"change": true, "answer": "...", "statement": "..."}
+- If refinement is needed, rewrite and return: {"change": true, "answer": "...", "statement": "..."}
 
 Prefer returning {"change": false}. Only refine if there is a clear, concrete issue. Do not make unnecessary changes."""
         prompt['user'] = f"""### Answer\n{row['answer']}\n\n### Statement\n{row['statement']}"""
-        response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True)
+        response = utils.query_llm(prompt, model='gpt-5.4', reasoning_effort='low', system_prompt_included=True, return_json=True)
         try:
             parsed_response = json.loads(response)
             if not parsed_response.get('change', True):
@@ -695,10 +697,13 @@ Prefer returning {"change": false}. Only refine if there is a clear, concrete is
         prompt['system'] = """Your task is to determine if a given (answer, statement) pair meets quality standards by acting as a filter.
 
 ### Quality Control Checklist
-1. Linguistically Reasonable: Consider the fill-in-the-blank statement. The answer should be linguistically reasonable as to how it would fit in the fill-in-the-blank. It should sound natural and not forced.
-2. Semantically Reasonable: Consider the fill-in-the-blank statement. The answer should be semantically reasonable as to how it would fit in the fill-in-the-blank. There should be one clear, unambiguous answer (or at least paraphrases of the answer).
-3. Answer leakage: The answer should not be leaked in the statement before the answer appears.
-4. Non trivial: The statement should be non-trivial. It should not be plainly obvious from the question itself for someone with no relevant knowledge.
+1. Unnatural and Verbose: The statement should be sensible and easy to read.
+    - The sentence should naturally build towards the answer, which must appear at the end of the sentence.
+    - It should sound natural and not forced. 
+    - The overall sentence should not be overly verbose.
+2. Answer leakage: The answer should not be leaked in the statement before the answer appears.
+    - Leakage occurs when the answer, or a semantically equivalent paraphrase of the answer, appears earlier in the statement, giving away the answer before the reader reaches the end.
+    - This one is particularly important; please double check that the answer is not leaked earlier in the statement.
 
 ### Action
 Based on the checklist, decide if the pair should be kept. Drop the pair if fails one of the checklist items.

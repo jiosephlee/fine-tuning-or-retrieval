@@ -15,7 +15,7 @@ from transformers import AutoTokenizer
 import os
 import argparse
 from utils.pipeline import save_df_for_debugging, is_text_in_document, check_tokenizer_consistency, process_papers
-from utils.prompts.pipeline import FACT_PROBE_CLOZE_PROMPT_SYSTEM
+from utils.prompts.pipeline import FACT_PROBE_CLOZE_PROMPT_SYSTEM_LEGAL
 
 
 def load_case_titles():
@@ -446,36 +446,31 @@ Questions:
 - "What type of securities scheme does the government allege the defendants engaged in?", Answer: "pump and dump"
 """
         contextualize_prompt = {}
-        contextualize_prompt['system'] = r"""You will be given two inputs, a section of a legal document (appellate opinion) for context, a single sentence drawn from that section, and a question extracted from the sentence as well as its corresponding answer. Your task is to then turn the question into a self-contained, precise question. Approach this task step-by-step as outlined below.
+        contextualize_prompt['system'] = r"""You will be given context from a legal opinion, one source sentence, and a question-answer pair extracted from that sentence. Rewrite the question so it is self-contained, clear, and targets one specific piece of knowledge.
 
-While you should use your expertise on this domain to handle and understand these texts, all information written into the questions and answers *MUST* originate from the provided context or sentence. Do not add, infer, or correct information using your internal knowledge. Every detail should be traceable back to the source text. As you write and rewrite the questions, also make sure to accurately represent the knowledge in the original sentence without distortion. Strive to use phrasing as close as possible to the original text, but prioritize clarity and self-containment. The questions should be written clearly so that they are easy to read.
+Use only information from the provided context/sentence. Do not add, infer, or correct facts.
 
 ### Instructions
-The goal of this task is to make the questions clear by incorporating the relevant context. This ensures the question is unambiguous and doesn't require looking back to the source material.
+1. Start the rewritten question with case framing such as:
+   - "In the case \"{case_name}\", ..."
+   - "According to the opinion in \"{case_name}\", ..."
+2. Add only sufficient context to make the question unambiguous.
+3. Do not force or squeeze in extra details. Keep it focused on one target fact and one answer.
+4. Resolve unclear references (e.g., pronouns, "the court", "the statute") only when needed for clarity.
+5. Do not leak the answer in the question.
+6. Keep the answer unchanged (except tiny grammatical adjustments if absolutely necessary).
+7. Keep wording natural and concise; avoid copying the sentence verbatim.
 
-For each question:
-1.  Rewrite the question so that it starts with one of the following templates. Always wrap the case name in double quotes — never use single quotes, asterisks, or underscores around the case name.
-    - "In the case \"{case_name}\", ..."
-    - "According to the opinion in \"{case_name}\", ..."
-    - "In the court's opinion in \"{case_name}\", the court held that..."
-    - "In the court's opinion in \"{case_name}\", the court stated that..."
-    - "According to the court in \"{case_name}\", ..."
-    - "In the court's analysis in \"{case_name}\", ..."
-    - "In \"{case_name}\", the court concluded that..."
-    This is a non-exhaustive list of templates, and you should use your own judgement to choose the most appropriate template or modify the template to fit the sentence.
-2.  Add sufficient context. Specifically, use the *provided context* to supply whatever information is needed to make the question self-contained and unambiguous. For instance, "Did the court find standing?" should be clarified into "In the case '...', did the court find that AFL had Article III standing to challenge OSC's refusal to investigate under section 1216?" if this was in the context of a specific standing challenge. The goal is to ensure someone reading just the question would understand exactly what is being asked without needing additional context.
-3.  Clarify pronouns and referential terms. Check the sentence for pronouns (it, this, that, these, those) or demonstrative phrases (this statute, that holding, these requirements) that refer to entities not explicitly defined within the sentence itself. Search the surrounding context to identify what these terms reference, then incorporate that clarifying information into the question to make it self-contained.
-4.  Clarify Context-Dependent Terms. Named entities (e.g., case names, statute sections, proper nouns) do not need clarification. However, if there are unnamed or context-specific terms (e.g., "the statute", "the court", "the defendant"), clarify their full context.
-5.  Disambiguate legal arguments. There are often numerous legal arguments in an opinion, so supply enough context that the question clearly identifies which argument, claim, or issue it addresses.
-6.  Handle legal abbreviations. If the answer is a common legal abbreviation (e.g., FOIA, OSC, MSPB) and the abbreviation appears frequently in the context, feel free to leave it as an abbreviation without defining it.
-7.  Do not leak the answer. Please make sure that *the answer is not revealed* in the question. The answer should never appear in the question.
-8.  Do not change the answer. Minor grammatical adjustments to the answer are allowed only if necessary to fit the restructured question (e.g., adjusting verb tense, determiners like "the").
-9.  Avoid quoting the source sentence directly in the question.
-10. Refine Question. The rewritten question can be broken up into multiple sentences if the question becomes verbose. Make sure the question is written clearly and grammatically correct. Do not put any of the context in parenthesis or followed after an "i.e.".
+### Output Format
+Return ONLY a single JSON object with exactly two keys:
+{"question": "...", "answer": "..."}
 
-Think carefully and critically through this task, following the step-by-step instructions outlined above. Then, provide the final output, listing each question and its corresponding answer."""
+Requirements for output JSON:
+- "question" must be the rewritten self-contained question.
+- "answer" must match the input answer exactly (except minor, appropriate changes).
+- Do not output markdown, lists, commentary, or extra keys."""
         cloze_prompt = {}
-        cloze_prompt['system'] = FACT_PROBE_CLOZE_PROMPT_SYSTEM
+        cloze_prompt['system'] = FACT_PROBE_CLOZE_PROMPT_SYSTEM_LEGAL
         json_parse_prompt = {
             'system': """You will be given a string containing questions and answers. Convert it into a JSON object with a single key "list_of_questions", which contains a list of objects. Each object in the list should have a "question" and "answer" key. The format should be: {"list_of_questions": [{"question": "...", "answer": "..."}, ...]}. Copy the question and answer content exactly as it appears. Do not modify the text.""",
             'user': ""
@@ -510,18 +505,64 @@ Think carefully and critically through this task, following the step-by-step ins
             question = pair['question']
             answer = pair['answer']
 
-            single_qa_string = f'### Question\n"{question}\n\n###Answer\n"{answer}"'
+            single_qa_string = f"""### Question
+{question}
+
+### Answer
+{answer}"""
 
             contextualize_prompt['user'] = f"""### Case Name\n{first_row['title']}\n### Context\n{context}\n\n### Sentence\n{first_row['raw_knowledge_statement'].strip()}\n\n{single_qa_string}"""
-            output2_individual = utils.query_llm(contextualize_prompt, model='gpt-5.4-mini', reasoning_effort='medium')
-            all_contextualized.append(output2_individual)
+            output2_individual = utils.query_llm(
+                contextualize_prompt,
+                model='gpt-5.4-mini',
+                reasoning_effort='medium',
+                return_json=True
+            )
 
-            cloze_prompt['user'] = f"""### Question and Answer\n{output2_individual}"""
+            try:
+                contextualized_pair = json.loads(output2_individual)
+            except (json.JSONDecodeError, TypeError):
+                print(f"Failed to parse contextualized JSON from: {output2_individual}")
+                continue
+
+            if not isinstance(contextualized_pair, dict):
+                continue
+
+            contextualized_question = str(contextualized_pair.get('question', '')).strip()
+            contextualized_answer = str(contextualized_pair.get('answer', '')).strip()
+
+            if not contextualized_question or not contextualized_answer:
+                continue
+
+            # Aggressive guardrail: preserve the extracted answer exactly to prevent drift.
+            if contextualized_answer != str(answer).strip():
+                contextualized_answer = str(answer).strip()
+
+            # Do not allow answer leakage in the contextualized question.
+            if contextualized_answer and contextualized_answer in contextualized_question:
+                continue
+
+            cloze_prompt['user'] = f"""### Question
+{contextualized_question}
+
+### Answer
+{contextualized_answer}"""
             output3_individual = utils.query_llm(cloze_prompt, system_prompt_included=True, model='gpt-5.4-mini', reasoning_effort='medium', return_json=True)
             try:
                 cloze_pair = json.loads(output3_individual)
                 if isinstance(cloze_pair, dict) and 'answer' in cloze_pair and 'statement' in cloze_pair:
-                    all_clozes.append(cloze_pair)
+                    cloze_answer = str(cloze_pair.get('answer', '')).strip()
+                    cloze_statement = str(cloze_pair.get('statement', '')).strip()
+
+                    if not cloze_answer or not cloze_statement:
+                        continue
+
+                    # Aggressive guardrail: drop if cloze stage changes the answer.
+                    if cloze_answer != contextualized_answer:
+                        continue
+
+                    all_contextualized.append(contextualized_question)
+                    all_clozes.append({'answer': cloze_answer, 'statement': cloze_statement})
             except (json.JSONDecodeError, TypeError):
                 print(f"Failed to parse cloze pair from: {output3_individual}")
 
@@ -608,6 +649,7 @@ Prefer returning {"change": false}. Only refine if there is a clear, concrete is
 2. Semantically Reasonable: Consider the fill-in-the-blank statement. The answer should be semantically reasonable as to how it would fit in the fill-in-the-blank. There should be one clear, unambiguous answer (or at least paraphrases of the answer).
 3. Answer leakage: The answer should not be leaked in the statement before the answer appears.
 4. Non trivial: The statement should be non-trivial. It should not be plainly obvious from the question itself for someone with no relevant knowledge.
+5. Ambiguity: Drop the pair if the blank can reasonably be completed by multiple distinct answers from the statement/context.
 
 ### Action
 Based on the checklist, decide if the pair should be kept. Drop the pair if fails one of the checklist items.
