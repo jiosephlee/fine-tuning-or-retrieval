@@ -15,7 +15,7 @@ from transformers import AutoTokenizer
 import os
 import argparse
 from utils.pipeline import save_df_for_debugging, is_text_in_document, check_tokenizer_consistency, process_papers
-from utils.prompts.pipeline import FACT_PROBE_CLOZE_PROMPT_SYSTEM
+from utils.prompts.pipeline import FACT_PROBE_CLOZE_PROMPT_SYSTEM_MEDICAL
 
 
 def load_case_report_titles():
@@ -328,26 +328,13 @@ Respond with JSON format with the following key:
     # ─────────────────────────────────────────────────────────────
 
     def extract_context_and_sentence(row):
-        full_text = row['subsection_text'].strip()
         statement = row['raw_knowledge_statement'].strip()
-        idx = full_text.find(statement)
+        idx = document.find(statement)
 
         if idx == -1:
             return statement
 
-        text_before = full_text[:idx]
-        text_after = full_text[idx + len(statement):]
-
-        words_before = text_before.split()
-        prev_words = ' '.join(words_before[-50:]) if len(words_before) > 50 else ' '.join(words_before)
-
-        words_after = text_after.split()
-        next_words = ' '.join(words_after[:50]) if len(words_after) > 50 else ' '.join(words_after)
-
-        context = prev_words + ' ' + statement + ' ' + next_words
-        context = context.strip()
-        context = '... ' + context + ' ...'
-
+        context = document[:idx + len(statement)]
         return context
 
     def extract_atomic_facts(first_row):
@@ -355,20 +342,19 @@ Respond with JSON format with the following key:
         prompt = {}
         prompt['system'] = r"""You will be given two inputs, a section of a medical case report for context and a single sentence drawn from that section. Medical writing often interweaves various pieces of knowledge together. While each sentence is interwoven with others, there is atomic knowledge that can be extracted from a particular sentence. Write questions that test for this atomic knowledge.
 
-Extract 1-2 questions from the sentence. If the sentence has lots of facts, extract up to 3 questions.
+Extract 1-2 questions from the sentence.
 
 ### Detailed Instructions
 Consider these instructions as you extract each question:
 - The question should be meaningful, focused on a main fact in the sentence, not a minor detail.
 - The question should be non-trivial and non-obvious. It should not be plainly obvious from the question for someone with no relevant knowledge.
-- The answer to the question MUST be a verbatim word, phrase (2-4 words), or expression copied exactly from the sentence. Capitalization can be adjusted appropriately. Otherwise, do not paraphrase, rephrase, or adjust the answer; it must appear as an exact substring of the sentence.
+- The answer must be a word or compact phrase (2-5 words).
+- The answer to the question MUST be verbatim copied exactly from the sentence. Capitalization can be adjusted appropriately. Otherwise, do not paraphrase, rephrase, or adjust the answer; it must appear as an exact substring of the sentence.
 - The question should have a clear, single answer and *NOT* multiple valid answers.
 - Prefer shorter answers.
 - Each question should be written separately and independently of the other questions; do not reference other questions in the same question.
 
 ### Demonstration 1: Clinical Finding
-Context: "Initial laboratory tests revealed marked hyponatraemia (124 mmol/L), elevated creatine kinase (1349 U/L), aspartate aminotransferase (77 U/L), alanine aminotransferase (64 U/L), C-reactive protein concentration (CRP) (180 mg/L; reference, <3 mg/L) and erythrocyte sedimentation rate (70 mm/hour; reference, <15 mm/hour), with normal renal function."
-
 Sentence: "Initial laboratory tests revealed marked hyponatraemia (124 mmol/L), elevated creatine kinase (1349 U/L), aspartate aminotransferase (77 U/L), alanine aminotransferase (64 U/L), C-reactive protein concentration (CRP) (180 mg/L; reference, <3 mg/L) and erythrocyte sedimentation rate (70 mm/hour; reference, <15 mm/hour), with normal renal function."
 
 Questions:
@@ -383,46 +369,34 @@ Sentence: "According to the International Criteria for Behçet's Disease, he had
 Questions:
 - "According to the International Criteria for Behçet's Disease, what total score indicates definite disease?", Answer: "≥4"
 - "What was the patient's total score according to the International Criteria for Behçet's Disease?", Answer: "five points"
-
-### Demonstration 3: Treatment
-Context: "On day 8, colchicine was started following the diagnosis of systemic BD and acute neuro-BD. Oral aphthous lesions were treated with topical corticosteroid ointment. Genital ulcers and cutaneous lesions were managed with silver sulfadiazine cream."
-
-Sentence: "Genital ulcers and cutaneous lesions were managed with silver sulfadiazine cream."
-
-Questions:
-- "What topical agent was used to manage the patient's genital ulcers and cutaneous lesions?", Answer: "silver sulfadiazine cream"
 """
         contextualize_prompt = {}
-        contextualize_prompt['system'] = r"""You will be given two inputs, a section of a medical case report for context, a single sentence drawn from that section, and a question extracted from the sentence as well as its corresponding answer. Your task is to then turn the question into a self-contained, precise question. Approach this task step-by-step as outlined below.
+        contextualize_prompt['system'] = r"""You will be given context from a medical case report, one source sentence, and a question-answer pair extracted from that sentence. Rewrite the question so it is self-contained, clear, and targets one specific piece of knowledge.
 
-While you should use your expertise on this domain to handle and understand these texts, all information written into the questions and answers *MUST* originate from the provided context or sentence. Do not add, infer, or correct information using your internal knowledge. Every detail should be traceable back to the source text. As you write and rewrite the questions, also make sure to accurately represent the knowledge in the original sentence without distortion. Strive to use phrasing as close as possible to the original text, but prioritize clarity and self-containment. The questions should be written clearly so that they are easy to read.
+Use only information from the provided context/sentence. Do not add, infer, or correct facts.
 
 ### Instructions
-The goal of this task is to make the questions clear by incorporating the relevant context. This ensures the question is unambiguous and doesn't require looking back to the source material.
+1. Start the rewritten question with a case-title framing such as:
+   - "In the case report \"{title}\", ..."
+   - "According to the case report \"{title}\", ..."
+2. Add comprehensive context so the question is self-contained i.e. answerable on its own. Please use multiple sentences to describe the context if the sentence becomes verbose.
+3. Include at least one concrete anchor when available (e.g., timepoint, symptom cluster, exam/lab context, treatment phase) so the question points to one specific fact.
+4. But do not force or squeeze in extra details. Keep it focused on one target fact and one answer.
+5. Resolve unclear references (e.g., pronouns, "the patient", "the finding") only when needed for clarity.
+6. Do not leak the answer in the question.
+7. Keep the answer unchanged (except tiny grammatical adjustments if absolutely necessary).
+8. Keep wording natural and concise; avoid copying the sentence verbatim.
 
-For each question:
-1.  Rewrite the question so that it starts with one of the following templates. Always wrap the case report title in double quotes — never use single quotes, asterisks, or underscores around the title.
-    - "In the case report \"{title}\", ..."
-    - "According to the case report \"{title}\", ..."
-    - "In the case report \"{title}\", the authors describe that..."
-    - "In the case report \"{title}\", the patient presented with..."
-    - "According to the case report \"{title}\", laboratory tests revealed..."
-    - "In the case report \"{title}\", the treatment involved..."
-    - "In the case report \"{title}\", the diagnosis was based on..."
-    This is a non-exhaustive list of templates, and you should use your own judgement to choose the most appropriate template or modify the template to fit the sentence.
-2.  Add sufficient context. Specifically, use the *provided context* to supply whatever information is needed to make the question self-contained and unambiguous. For instance, "What was the sodium level?" should be clarified into "In the case report '...', what was the patient's serum sodium level on initial laboratory testing at admission?" if this was in the context of initial workup. The goal is to ensure someone reading just the question would understand exactly what is being asked without needing additional context.
-3.  Clarify pronouns and referential terms. Check the sentence for pronouns (it, this, that, these, those) or demonstrative phrases (this condition, that treatment, these findings) that refer to entities not explicitly defined within the sentence itself. Search the surrounding context to identify what these terms reference, then incorporate that clarifying information into the question to make it self-contained.
-4.  Clarify Context-Dependent Terms. Named entities (e.g., drug names, disease names, specific tests) do not need clarification. However, if there are unnamed or context-specific terms (e.g., "the patient", "the level", "the medication"), clarify their full context.
-5.  Disambiguate clinical events. There are often numerous investigations, treatments, and timepoints in a case report, so supply enough clinical context that the question clearly identifies which event it addresses.
-6.  Handle medical abbreviations. If the answer is a common medical abbreviation (e.g., CRP, CSF, MRI, BD) and the abbreviation appears frequently in the context, feel free to leave it as an abbreviation without defining it.
-7.  Do not leak the answer. Please make sure that *the answer is not revealed* in the question. The answer should never appear in the question.
-8.  Do not change the answer. Minor grammatical adjustments to the answer are allowed only if necessary to fit the restructured question (e.g., adjusting verb tense, determiners like "the").
-9.  Avoid quoting the source sentence directly in the question.
-10. Refine Question. The rewritten question can be broken up into multiple sentences if the question becomes verbose. Make sure the question is written clearly and grammatically correct. Do not put any of the context in parenthesis or followed after an "i.e.".
+### Output Format
+Return ONLY a single JSON object with exactly two keys:
+{"question": "...", "answer": "..."}
 
-Think carefully and critically through this task, following the step-by-step instructions outlined above. Then, provide the final output, listing each question and its corresponding answer."""
+Requirements for output JSON:
+- "question" must be the rewritten self-contained question.
+- "answer" must match the input answer exactly (except minor, appropriate changes).
+- Do not output markdown, lists, commentary, or extra keys."""
         cloze_prompt = {}
-        cloze_prompt['system'] = FACT_PROBE_CLOZE_PROMPT_SYSTEM
+        cloze_prompt['system'] = FACT_PROBE_CLOZE_PROMPT_SYSTEM_MEDICAL
         json_parse_prompt = {
             'system': """You will be given a string containing questions and answers. Convert it into a JSON object with a single key "list_of_questions", which contains a list of objects. Each object in the list should have a "question" and "answer" key. The format should be: {"list_of_questions": [{"question": "...", "answer": "..."}, ...]}. Copy the question and answer content exactly as it appears. Do not modify the text.""",
             'user': ""
@@ -457,18 +431,64 @@ Think carefully and critically through this task, following the step-by-step ins
             question = pair['question']
             answer = pair['answer']
 
-            single_qa_string = f'### Question\n"{question}\n\n###Answer\n"{answer}"'
+            single_qa_string = f"""### Question
+{question}
+
+### Answer
+{answer}"""
 
             contextualize_prompt['user'] = f"""### Case Report Title\n{first_row['title']}\n### Context\n{context}\n\n### Sentence\n{first_row['raw_knowledge_statement'].strip()}\n\n{single_qa_string}"""
-            output2_individual = utils.query_llm(contextualize_prompt, model='gpt-5.4-mini', reasoning_effort='medium')
-            all_contextualized.append(output2_individual)
+            output2_individual = utils.query_llm(
+                contextualize_prompt,
+                model='gpt-5.4-mini',
+                reasoning_effort='medium',
+                return_json=True
+            )
 
-            cloze_prompt['user'] = f"""### Question and Answer\n{output2_individual}"""
+            try:
+                contextualized_pair = json.loads(output2_individual)
+            except (json.JSONDecodeError, TypeError):
+                print(f"Failed to parse contextualized JSON from: {output2_individual}")
+                continue
+
+            if not isinstance(contextualized_pair, dict):
+                continue
+
+            contextualized_question = str(contextualized_pair.get('question', '')).strip()
+            contextualized_answer = str(contextualized_pair.get('answer', '')).strip()
+
+            if not contextualized_question or not contextualized_answer:
+                continue
+
+            # Aggressive guardrail: preserve the extracted answer exactly to prevent drift.
+            if contextualized_answer != str(answer).strip():
+                contextualized_answer = str(answer).strip()
+
+            # Do not allow answer leakage in the contextualized question.
+            if contextualized_answer and contextualized_answer in contextualized_question:
+                continue
+
+            cloze_prompt['user'] = f"""### Question
+{contextualized_question}
+
+### Answer
+{contextualized_answer}"""
             output3_individual = utils.query_llm(cloze_prompt, system_prompt_included=True, model='gpt-5.4-mini', reasoning_effort='medium', return_json=True)
             try:
                 cloze_pair = json.loads(output3_individual)
                 if isinstance(cloze_pair, dict) and 'answer' in cloze_pair and 'statement' in cloze_pair:
-                    all_clozes.append(cloze_pair)
+                    cloze_answer = str(cloze_pair.get('answer', '')).strip()
+                    cloze_statement = str(cloze_pair.get('statement', '')).strip()
+
+                    if not cloze_answer or not cloze_statement:
+                        continue
+
+                    # Aggressive guardrail: drop if cloze stage changes the answer.
+                    if cloze_answer != contextualized_answer:
+                        continue
+
+                    all_contextualized.append(contextualized_question)
+                    all_clozes.append({'answer': cloze_answer, 'statement': cloze_statement})
             except (json.JSONDecodeError, TypeError):
                 print(f"Failed to parse cloze pair from: {output3_individual}")
 
@@ -511,8 +531,9 @@ For each '(answer, statement)' pair, check the following:
 - Leave numbers as how they are written in the original sentence. e.g. eight should be eight and 8 should be 8.
 - Ensure medical units, abbreviations, and values are preserved accurately.
 
-2. Declarative
+2. Declarative and Natural
 - The statement should be written like a declarative sentence without question marks.
+- The sentence should not be terse or verbose because it's squeezing a lot of context into a single sentence. This should be broken up into multiple sentences.
 
 3. Answer Placement
 - The statement must be a COMPLETE sentence that ENDS WITH the answer as its final words.
@@ -551,13 +572,16 @@ Prefer returning {"change": false}. Only refine if there is a clear, concrete is
         prompt['system'] = """Your task is to determine if a given (answer, statement) pair meets quality standards by acting as a filter.
 
 ### Quality Control Checklist
-1. Linguistically Reasonable: Consider the fill-in-the-blank statement. The answer should be linguistically reasonable as to how it would fit in the fill-in-the-blank. It should sound natural and not forced.
-2. Semantically Reasonable: Consider the fill-in-the-blank statement. The answer should be semantically reasonable as to how it would fit in the fill-in-the-blank. There should be one clear, unambiguous answer (or at least paraphrases of the answer).
-3. Answer leakage: The answer should not be leaked in the statement before the answer appears.
-4. Non trivial: The statement should be non-trivial. It should not be plainly obvious from the question itself for someone with no relevant knowledge.
+1. Unnatural and Verbose: The statement should be sensible and easy to read.
+    - The sentence should naturally build towards the answer, which must appear at the end of the sentence.
+    - It should sound natural and not forced. 
+    - The overall sentence should not be overly verbose.
+2. Answer leakage: The answer should not be leaked in the statement before the answer appears.
+    - Leakage occurs when the answer, or a semantically equivalent paraphrase of the answer, appears earlier in the statement, giving away the answer before the reader reaches the end.
+    - This one is particularly important; please double check that the answer is not leaked earlier in the statement.
 
 ### Action
-Based on the checklist, decide if the pair should be kept. Drop the pair if fails one of the checklist items.
+Based on the checklist, decide if the pair should be kept. Drop the pair if fails one of the checklist items. Lean towards dropping ambiguous cases.
 
 ### Output Format
 Provide your decision as a JSON object with a single boolean key: `{"keep": true}` or `{"keep": false}`."""
@@ -845,7 +869,11 @@ Return a JSON object:
 
 ### Current Answer (not verbatim)
 {row['target']}"""
-        response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True)
+        try:
+            response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='medium', system_prompt_included=True, return_json=True)
+        except Exception as e:
+            print(f"Verbatim recovery failed for row due to API error: {e}")
+            return {'success': False}
         try:
             parsed = json.loads(response)
             return parsed

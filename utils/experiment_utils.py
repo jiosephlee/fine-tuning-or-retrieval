@@ -4,12 +4,15 @@ import pandas as pd
 from typing import Dict, List
 from utils import llm_callbacks
 from utils import llm_configs
+from utils import probe_paths
 
 
 def get_all_domains(facts_root: str = '../../data/probes/facts') -> List[str]:
-    if not os.path.isdir(facts_root):
-        return []
-    return [name for name in os.listdir(facts_root) if os.path.isdir(os.path.join(facts_root, name))]
+    if facts_root != '../../data/probes/facts':
+        if not os.path.isdir(facts_root):
+            return []
+        return [name for name in os.listdir(facts_root) if os.path.isdir(os.path.join(facts_root, name))]
+    return probe_paths.get_all_domains_from_probe_kind("facts")
 
 
 def load_prompts(prompt_files: Dict[str, str], append_eot: bool = False) -> Dict[str, List[Dict[str, str]]]:
@@ -102,13 +105,17 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
         suffix = "_lima" if is_lima else ""
         output_dir_knowledge_probe = os.path.join(args.base_results_dir, args.experiment_name, f"{domain}{suffix}_knowledge_probe")
         os.makedirs(output_dir_knowledge_probe, exist_ok=True)
+        domain_source = domain_sources.get(domain)
 
         # Knowledge probes path
         knowledge_probes_version = args.knowledge_probes_version
-        if int(knowledge_probes_version[-1]) >= 8:
-            knowledge_probe_path = f'../../data/probes/facts/{domain}/probes_{knowledge_probes_version}.csv'
-        else:
-            knowledge_probe_path = f'../../data/probes/facts/{domain}/{domain}_knowledge_probes_{knowledge_probes_version}.csv'
+        knowledge_probe_path = str(
+            probe_paths.resolve_knowledge_probe_path(
+                domain,
+                knowledge_probes_version,
+                domain_source=domain_source,
+            )
+        )
 
         if os.path.exists(knowledge_probe_path):
             knowledge_probe_df = pd.read_csv(knowledge_probe_path)
@@ -137,7 +144,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
 
             # Optional subset-specific test files: test_probes_vX.csv or type_split_test_probes_vX.csv
             if inference_probe_subset in {"test", "type_split_test"}:
-                base_dir = f'../../data/probes/inference/{domain}'
+                base_dir = str(probe_paths.resolve_probe_dir("inference", domain, domain_source))
                 candidate_path = []
                 if inference_probe_subset == "test":
                     candidate_path.append(os.path.join(base_dir, f'train_probes_{inference_probes_version}.csv'))
@@ -170,8 +177,14 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                     callbacks.append(inference_probe_callback)
                     log.info(f"Loaded {len(inference_probe_df)} inference probes from {inference_probe_path}")
             else:
-                path1 = f'../../data/probes/inference/{domain}/probes_{inference_probes_version}.csv'
-                path2 = f'../../data/probes/inference/{domain}/{domain.lower()}_high_level_probes_{inference_probes_version}.csv'
+                path1, path2 = [
+                    str(path)
+                    for path in probe_paths.resolve_inference_probe_candidates(
+                        domain,
+                        inference_probes_version,
+                        domain_source=domain_source,
+                    )
+                ]
 
                 if os.path.exists(path1):
                     inference_probe_path = path1
@@ -222,11 +235,23 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
         if getattr(args, "do_eval", False) is not None:
             if is_lima:
                 prompt_files = {
-                    f'recall_{domain}_QA': f'../../data/probes/generation/{domain}/recall_{domain}_QA.json'
+                    f'recall_{domain}_QA': str(
+                        probe_paths.resolve_generation_prompt_path(
+                            domain,
+                            f'recall_{domain}_QA.json',
+                            domain_source=domain_source,
+                        )
+                    )
                 }
             else:
                 prompt_files = {
-                    f'recall_{domain}': f'../../data/probes/generation/{domain}/recall_{domain}.json'
+                    f'recall_{domain}': str(
+                        probe_paths.resolve_generation_prompt_path(
+                            domain,
+                            f'recall_{domain}.json',
+                            domain_source=domain_source,
+                        )
+                    )
                 }
             domain_prompts = load_prompts(prompt_files, append_eot=is_lima)
             all_generation_prompts.update(domain_prompts)
