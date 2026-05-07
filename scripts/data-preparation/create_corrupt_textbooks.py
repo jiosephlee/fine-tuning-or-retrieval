@@ -7,6 +7,10 @@ from collections import Counter
 
 import pandas as pd
 import string
+import sys
+
+sys.path.append(str(Path(__file__).resolve().parents[2]))
+from utils import probe_paths
 
 # ---------------------------------------------------------------------
 # CONFIG
@@ -17,9 +21,7 @@ EXPLANATIONS_ROOT = Path(
 )
 PROBE_DOMAINS = ["1_58", "GRPO", "QLoRA", "BOFT", "OFT", "DPO"]
 
-PROBES_ROOT = Path(
-    "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/data/probes/inference"
-)
+PROBES_ROOT = probe_paths.resolve_probe_kind_root("inference")
 REPORTS_DIR = Path(
     "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/reports"
 )
@@ -198,7 +200,7 @@ def collect_probe_csv_paths() -> List[Path]:
     """
     csvs: List[Path] = []
     for dom in PROBE_DOMAINS:
-        p = PROBES_ROOT / dom / "probes_v7.csv"
+        p = probe_paths.resolve_probe_path("inference", dom, "v7")
         if p.exists():
             csvs.append(p)
         else:

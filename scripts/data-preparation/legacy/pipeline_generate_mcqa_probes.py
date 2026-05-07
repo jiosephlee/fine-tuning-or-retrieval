@@ -11,6 +11,7 @@ import argparse
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 import utils.utils as utils
+from utils import probe_paths
 
 # 4-shot examples
 FEW_SHOT_EXAMPLES = """Question: In the paper 'Direct Preference Optimization: Your Language Model is Secretly a Reward Model', DPO stands for
@@ -241,9 +242,8 @@ def process_row(row, paper_title, paper_text):
     return None
 
 def process_domain(domain):
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    input_path = os.path.join(base_dir, f'data/probes/inference/{domain}/probes_v7.csv')
-    output_path = os.path.join(base_dir, f'data/probes/inference/{domain}/probes_v7_mcqa.csv')
+    input_path = str(probe_paths.resolve_probe_path("inference", domain, "v7"))
+    output_path = str(probe_paths.resolve_probe_dir("inference", domain) / 'probes_v7_mcqa.csv')
     
     if not os.path.exists(input_path):
         print(f"Input file not found: {input_path}")

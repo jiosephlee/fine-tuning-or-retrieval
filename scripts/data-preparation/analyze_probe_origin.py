@@ -7,6 +7,7 @@ import re
 
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from utils import probe_paths
 
 def load_all_text_from_dir(directory: str, extension: str) -> str:
     """Loads and concatenates all text from files with a given extension in a directory."""
@@ -116,8 +117,8 @@ def analyze_domain(domain: str, project_root: str, probe_type: str):
     
     # --- Load Probe Targets ---
     probe_folder = 'facts' if probe_type == 'knowledge' else 'inference'
-    probes_dir = os.path.join(project_root, 'data/probes', probe_folder, domain)
-    probes_file = find_probe_file(probes_dir, probe_type)
+    probes_dir = probe_paths.resolve_probe_dir(probe_folder, domain)
+    probes_file = find_probe_file(str(probes_dir), probe_type)
     
     if not probes_file:
         print(f"  - No probe CSV file found in {probes_dir}. Skipping.")
@@ -227,7 +228,7 @@ def analyze_domain(domain: str, project_root: str, probe_type: str):
 
     # --- Run Analysis for N-Gram ---
     ngram_results = categorize_probes(is_ngram_in_document)
-    filter_output_path = os.path.join(project_root, 'data/probes', probe_folder, domain, 'filter.json')
+    filter_output_path = str(probe_paths.resolve_filter_path(probe_folder, domain, exact_match=False))
     os.makedirs(os.path.dirname(filter_output_path), exist_ok=True)
     with open(filter_output_path, 'w', encoding='utf-8') as f:
         json.dump(ngram_results, f, indent=2)
@@ -235,7 +236,7 @@ def analyze_domain(domain: str, project_root: str, probe_type: str):
 
     # --- Run Analysis for Exact Match ---
     em_results = categorize_probes(is_exact_match_in_document)
-    filter_em_output_path = os.path.join(project_root, 'data/probes', probe_folder, domain, 'filter_em.json')
+    filter_em_output_path = str(probe_paths.resolve_filter_path(probe_folder, domain, exact_match=True))
     with open(filter_em_output_path, 'w', encoding='utf-8') as f:
         json.dump(em_results, f, indent=2)
     print(f"  - Saved Exact Match filter data to {filter_em_output_path}")
@@ -264,13 +265,13 @@ def main():
     project_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
     
     probe_folder = 'facts' if args.probe_type == 'knowledge' else 'inference'
-    probes_base_dir = os.path.join(project_root, 'data/probes', probe_folder)
-    
-    if not os.path.isdir(probes_base_dir):
+    probes_base_dir = probe_paths.resolve_probe_kind_root(probe_folder)
+
+    if not probes_base_dir.exists():
         print(f"Error: Probe directory not found at '{probes_base_dir}'")
         return
 
-    domains = [d for d in os.listdir(probes_base_dir) if os.path.isdir(os.path.join(probes_base_dir, d))]
+    domains = probe_paths.get_all_domains_from_probe_kind(probe_folder)
     
     all_results = {}
     for domain in sorted(domains):

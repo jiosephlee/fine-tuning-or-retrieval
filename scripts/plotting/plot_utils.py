@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
+from utils import probe_paths
 
 
 # ================================================================
@@ -208,7 +209,7 @@ def aggregate_across_domains(
     split_probes : bool
         If True, annotate each row with its probe origin using ``filter.json``.
     project_root : str
-        Repository root (used to locate ``data/probes/``).
+        Repository root.
     lima : bool
         If True, read from the ``*_lima_*`` probe directories.
 
@@ -251,9 +252,7 @@ def aggregate_across_domains(
 
         if split_probes:
             probe_folder = "inference" if probe_type == "inference" else "facts"
-            filter_path = os.path.join(
-                project_root, "data/probes", probe_folder, domain, "filter.json"
-            )
+            filter_path = str(probe_paths.resolve_filter_path(probe_folder, domain))
             if os.path.exists(filter_path):
                 with open(filter_path, "r") as f:
                     filter_data = json.load(f)
@@ -311,8 +310,8 @@ def load_metrics(
     with_lima : bool
         Append LIMA probe data after the base fine-tuning steps.
     filter_file : str or None
-        Name of a filter JSON inside ``data/probes/{probe_folder}/{domain}/``
-        (e.g. ``"filter.json"`` or ``"filter_em.json"``).  When set,
+        Name of a filter JSON inside the canonical probe directory
+        (e.g. ``"filter.json"`` or ``"filter_em.json"``). When set,
         ``split_probes`` is enabled in ``aggregate_across_domains``.
     exclude_origins : sequence of str or None
         If *filter_file* is set, drop rows whose ``origin`` is in this list

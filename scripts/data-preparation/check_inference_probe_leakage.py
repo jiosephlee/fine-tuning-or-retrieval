@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 import utils.utils as utils
 from utils.pipeline import is_text_in_document
+from utils import probe_paths
 
 def process_file(filepath: str, filename: str, probes: List[str], subfolder: str) -> List[Dict[str, Any]]:
     """
@@ -88,7 +89,7 @@ def process_domain(domain: str, probes_base_dir: str, explanations_base_dir: str
     print(f"Processing domain: {domain}...")
 
     # Load probes
-    probes_file = os.path.join(probes_base_dir, domain, 'probes_v7.csv')
+    probes_file = str(probe_paths.resolve_probe_path("inference", domain, "v7"))
     if not os.path.exists(probes_file):
         print(f"Probes file not found for {domain}, skipping.")
         return domain, []
@@ -173,10 +174,9 @@ def run_analysis(inference_type_filter: str, output_suffix: str):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
 
-    probes_base_dir = os.path.join(project_root, 'data/probes/inference')
     explanations_base_dir = os.path.join(project_root, 'data/arxiv/explanations')
-    
-    domains = [d for d in os.listdir(probes_base_dir) if os.path.isdir(os.path.join(probes_base_dir, d))]
+
+    domains = probe_paths.get_all_domains_from_probe_kind("inference")
     subfolders = ['blogs', 'stackexchange', 'textbooks']
     
     print(f"\n{'='*80}")
@@ -187,7 +187,7 @@ def run_analysis(inference_type_filter: str, output_suffix: str):
 
     # Process domains sequentially, but files within subfolders in parallel
     for domain in domains:
-        domain_name, candidate_pairs = process_domain(domain, probes_base_dir, explanations_base_dir, subfolders, inference_type_filter)
+        domain_name, candidate_pairs = process_domain(domain, "", explanations_base_dir, subfolders, inference_type_filter)
         all_results[domain_name] = candidate_pairs
 
     output_file = os.path.join(project_root, f'results/inference_probe_leakage_{output_suffix}.json')

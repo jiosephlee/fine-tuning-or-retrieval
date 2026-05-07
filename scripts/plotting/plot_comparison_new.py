@@ -48,10 +48,10 @@ DOMAINS = ["1_58", "DPO", "GRPO", "BOFT", "OFT", "QLoRA"]
 
 PROBE_MASTER_CSV = os.path.join(
     PROJECT_ROOT,
-    "data",
     "probes",
-    "inference",
+    "arxiv",
     "BOFT",
+    "inference",
     "probes_v7.csv",
 )
 
@@ -318,7 +318,7 @@ def plot_two_by_two_lex_filtered(
     os.makedirs(out_dir, exist_ok=True)
 
     # Build lexical overlap tables
-    # Inference probes: probes_v7.csv under data/probes/inference
+    # Inference probes: probes_v7.csv under probes/<source>/<domain>/inference
     idf_inf, probe_texts_inf, expl_texts_inf = _build_idf_and_texts(
         PROJECT_ROOT,
         probe_folder="inference",
@@ -327,7 +327,7 @@ def plot_two_by_two_lex_filtered(
     )
     lex_inf = _compute_idf_overlap(idf_inf, probe_texts_inf, expl_texts_inf)
 
-    # Factual / knowledge probes: probes_v9.csv under data/probes/facts
+    # Factual / knowledge probes: probes_v9.csv under probes/<source>/<domain>/facts
     idf_fact, probe_texts_fact, expl_texts_fact = _build_idf_and_texts(
         PROJECT_ROOT,
         probe_folder="facts",

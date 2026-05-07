@@ -43,6 +43,12 @@ def resolve_probe_dir(probe_kind: str, domain: str, domain_source: Optional[str]
     return canonical_probe_dir(probe_kind, domain, domain_source)
 
 
+def resolve_probe_kind_root(probe_kind: str, domain_source: Optional[str] = None) -> Path:
+    if domain_source is None:
+        return CANONICAL_PROBES_ROOT
+    return CANONICAL_PROBES_ROOT / domain_source
+
+
 def get_all_domains_from_probe_kind(probe_kind: str = "facts") -> List[str]:
     domains = set()
 
@@ -83,3 +89,41 @@ def resolve_generation_prompt_path(
     domain_source: Optional[str] = None,
 ) -> Path:
     return resolve_probe_dir("generation", domain, domain_source) / filename
+
+
+def resolve_probe_path(
+    probe_kind: str,
+    domain: str,
+    version: str,
+    domain_source: Optional[str] = None,
+) -> Path:
+    if probe_kind == "facts":
+        return resolve_knowledge_probe_path(domain, version, domain_source)
+    if probe_kind == "inference":
+        candidates = resolve_inference_probe_candidates(domain, version, domain_source)
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
+    return resolve_probe_dir(probe_kind, domain, domain_source) / f"probes_{version}.csv"
+
+
+def resolve_mcqa_probe_path(
+    probe_kind: str,
+    domain: str,
+    version: str,
+    domain_source: Optional[str] = None,
+) -> Path:
+    """Return path to the MCQA variant of a probe CSV, e.g. probes_v11_mcqa.csv."""
+    base_dir = resolve_probe_dir(probe_kind, domain, domain_source)
+    return base_dir / f"probes_{version}_mcqa.csv"
+
+
+def resolve_filter_path(
+    probe_kind: str,
+    domain: str,
+    exact_match: bool = False,
+    domain_source: Optional[str] = None,
+) -> Path:
+    filename = "filter_em.json" if exact_match else "filter.json"
+    return resolve_probe_dir(probe_kind, domain, domain_source) / filename

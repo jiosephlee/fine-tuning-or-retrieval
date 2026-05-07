@@ -25,8 +25,9 @@ def load_utils(project_root: str):
     sys.path.append(project_root)
     import importlib
     import utils.utils as utils
+    from utils import probe_paths
     importlib.reload(utils)
-    return utils
+    return utils, probe_paths
 
 # -----------------------------------------------------------
 # LLM SPLIT CALL
@@ -172,19 +173,13 @@ def validate_and_fix_split(split_plan, num_probes: int):
 def process_domain(project_root: str, utils, domain: str, model: str = "gpt-5"):
     """
     For a single domain:
-    - Load data/probes/inference/{domain}/probes_v7.csv
+    - Load probes/.../{domain}/inference/probes_v7.csv
     - Call LLM to split into train/test indices (~25/75, minimal overlap)
     - Save train_probes_v7.csv and test_probes_v7.csv
     - Save split_plan.json with the raw LLM response
     """
-    probes_path = os.path.join(
-        project_root,
-        "data",
-        "probes",
-        "inference",
-        domain,
-        "probes_v7.csv"
-    )
+    from utils import probe_paths
+    probes_path = str(probe_paths.resolve_probe_path("inference", domain, "v7"))
 
     if not os.path.exists(probes_path):
         print(f"[{domain}] probes_v7.csv not found at {probes_path}, skipping.")
@@ -201,14 +196,7 @@ def process_domain(project_root: str, utils, domain: str, model: str = "gpt-5"):
     split_plan, raw_response = call_llm_for_split(utils, df, model=model)
 
     # Save raw LLM response for auditing
-    split_plan_path = os.path.join(
-        project_root,
-        "data",
-        "probes",
-        "inference",
-        domain,
-        "split_plan.json"
-    )
+    split_plan_path = str(probe_paths.resolve_probe_dir("inference", domain) / "split_plan.json")
     with open(split_plan_path, "w") as f:
         f.write(raw_response)
     print(f"[{domain}] Saved raw split plan to {split_plan_path}")
@@ -221,22 +209,8 @@ def process_domain(project_root: str, utils, domain: str, model: str = "gpt-5"):
     train_df = df.iloc[train_indices].copy()
     test_df = df.iloc[test_indices].copy()
 
-    train_out_path = os.path.join(
-        project_root,
-        "data",
-        "probes",
-        "inference",
-        domain,
-        "train_probes_v7.csv"
-    )
-    test_out_path = os.path.join(
-        project_root,
-        "data",
-        "probes",
-        "inference",
-        domain,
-        "test_probes_v7.csv"
-    )
+    train_out_path = str(probe_paths.resolve_probe_dir("inference", domain) / "train_probes_v7.csv")
+    test_out_path = str(probe_paths.resolve_probe_dir("inference", domain) / "test_probes_v7.csv")
 
     train_df.to_csv(train_out_path, index=False)
     test_df.to_csv(test_out_path, index=False)
@@ -279,7 +253,7 @@ def main():
     project_root = os.path.abspath(args.project_root)
 
     # Load utils
-    utils = load_utils(project_root)
+    utils, _ = load_utils(project_root)
 
     print(f"Project root: {project_root}")
     print(f"Domains: {args.domains}")

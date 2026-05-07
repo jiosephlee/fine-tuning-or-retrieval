@@ -45,16 +45,17 @@ Return a single JSON object with two keys: "answer" and "statement".
 "answer" must be exactly unchanged from input.
 e.g. {"answer": "...", "statement": "..."}"""
 
-FACT_PROBE_CLOZE_PROMPT_SYSTEM_LEGAL = r"""You will be given a question and its corresponding answer from a legal opinion/case text. Convert them into a single declarative cloze statement where the answer appears only at the very end.
+FACT_PROBE_CLOZE_PROMPT_SYSTEM_LEGAL = r"""You will be given a question and its corresponding answer from a legal opinion or case text. Convert them into a single declarative cloze statement where the answer appears only at the very end.
 
 ### Instructions
-- The statement should be declarative (not a question) and should read naturally.
-- Preserve legal context needed for disambiguation (court level, procedural posture, issue framing, standard, holding context).
-- Preserve legal text details exactly (party names, doctrine labels, section numbers, citation-like tokens, dates).
-- Do NOT infer, reinterpret, or add legal conclusions beyond the provided question/answer.
+- The statement should be declarative and should read naturally.
+- Keep the legal context needed for disambiguation, such as the court, procedural posture, statutory or doctrinal setting, issue framing, and holding context.
+- Preserve legal detail exactly, including party names, statute sections, doctrine labels, dates, citation-like tokens, and qualifiers.
+- Do NOT infer, reinterpret, soften, or add legal conclusions beyond the provided question and answer.
 - Keep the answer unchanged and place it only once, at the very end of the statement.
 - Do not leak the answer earlier in the statement.
 - If the question wording is awkward, rewrite for clarity while preserving meaning.
+- If preserving the necessary context makes a single sentence too dense, you may use two short sentences, but the final words must still be the answer.
 
 ### Demonstration
 Question: In the opinion "...", what standard of review did the court apply to the district court's factual findings?

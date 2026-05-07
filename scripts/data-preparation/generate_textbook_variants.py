@@ -8,6 +8,7 @@ from tqdm import tqdm
 
 sys.path.append('../../')
 import utils.utils as utils
+from utils import probe_paths
 from importlib import reload
 reload(utils)
 
@@ -75,8 +76,8 @@ def generate_non_probe_textbook(paper_name, base_dir, probes_dir):
     
     paper_path = os.path.join(base_dir, 'cleaned', f'{paper_name}.tex')
     outline_path = os.path.join(base_dir, 'explanations', paper_name, 'textbook_outline.json')
-    facts_path = os.path.join(probes_dir, 'facts', paper_name, 'probes_v9.csv')
-    inference_path = os.path.join(probes_dir, 'inference', paper_name, 'probes_v6.csv')
+    facts_path = str(probe_paths.resolve_probe_path('facts', paper_name, 'v9'))
+    inference_path = str(probe_paths.resolve_probe_path('inference', paper_name, 'v6'))
     output_dir = os.path.join(base_dir, 'explanations', paper_name, 'non_probe_textbook')
     
     os.makedirs(output_dir, exist_ok=True)
@@ -291,7 +292,6 @@ def generate_misleading_textbook(paper_name, base_dir, probes_dir):
 
 def main():
     base_dir = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/data/arxiv'
-    probes_dir = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/data/probes'
     
     # Get all domains from explanations directory
     explanations_dir = os.path.join(base_dir, 'explanations')
@@ -302,7 +302,7 @@ def main():
     
     for domain in domains:
         try:
-            generate_non_probe_textbook(domain, base_dir, probes_dir)
+            generate_non_probe_textbook(domain, base_dir, "")
         except Exception as e:
             print(f"Error generating non-probe textbook for {domain}: {e}")
         
@@ -313,4 +313,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -8,6 +8,7 @@ import numpy as np
 # Adjust path to include utils if needed, though we might not need it for this standalone script
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from utils.llm_plotting import set_plot_style
+from utils import probe_paths
 
 def load_and_filter_data(run_path, probe_type, domains, filter_logic, project_root):
     """
@@ -74,23 +75,20 @@ def load_and_filter_data(run_path, probe_type, domains, filter_logic, project_ro
             continue
 
         # Filter
-        filter_path = os.path.join(project_root, 'data/probes/facts/1_58/filter_em.json') 
+        filter_path = str(probe_paths.resolve_filter_path('facts', '1_58', exact_match=True))
         # Wait, the filter path depends on the domain? 
-        # In the reference script: `os.path.join(project_root, 'data/probes', probe_folder, domain, 'filter_em.json')`
-        # But in step 12/15, I viewed `/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/data/probes/facts/1_58/filter_em.json`.
+        # In the reference script: `probe_paths.resolve_filter_path(probe_folder, domain, exact_match=True)`
+        # Earlier exploration pointed at the 1_58 exact-match filter specifically.
         # That path does NOT have the domain in it.
         # Let's re-read the reference script carefully.
-        # Line 137: `filter_path = os.path.join(project_root, 'data/probes', probe_folder, domain, 'filter_em.json')`
-        # But the user provided metadata says: `Active Document: .../data/probes/facts/GRPO/filter_em.json`.
-        # And I viewed `.../data/probes/facts/1_58/filter_em.json`.
+        # Earlier notes referenced both a domain-specific filter and the 1_58 filter.
         # It seems the filter might be global or per-method, not per-domain?
         # OR, the `1_58` IS the domain? No, `1_58` looks like a method or model identifier.
         # The user said "filter the probes similar to @[scripts/plotting/plot_comparison.py]".
         # In `plot_comparison.py`, it uses `domain` in the path.
-        # Let's check if `data/probes/facts/1_58` is a directory containing domains or just a file.
+        # The canonical filter path now resolves through probe_paths.
         # Step 12 `list_dir` was on `.../1_58_knowledge_probe`.
-        # Step 14 `view_file` was `.../data/probes/facts/1_58/filter_em.json`.
-        # If `1_58` is a directory in `data/probes/facts/`, does it contain `filter_em.json` directly? Yes, step 15 shows the content.
+        # The 1_58 exact-match filter exists as a canonical probe artifact.
         # This implies `1_58` might be acting as the "domain" or the filter is shared.
         # BUT, the metrics CSV has a `domain` column (Step 14, line 133 in ref script adds it, but let's check the CSV content).
         # The CSV content in Step 14 does NOT have a `domain` column. It has `step,probe_index,log_prob...`.
@@ -110,7 +108,7 @@ def load_and_filter_data(run_path, probe_type, domains, filter_logic, project_ro
         # But `1_58` sounds like "1.58 bit" or a method name.
         # The user said "take all the bs64 source only strategies...".
         # Let's assume for this specific plot, we are just plotting the data found in that directory, and we need to apply the filter.
-        # The filter file I viewed was `data/probes/facts/1_58/filter_em.json`.
+        # Use that exact-match filter here.
         # This strongly suggests `1_58` is the "domain" or the key for filtering.
         # So I will use that specific filter file.
         
@@ -186,7 +184,7 @@ def main():
                 k_df = pd.read_csv(k_path)
                 
                 # Load Knowledge Filter
-                k_filter_path = os.path.join(project_root, 'data/probes/facts', domain, 'filter_em.json')
+                k_filter_path = str(probe_paths.resolve_filter_path('facts', domain, exact_match=True))
                 if os.path.exists(k_filter_path):
                     with open(k_filter_path, 'r') as f:
                         k_filter_data = json.load(f)
@@ -208,7 +206,7 @@ def main():
                 i_df = pd.read_csv(i_path)
                 
                 # Load Inference Filter
-                i_filter_path = os.path.join(project_root, 'data/probes/inference', domain, 'filter_em.json')
+                i_filter_path = str(probe_paths.resolve_filter_path('inference', domain, exact_match=True))
                 if os.path.exists(i_filter_path):
                     with open(i_filter_path, 'r') as f:
                         i_filter_data = json.load(f)

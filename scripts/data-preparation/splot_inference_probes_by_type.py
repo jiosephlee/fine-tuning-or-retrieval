@@ -3,6 +3,9 @@ import sys
 import argparse
 import pandas as pd
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from utils import probe_paths
+
 # -----------------------------------------------------------
 # CONFIG
 # -----------------------------------------------------------
@@ -28,7 +31,7 @@ TARGET_INFERENCE_TYPE_FOR_TEST = "Conceptual Synthesis"
 def process_domain(project_root: str, domain: str):
     """
     For a single domain:
-    - Load data/probes/inference/{domain}/probes_v7.csv
+    - Load probes/.../{domain}/inference/probes_v7.csv
     - Split by 'inference_type':
         * TEST: inference_type == 'Conceptual Synthesis'
         * TRAIN: everything else
@@ -36,14 +39,7 @@ def process_domain(project_root: str, domain: str):
         * type_split_train_probes_v7.csv
         * type_split_test_probes_v7.csv
     """
-    probes_path = os.path.join(
-        project_root,
-        "data",
-        "probes",
-        "inference",
-        domain,
-        MAIN_PROBES_FILENAME,
-    )
+    probes_path = str(probe_paths.resolve_probe_path("inference", domain, "v7"))
 
     if not os.path.exists(probes_path):
         print(f"[{domain}] {MAIN_PROBES_FILENAME} not found at {probes_path}, skipping.")
@@ -71,22 +67,8 @@ def process_domain(project_root: str, domain: str):
     )
 
     # Output paths
-    out_train_path = os.path.join(
-        project_root,
-        "data",
-        "probes",
-        "inference",
-        domain,
-        TYPE_TRAIN_FILENAME,
-    )
-    out_test_path = os.path.join(
-        project_root,
-        "data",
-        "probes",
-        "inference",
-        domain,
-        TYPE_TEST_FILENAME,
-    )
+    out_train_path = str(probe_paths.resolve_probe_dir("inference", domain) / TYPE_TRAIN_FILENAME)
+    out_test_path = str(probe_paths.resolve_probe_dir("inference", domain) / TYPE_TEST_FILENAME)
 
     # Save splits
     train_df.to_csv(out_train_path, index=False)

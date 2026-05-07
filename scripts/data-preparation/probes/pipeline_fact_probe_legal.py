@@ -21,7 +21,7 @@ from utils import probe_paths
 
 def load_case_titles():
     """Load the case title mapping from the JSON file."""
-    titles_path = os.path.join(os.path.dirname(__file__), '../../data/legal/case_titles.json')
+    titles_path = os.path.join(os.path.dirname(__file__), '../../../data/legal/case_titles.json')
     with open(titles_path, 'r') as f:
         return json.load(f)
 
@@ -34,11 +34,11 @@ def generate_probes_for_document(document_name, document_content, sample=False):
     checkpoint_dir = str(probe_paths.resolve_probe_dir('facts', document_name, 'legal') / 'checkpoints')
     checkpoint_path = os.path.join(checkpoint_dir, '07_knowledge_kept_v10_5.csv')
 
-    if False:  # Skip checkpoint to force full pipeline run
+    if os.path.exists(checkpoint_path):
         print(f"Checkpoint found for {document_name}. Loading from {checkpoint_path}...")
         document_df_knowledge = pd.read_csv(checkpoint_path)
     else:
-        print(f"Running full pipeline (checkpoint skipped)...")
+        print("Running full pipeline...")
         # Known ALL-CAPS section headers in appellate opinions
         LEGAL_CAPS_SECTIONS = {
             'BACKGROUND', 'DISCUSSION', 'CONCLUSION', 'ANALYSIS',
@@ -148,7 +148,7 @@ Guidelines:
 3. Parenthetical citations (e.g., "(D.C. Cir. 2005)") are part of the sentence they follow.
 4. When boundaries are unclear, extend to the next clear boundary.
 
-For each sentence, copy its opening fragment (first ~6-10 words) and closing fragment (last ~6-10 words) VERBATIM from the input. Use enough words to uniquely locate the sentence.
+For each sentence, copy its opening fragment (first 5 words) and closing fragment (last 5 words) VERBATIM from the input.
 
 Return JSON: {"sentences": [{"start": "verbatim opening...", "end": "...verbatim closing"}, ...]}"""
 
@@ -390,40 +390,27 @@ Respond with JSON format with the following key:
         if idx == -1:
             return statement
 
-        text_before = full_text[:idx]
-        text_after = full_text[idx + len(statement):]
-
-        words_before = text_before.split()
-        prev_words = ' '.join(words_before[-50:]) if len(words_before) > 50 else ' '.join(words_before)
-
-        words_after = text_after.split()
-        next_words = ' '.join(words_after[:50]) if len(words_after) > 50 else ' '.join(words_after)
-
-        context = prev_words + ' ' + statement + ' ' + next_words
-        context = context.strip()
-        context = '... ' + context + ' ...'
-
-        return context
+        # Preserve all prior subsection context up through the source sentence.
+        return full_text[:idx + len(statement)]
 
     def extract_atomic_facts(first_row):
         """Extract atomic facts from a sentence using LLM."""
         prompt = {}
         prompt['system'] = r"""You will be given two inputs, a section of a legal document (appellate opinion) for context and a single sentence drawn from that section. Legal writing often interweaves various pieces of knowledge together. While each sentence is interwoven with others, there is atomic knowledge that can be extracted from a particular sentence. Write questions that test for this atomic knowledge.
 
-Extract 1-2 questions from the sentence. If the sentence has lots of facts, extract up to 3 questions.
+Extract 1-2 questions from the sentence.
 
 ### Detailed Instructions
 Consider these instructions as you extract each question:
 - The question should be meaningful, focused on a main fact in the sentence, not a minor detail.
 - The question should be non-trivial and non-obvious. It should not be plainly obvious from the question for someone with no relevant knowledge.
-- The answer to the question MUST be a verbatim word, phrase (2-4 words), or expression copied exactly from the sentence. Capitalization can be adjusted appropriately. Otherwise, do not paraphrase, rephrase, or adjust the answer; it must appear as an exact substring of the sentence.
+- The answer to the question MUST be a verbatim word, compact phrase, or expression copied exactly from the sentence.
+- The answer should be short, usually around 2-5 words.
+- Do not paraphrase, rephrase, or adjust the answer; it must appear as an exact substring of the sentence. Capitalization can be adjusted appropriately.
 - The question should have a clear, single answer and *NOT* multiple valid answers.
-- Prefer shorter answers.
 - Each question should be written separately and independently of the other questions; do not reference other questions in the same question.
 
 ### Demonstration 1: Legal Holding
-Context: "The securities fraud statute prohibits schemes to 'defraud any person in connection with . . . any security' and schemes 'to obtain, by means of false or fraudulent pretenses, representations, or promises, any money or property in connection with the purchase or sale of . . . any security.' U.S.C. § 1348. While '[t]here is scant caselaw construing the securities fraud statute in this circuit,' § 1348 'borrows key concepts from the mail and wire fraud statutes,' so 'courts have given the terms similar treatment,' often relying on mail and wire fraud cases in analyzing securities fraud charges."
-
 Sentence: "While '[t]here is scant caselaw construing the securities fraud statute in this circuit,' § 1348 'borrows key concepts from the mail and wire fraud statutes,' so 'courts have given the terms similar treatment,' often relying on mail and wire fraud cases in analyzing securities fraud charges."
 
 Questions:
@@ -431,20 +418,10 @@ Questions:
 - "Because § 1348 borrows concepts from mail and wire fraud statutes, courts analyzing securities fraud charges often rely on what type of cases?", Answer: "mail and wire fraud cases"
 
 ### Demonstration 2: Statutory Interpretation
-Context: "Section 1216 empowers OSC to investigate and seek corrective action for certain other forms of misconduct by government employees. As relevant here, it provides that OSC 'shall … conduct an investigation of any allegation concerning arbitrary or capricious withholding of information prohibited under section 552'—in other words, withholdings prohibited by the Freedom of Information Act."
-
 Sentence: "Section 1216 empowers OSC to investigate and seek corrective action for certain other forms of misconduct by government employees."
 
 Questions:
 - "What federal statute empowers OSC to investigate and seek corrective action for certain forms of misconduct by government employees?", Answer: "Section 1216"
-
-### Demonstration 3: Factual Background
-Context: "The government alleges that Edward Constantinescu, Perry 'PJ' Matlock, John Rybarczyk, Gary Deel, Stefan Hrvatin, Tom Cooperman, Mitchell Hennessey, and Daniel Knight engaged in a scheme to 'pump and dump' securities. Defendants each had large social media followings across various platforms. They held themselves out to be skilled stock traders and frequently posted their trading activities on social media."
-
-Sentence: "The government alleges that Edward Constantinescu, Perry 'PJ' Matlock, John Rybarczyk, Gary Deel, Stefan Hrvatin, Tom Cooperman, Mitchell Hennessey, and Daniel Knight engaged in a scheme to 'pump and dump' securities."
-
-Questions:
-- "What type of securities scheme does the government allege the defendants engaged in?", Answer: "pump and dump"
 """
         contextualize_prompt = {}
         contextualize_prompt['system'] = r"""You will be given context from a legal opinion, one source sentence, and a question-answer pair extracted from that sentence. Rewrite the question so it is self-contained, clear, and targets one specific piece of knowledge.
@@ -455,12 +432,13 @@ Use only information from the provided context/sentence. Do not add, infer, or c
 1. Start the rewritten question with case framing such as:
    - "In the case \"{case_name}\", ..."
    - "According to the opinion in \"{case_name}\", ..."
-2. Add only sufficient context to make the question unambiguous.
-3. Do not force or squeeze in extra details. Keep it focused on one target fact and one answer.
-4. Resolve unclear references (e.g., pronouns, "the court", "the statute") only when needed for clarity.
-5. Do not leak the answer in the question.
-6. Keep the answer unchanged (except tiny grammatical adjustments if absolutely necessary).
-7. Keep wording natural and concise; avoid copying the sentence verbatim.
+2. Add enough context to make the question self-contained and answerable on its own. Please use multiple sentences if one sentence becomes too dense.
+3. Include at least one concrete anchor when available, such as the court, procedural posture, statute, doctrine, party posture, or specific issue being resolved.
+4. Do not force or squeeze in extra details. Keep it focused on one target fact and one answer.
+5. Resolve unclear references (e.g., pronouns, "the court", "the statute", "the defendants") only when needed for clarity.
+6. Do not leak the answer in the question.
+7. Keep the answer unchanged (except tiny grammatical adjustments if absolutely necessary).
+8. Keep wording natural and concise; avoid copying the sentence verbatim.
 
 ### Output Format
 Return ONLY a single JSON object with exactly two keys:
@@ -479,7 +457,7 @@ Requirements for output JSON:
 
         context = extract_context_and_sentence(first_row)
         prompt['user'] = f"""### Case Name\n{first_row['title']}\n### Context\n{context}\n\n### Sentence\n{first_row['raw_knowledge_statement'].strip()}"""
-        output1 = utils.query_llm(prompt, model='gpt-5.4', reasoning_effort='low')
+        output1 = utils.query_llm(prompt, model='gpt-5.4', reasoning_effort='medium')
 
         json_parse_prompt['user'] = output1
         try:
@@ -515,8 +493,8 @@ Requirements for output JSON:
             contextualize_prompt['user'] = f"""### Case Name\n{first_row['title']}\n### Context\n{context}\n\n### Sentence\n{first_row['raw_knowledge_statement'].strip()}\n\n{single_qa_string}"""
             output2_individual = utils.query_llm(
                 contextualize_prompt,
-                model='gpt-5.4-mini',
-                reasoning_effort='medium',
+                model='gpt-5.4',
+                reasoning_effort='low',
                 return_json=True
             )
 
@@ -606,8 +584,10 @@ For each '(answer, statement)' pair, check the following:
 - Leave numbers as how they are written in the original sentence. e.g. eight should be eight and 8 should be 8.
 - Ensure legal citations are preserved accurately.
 
-2. Declarative
+2. Declarative and Natural
 - The statement should be written like a declarative sentence without question marks.
+- The statement should be sensible and easy to read.
+- If the legal context makes it too dense, verbose, or awkward, split it into multiple sentences.
 
 3. Answer Placement
 - The statement must be a COMPLETE sentence that ENDS WITH the answer as its final words.
@@ -646,14 +626,20 @@ Prefer returning {"change": false}. Only refine if there is a clear, concrete is
         prompt['system'] = """Your task is to determine if a given (answer, statement) pair meets quality standards by acting as a filter.
 
 ### Quality Control Checklist
-1. Linguistically Reasonable: Consider the fill-in-the-blank statement. The answer should be linguistically reasonable as to how it would fit in the fill-in-the-blank. It should sound natural and not forced.
-2. Semantically Reasonable: Consider the fill-in-the-blank statement. The answer should be semantically reasonable as to how it would fit in the fill-in-the-blank. There should be one clear, unambiguous answer (or at least paraphrases of the answer).
-3. Answer leakage: The answer should not be leaked in the statement before the answer appears.
-4. Non trivial: The statement should be non-trivial. It should not be plainly obvious from the question itself for someone with no relevant knowledge.
-5. Ambiguity: Drop the pair if the blank can reasonably be completed by multiple distinct answers from the statement/context.
+1. Unnatural or Overly Dense
+- The statement should be sensible and easy to read.
+- The answer should fit naturally at the end of the fill-in-the-blank statement.
+- Drop statements that sound forced, malformed, or overloaded with unnecessary detail.
+2. Ambiguity
+- There should be one clear target answer.
+- Drop the pair if the blank can reasonably be completed by multiple distinct answers from the statement or immediate context.
+3. Answer leakage
+- The answer should not be leaked in the statement before the answer appears.
+4. Non-triviality
+- The statement should not make the answer obvious to someone with no knowledge of the opinion.
 
 ### Action
-Based on the checklist, decide if the pair should be kept. Drop the pair if fails one of the checklist items.
+Based on the checklist, decide if the pair should be kept. Drop the pair if it fails any checklist item. Lean toward dropping ambiguous cases.
 
 ### Output Format
 Provide your decision as a JSON object with a single boolean key: `{"keep": true}` or `{"keep": false}`."""

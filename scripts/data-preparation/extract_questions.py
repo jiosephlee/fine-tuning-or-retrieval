@@ -1,13 +1,17 @@
 import os
 import pandas as pd
+import sys
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from utils import probe_paths
 
 def extract_questions():
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
     domains = ['DPO', 'BOFT', '1_58', 'OFT', 'QLoRA', 'GRPO']
     
     for domain in domains:
-        input_path = os.path.join(base_dir, f'data/probes/inference/{domain}/probes_v7.csv')
-        output_path = os.path.join(base_dir, f'data/probes/inference/{domain}/questions_v7.txt')
+        input_path = str(probe_paths.resolve_probe_path("inference", domain, "v7"))
+        output_path = str(probe_paths.resolve_probe_dir("inference", domain) / 'questions_v7.txt')
         
         if os.path.exists(input_path):
             try:

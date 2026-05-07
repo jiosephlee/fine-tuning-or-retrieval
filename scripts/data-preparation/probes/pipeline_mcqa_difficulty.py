@@ -25,14 +25,16 @@ import os
 import sys
 import json
 import random
+from pathlib import Path
 import pandas as pd
 import concurrent.futures
 from tqdm import tqdm
 import argparse
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+sys.path.append(str(PROJECT_ROOT))
 import utils.utils as utils
-from utils.pipeline import save_debug_file
+from utils import probe_paths
 
 # ─────────────────────────────────────────────────────────────
 # Step 0: Filter probes for MCQA suitability
@@ -42,39 +44,64 @@ MCQA_FILTER_PROMPT = r"""You are evaluating whether a knowledge probe is suitabl
 
 A probe is UNSUITABLE for MCQA if ANY of these apply:
 1. **Tautological / circular**: The target simply restates or paraphrases something already stated in the probe. E.g. probe says "The models described as being trained on very large datasets are:" and target is "large unsupervised language models" — the answer is just the probe reworded.
-2. **Target appears verbatim in the probe**: The answer is already written out in the probe text itself.
+2. **Target appears verbatim in the probe/question itself**: The answer is already written out in the question the model will see.
+    - Do NOT reject a probe merely because the target appears verbatim in the source fact or source context. That is expected: these are memorization probes, and the source fact is provided only so you can check correctness.
+    - Only apply this criterion when the target is exposed in the probe/question text itself.
 3. **Trivially short / obvious target**: The target is a single common word like "humans", "the LM", "a model" where there is no conceptual depth to distinguish among 5 options.
 4. **Hard to construct meaningful distractors**: The answer is yes/no, true/false, increase/decrease, etc. — 5 distinct options are unnatural.
+5. **Incorrectly formulated**: The question and answer does not properly reflect the source fact.
 
 A probe IS suitable when:
 - The target is a concept, method, technique, algorithm name, dataset name, model name, or short descriptive phrase.
 - There exist related-but-wrong concepts in the same field that make plausible distractors.
 - A knowledgeable reader could meaningfully reason among 5 options.
 - Dates, numbers, and proper nouns ARE fine if there are plausible alternatives.
+- The question and answer properly reflect the source fact.
 
-You will be given the probe (cloze statement), the target (correct completion), and the source fact.
+You will be given the probe (cloze statement), the target (correct completion), and the source fact with surrounding context from the paper. The model being evaluated will NOT see the source fact or source context. Therefore, target overlap with the source fact/source context is not leakage and is not a rejection reason.
 
 ### Output Format
 Provide a JSON object:
 - "suitable": (boolean) true if this probe can naturally support 5 meaningful MCQA options
-- "reason": (string) one-sentence explanation citing which criterion (1-6) it fails, or why it is suitable"""
+- "reason": (string) one-sentence explanation citing which criterion (1-5) it fails, or why it is suitable"""
+
+
+def _extract_preceding_context(row: pd.Series, preceding_words: int = 200, following_words: int = 100) -> str:
+    """Return the source fact with surrounding context from the section text.
+
+    Includes up to *preceding_words* before the fact and *following_words* after it.
+    Falls back to the fact if it cannot be located.
+    """
+    fact = str(row.get('raw_knowledge_statement', row.get('fact', ''))).strip()
+    for col in ('section_text', 'subsection_text'):
+        haystack = str(row.get(col, '')).strip()
+        if not haystack or not fact:
+            continue
+        idx = haystack.find(fact[:80])
+        if idx >= 0:
+            preceding = haystack[:idx]
+            following = haystack[idx + len(fact):]
+            preceding_context = ' '.join(preceding.split()[-preceding_words:])
+            following_context = ' '.join(following.split()[:following_words])
+            return f"...{preceding_context} {fact} {following_context}...".strip()
+    return fact
 
 
 def filter_probe_for_mcqa(row: pd.Series) -> dict:
     """Check whether a single probe is suitable for MCQA conversion."""
     target = str(row['target']).strip()
     probe = str(row['probe']).strip()
-    source = str(row.get('raw_knowledge_statement', row.get('fact', ''))).strip()
+    source_with_context = _extract_preceding_context(row)
 
     prompt = {
         'system': MCQA_FILTER_PROMPT,
         'user': (f"### Probe Statement\n{probe}\n\n"
                  f"### Correct Answer\n{target}\n\n"
-                 f"### Source Fact\n{source}")
+                 f"### Source Fact / Reference Context\n{source_with_context}")
     }
 
     try:
-        response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='low',
+        response = utils.query_llm(prompt, model='gpt-5.4', reasoning_effort='low',
                                     system_prompt_included=True, return_json=True, max_tokens=200)
         data = json.loads(response) if isinstance(response, str) else response
         return {'suitable': data.get('suitable', False), 'reason': data.get('reason', '')}
@@ -92,16 +119,15 @@ DISTRACTOR_PROMPT = r"""You are generating distractors for a multiple-choice que
 You will be given:
 - A cloze-style statement (the "probe") that ends right before the answer.
 - The correct answer (the "target").
-- The source sentence from the paper.
-- The subsection of the paper where this fact appears (for sourcing plausible in-context distractors).
+- The source sentence from the paper with surrounding context: up to ~200 words before the fact and ~100 words after it.
 
 Your task: generate 4 plausible but incorrect distractors.
 
 ### Distractor Design Principles
 - Each distractor should be a plausible completion of the probe statement.
 - Distractors should represent *common misunderstandings* or *closely related concepts* that someone with surface-level knowledge might confuse with the correct answer.
-- At least one distractor should come from the provided subsection text (a real concept mentioned in context, but wrong for this specific probe).
-- At least one distractor should come from the broader field but outside the subsection.
+- At least one distractor should come from the provided source context (a real concept mentioned nearby, but wrong for this specific probe).
+- At least one distractor should come from the broader field but outside the provided source context.
 - Distractors should be similar in length, style, and specificity to the correct answer.
 - Do NOT include obviously wrong or unrelated answers.
 - Ensure there is exactly ONE correct answer — no distractor should be arguably correct.
@@ -111,22 +137,20 @@ Provide a JSON object with a single key "distractors" containing a list of exact
 
 
 def generate_distractors(row: pd.Series) -> list | None:
-    """Generate 4 hard distractors for a single probe using subsection context."""
+    """Generate 4 hard distractors for a single probe using source context."""
     target = str(row['target']).strip()
     probe = str(row['probe']).strip()
-    source = str(row.get('raw_knowledge_statement', row.get('fact', ''))).strip()
-    subsection = str(row.get('subsection_text', '')).strip()
+    source_with_context = _extract_preceding_context(row)
 
     prompt = {
         'system': DISTRACTOR_PROMPT,
-        'user': (f"### Subsection Text (for sourcing plausible distractors)\n{subsection}\n\n"
-                 f"### Probe Statement\n{probe}\n\n"
+        'user': (f"### Probe Statement\n{probe}\n\n"
                  f"### Correct Answer\n{target}\n\n"
-                 f"### Source Sentence\n{source}")
+                 f"### Source Sentence with Surrounding Context\n{source_with_context}")
     }
 
     try:
-        response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='medium',
+        response = utils.query_llm(prompt, model='gpt-5.4', reasoning_effort='medium',
                                     system_prompt_included=True, return_json=True, max_tokens=600)
         data = json.loads(response) if isinstance(response, str) else response
         distractors = data.get('distractors', [])
@@ -147,10 +171,11 @@ Check:
 1. Is the intended answer clearly correct given the statement?
 2. Could any distractor also be argued as correct? If so, the question fails.
 3. Are the distractors plausible enough that someone unfamiliar with the material might choose them?
+4. Is the answer trivial or obvious or implicitly leaked from the question itself?
 
 ### Output Format
 Provide a JSON object:
-- "passes": (boolean) true if exactly one answer is correct and distractors are plausible
+- "passes": (boolean) true if exactly one answer is correct and distractors are plausible and the answer is not trivial or obvious from the question itself
 - "reason": (string) brief explanation if it fails"""
 
 
@@ -218,8 +243,7 @@ def format_mcqa_row(row: pd.Series, distractors: list) -> dict:
 def process_domain(domain: str, probe_type: str, probe_version: str,
                    output_version: str, skip_filtering: bool = False):
     """Convert probes for a single domain to MCQA."""
-    base = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    input_path = os.path.join(base, f'data/probes/{probe_type}/{domain}/probes_{probe_version}.csv')
+    input_path = str(probe_paths.resolve_probe_path(probe_type, domain, probe_version))
 
     if not os.path.exists(input_path):
         print(f"Probe file not found: {input_path}")
@@ -229,7 +253,7 @@ def process_domain(domain: str, probe_type: str, probe_version: str,
     total_input = len(df)
     print(f"Loaded {total_input} probes from {input_path}")
 
-    output_dir = os.path.join(base, f'data/probes/{probe_type}/{domain}/')
+    output_dir = str(probe_paths.resolve_probe_dir(probe_type, domain))
     os.makedirs(output_dir, exist_ok=True)
 
     # Step 0: Filter probes for MCQA suitability
@@ -373,21 +397,19 @@ if __name__ == '__main__':
                         help='Skip MCQA suitability pre-filtering step.')
     args = parser.parse_args()
 
-    base = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    probes_dir = os.path.join(base, f'data/probes/{args.probe_type}/')
+    probes_dir = probe_paths.resolve_probe_kind_root(args.probe_type)
 
-    if not os.path.isdir(probes_dir):
+    if not probes_dir.exists():
         print(f"Probes directory not found: {probes_dir}")
         sys.exit(1)
 
     domains = sorted([
-        d for d in os.listdir(probes_dir)
-        if os.path.isdir(os.path.join(probes_dir, d))
-        and os.path.exists(os.path.join(probes_dir, d, f'probes_{args.probe_version}.csv'))
+        domain for domain in probe_paths.get_all_domains_from_probe_kind(args.probe_type)
+        if probe_paths.resolve_probe_path(args.probe_type, domain, args.probe_version).exists()
     ])
 
     if args.filter:
-        domains = [d for d in domains if args.filter in d]
+        domains = [args.filter] if args.filter in domains else [d for d in domains if args.filter in d]
 
     print(f"Domains to process: {domains}")
 

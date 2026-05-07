@@ -676,7 +676,17 @@ For each '(answer, statement)' pair, check the following:
 
 Prefer returning {"change": false}. Only refine if there is a clear, concrete issue. Do not make unnecessary changes."""
         prompt['user'] = f"""### Answer\n{row['answer']}\n\n### Statement\n{row['statement']}"""
-        response = utils.query_llm(prompt, model='gpt-5.4', reasoning_effort='low', system_prompt_included=True, return_json=True)
+        try:
+            response = utils.query_llm(
+                prompt,
+                model='gpt-5.4',
+                reasoning_effort='low',
+                system_prompt_included=True,
+                return_json=True
+            )
+        except Exception as e:
+            print(f"QC request failed, using original pair for row. Error: {e}")
+            return {'answer': row['answer'], 'statement': row['statement'], 'was_refined': False}
         try:
             parsed_response = json.loads(response)
             if not parsed_response.get('change', True):
@@ -715,7 +725,17 @@ Provide your decision as a JSON object with a single boolean key: `{"keep": true
             return False
         prompt['user'] = f"""### Answer\n{validated_pair['answer']}\n\n### Statement\n{validated_pair['statement'].replace(str(validated_pair['answer']), '___')}"""
         
-        response = utils.query_llm(prompt, model='gpt-5.4-mini', reasoning_effort='low', system_prompt_included=True, return_json=True)
+        try:
+            response = utils.query_llm(
+                prompt,
+                model='gpt-5.4-mini',
+                reasoning_effort='low',
+                system_prompt_included=True,
+                return_json=True
+            )
+        except Exception as e:
+            print(f"Filter request failed, dropping pair. Error: {e}")
+            return False
         try:
             parsed_response = json.loads(response)
             return parsed_response.get('keep', False)
@@ -727,10 +747,23 @@ Provide your decision as a JSON object with a single boolean key: `{"keep": true
     rows_for_qc = []
     for idx, row in paper_df_knowledge.iterrows():
         if row['cloze_pairs'] and row['contextualized_questions']:
-            cloze_pairs = row['cloze_pairs']
-            contextualized_questions = row['contextualized_questions']
+            cloze_pairs = [
+                pair for pair in row['cloze_pairs']
+                if isinstance(pair, dict)
+                and pair.get('answer') not in [None, 'None', '']
+                and pair.get('statement') not in [None, 'None', '', 'The question and answer are None.']
+            ]
+            contextualized_questions = [
+                q for q in row['contextualized_questions']
+                if isinstance(q, str) and q.strip() and q.strip() != 'None'
+            ]
 
-            assert len(cloze_pairs) == len(contextualized_questions), f"Mismatch in lengths for row {idx}: {len(cloze_pairs)} vs {len(contextualized_questions)}"
+            if len(cloze_pairs) != len(contextualized_questions):
+                print(
+                    f"Warning: Mismatch in lengths for row {idx}: "
+                    f"{len(cloze_pairs)} cloze pairs vs {len(contextualized_questions)} contextualized questions. "
+                    "Keeping aligned prefix only."
+                )
 
             for pair, contextualized_question in zip(cloze_pairs, contextualized_questions):
                 if isinstance(pair, dict) and 'answer' in pair and 'statement' in pair:

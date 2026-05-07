@@ -13,6 +13,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 import utils.utils as utils
 from utils.pipeline import save_df_for_debugging, save_debug_file, is_text_in_document, process_papers
 from utils.prompts.pipeline import FACT_PROBE_CLOZE_PROMPT_SYSTEM
+from utils import probe_paths
 
 def parse_paper_structure(text):
     """Parse paper into sections, subsections and paragraphs with metadata."""
@@ -319,7 +320,7 @@ def process_paper(paper_name: str, paper_content: str, add_on_mode: bool = False
         return cloze_df
     else:
         # Original behavior: save to paper-specific directory
-        output_dir = f'../../data/probes/comprehension/{paper_name}/'
+        output_dir = str(probe_paths.resolve_probe_dir('comprehension', paper_name))
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, 'probes_v1.csv')
         cloze_df.to_csv(output_path, index=False)
@@ -334,7 +335,7 @@ if __name__ == '__main__':
     
     if args.add_on_to_v6:
         # Load existing v6 probes
-        v6_path = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/data/probes/inference/DPO/probes_v6.csv'
+        v6_path = str(probe_paths.resolve_probe_path('inference', 'DPO', 'v6'))
         if os.path.exists(v6_path):
             v6_df = pd.read_csv(v6_path)
             print(f"Loaded {len(v6_df)} existing probes from v6")

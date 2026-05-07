@@ -16,6 +16,7 @@ sys.path.append(project_root)
 
 # Import from utils
 from utils.llm_plotting import set_plot_style
+from utils import probe_paths
 from scripts.plotting.plot_utils import (
     discover_domains,
     load_probe_series,
@@ -123,7 +124,7 @@ def load_filtered_series(run_path, probe_type, domains, project_root):
                 continue
 
             # Load Filter
-            filter_path = os.path.join(project_root, 'data/probes', probe_folder, domain, 'filter.json')
+            filter_path = str(probe_paths.resolve_filter_path(probe_folder, domain))
             if os.path.exists(filter_path):
                 with open(filter_path, 'r') as f:
                     filter_data = json.load(f)

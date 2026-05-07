@@ -8,19 +8,38 @@ import statistics
 import argparse
 
 # Add repo root to path relative to this file, not the current working directory.
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 import utils.utils as utils
 
-prompt = {}
-prompt['system'] = """You will be given a portion of an academic paper. Please paraphrase the text. 
+PROMPT_PRESETS = {
+    "academic": """You will be given a portion of an academic paper. Please paraphrase the text. 
 # Instructions
 - Paraphrase the text as much as possible, writing in a different tone and style (that's still within academic bounds) and changing the sentence structure.
 - Keeping the meaning of the text.
 - Keep latex formatting identical to the original text. 
 - Leave proper nouns, titles, section headers, equations, and domain-specific terminology unchanged.
-- Only output the paraphrased text, no other text."""
+- Only output the paraphrased text, no other text.""",
+    "legal": """You will be given a portion of a legal document, usually a court opinion. Please paraphrase the text.
+# Instructions
+- Paraphrase the prose as much as possible while preserving the legal meaning exactly.
+- Use different sentence structures and wording, but keep the tone appropriate for legal writing.
+- Do not add, infer, omit, or correct facts, holdings, procedural history, or legal reasoning.
+- Preserve party names, judge names, court names, statutory references, citations, quoted language, section headings, dates, docket numbers, and legal terms of art.
+- Keep citations and quotations exactly as written unless the original surrounding sentence must be restructured.
+- Only output the paraphrased text, no other text.""",
+    "medical": """You will be given a portion of a medical case report or clinical paper. Please paraphrase the text.
+# Instructions
+- Paraphrase the prose as much as possible while preserving the clinical meaning exactly.
+- Use different wording and sentence structure, but keep the tone appropriate for medical writing.
+- Do not add, infer, omit, normalize, or correct diagnoses, medications, doses, routes, timelines, lab values, imaging findings, procedures, outcomes, or clinical reasoning.
+- Preserve patient descriptors, disease names, medication names, abbreviations, units, numeric values, time intervals, anatomy, test names, section headings, and cited terminology.
+- Keep direct quotations and citations exactly as written unless the original surrounding sentence must be restructured.
+- Only output the paraphrased text, no other text.""",
+}
+
+DEFAULT_PROMPT_DOMAIN = "academic"
 
 MIN_CHARS_TO_PARAPHRASE = 200
 MIN_WORDS_PER_PARAGRAPH = 200
@@ -91,16 +110,32 @@ def sanitize_for_api(text):
     )
     return sanitized
 
-def paraphrase_paragraph(part, model="gpt-4.1", is_hippa=False, reasoning_effort=None):
+def get_system_prompt(prompt_domain):
+    try:
+        return PROMPT_PRESETS[prompt_domain]
+    except KeyError as exc:
+        valid_domains = ", ".join(sorted(PROMPT_PRESETS))
+        raise ValueError(f"Unknown prompt_domain '{prompt_domain}'. Expected one of: {valid_domains}") from exc
+
+def paraphrase_paragraph(
+    part,
+    model="gpt-4.1",
+    is_hippa=False,
+    reasoning_effort=None,
+    prompt_domain=DEFAULT_PROMPT_DOMAIN,
+):
     if is_preserved_paragraph(part):
         return part
     else:
-        prompt['user'] = f"Text: {sanitize_for_api(part)}"
+        prompt = {
+            'system': get_system_prompt(prompt_domain),
+            'user': f"Text: {sanitize_for_api(part)}",
+        }
         return utils.query_llm(
             prompt=prompt,
             model=model,
             temperature=1.25,
-            top_p=0.95,
+            top_p=0.975,
             system_prompt_included=True,
             is_hippa=is_hippa,
             reasoning_effort=reasoning_effort,
@@ -169,7 +204,13 @@ def split_and_merge_paragraphs(text):
     
     return paragraphs
 
-def paraphrase_texts(paragraphs, model="gpt-4.1", is_hippa=False, reasoning_effort=None):
+def paraphrase_texts(
+    paragraphs,
+    model="gpt-4.1",
+    is_hippa=False,
+    reasoning_effort=None,
+    prompt_domain=DEFAULT_PROMPT_DOMAIN,
+):
     """Paraphrase each paragraph linearly and return joined text."""
     paraphrased_paragraphs = []
     for paragraph in tqdm(paragraphs, desc="Paraphrasing paragraphs"):
@@ -179,6 +220,7 @@ def paraphrase_texts(paragraphs, model="gpt-4.1", is_hippa=False, reasoning_effo
                 model=model,
                 is_hippa=is_hippa,
                 reasoning_effort=reasoning_effort,
+                prompt_domain=prompt_domain,
             )
         )
     return paraphrased_paragraphs
@@ -203,7 +245,9 @@ def process_papers(
     model="gpt-4.1",
     is_hippa=False,
     reasoning_effort=None,
+    prompt_domain=DEFAULT_PROMPT_DOMAIN,
 ):
+    get_system_prompt(prompt_domain)
     input_extension = normalize_extension(input_extension)
     output_extension = normalize_extension(output_extension or input_extension)
     
@@ -240,6 +284,7 @@ def process_papers(
                     model=model,
                     is_hippa=is_hippa,
                     reasoning_effort=reasoning_effort,
+                    prompt_domain=prompt_domain,
                 )
             )
             
@@ -260,7 +305,7 @@ def process_papers(
             list(executor.map(generate_paraphrase, range(start_index, start_index + num_paraphrases)))
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Paraphrase academic papers.")
+    parser = argparse.ArgumentParser(description="Paraphrase documents with a selectable prompt preset.")
     parser.add_argument(
         '--papers', 
         nargs='+', 
@@ -319,6 +364,12 @@ if __name__ == "__main__":
         default=None,
         help='Optional reasoning effort for GPT-5/o-series models.'
     )
+    parser.add_argument(
+        '--prompt_domain',
+        choices=sorted(PROMPT_PRESETS),
+        default=DEFAULT_PROMPT_DOMAIN,
+        help='System prompt preset to use when paraphrasing.'
+    )
     args = parser.parse_args()
     
     process_papers(
@@ -333,4 +384,5 @@ if __name__ == "__main__":
         model=args.model,
         is_hippa=args.is_hippa,
         reasoning_effort=args.reasoning_effort,
+        prompt_domain=args.prompt_domain,
     )

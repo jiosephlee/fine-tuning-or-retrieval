@@ -9,8 +9,10 @@ import re
 import argparse
 
 # Add project root to path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+sys.path.append(PROJECT_ROOT)
 import utils.utils as utils
+from utils import probe_paths
 
 # 4-shot examples for comprehension MCQA
 FEW_SHOT_EXAMPLES = """Question: In the paper 'Attention Is All You Need', the authors replace recurrence and convolutions entirely with attention. What is the primary architectural motivation for this design choice?
@@ -47,11 +49,14 @@ Answer: (B)
 """
 
 _QUESTION_GENERATION_TEMPLATES = {
-    'arxiv': r"""You are an expert at creating comprehension questions for academic papers. You will be given an academic paper. Your task is to generate questions that test *deep understanding* of the paper's content, not factual recall.
+    'arxiv': r"""You are an expert at creating difficult comprehension questions for academic papers. You will be given an academic paper. Your task is to generate questions that test *deep, passage-specific understanding* of the paper's content, not factual recall and not general familiarity with the paper's headline ideas.
 
 ### What makes a good comprehension question
 - It requires *reasoning* about the text: synthesizing information across sentences/paragraphs, understanding cause-and-effect relationships, grasping the motivation behind design choices, or drawing connections between different parts of the paper.
 - It cannot be answered by copying or lightly rephrasing a single sentence from the paper.
+- It should be difficult to answer, requiring a deep understanding.
+- It should be **passage-specific**: a reader who generally knows the paper or topic should still be at a disadvantage without the excerpt.
+- It should require combining **at least two distinct claims** from the excerpt.
 - It *can* be answered by a careful reader who has the text available; no external knowledge beyond the paper is needed besides basic background knowledge.
 - Good question types include:
   - **Why** questions: Why did the authors make a specific design choice? Why does a particular method work?
@@ -60,9 +65,16 @@ _QUESTION_GENERATION_TEMPLATES = {
   - **Compare/contrast**: How does the proposed method differ from a baseline in a non-obvious way?
   - **Implication**: What does a specific result imply about the broader problem?
 
+### What to avoid
+- Do **not** ask about the paper's headline contribution, slogan, title claim, or any canonical fact that a model might know from general training data.
+- Do **not** ask questions that could be answered from broad topic knowledge alone, even if they are technically true of the excerpt.
+- Do **not** ask for definitions, named methods, high-level summaries, or “what is the main contribution?” style questions.
+- Do **not** make the correct answer a near-verbatim paraphrase of one sentence in the excerpt.
+- Do **not** rely on a single local clue; the reader should need to integrate multiple details.
+
 ### Instructions
-1. Generate many comprehension questions as possible from the paper, spread out over all sections of the paper.
-2. For each question, identify the **contiguous excerpt** from the paper (~1024 tokens) that contains all the information needed to answer the question. This excerpt must be a verbatim, contiguous passage from the paper text.
+1. Generate many comprehension questions as possible from the paper, spread out over all sections of the text.
+2. For each question, identify the **shortest contiguous excerpt** from the paper (prefer 256-700 tokens; only exceed this when truly necessary) that contains all the information needed to answer the question. This excerpt must be a verbatim, contiguous passage from the paper text.
 3. For each question, provide:
    - "question": The question text.
    - "answer": A concise answer (1-3 sentences). This answer must be derivable from the excerpt.
@@ -71,7 +83,8 @@ _QUESTION_GENERATION_TEMPLATES = {
 4. Avoid questions that:
    - Ask for a single named entity, number, or definition (those are factual recall)
    - Require knowledge not in the paper
-5. Avoid asking questions that are too similar to each other.
+5. Prefer questions where the answer depends on a subtle mechanism, tradeoff, caveat, comparison, or implication that is easy to miss on a shallow read.
+6. Avoid asking questions that are too similar to each other.
 
 ### Output Format
 JSON with a single key "questions" containing a list of question objects.
@@ -81,6 +94,7 @@ JSON with a single key "questions" containing a list of question objects.
 ### What makes a good comprehension question
 - It requires *reasoning* about the text: synthesizing clinical findings across sections, understanding diagnostic logic, grasping treatment rationale, or drawing connections between presentation, workup, and outcome.
 - It cannot be answered by copying or lightly rephrasing a single sentence from the report.
+- It should be difficult to answer, requiring a deep understanding.
 - It *can* be answered by a careful reader who has the text available; no external medical knowledge beyond the report is needed besides basic clinical background.
 - Good question types include:
   - **Why** questions: Why was a particular treatment chosen? Why did the differential diagnosis narrow?
@@ -90,8 +104,8 @@ JSON with a single key "questions" containing a list of question objects.
   - **Implication**: What does this case suggest about managing similar presentations?
 
 ### Instructions
-1. Generate as many comprehension questions as possible from the case report, spread across all sections (presentation, workup, diagnosis, treatment, outcome, discussion).
-2. For each question, identify the **contiguous excerpt** from the report (~1024 tokens) that contains all the information needed to answer the question. This excerpt must be a verbatim, contiguous passage from the report text.
+1. Generate as many comprehension questions as possible from the case report, spread across all sections of the text.
+2. For each question, identify the **contiguous excerpt** from the report (256-1024 tokens) that contains all the information needed to answer the question. This excerpt must be a verbatim, contiguous passage from the report text.
 3. For each question, provide:
    - "question": The question text.
    - "answer": A concise answer (1-3 sentences). This answer must be derivable from the excerpt.
@@ -109,7 +123,8 @@ JSON with a single key "questions" containing a list of question objects.
 
 ### What makes a good comprehension question
 - It requires *reasoning* about the text: synthesizing legal arguments across sections, understanding how precedent is applied, grasping the court's analytical framework, or drawing connections between facts, law, and holding.
-- It cannot be answered by copying or lightly rephrasing a single sentence from the opinion.
+- It cannot be answered by copying or lightly rephrasing a single sentence from the opinion
+- It should be difficult to answer, requiring a deep understanding.
 - It *can* be answered by a careful reader who has the text available; no external legal knowledge beyond the opinion is needed besides basic legal background.
 - Good question types include:
   - **Why** questions: Why did the court reject a particular argument? Why was a specific standard of review applied?
@@ -119,8 +134,8 @@ JSON with a single key "questions" containing a list of question objects.
   - **Implication**: What does the holding imply for similar future cases?
 
 ### Instructions
-1. Generate as many comprehension questions as possible from the opinion, spread across all major sections (facts, procedural history, analysis, holding).
-2. For each question, identify the **contiguous excerpt** from the opinion (~1024 tokens) that contains all the information needed to answer the question. This excerpt must be a verbatim, contiguous passage from the opinion text.
+1. Generate as many comprehension questions as possible from the opinion, spread across all sections of the text. 
+2. For each question, identify the **contiguous excerpt** from the opinion (256-1024 tokens) that contains all the information needed to answer the question. This excerpt must be a verbatim, contiguous passage from the opinion text.
 3. For each question, provide:
    - "question": The question text.
    - "answer": A concise answer (1-3 sentences). This answer must be derivable from the excerpt.
@@ -171,6 +186,17 @@ Prefer returning the question and answer unchanged. Only refine if there is a cl
 - If refinement is needed, return: {"change": true, "question": "...", "answer": "..."}
 """
 
+ANSWERABILITY_FILTER_PROMPT = r"""You will be given an excerpt and a multiple-choice question. Answer the question using only the excerpt.
+
+### Instructions
+- Choose exactly one answer from (A), (B), (C), (D), or (E).
+- Return only the answer label in JSON.
+- Do not use outside knowledge.
+
+### Output Format
+{"answer": "(A)"}
+"""
+
 
 def _load_title_map(json_path):
     try:
@@ -179,7 +205,7 @@ def _load_title_map(json_path):
     except FileNotFoundError:
         return {}
 
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+BASE_DIR = PROJECT_ROOT
 MEDICAL_TITLES = _load_title_map(os.path.join(BASE_DIR, 'data/medical/case_report_titles.json'))
 LEGAL_TITLES = _load_title_map(os.path.join(BASE_DIR, 'data/legal/case_titles.json'))
 MEDICAL_DOMAINS = set(MEDICAL_TITLES.keys())
@@ -326,6 +352,30 @@ def generate_distractors(question_text, answer, excerpt):
         return None
 
 
+def answer_mcqa_from_excerpt(excerpt, mcqa_question):
+    """Ask the model to answer the MCQA using only the excerpt."""
+    prompt = {
+        'system': ANSWERABILITY_FILTER_PROMPT,
+        'user': f"### Excerpt\n{excerpt}\n\n### Question\n{mcqa_question}"
+    }
+
+    try:
+        response = utils.query_llm(
+            prompt, model='gpt-5.4-mini', reasoning_effort='low',
+            system_prompt_included=True, return_json=True
+        )
+        data = json.loads(response) if isinstance(response, str) else response
+        answer = str(data.get('answer', '')).strip()
+        match = re.search(r'\(([A-E])\)|\b([A-E])\b', answer)
+        if not match:
+            return None
+        label = match.group(1) or match.group(2)
+        return f"({label})"
+    except Exception as e:
+        print(f"Error in answerability filter: {e}")
+        return None
+
+
 def format_mcqa(question_text, answer, distractors):
     """Format question + answer + distractors into MCQA with shuffled options."""
     options = [answer] + distractors
@@ -348,6 +398,28 @@ def format_mcqa(question_text, answer, distractors):
         'mcqa_question': full_question,
         'mcqa_answer': correct_label
     }
+
+
+def build_contextualized_question(excerpt, mcqa_question, paper_title):
+    """Build a natural prompt that includes the excerpt and question."""
+    return (
+        f"You will be given an excerpt from '{paper_title}'. Read it carefully and answer "
+        f"the multiple-choice question that follows.\n\n"
+        f"Excerpt:\n{excerpt}\n\n"
+        f"Question:\n{mcqa_question}"
+    )
+
+
+def build_contextualized_fewshot_question(excerpt, mcqa_question, paper_title):
+    """Build a contextualized few-shot prompt with the excerpt, examples, and question."""
+    return (
+        f"You will be given an excerpt from '{paper_title}'. Read it carefully and answer "
+        f"the multiple-choice question that follows using the same answer format as the examples.\n\n"
+        f"Excerpt:\n{excerpt}\n\n"
+        f"{FEW_SHOT_EXAMPLES}\n"
+        f"Question: {mcqa_question}\n"
+        f"Answer:"
+    )
 
 
 def process_question(q, paper_title, paper_text):
@@ -379,11 +451,30 @@ def process_question(q, paper_title, paper_text):
 
         # 4. Build few-shot prompt
         fewshot_q = f"{FEW_SHOT_EXAMPLES}\nQuestion: {mcqa['mcqa_question']}\nAnswer:"
+        contextualized_q = build_contextualized_question(excerpt, mcqa['mcqa_question'], paper_title)
+        contextualized_fewshot_q = build_contextualized_fewshot_question(
+            excerpt, mcqa['mcqa_question'], paper_title
+        )
+
+        # 5. Final answerability filter
+        predicted_answer = answer_mcqa_from_excerpt(excerpt, mcqa['mcqa_question'])
+        if predicted_answer != mcqa['mcqa_answer']:
+            return {
+                'ok': False,
+                'drop_reason': 'answerability_filter_failed',
+                'question': mcqa['mcqa_question'],
+                'expected_answer': mcqa['mcqa_answer'],
+                'predicted_answer': predicted_answer,
+                'excerpt': excerpt,
+            }
 
         return {
+            'ok': True,
             'question': mcqa['mcqa_question'],
             'answer': mcqa['mcqa_answer'],
             'fewshot_question': fewshot_q,
+            'contextualized_question': contextualized_q,
+            'contextualized_fewshot_question': contextualized_fewshot_q,
             'original_question': question_text,
             'comprehension_answer': refined_answer,
             'excerpt': excerpt,
@@ -395,8 +486,7 @@ def process_question(q, paper_title, paper_text):
 
 
 def process_domain(domain, num_questions=None):
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    output_dir = os.path.join(base_dir, f'data/probes/inference/{domain}')
+    output_dir = str(probe_paths.resolve_probe_dir("inference", domain))
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, 'comprehension_mcqa.csv')
 
@@ -417,6 +507,7 @@ def process_domain(domain, num_questions=None):
     print("Generating comprehension questions...")
     questions = generate_comprehension_questions(paper_text, paper_title, domain=domain)
     print(f"Generated {len(questions)} raw questions.")
+    raw_question_count = len(questions)
 
     if not questions:
         print(f"No questions generated for {domain}.")
@@ -424,21 +515,25 @@ def process_domain(domain, num_questions=None):
 
     # Validate excerpt extraction before proceeding
     valid_questions = []
+    excerpt_drop_count = 0
     for q in questions:
         excerpt = extract_excerpt(paper_text, q.get('excerpt_start', ''), q.get('excerpt_end', ''))
         if excerpt:
             valid_questions.append(q)
         else:
+            excerpt_drop_count += 1
             print(f"  Dropped (excerpt not found): {q['question'][:80]}...")
 
     print(f"Validated excerpts: {len(valid_questions)}/{len(questions)} questions have extractable excerpts.")
     questions = valid_questions
+    validated_question_count = len(valid_questions)
 
     if num_questions:
         questions = questions[:num_questions]
 
     # Step 2: Process each question (QC + distractors + MCQA formatting) in parallel
     results = []
+    answerability_filter_drops = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = [
             executor.submit(process_question, q, paper_title, paper_text)
@@ -446,21 +541,40 @@ def process_domain(domain, num_questions=None):
         ]
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Processing MCQA for {domain}"):
             res = future.result()
-            if res:
-                results.append(res)
+            if not res:
+                continue
+            if not res.get('ok', True):
+                answerability_filter_drops.append(res)
+                continue
+            results.append(res)
 
     if results:
         out_df = pd.DataFrame(results)
+        if 'ok' in out_df.columns:
+            out_df = out_df.drop(columns=['ok'])
         out_df.to_csv(output_path, index=False)
         print(f"Saved {len(out_df)} comprehension MCQA probes to {output_path}")
+        print(f"Dropped {len(answerability_filter_drops)} questions in answerability filter.")
 
         # Save readable debug txt
         debug_path = os.path.join(output_dir, 'comprehension_mcqa_debug.txt')
         with open(debug_path, 'w', encoding='utf-8') as f:
             f.write(f"Comprehension MCQA Probes — {domain}\n")
+            f.write(f"Generated raw questions: {raw_question_count}\n")
+            f.write(f"Validated excerpts: {validated_question_count}\n")
+            f.write(f"Dropped (excerpt not found): {excerpt_drop_count}\n")
+            f.write(f"Dropped (answerability filter): {len(answerability_filter_drops)}\n")
             f.write(f"Total: {len(out_df)} questions\n")
             f.write(f"Refined by QC: {out_df['was_refined'].sum()}, Unchanged: {(~out_df['was_refined']).sum()}\n")
             f.write(f"{'='*80}\n\n")
+            if answerability_filter_drops:
+                f.write("Dropped by answerability filter:\n")
+                for idx, row in enumerate(answerability_filter_drops, start=1):
+                    f.write(
+                        f"  {idx}. Expected {row['expected_answer']}, predicted {row['predicted_answer']}; "
+                        f"{row['question'].splitlines()[0]}\n"
+                    )
+                f.write(f"\n{'='*80}\n\n")
             for idx, row in out_df.iterrows():
                 f.write(f"----- Question {idx + 1} (Answer: {row['answer']}, Refined: {row['was_refined']}) -----\n")
                 f.write(f"{row['question']}\n\n")

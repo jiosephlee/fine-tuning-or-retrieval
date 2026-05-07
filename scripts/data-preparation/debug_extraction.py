@@ -4,10 +4,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 import pandas as pd
 from tqdm import tqdm
 import utils.utils as utils
+from utils import probe_paths
 from pipeline_fact_probe import generate_probes_for_paper  # we'll pull the prompts from here
 
 # Load checkpoint
-checkpoint_path = '../../data/probes/facts/DPO/checkpoints/07_knowledge_kept.csv'
+checkpoint_path = str(probe_paths.resolve_probe_dir("facts", "DPO") / 'checkpoints' / '07_knowledge_kept.csv')
 paper_df = pd.read_csv(checkpoint_path)
 print(f"Loaded {len(paper_df)} rows from checkpoint")
 
@@ -140,7 +141,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
     results = list(tqdm(executor.map(extract_only, [paper_df.iloc[i] for i in range(len(paper_df))]), total=len(paper_df)))
 
 # Save debug output
-output_path = '../../data/probes/facts/DPO/debug_extraction.txt'
+output_path = str(probe_paths.resolve_probe_dir("facts", "DPO") / 'debug_extraction.txt')
 total_qa = 0
 math_qa = 0
 with open(output_path, 'w') as f:

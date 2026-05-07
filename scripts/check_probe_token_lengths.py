@@ -5,6 +5,7 @@ import os
 from typing import List, Tuple
 
 from transformers import AutoTokenizer
+from utils import probe_paths
 
 
 def compute_lengths(tokenizer, texts: List[str]) -> Tuple[List[int], List[int], dict]:
@@ -40,7 +41,7 @@ def main():
     parser.add_argument(
         "--csv_path",
         type=str,
-        default="data/probes/inference/1_58/probes_v7.csv",
+        default=str(probe_paths.resolve_probe_path("inference", "1_58", "v7")),
         help="Path to the probes CSV (must contain 'probe', 'target', and 'fact' columns).",
     )
     parser.add_argument(

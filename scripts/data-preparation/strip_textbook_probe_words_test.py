@@ -9,6 +9,7 @@ from tqdm import tqdm
 # Add the project root to the path
 sys.path.append('../../')
 import utils.utils as utils
+from utils import probe_paths
 
 # Common English stop words to exclude from replacement
 STOP_WORDS = {
@@ -155,8 +156,8 @@ def process_domain(domain, base_dir, probes_dir, output_dir):
     
     # Paths
     textbook_path = os.path.join(base_dir, 'explanations', domain, 'textbook.txt')
-    facts_path = os.path.join(probes_dir, 'facts', domain, 'probes_v9.csv')
-    inference_path = os.path.join(probes_dir, 'inference', domain, 'probes_v6.csv')
+    facts_path = str(probe_paths.resolve_probe_path('facts', domain, 'v9'))
+    inference_path = str(probe_paths.resolve_probe_path('inference', domain, 'v6'))
     source_paper_path = os.path.join(base_dir, 'cleaned', domain + '.tex')
     
     # Check if textbook exists
@@ -324,7 +325,6 @@ def process_domain(domain, base_dir, probes_dir, output_dir):
 
 def main():
     base_dir = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/data/arxiv'
-    probes_dir = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/data/probes'
     output_dir = '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/data/arxiv/explanations_stripped_test'
     
     os.makedirs(output_dir, exist_ok=True)
@@ -333,7 +333,7 @@ def main():
     test_domain = '1_58'  # You can change this to test different domains
     
     print(f"Testing on domain: {test_domain}")
-    stats = process_domain(test_domain, base_dir, probes_dir, output_dir)
+    stats = process_domain(test_domain, base_dir, "", output_dir)
     
     if stats:
         print("\n" + "="*60)
@@ -346,4 +346,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

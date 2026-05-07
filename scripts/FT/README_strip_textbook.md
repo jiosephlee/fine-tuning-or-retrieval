@@ -56,8 +56,8 @@ This will:
 
 For each domain (e.g., '1_58'), the script expects:
 - Textbook: `/data/arxiv/explanations/{domain}/textbook.txt`
-- Factual probes: `/data/probes/facts/{domain}/probes_v9.csv`
-- Inference probes: `/data/probes/inference/{domain}/probes_v6.csv`
+- Factual probes: `/probes/<source>/{domain}/facts/probes_v9.csv`
+- Inference probes: `/probes/<source>/{domain}/inference/probes_v6.csv`
 - Source paper: `/data/arxiv/cleaned/{domain}.tex`
 
 ## Output Files
@@ -138,4 +138,3 @@ data/arxiv/explanations_stripped/
 - Multi-word phrases are preserved and replaced as complete phrases
 - LaTeX notation is handled appropriately
 - The script processes flagged paragraphs sequentially with progress bars
-

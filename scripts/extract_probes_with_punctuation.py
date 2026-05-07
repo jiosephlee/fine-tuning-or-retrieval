@@ -16,11 +16,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..'))
 sys.path.insert(0, PROJECT_ROOT)
 import utils.utils as utils
+from utils import probe_paths
 
 # Define paths
-BASE_DIR = Path("/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/data/probes")
-FACTS_DIR = BASE_DIR / "facts"
-INFERENCE_DIR = BASE_DIR / "inference"
+BASE_DIR = Path(PROJECT_ROOT) / "probes"
 OUTPUT_FILE = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/probes_with_punctuation.txt"
 FIX_OUTPUT_FILE = "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/probes_fixed_comparison.txt"
 
@@ -110,37 +109,33 @@ def main():
     
     # Process facts domains (probes_v9.csv)
     print("Processing facts probes_v9.csv files...")
-    for domain_dir in FACTS_DIR.iterdir():
-        if domain_dir.is_dir():
-            csv_path = domain_dir / "probes_v9.csv"
-            if csv_path.exists():
-                print(f"  Reading {domain_dir.name}/probes_v9.csv...")
-                probes = extract_probes_from_csv(csv_path, extract_all_data=True)
-                print(f"    Found {len(probes)} probes ending with punctuation")
-                for row in probes:
-                    row['domain'] = domain_dir.name
-                    row['source_file'] = 'facts/probes_v9.csv'
-                    row['csv_path'] = str(csv_path)
-                all_probe_data.extend(probes)
-                if csv_path not in csv_files_to_update:
-                    csv_files_to_update[str(csv_path)] = []
+    for csv_path in BASE_DIR.glob("*/**/facts/probes_v9.csv"):
+        domain = csv_path.parent.parent.name
+        print(f"  Reading {domain}/probes_v9.csv...")
+        probes = extract_probes_from_csv(csv_path, extract_all_data=True)
+        print(f"    Found {len(probes)} probes ending with punctuation")
+        for row in probes:
+            row['domain'] = domain
+            row['source_file'] = 'facts/probes_v9.csv'
+            row['csv_path'] = str(csv_path)
+        all_probe_data.extend(probes)
+        if str(csv_path) not in csv_files_to_update:
+            csv_files_to_update[str(csv_path)] = []
     
     # Process inference domains (probes_v6.csv)
     print("\nProcessing inference probes_v6.csv files...")
-    for domain_dir in INFERENCE_DIR.iterdir():
-        if domain_dir.is_dir():
-            csv_path = domain_dir / "probes_v6.csv"
-            if csv_path.exists():
-                print(f"  Reading {domain_dir.name}/probes_v6.csv...")
-                probes = extract_probes_from_csv(csv_path, extract_all_data=True)
-                print(f"    Found {len(probes)} probes ending with punctuation")
-                for row in probes:
-                    row['domain'] = domain_dir.name
-                    row['source_file'] = 'inference/probes_v6.csv'
-                    row['csv_path'] = str(csv_path)
-                all_probe_data.extend(probes)
-                if str(csv_path) not in csv_files_to_update:
-                    csv_files_to_update[str(csv_path)] = []
+    for csv_path in BASE_DIR.glob("*/**/inference/probes_v6.csv"):
+        domain = csv_path.parent.parent.name
+        print(f"  Reading {domain}/probes_v6.csv...")
+        probes = extract_probes_from_csv(csv_path, extract_all_data=True)
+        print(f"    Found {len(probes)} probes ending with punctuation")
+        for row in probes:
+            row['domain'] = domain
+            row['source_file'] = 'inference/probes_v6.csv'
+            row['csv_path'] = str(csv_path)
+        all_probe_data.extend(probes)
+        if str(csv_path) not in csv_files_to_update:
+            csv_files_to_update[str(csv_path)] = []
     
     print(f"\nTotal probes to process: {len(all_probe_data)}")
     
@@ -238,4 +233,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

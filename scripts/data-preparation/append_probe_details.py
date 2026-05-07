@@ -2,6 +2,10 @@ import os
 import json
 import pandas as pd
 import ast
+import sys
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from utils import probe_paths
 
 def append_sentences_to_json(probes_base_dir: str, json_file_path: str):
     """
@@ -25,7 +29,7 @@ def append_sentences_to_json(probes_base_dir: str, json_file_path: str):
 
     for domain in all_domains:
         print(f"Processing domain: {domain}...")
-        probes_file = os.path.join(probes_base_dir, domain, 'probes_v6.csv')
+        probes_file = str(probe_paths.resolve_probe_path("inference", domain, "v6"))
 
         if not os.path.exists(probes_file):
             print(f"  - Probes file not found for {domain}, skipping.")
@@ -73,10 +77,9 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
     
-    probes_base_dir = os.path.join(project_root, 'data/probes/inference')
     json_file_path = os.path.join(project_root, 'results/inference_probe_leakage.json')
     
-    append_sentences_to_json(probes_base_dir, json_file_path)
+    append_sentences_to_json("", json_file_path)
 
 if __name__ == '__main__':
     main()

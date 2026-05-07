@@ -68,6 +68,7 @@ METHOD_TO_CORPUS = {
 }
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), ".")))
+from utils import probe_paths
 try:
     from utils.llm_plotting import set_plot_style
 except ImportError:
@@ -103,10 +104,8 @@ def tokenize_bigrams(text: str):
 
 def load_probe_data(project_root, domains):
     data = {"inference": {}, "knowledge": {}}
-    
-    path_inf = os.path.join(project_root, "data/probes/inference")
     for d in domains:
-        p = os.path.join(path_inf, d, "probes_v7.csv")
+        p = str(probe_paths.resolve_probe_path("inference", d, "v7"))
         if os.path.exists(p):
             df = pd.read_csv(p)
             if "fact" in df.columns:
@@ -114,9 +113,8 @@ def load_probe_data(project_root, domains):
                     # USE BIGRAM TOKENIZER
                     data["inference"][(d, idx)] = tokenize_bigrams(str(row["fact"]))
 
-    path_fact = os.path.join(project_root, "data/probes/facts")
     for d in domains:
-        p = os.path.join(path_fact, d, "probes_v9.csv")
+        p = str(probe_paths.resolve_probe_path("facts", d, "v9"))
         if os.path.exists(p):
             df = pd.read_csv(p)
             if "fact" in df.columns:
