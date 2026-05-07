@@ -66,4 +66,3 @@
 - close_or_stronger: human_blog_3.txt
 - moderately_close: none
 - weaker: human_blog_1.txt, human_blog_2.txt
-

@@ -102,21 +102,97 @@ Important: in `prepare_training_mix`, explanation loading is controlled by `"Wit
 
 Controlled by `--explanations_insertion_strategy` with mutually validated constraints.
 
-- `granular`
-  - builds per-domain explanation tracks
-  - supports `--explanations_cycle` and `--explanations_num_tracks`
-  - mixed via `replicate_and_interleave_tracks(...)`
-- `whole`
-  - inserts standalone explanation-only batches every `N` doc batches
-  - mixed via `replicate_and_interleave_whole_insert_every_n(...)`
-- `legacy`
-  - older coupled splice behavior
-  - mixed via `replicate_and_interleave_legacy(...)`
+The script currently supports several "multiview" layouts, where source,
+paraphrase, and explanation views are mixed into CPT batches.
+
+Baseline, no explanation views:
+
+- Trigger: omit `--with_explanations` and `--with_specific_explanation`.
+- Data: source document plus `--num_paraphrased_texts` paraphrase views.
+- Mixing: uses `replicate_and_interleave_legacy(...)` with only document batches.
+- Batch order: source batch, paraphrase batch 0, paraphrase batch 1, etc.,
+  replicated according to the epoch-derived replication factor.
+
+Granular explanation tracks:
+
+- Trigger: `--with_explanations` or `--with_specific_explanation`, with
+  `--explanations_insertion_strategy granular`.
+- File layout with `--with_specific_explanation`: loads subfolders under
+  `data/<source>/explanations/<domain>/<type>/*.txt`.
+- File layout with `--with_explanations`: loads flat defaults from
+  `data/<source>/explanations/<domain>/blogs.txt`, `stackexchange.txt`, and
+  `textbook.txt` when present.
+- Cycle control: `--explanations_cycle N` loads the first `N` files per selected
+  subfolder; `--explanations_cycle full` loads all files. This is required when
+  using `--with_specific_explanation` with granular insertion.
+- Track control: `--explanations_num_tracks K` creates `K` phase-offset cycles
+  per domain. Track 1 starts at file 0; later tracks start at
+  `floor(track_idx * num_files / K)`.
+- Mixing: `replicate_and_interleave_tracks(...)` keeps document batches intact
+  and appends chunks from every active explanation track to every document
+  batch.
+- Constraint: `--explanations_num_tracks` is only valid for `granular`.
+
+Whole explanation insertion:
+
+- Trigger: `--with_explanations` or `--with_specific_explanation`, with
+  `--explanations_insertion_strategy whole`.
+- File layout: loads flat explanation files from
+  `data/<source>/explanations/<domain>/`.
+- Default files: `blogs.txt`, `stackexchange.txt`, and `textbook.txt` when
+  present.
+- Specific files: `--with_specific_explanation` names map to flat files; aliases
+  include `textbooks -> textbook.txt`, `blogs -> blogs.txt`, and
+  `stack -> stackexchange.txt`.
+- Mixing: `replicate_and_interleave_whole_insert_every_n(...)` keeps document
+  batches intact and inserts one combined explanation-only batch after every
+  `--explanations_insert_every_n` document batches.
+- Constraint: `--explanations_insert_every_n` must be positive.
+
+Legacy coupled splice:
+
+- Trigger: `--with_explanations` or `--with_specific_explanation`, with
+  `--explanations_insertion_strategy legacy`.
+- File layout: same flat-file loading as `whole`.
+- Mixing: builds a second set of document-shaped batches where explanation
+  chunks are spliced into/replacing paraphrase-batch chunks, then
+  `replicate_and_interleave_legacy(...)` uses the explanation-spliced batches
+  for every replication. If no explanation-spliced batches exist, it falls back
+  to the ordinary source/paraphrase batches.
+- Constraint: legacy supports only one `--with_specific_explanation` type.
+
+Random splice:
+
+- Trigger: `--with_explanations` or `--with_specific_explanation`, with
+  `--explanations_insertion_strategy random_splice`.
+- File layout: same flat-file loading as `whole` and `legacy`.
+- Mixing: preserves the source batch, chooses a deterministic random paraphrase
+  start point using `--shuffle_seed` plus a stable domain offset, then replaces
+  paraphrase chunks with explanation chunks in wraparound order.
+- Example: with paraphrases `[p0, p1, p2, p3]` and random start `p2`, the splice
+  order is `[p2, p3, p0, p1]`.
+- Unit: chunk-level replacement only; it does not cut into the middle of a text
+  chunk or token sequence.
+- Partial replacement keeps the original paraphrase prefix and places
+  explanation chunks at the tail, matching legacy partial-splice shape.
+
+Shared controls:
+
+- `--times_explanations N` repeats loaded explanation chunks before insertion.
+- `--fill_batches_with_pretraining` pads underfilled mixed batches with replay
+  tokens from `data/olmo/<pretraining_data_type>_100M_tokens.npy`.
+- `--separate_batches_with_pretraining N` inserts `N` full replay batches between
+  scheduled document/explanation batches.
+- `fill_underfilled_chunks(...)` can fill large empty space inside individual
+  chunks after the final schedule is built.
 
 Where implemented:
 
 - validation/normalization: `scripts/FT/finetuning_knowledge_v9.py`
 - mixing logic: `utils/data_preparation.py`
+- granular schedule: `replicate_and_interleave_tracks(...)`
+- whole schedule: `replicate_and_interleave_whole_insert_every_n(...)`
+- baseline/legacy schedule: `replicate_and_interleave_legacy(...)`
 
 ## 5) Data Replay / Batch Filling Layer
 
@@ -144,6 +220,11 @@ Main callback classes live in `utils/llm_callbacks.py`:
 
 V9 built-ins (set in main after parsing):
 
+- factual knowledge probes default to `probes_v13.csv`
+- selected factual probe files are preflighted before model loading for required
+  `fact`, `probe`, and `target` columns
+- MCQA probe callbacks are opt-in with `--mcqa_probes`/`--mcqa-probes` and can
+  be explicitly disabled with `--disable_mcqa_probes`/`--no-mcqa-probes`
 - inference probes disabled
 - W&B corpus perplexity logging disabled
 - W&B training-loss perplexity logging disabled
@@ -172,6 +253,7 @@ The script itself is orchestration glue; these APIs own the heavy lifting.
 
 - parse CLI args
 - apply v9 hard defaults (disable inference probes/perplexity W&B)
+- resolve domains and validate the selected factual probe CSVs
 - apply `--prior_knowledge` overrides (disable paraphrase/explanation; optional epoch/batch overrides)
 - parse and validate explanation strategy constraints
 

@@ -25,7 +25,7 @@ python scripts/FT/analyze_probe_origin.py --probe_type inference
 ```
 
 **Process:**
-1. Loads probe targets from CSV files in `data/probes/facts/` or `data/probes/inference/`
+1. Loads probe targets from CSV files in `probes/<source>/<domain>/facts/` or `probes/<source>/<domain>/inference/`
 2. Loads text from:
    - **Explanations**: All `.txt` files in `data/arxiv/explanations/{domain}/`
    - **Source**: Paraphrased `.tex` files + cleaned source `.tex` file
@@ -120,4 +120,3 @@ Probes in the "Neither" category could indicate:
 - Potential data quality issues
 
 These probes can confound analysis if lumped together with "Both" probes, which is why the four-way split is important.
-
