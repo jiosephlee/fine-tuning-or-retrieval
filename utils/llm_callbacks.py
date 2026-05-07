@@ -3,6 +3,7 @@ from transformers import TrainerCallback, AutoTokenizer
 from typing import List, Dict, Any, Optional
 import pandas as pd
 import os
+import re
 import wandb
 import json
 from utils.llm_inference import generate_text
@@ -11,6 +12,7 @@ from utils.llm_evals import evaluate_response
 import matplotlib.pyplot as plt
 import math
 from tqdm import tqdm
+from utils import parameter_delta_metrics
 
 
 def _should_skip_sparse_eval(callback, state) -> bool:
@@ -781,7 +783,7 @@ class WandbSourcePanelsCallback(TrainerCallback):
     - panel/<source>/papers/<domain>/hits_1
     - panel/<source>/papers/<domain>/hits_10
     - panel/<source>/papers/<domain>/hits_100
-    - panel/<source>/papers/<domain>/mcqa (TODO placeholder namespace only)
+    - panel/<source>/papers/<domain>/mcqa_accuracy
     """
     PAPER_METRICS = (
         ("log_prob", "log_prob_average"),
@@ -793,15 +795,16 @@ class WandbSourcePanelsCallback(TrainerCallback):
     def __init__(
         self,
         knowledge_callbacks: List[BaseKnowledgeProbeCallBack],
+        mcqa_callbacks: Optional[List["MCQAProbeCallback"]] = None,
         domain_sources: Optional[Dict[str, str]] = None,
         panel_sources: Optional[List[str]] = None,
         report_to_wandb: bool = True,
     ):
         self.knowledge_callbacks = knowledge_callbacks
+        self.mcqa_callbacks = mcqa_callbacks or []
         self.domain_sources = domain_sources or {}
         self.panel_sources = panel_sources or ["legal", "arxiv", "medical"]
         self.report_to_wandb = report_to_wandb
-        self._mcqa_metric_defined = False
 
     @staticmethod
     def _valid_number(value: Any) -> bool:
@@ -822,11 +825,11 @@ class WandbSourcePanelsCallback(TrainerCallback):
         source = self.domain_sources.get(domain, "arxiv")
         return source if source in self.panel_sources else "arxiv"
 
-    def _domain_from_knowledge_prefix(self, log_prefix: str) -> Optional[str]:
-        suffix = "_knowledge_probe"
-        if not log_prefix.endswith(suffix):
-            return None
-        return log_prefix[: -len(suffix)]
+    def _domain_from_prefix(self, log_prefix: str) -> Optional[str]:
+        for suffix in ("_knowledge_probe", "_mcqa_probe"):
+            if log_prefix.endswith(suffix):
+                return log_prefix[: -len(suffix)]
+        return None
 
     @staticmethod
     def _entry_for_step(entries: List[Dict[str, Any]], step: int) -> Optional[Dict[str, Any]]:
@@ -838,7 +841,7 @@ class WandbSourcePanelsCallback(TrainerCallback):
     def _collect_paper_metrics_by_domain(self, step: int) -> Dict[str, Dict[str, float]]:
         per_domain: Dict[str, Dict[str, float]] = {}
         for callback in self.knowledge_callbacks:
-            domain = self._domain_from_knowledge_prefix(getattr(callback, "log_prefix", ""))
+            domain = self._domain_from_prefix(getattr(callback, "log_prefix", ""))
             if not domain:
                 continue
             domain_metrics: Dict[str, float] = {}
@@ -852,6 +855,20 @@ class WandbSourcePanelsCallback(TrainerCallback):
                     domain_metrics[panel_name] = float(avg)
             if domain_metrics:
                 per_domain[domain] = domain_metrics
+
+        # MCQA constrained-decoding accuracy
+        for callback in self.mcqa_callbacks:
+            domain = self._domain_from_prefix(getattr(callback, "log_prefix", ""))
+            if not domain:
+                continue
+            acc_entries = callback.history.get("mcqa_accuracy", [])
+            entry = self._entry_for_step(acc_entries, step)
+            if not entry:
+                continue
+            avg = self._safe_average(entry.get("values", []))
+            if self._valid_number(avg):
+                per_domain.setdefault(domain, {})["mcqa_accuracy"] = float(avg)
+
         return per_domain
 
     def _build_logs_for_step(self, step: int) -> Dict[str, float]:
@@ -874,19 +891,9 @@ class WandbSourcePanelsCallback(TrainerCallback):
 
         return logs
 
-    def _define_mcqa_placeholder_metrics(self):
-        if self._mcqa_metric_defined or not self.report_to_wandb or not wandb.run:
-            return
-        # TODO: Wire real MCQA values when MCQA callback lands.
-        for domain, source in self.domain_sources.items():
-            if source in self.panel_sources:
-                wandb.define_metric(f"panel/{source}/papers/{domain}/mcqa")
-        self._mcqa_metric_defined = True
-
     def on_train_begin(self, args, state, control, model, **kwargs):
         if not state.is_world_process_zero:
             return
-        self._define_mcqa_placeholder_metrics()
         logs = self._build_logs_for_step(0)
         if self.report_to_wandb and wandb.run and logs:
             wandb.log(logs, step=0)
@@ -894,7 +901,6 @@ class WandbSourcePanelsCallback(TrainerCallback):
     def on_step_end(self, args, state, control, model, **kwargs):
         if not state.is_world_process_zero:
             return
-        self._define_mcqa_placeholder_metrics()
         logs = self._build_logs_for_step(state.global_step)
         if self.report_to_wandb and wandb.run and logs:
             wandb.log(logs, step=state.global_step)
@@ -1075,6 +1081,214 @@ class GenerationProbeCallback(TrainerCallback):
             else:
                 print(f" > Saved evaluation plot for {dataset_name} to '{plot_path}'")
 
+class MCQAProbeCallback(BaseKnowledgeProbeCallBack):
+    """
+    Extends BaseKnowledgeProbeCallBack with constrained-decoding MCQA evaluation.
+
+    Inherits all standard probe+target metrics (log_prob, perplexity, hits@k)
+    from the base class and additionally evaluates MCQA accuracy by extracting
+    log probabilities for a constrained set of choice tokens at the last
+    position of each formatted question prompt.
+
+    Extra constructor args beyond BaseKnowledgeProbeCallBack:
+        formatted_questions: list of MCQA prompts (formatted_question + suffix)
+        correct_choice_indices: int index into choice_tokens per probe
+        choice_tokens: list of single-token strings (e.g. ["A", "B", "C", "D", "E"]
+            when prompts end with "Answer: (")
+    """
+
+    def __init__(
+        self,
+        tokenizer: AutoTokenizer,
+        facts: List[str],
+        probes: List[str],
+        targets: List[str],
+        formatted_questions: List[str],
+        correct_choice_indices: List[int],
+        choice_tokens: List[str],
+        probes_df: pd.DataFrame = None,
+        track_hits: bool = True,
+        track_logprobs: bool = True,
+        batch_size: int = 8,
+        logger=None,
+        output_dir: str = "",
+        log_prefix: str = "mcqa_probe",
+        report_to_wandb: bool = True,
+        sparse_eval: bool = False,
+        wandb_metric_allowlist: Optional[List[str]] = None,
+    ):
+        super().__init__(
+            tokenizer=tokenizer,
+            facts=facts,
+            probes=probes,
+            targets=targets,
+            probes_df=probes_df,
+            track_hits=track_hits,
+            track_logprobs=track_logprobs,
+            batch_size=batch_size,
+            logger=logger,
+            output_dir=output_dir,
+            log_prefix=log_prefix,
+            report_to_wandb=report_to_wandb,
+            sparse_eval=sparse_eval,
+            wandb_metric_allowlist=wandb_metric_allowlist,
+        )
+
+        self.formatted_questions = formatted_questions
+        self.correct_choice_indices = correct_choice_indices
+
+        # Resolve choice token IDs — each must be a single token
+        self.choice_tokens = choice_tokens
+        self.choice_token_ids: List[int] = []
+        for token_str in choice_tokens:
+            ids = tokenizer.encode(token_str, add_special_tokens=False)
+            if len(ids) != 1:
+                raise ValueError(
+                    f"Choice token '{token_str}' encodes to {len(ids)} tokens {ids}; "
+                    f"each choice must be a single token. "
+                    f"Try a different string form (e.g. ' A' vs 'A')."
+                )
+            self.choice_token_ids.append(ids[0])
+        print(
+            f"MCQAProbeCallback: resolved choice tokens "
+            f"{list(zip(choice_tokens, self.choice_token_ids))}"
+        )
+
+        # Pre-tokenize MCQA prompts (separate from the cloze facts)
+        self.tokenized_mcqa_prompts = tokenizer(
+            formatted_questions, padding=True, return_tensors="pt",
+            add_special_tokens=False,
+        )
+        print(
+            f"MCQAProbeCallback: {len(formatted_questions)} MCQA prompts, "
+            f"max length {self.tokenized_mcqa_prompts['input_ids'].shape[1]}"
+        )
+
+        # Extend history with MCQA-specific keys
+        self.history["mcqa_accuracy"] = []
+        self.history["mcqa_correct_logprob"] = []
+
+    # ------------------------------------------------------------------
+    # Override _evaluate_probes to also run constrained-decoding
+    # ------------------------------------------------------------------
+    def _evaluate_probes(self, model, return_logits=False) -> Dict[str, torch.Tensor]:
+        result = super()._evaluate_probes(model, return_logits=return_logits)
+        if return_logits:
+            metrics, logits_out = result
+        else:
+            metrics = result
+
+        mcqa_metrics = self._evaluate_mcqa(model)
+        metrics.update(mcqa_metrics)
+
+        return (metrics, logits_out) if return_logits else metrics
+
+    # ------------------------------------------------------------------
+    # Constrained-decoding evaluation
+    # ------------------------------------------------------------------
+    def _evaluate_mcqa(self, model) -> Dict[str, torch.Tensor]:
+        device = model.device
+        num_prompts = len(self.formatted_questions)
+        choice_ids = torch.tensor(self.choice_token_ids, device=device)
+
+        all_correct: List[torch.Tensor] = []
+        all_correct_logprobs: List[torch.Tensor] = []
+
+        for i in range(0, num_prompts, self.batch_size):
+            end_idx = min(i + self.batch_size, num_prompts)
+            inputs = {
+                "input_ids": self.tokenized_mcqa_prompts["input_ids"][i:end_idx].to(device),
+                "attention_mask": self.tokenized_mcqa_prompts["attention_mask"][i:end_idx].to(device),
+            }
+
+            with torch.no_grad():
+                logits = model(**inputs).logits
+
+            seq_lengths = inputs["attention_mask"].sum(dim=1) - 1
+            bs = logits.shape[0]
+            last_logits = logits[torch.arange(bs, device=device), seq_lengths]
+
+            choice_logits = last_logits[:, choice_ids]
+            choice_log_probs = torch.nn.functional.log_softmax(choice_logits, dim=-1)
+
+            predicted_idx = choice_logits.argmax(dim=-1)
+
+            correct_indices = torch.tensor(
+                self.correct_choice_indices[i:end_idx], device=device, dtype=torch.long,
+            )
+            all_correct.append((predicted_idx == correct_indices).float())
+            all_correct_logprobs.append(
+                choice_log_probs[torch.arange(bs, device=device), correct_indices]
+            )
+
+        return {
+            "mcqa_accuracy": torch.cat(all_correct),
+            "mcqa_correct_logprob": torch.cat(all_correct_logprobs),
+        }
+
+    # ------------------------------------------------------------------
+    # Additional end-of-training report
+    # ------------------------------------------------------------------
+    def on_train_end(self, args, state, control, model, **kwargs):
+        super().on_train_end(args, state, control, model, **kwargs)
+        if state.is_world_process_zero:
+            self._generate_mcqa_report()
+
+    def _generate_mcqa_report(self):
+        if not self.history["mcqa_accuracy"]:
+            return
+
+        report_path = os.path.join(
+            self.output_dir, f"{self.log_prefix}_mcqa_report.txt"
+        )
+
+        final_acc = self.history["mcqa_accuracy"][-1]
+        initial_acc = self.history["mcqa_accuracy"][0]
+
+        with open(report_path, "w") as f:
+            f.write(f"MCQA Probe Report — {self.log_prefix}\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(f"Number of probes : {len(self.formatted_questions)}\n")
+            f.write(f"Number of choices: {len(self.choice_token_ids)}\n")
+            f.write(f"Choice tokens    : {self.choice_tokens}\n\n")
+
+            if initial_acc:
+                init_vals = torch.tensor(initial_acc["values"])
+                f.write(
+                    f"Initial accuracy : {init_vals.mean().item():.4f} "
+                    f"(step {initial_acc['step']})\n"
+                )
+
+            final_vals = torch.tensor(final_acc["values"])
+            f.write(
+                f"Final accuracy   : {final_vals.mean().item():.4f} "
+                f"(step {final_acc['step']})\n\n"
+            )
+
+            wrong_indices = (final_vals == 0).nonzero(as_tuple=True)[0]
+            if wrong_indices.numel() > 0:
+                f.write(f"Incorrectly answered probes ({wrong_indices.numel()}):\n")
+                f.write("-" * 40 + "\n")
+                for idx in wrong_indices[:20]:
+                    idx_int = idx.item()
+                    if self.probes_df is not None and idx_int < len(self.probes_df):
+                        row = self.probes_df.iloc[idx_int]
+                        f.write(
+                            f"  Probe {idx_int}: "
+                            f"{str(row.get('probe', ''))[:120]}...\n"
+                        )
+                        f.write(
+                            f"    Correct: {row.get('correct_label', '')}\n\n"
+                        )
+                    else:
+                        f.write(
+                            f"  Probe {idx_int}: "
+                            f"{self.formatted_questions[idx_int][:120]}...\n\n"
+                        )
+
+        print(f" > Saved MCQA report to '{report_path}'")
+
+
 class CorpusPerplexityCallback(TrainerCallback):
     """
     Calculates the perplexity of an entire text corpus at the end of each
@@ -1223,3 +1437,190 @@ class TrainingLossPerplexityCallback(TrainerCallback):
             print(f" > Saved training loss perplexity metrics to '{output_path}' with {len(df)} rows.")
         else:
             print(" > No training loss perplexity metrics to save.")
+
+
+class ParameterDeltaCallback(TrainerCallback):
+    """
+    Tracks parameter movement relative to the model state at training start.
+    The callback records compact summaries for plotting and, optionally,
+    temporary raw delta tensors for final-direction alignment plots.
+    """
+
+    def __init__(
+        self,
+        output_dir: str,
+        storage_path: Optional[str] = None,
+        include_embeddings: bool = True,
+        compute_final_alignment: bool = True,
+        sparse_milestones: bool = True,
+        report_to_wandb: bool = True,
+        logger=None,
+    ):
+        self.output_dir = output_dir
+        self.storage_path = storage_path
+        self.include_embeddings = include_embeddings
+        self.compute_final_alignment = compute_final_alignment
+        self.sparse_milestones = sparse_milestones
+        self.report_to_wandb = report_to_wandb
+        self.logger = logger
+
+        self.entries = []
+        self.baseline = {}
+        self.scalar_rows = []
+        self.layer_rows = []
+        self.concentration_rows = []
+        self.recorded_steps = set()
+        self._milestones = None
+        self.raw_delta_dir = self._resolve_raw_delta_dir()
+
+    def _log_info(self, message: str) -> None:
+        if self.logger:
+            self.logger.info(message)
+        else:
+            print(message)
+
+    def _log_warning(self, message: str) -> None:
+        if self.logger:
+            self.logger.warning(message)
+        else:
+            print(message)
+
+    def _resolve_raw_delta_dir(self) -> str:
+        if self.storage_path:
+            run_name = os.path.basename(os.path.dirname(os.path.abspath(self.output_dir)))
+            safe_run_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_name) if run_name else "run"
+            return os.path.join(self.storage_path, f"{safe_run_name}_parameter_delta_raw_deltas")
+        return os.path.join(self.output_dir, "tmp_raw_deltas")
+
+    def _get_milestones(self, state) -> set:
+        if not self.sparse_milestones:
+            return set()
+        if self._milestones is not None:
+            return self._milestones
+        total_steps = state.max_steps
+        if not total_steps or total_steps <= 0:
+            self._milestones = {0}
+            return self._milestones
+        self._milestones = {0, int(total_steps)}
+        self._milestones.update(
+            max(1, int(total_steps * fraction / 10.0))
+            for fraction in range(1, 10)
+        )
+        return self._milestones
+
+    def _should_record_step(self, step: int, state) -> bool:
+        if step in self.recorded_steps:
+            return False
+        if not self.sparse_milestones:
+            return True
+        return step in self._get_milestones(state)
+
+    def _discover_entries(self, model) -> None:
+        entries = parameter_delta_metrics.discover_mlp_tensors(model)
+        if self.include_embeddings:
+            try:
+                entries.append(parameter_delta_metrics.discover_embedding_tensor(model))
+            except Exception as exc:
+                self._log_warning(f"ParameterDeltaCallback: skipping embeddings: {exc}")
+        self.entries = entries
+
+    def _record_step(self, step: int, model) -> None:
+        if not self.entries:
+            return
+
+        raw_delta_dir = self.raw_delta_dir if self.compute_final_alignment else None
+        with torch.no_grad():
+            result = parameter_delta_metrics.compute_step_metrics(
+                step=step,
+                entries=self.entries,
+                baseline=self.baseline,
+                raw_delta_dir=raw_delta_dir,
+            )
+
+        self.scalar_rows.extend(result.scalar_rows)
+        self.layer_rows.extend(result.layer_rows)
+        self.concentration_rows.extend(result.concentration_rows)
+        self.recorded_steps.add(step)
+        self._log_info(f"ParameterDeltaCallback: recorded parameter deltas at step {step}.")
+
+        if self.report_to_wandb and wandb.run:
+            log_data = {}
+            for row in result.scalar_rows:
+                component = row["component"]
+                metric = row["metric"]
+                log_data[f"parameter_delta/{component}/{metric}/mean"] = row["mean"]
+                log_data[f"parameter_delta/{component}/{metric}/max"] = row["max"]
+            for row in result.concentration_rows:
+                component = row["component"]
+                metric = row["metric"]
+                log_data[f"parameter_delta/{component}/{metric}/top_1pct_share"] = row["top_1pct_share"]
+                log_data[f"parameter_delta/{component}/{metric}/top_5pct_share"] = row["top_5pct_share"]
+                log_data[f"parameter_delta/{component}/{metric}/gini"] = row["gini"]
+            if log_data:
+                wandb.log(log_data, step=step)
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if not state.is_world_process_zero or model is None:
+            return
+        os.makedirs(self.output_dir, exist_ok=True)
+        if self.compute_final_alignment and os.path.isdir(self.raw_delta_dir):
+            parameter_delta_metrics.cleanup_raw_delta_dir(self.raw_delta_dir)
+        if self.compute_final_alignment:
+            os.makedirs(self.raw_delta_dir, exist_ok=True)
+
+        self._discover_entries(model)
+        self._log_info(
+            "ParameterDeltaCallback: tracking "
+            f"{len([e for e in self.entries if e.component == 'mlp'])} MLP tensors"
+            f"{' plus embeddings' if self.include_embeddings else ''}."
+        )
+        with torch.no_grad():
+            self.baseline = parameter_delta_metrics.snapshot_baseline(self.entries)
+        self._record_step(0, model)
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if not state.is_world_process_zero or model is None:
+            return
+        step = int(state.global_step)
+        if self._should_record_step(step, state):
+            self._record_step(step, model)
+
+    def on_train_end(self, args, state, control, model=None, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        if model is not None:
+            final_step = int(state.global_step)
+            if final_step not in self.recorded_steps:
+                self._record_step(final_step, model)
+
+        parameter_delta_metrics.save_metric_csvs(
+            self.output_dir,
+            self.scalar_rows,
+            self.layer_rows,
+            self.concentration_rows,
+        )
+
+        alignment_scalar = pd.DataFrame()
+        alignment_layer = pd.DataFrame()
+        alignment_succeeded = False
+        if self.compute_final_alignment:
+            try:
+                alignment_scalar, alignment_layer = parameter_delta_metrics.compute_final_alignment(
+                    self.raw_delta_dir,
+                    self.output_dir,
+                )
+            except Exception as exc:
+                self._log_warning(f"ParameterDeltaCallback: final alignment failed: {exc}")
+            else:
+                alignment_succeeded = True
+
+        try:
+            from utils.parameter_delta_plotting import plot_parameter_delta_outputs
+
+            plot_parameter_delta_outputs(self.output_dir)
+            if alignment_succeeded:
+                parameter_delta_metrics.cleanup_raw_delta_dir(self.raw_delta_dir)
+        except Exception as exc:
+            self._log_warning(f"ParameterDeltaCallback: plotting failed: {exc}")
+
+        self._log_info(f"ParameterDeltaCallback: saved outputs to {self.output_dir}.")

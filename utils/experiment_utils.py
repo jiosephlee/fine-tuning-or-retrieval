@@ -35,6 +35,68 @@ def load_prompts(prompt_files: Dict[str, str], append_eot: bool = False) -> Dict
     return prompts
 
 
+DEFAULT_MCQA_PROMPT_SUFFIX = "\nAnswer: ("
+DEFAULT_MCQA_CHOICE_TOKENS = ["A", "B", "C", "D", "E"]
+MCQA_LABEL_TO_INDEX = {"(A)": 0, "(B)": 1, "(C)": 2, "(D)": 3, "(E)": 4,
+                        "A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
+
+
+def _create_mcqa_callback(
+    tokenizer,
+    mcqa_df: pd.DataFrame,
+    batch_size: int,
+    log,
+    output_dir: str,
+    log_prefix: str,
+    report_to_wandb: bool,
+    sparse_eval: bool,
+    wandb_metric_allowlist=None,
+    prompt_suffix: str = DEFAULT_MCQA_PROMPT_SUFFIX,
+    choice_tokens: list = None,
+):
+    """Create an MCQAProbeCallback from a MCQA probe DataFrame.
+
+    The DataFrame must contain the standard cloze columns (``fact``, ``probe``,
+    ``target``) **plus** MCQA-specific columns (``formatted_question``,
+    ``correct_label``).  ``correct_label`` may be ``"(D)"`` or ``"D"`` style.
+    """
+    if choice_tokens is None:
+        choice_tokens = list(DEFAULT_MCQA_CHOICE_TOKENS)
+
+    formatted_questions = [
+        str(row["formatted_question"]).strip() + prompt_suffix
+        for _, row in mcqa_df.iterrows()
+    ]
+    correct_indices = []
+    for _, row in mcqa_df.iterrows():
+        label = str(row["correct_label"]).strip()
+        idx = MCQA_LABEL_TO_INDEX.get(label)
+        if idx is None:
+            raise ValueError(
+                f"Unrecognised correct_label '{label}'. "
+                f"Expected one of {list(MCQA_LABEL_TO_INDEX.keys())}"
+            )
+        correct_indices.append(idx)
+
+    return llm_callbacks.MCQAProbeCallback(
+        tokenizer=tokenizer,
+        facts=mcqa_df["fact"].tolist(),
+        probes=mcqa_df["probe"].tolist(),
+        targets=mcqa_df["target"].tolist(),
+        formatted_questions=formatted_questions,
+        correct_choice_indices=correct_indices,
+        choice_tokens=choice_tokens,
+        probes_df=mcqa_df,
+        batch_size=batch_size,
+        logger=log,
+        output_dir=output_dir,
+        log_prefix=log_prefix,
+        report_to_wandb=report_to_wandb,
+        sparse_eval=sparse_eval,
+        wandb_metric_allowlist=wandb_metric_allowlist,
+    )
+
+
 def _create_probe_callback(
     tokenizer,
     probe_df,
@@ -92,7 +154,10 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
     disable_corpus_perplexity_wandb = getattr(args, "disable_corpus_perplexity_wandb", False)
     disable_training_loss_perplexity_wandb = getattr(args, "disable_training_loss_perplexity_wandb", False)
     domain_sources = getattr(args, "domain_data_sources", {}) or {}
+    enable_mcqa_probes = getattr(args, "mcqa_probes", False)
+    enable_parameter_delta_tracking = getattr(args, "enable_parameter_delta_tracking", False)
     knowledge_probe_callbacks = []
+    mcqa_probe_callbacks = []
 
     if not domains:
         domains = get_all_domains()
@@ -131,6 +196,33 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
         else:
             log.warning(f"Knowledge probe file not found for domain {domain} at {knowledge_probe_path}")
 
+        # MCQA probes (constrained-decoding evaluation) — version follows knowledge probes
+        if enable_mcqa_probes:
+            mcqa_probe_path = str(
+                probe_paths.resolve_mcqa_probe_path(
+                    "facts", domain, knowledge_probes_version,
+                    domain_source=domain_source,
+                )
+            )
+            if os.path.exists(mcqa_probe_path):
+                mcqa_df = pd.read_csv(mcqa_probe_path)
+                output_dir_mcqa = os.path.join(
+                    args.base_results_dir, args.experiment_name,
+                    f"{domain}{suffix}_mcqa_probe",
+                )
+                os.makedirs(output_dir_mcqa, exist_ok=True)
+                mcqa_callback = _create_mcqa_callback(
+                    tokenizer, mcqa_df, probe_batch_size, log,
+                    output_dir_mcqa, f"{domain}_mcqa_probe",
+                    report_to_wandb, sparse_eval,
+                    wandb_probe_metric_allowlist,
+                )
+                callbacks.append(mcqa_callback)
+                mcqa_probe_callbacks.append(mcqa_callback)
+                log.info(f"Loaded {len(mcqa_df)} MCQA probes from {mcqa_probe_path}")
+            else:
+                log.warning(f"MCQA probe file not found for domain {domain} at {mcqa_probe_path}")
+
         if disable_inference_probes:
             log.info(f"Skipping inference probes for domain {domain} (--disable_inference_probes).")
         else:
@@ -166,6 +258,12 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                         f"but file not found at {candidate_path}"
                     )
                 for inference_probe_path in candidate_path:
+                    if not os.path.exists(inference_probe_path):
+                        log.warning(
+                            f"Skipping missing {inference_probe_subset} inference probe file for "
+                            f"domain {domain}: {inference_probe_path}"
+                        )
+                        continue
                     inference_probe_df = pd.read_csv(inference_probe_path)
                     prefix = f"train_{domain}_inference_probe" if "train" in inference_probe_path else f"test_{domain}_inference_probe"
                     inference_probe_callback = _create_probe_callback(
@@ -280,10 +378,33 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
             report_to_wandb=(report_to_wandb and not disable_training_loss_perplexity_wandb)
         )
     )
+    if enable_parameter_delta_tracking:
+        suffix = "_lima" if is_lima else ""
+        output_dir_parameter_delta = os.path.join(
+            args.base_results_dir,
+            args.experiment_name,
+            f"parameter_delta{suffix}",
+        )
+        callbacks.append(
+            llm_callbacks.ParameterDeltaCallback(
+                output_dir=output_dir_parameter_delta,
+                storage_path=getattr(args, "parameter_delta_storage_path", None),
+                include_embeddings=getattr(args, "parameter_delta_include_embeddings", True),
+                compute_final_alignment=getattr(args, "parameter_delta_compute_final_alignment", True),
+                sparse_milestones=getattr(args, "parameter_delta_sparse_milestones", True),
+                report_to_wandb=(
+                    report_to_wandb
+                    and getattr(args, "parameter_delta_report_to_wandb", True)
+                ),
+                logger=log,
+            )
+        )
+        log.info(f"Enabled ParameterDeltaCallback; outputs will save to {output_dir_parameter_delta}")
     if enable_wandb_source_panels:
         callbacks.append(
             llm_callbacks.WandbSourcePanelsCallback(
                 knowledge_callbacks=knowledge_probe_callbacks,
+                mcqa_callbacks=mcqa_probe_callbacks,
                 domain_sources=domain_sources,
                 panel_sources=panel_sources,
                 report_to_wandb=report_to_wandb,
@@ -302,6 +423,8 @@ def save_probe_results(callbacks, log, args):
 
     for callback in callbacks:
         if isinstance(callback, llm_callbacks.BaseKnowledgeProbeCallBack):
+            # MCQAProbeCallback extends BaseKnowledgeProbeCallBack, so this
+            # branch covers both cloze and MCQA metrics via the shared history.
             callback.save_results(output_dir=callback.output_dir)
             log.info(f"Probe metrics for {callback.log_prefix} saved to {callback.output_dir}")
             if training_loss_callback:
