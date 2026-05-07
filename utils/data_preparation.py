@@ -159,6 +159,90 @@ def prepare_lima_dataset(tokenizer: AutoTokenizer, log, use_eot_token=False, sor
         
     return train_dataset
 
+
+def _stable_domain_offset(domain: str) -> int:
+    return sum((idx + 1) * ord(char) for idx, char in enumerate(domain))
+
+
+def _paraphrase_splice_order(
+    num_paraphrases: int,
+    insertion_strategy: str,
+    shuffle_seed: int,
+    domain: str,
+) -> List[int]:
+    if num_paraphrases <= 0:
+        return []
+
+    if insertion_strategy == "legacy":
+        return list(range(num_paraphrases, 0, -1))
+
+    if insertion_strategy == "random_splice":
+        rng = random.Random(shuffle_seed + _stable_domain_offset(domain))
+        start = rng.randrange(num_paraphrases)
+        paraphrase_positions = list(range(start, num_paraphrases)) + list(range(0, start))
+        return [position + 1 for position in paraphrase_positions]
+
+    raise ValueError(f"Unsupported splice insertion strategy: {insertion_strategy}")
+
+
+def _extend_spliced_document_batches(
+    target_batches: List[List[str]],
+    source_chunks: List[str],
+    paraphrased_chunks_by_doc: List[List[str]],
+    explanation_chunks: List[str],
+    insertion_strategy: str,
+    shuffle_seed: int,
+    domain: str,
+) -> None:
+    """Extend document-shaped batches with source plus spliced paraphrase chunks.
+
+    The source batch is always preserved. Splicing happens at chunk granularity:
+    explanation chunks replace whole paraphrase chunks and never split a chunk.
+    """
+    if target_batches:
+        target_batches[0].extend(source_chunks)
+
+    if not explanation_chunks:
+        for batch_idx, chunks in enumerate(paraphrased_chunks_by_doc, start=1):
+            if batch_idx < len(target_batches):
+                target_batches[batch_idx].extend(chunks)
+        return
+
+    if insertion_strategy == "legacy":
+        to_insert = list(explanation_chunks)
+        for batch_idx in _paraphrase_splice_order(
+            len(paraphrased_chunks_by_doc), insertion_strategy, shuffle_seed, domain
+        ):
+            original_chunks = paraphrased_chunks_by_doc[batch_idx - 1]
+            if not to_insert:
+                target_batches[batch_idx].extend(original_chunks)
+                continue
+            if len(to_insert) >= len(original_chunks):
+                target_batches[batch_idx].extend(to_insert[-len(original_chunks):])
+                to_insert = to_insert[:-len(original_chunks)]
+            else:
+                keep_n = len(original_chunks) - len(to_insert)
+                target_batches[batch_idx].extend(original_chunks[:keep_n] + to_insert)
+                to_insert = []
+        return
+
+    to_insert = list(explanation_chunks)
+    for batch_idx in _paraphrase_splice_order(
+        len(paraphrased_chunks_by_doc), insertion_strategy, shuffle_seed, domain
+    ):
+        original_chunks = paraphrased_chunks_by_doc[batch_idx - 1]
+        if not to_insert:
+            target_batches[batch_idx].extend(original_chunks)
+            continue
+        if len(to_insert) >= len(original_chunks):
+            target_batches[batch_idx].extend(to_insert[:len(original_chunks)])
+            to_insert = to_insert[len(original_chunks):]
+        else:
+            keep_n = len(original_chunks) - len(to_insert)
+            target_batches[batch_idx].extend(original_chunks[:keep_n] + to_insert)
+            to_insert = []
+
+
 def prepare_training_mix(
     strategy_name: str,
     tokenizer,
@@ -178,10 +262,9 @@ def prepare_training_mix(
     specific_explanation_type = strategy_args.get("with_specific_explanation", None)
     if isinstance(specific_explanation_type, list) and len(specific_explanation_type) == 1:
         specific_explanation_type = specific_explanation_type[0]
-    times_explanations = strategy_args.get("times_explanations", 1) # Legacy mode, not used
+    times_explanations = strategy_args.get("times_explanations", 1)
     semi_cleaned_version = strategy_args.get("semi_cleaned", None)
     use_raw = strategy_args.get("use_raw", False)
-    explanation_every_round = strategy_args.get("explanation_every_round", False) # Legacy mode, not used
     shuffle_chunks_flag = strategy_args.get("shuffle_chunks", False)
     shuffle_seed = strategy_args.get("shuffle_seed", 42)
     explanations_cycle = strategy_args.get("explanations_cycle", 0)
@@ -420,39 +503,28 @@ def prepare_training_mix(
                     actual_files.sort()
                     files_to_load["default"] = actual_files
 
-            if explanations_insertion_strategy == "legacy":
-                # >> LEGACY METHOD (Splice) <<
-                legacy_expl_chunks = []
+            if explanations_insertion_strategy in ("legacy", "random_splice"):
+                # >> SPLICE METHODS <<
+                splice_expl_chunks = []
                 if "default" in files_to_load:
                     for filename in files_to_load["default"]:
                         with open(os.path.join(explanation_dir, filename), 'r', encoding='utf-8') as f:
-                            legacy_expl_chunks.extend(_chunk_explanation(f.read()))
-                if times_explanations > 1 and legacy_expl_chunks:
-                    legacy_expl_chunks = legacy_expl_chunks * times_explanations
+                            splice_expl_chunks.extend(_chunk_explanation(f.read()))
+                if times_explanations > 1 and splice_expl_chunks:
+                    splice_expl_chunks = splice_expl_chunks * times_explanations
 
                 if unique_document_batches_with_explanations is None:
                     unique_document_batches_with_explanations = [[] for _ in range(len(unique_document_batches))]
-                if len(unique_document_batches_with_explanations) > 0:
-                    unique_document_batches_with_explanations[0].extend(source_chunks)
 
-                if legacy_expl_chunks:
-                    to_insert = list(legacy_expl_chunks)
-                    for i in range(len(unique_document_batches) - 1, 0, -1):
-                        original_chunks = unique_document_batches[i][-len(paraphrased_chunks_by_doc[i-1]):]
-                        if not to_insert:
-                            unique_document_batches_with_explanations[i].extend(original_chunks)
-                            continue
-                        if len(to_insert) >= len(original_chunks):
-                            unique_document_batches_with_explanations[i].extend(to_insert[-len(original_chunks):])
-                            to_insert = to_insert[:-len(original_chunks)]
-                        else:
-                            keep_n = len(original_chunks) - len(to_insert)
-                            new_c = original_chunks[:keep_n] + to_insert
-                            unique_document_batches_with_explanations[i].extend(new_c)
-                            to_insert = []
-                else:
-                    for i in range(1, len(unique_document_batches)):
-                        unique_document_batches_with_explanations[i].extend(unique_document_batches[i][-len(paraphrased_chunks_by_doc[i-1]):])
+                _extend_spliced_document_batches(
+                    target_batches=unique_document_batches_with_explanations,
+                    source_chunks=source_chunks,
+                    paraphrased_chunks_by_doc=paraphrased_chunks_by_doc,
+                    explanation_chunks=splice_expl_chunks,
+                    insertion_strategy=explanations_insertion_strategy,
+                    shuffle_seed=shuffle_seed,
+                    domain=domain,
+                )
             elif explanations_insertion_strategy in ("granular", "whole"):
                 # Build base objects {type: [(filename, chunks)]}
                 type_objects = {}
@@ -517,7 +589,7 @@ def prepare_training_mix(
             else:
                 raise ValueError(
                     f"Unsupported explanations_insertion_strategy: {explanations_insertion_strategy}. "
-                    "Expected one of: granular, whole, legacy."
+                    "Expected one of: granular, whole, legacy, random_splice."
                 )
 
         # Append explanation structures for this domain
@@ -585,7 +657,6 @@ def prepare_training_mix(
             log=log,
             test_script=test_script,
             fill_with_pretraining=fill_with_pretraining,
-            use_explanations_every_round=explanation_every_round
         )
 
     # --- 4. Fill Gaps & Shuffle ---
@@ -693,10 +764,10 @@ def replicate_and_interleave_legacy(
     log,
     test_script: bool = False,
     fill_with_pretraining: bool = False,
-    use_explanations_every_round: bool = False,
 ) -> List[str]:
     """
-    The Old Way: Switching between pre-baked coupled batches.
+    The old coupled-batch schedule. If explanation-spliced batches exist, use
+    them for every replication; otherwise use the ordinary document batches.
     """
     final_chunks = []
     effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
@@ -706,12 +777,8 @@ def replicate_and_interleave_legacy(
         
         batches_for_this_rep = unique_document_batches
         
-        # Legacy alternation logic
         if unique_document_batches_with_explanations:
-            if use_explanations_every_round:
-                batches_for_this_rep = unique_document_batches_with_explanations
-            elif (rep % 2 == 1): # Odd reps get explanations
-                batches_for_this_rep = unique_document_batches_with_explanations
+            batches_for_this_rep = unique_document_batches_with_explanations
 
         for i, batch in enumerate(batches_for_this_rep):
             current_batch = list(batch)
