@@ -16,9 +16,11 @@ import utils.data_preparation as data_preparation
 import utils.model_setup as model_setup
 import utils.llm_configs as llm_configs
 from utils import experiment_utils
+from utils import probe_paths
 import argparse
 import wandb
 import logging
+import pandas as pd
 # wandb.init(project="fine_tuning_study")
 # Local callback types are no longer used directly; delegated to utils.experiment_utils
 
@@ -30,6 +32,8 @@ DOMAIN_OVERRIDE_ARG_BY_SOURCE = {
 }
 DEFAULT_WANDB_PROJECT = "fine_tuning_study_v9"
 DEFAULT_WANDB_PANEL_SOURCES = ("legal", "arxiv", "medical")
+DEFAULT_KNOWLEDGE_PROBES_VERSION = "v13"
+REQUIRED_KNOWLEDGE_PROBE_COLUMNS = ("fact", "probe", "target")
 
 
 def _domain_catalog_root(source: str, args) -> str:
@@ -113,6 +117,59 @@ def resolve_domains_and_sources(args, log) -> Tuple[Optional[List[str]], Dict[st
     log.info(f"Resolved domains: {resolved_domains}")
     log.info(f"Resolved domain sources: {domain_sources}")
     return resolved_domains, domain_sources
+
+
+def validate_selected_knowledge_probes(args, log) -> None:
+    """Fail early if the selected factual probe files are absent or malformed."""
+    missing_paths = []
+    malformed = []
+    total_rows = 0
+
+    for domain in args.resolved_domains:
+        domain_source = args.domain_data_sources.get(domain)
+        probe_path = probe_paths.resolve_knowledge_probe_path(
+            domain,
+            args.knowledge_probes_version,
+            domain_source=domain_source,
+        )
+
+        if not os.path.exists(probe_path):
+            missing_paths.append(str(probe_path))
+            continue
+
+        probe_df = pd.read_csv(probe_path)
+        missing_columns = [
+            column for column in REQUIRED_KNOWLEDGE_PROBE_COLUMNS
+            if column not in probe_df.columns
+        ]
+        if missing_columns:
+            malformed.append((str(probe_path), missing_columns))
+            continue
+
+        total_rows += len(probe_df)
+
+    if missing_paths or malformed:
+        details = []
+        if missing_paths:
+            details.append(
+                "Missing knowledge probe files:\n"
+                + "\n".join(f"  - {path}" for path in missing_paths)
+            )
+        if malformed:
+            details.append(
+                "Malformed knowledge probe files:\n"
+                + "\n".join(
+                    f"  - {path}: missing columns {columns}"
+                    for path, columns in malformed
+                )
+            )
+        raise ValueError("\n".join(details))
+
+    log.info(
+        f"Validated {total_rows} factual probes from "
+        f"probes_{args.knowledge_probes_version}.csv across "
+        f"{len(args.resolved_domains)} domains."
+    )
 
 
 def construct_experiment_name(args):
@@ -332,7 +389,6 @@ def continue_pretraining(model, tokenizer, log, args, train: bool = True):
             "times_explanations": args.times_explanations,
             "semi_cleaned": args.semi_cleaned,
             "use_raw": args.raw if hasattr(args, "raw") else False,
-            "explanation_every_round": args.explanation_every_round,
             "shuffle_chunks": args.shuffle_chunks,
             "shuffle_seed": args.shuffle_seed,
             "explanations_cycle": args.explanations_cycle,
@@ -519,8 +575,33 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--constant_lr", action="store_true", help="Use constant learning rate instead of a scheduler (with minimal warmup)")
     parser.add_argument("--overrule_warmup_via_steps", type=int, default=None, help="Override warmup_ratio and specify warmup in steps instead")
-    parser.add_argument("--knowledge_probes_version", type=str, default="v9", help="Version of the knowledge probes to use.")
+    parser.add_argument(
+        "--knowledge_probes_version",
+        type=str,
+        default=DEFAULT_KNOWLEDGE_PROBES_VERSION,
+        help="Version of the factual knowledge probes to use.",
+    )
     parser.add_argument("--inference_probes_version", type=str, default="v7", help="Version of the inference probes to use.")
+    parser.set_defaults(mcqa_probes=False)
+    parser.add_argument(
+        "--mcqa_probes",
+        "--mcqa-probes",
+        dest="mcqa_probes",
+        action="store_true",
+        help=(
+            "Enable constrained-decoding MCQA evaluation. "
+            "Loads probes_<knowledge_probes_version>_mcqa.csv from the facts directory."
+        ),
+    )
+    parser.add_argument(
+        "--disable_mcqa_probes",
+        "--disable-mcqa-probes",
+        "--no_mcqa_probes",
+        "--no-mcqa-probes",
+        dest="mcqa_probes",
+        action="store_false",
+        help="Disable constrained-decoding MCQA evaluation.",
+    )
     parser.add_argument(
         "--inference_probe_subset",
         type=str,
@@ -565,7 +646,6 @@ if __name__ == "__main__":
     parser.add_argument("--times_explanations", type=int, default=1, help="Number of times to repeat the explanation texts.")
     parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
     parser.add_argument("--test_script", action="store_true", help="Run in test mode with a small model and minimal epochs.")
-    parser.add_argument("--explanation_every_round", action="store_true", help="Inject explanations for every round/replication instead of alternating.")
     parser.add_argument("--shuffle_chunks", action="store_true", help="Shuffle constructed training chunks with seed 42 before training.")
     parser.add_argument("--shuffle_seed", type=int, default=42, help="Seed to use when shuffling training chunks.")
     parser.add_argument("--explanations_cycle", type=str, default="0", help="Granular strategy only: number of explanation files to cycle through across document batches. Use 'full' to load all available files, or specify an integer.")
@@ -573,8 +653,13 @@ if __name__ == "__main__":
         "--explanations_insertion_strategy",
         type=str,
         default="granular",
-        choices=["granular", "whole", "legacy"],
-        help="How explanations are inserted: 'granular' (per-batch cycling), 'whole' (insert explanation-only batch every N steps), or 'legacy' (older coupled splice behavior).",
+        choices=["granular", "whole", "legacy", "random_splice"],
+        help=(
+            "How explanations are inserted: 'granular' (per-batch cycling), "
+            "'whole' (insert explanation-only batch every N steps), 'legacy' "
+            "(older coupled splice behavior), or 'random_splice' (legacy-style "
+            "chunk replacement starting at a deterministic random paraphrase batch)."
+        ),
     )
     parser.add_argument(
         "--explanations_insert_every_n",
@@ -661,7 +746,45 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no_callback_every_step",
         action="store_true",
-        help="If set, run heavy callbacks only at 25%, 50%, and 75% of training instead of every step.",
+        help="If set, run heavy callbacks only at 25%%, 50%%, and 75%% of training instead of every step.",
+    )
+    parser.add_argument(
+        "--enable_parameter_delta_tracking",
+        action="store_true",
+        help="Track parameter delta summaries and plots during training.",
+    )
+    parser.add_argument(
+        "--parameter_delta_include_embeddings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include input token embeddings in parameter delta tracking.",
+    )
+    parser.add_argument(
+        "--parameter_delta_storage_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional folder for large temporary raw delta tensors used for final-direction "
+            "alignment. A run-specific subfolder is created and deleted after plotting."
+        ),
+    )
+    parser.add_argument(
+        "--parameter_delta_compute_final_alignment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute final-direction alignment plots from temporary raw delta tensors.",
+    )
+    parser.add_argument(
+        "--parameter_delta_sparse_milestones",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Track parameter deltas at train begin, every 10%% of training, and train end.",
+    )
+    parser.add_argument(
+        "--parameter_delta_report_to_wandb",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Log compact parameter delta summaries to W&B.",
     )
     parser.add_argument("--parcc", action="store_true", help="Use /vast/projects/myatskar/design-documents as cache directory for model and dataset loading operations")
 
@@ -678,6 +801,8 @@ if __name__ == "__main__":
         "hit_accuracy_at_1",
         "hit_accuracy_at_10",
         "hit_accuracy_at_100",
+        "mcqa_accuracy",
+        "mcqa_correct_logprob",
     ]
     args.disable_corpus_perplexity_wandb = True
     args.disable_training_loss_perplexity_wandb = True
@@ -735,13 +860,13 @@ if __name__ == "__main__":
     ):
         raise ValueError(
             "--explanations_num_tracks is only supported with --explanations_insertion_strategy granular "
-            "(set it to 1 for whole/legacy)."
+            "(set it to 1 for whole/legacy/random_splice)."
         )
 
     if args.explanations_insertion_strategy != "granular" and args.explanations_cycle != 0:
         raise ValueError(
             "--explanations_cycle is only supported with --explanations_insertion_strategy granular. "
-            "For whole/legacy, leave --explanations_cycle at the default 0."
+            "For whole/legacy/random_splice, leave --explanations_cycle at the default 0."
         )
 
     if (
@@ -786,12 +911,14 @@ if __name__ == "__main__":
 
     log.info("Inference probes are disabled.")
     if args.enable_wandb_source_panels:
+        mcqa_note = f" MCQA constrained-decoding ({args.knowledge_probes_version})." if args.mcqa_probes else ""
         log.info(
             f"W&B source panels enabled for: {args.wandb_panel_sources}. "
-            f"Per-paper metrics: log_prob_average, hits_1, hits_10, hits_100. MCQA metrics TODO."
+            f"Per-paper metrics: log_prob_average, hits_1, hits_10, hits_100, mcqa_accuracy.{mcqa_note}"
         )
 
     args.resolved_domains, args.domain_data_sources = resolve_domains_and_sources(args, log)
+    validate_selected_knowledge_probes(args, log)
 
     if args.override_experiment_name:
         args.experiment_name = args.override_experiment_name
