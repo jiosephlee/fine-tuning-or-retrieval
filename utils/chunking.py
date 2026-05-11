@@ -1,5 +1,46 @@
 from typing import List
 import math
+import re
+
+
+def _normalize_title(title: str) -> str:
+    return " ".join(title.strip().split())
+
+
+def _format_title_prefix(title: str, label: str = "latex") -> str:
+    title = _normalize_title(title)
+    if not title:
+        return ""
+    if label == "latex":
+        return f"\\title{{{title}}}\n\n"
+    return f"{label}: {title}\n\n"
+
+
+def _is_title_block(text: str) -> bool:
+    stripped = text.strip()
+    return bool(
+        re.match(r'^\\title\{[^}]+\}', stripped)
+        or re.match(r'(?is)^Title\s*:', stripped)
+        or re.match(r'(?is)^Case\s+(?:Title|Name)\s*:', stripped)
+    )
+
+
+def extract_title_prefix(text_content: str) -> str:
+    """Extract a title prefix, preserving the document's title-header style."""
+    latex_match = re.search(r'\\title\{([^}]+)\}', text_content)
+    if latex_match:
+        return _format_title_prefix(latex_match.group(1), label="latex")
+
+    line_match = re.search(
+        r'(?im)^\s*(Title|Case\s+(?:Title|Name))\s*:\s*(.+?)\s*$',
+        text_content,
+    )
+    if line_match:
+        return _format_title_prefix(
+            line_match.group(2),
+            label=_normalize_title(line_match.group(1)),
+        )
+    return ""
 
 def chunk_texts(texts: List[str], tokenizer, context_length: int) -> tuple[List[str], int]:
     """
@@ -37,15 +78,11 @@ def chunk_text(text_content: str, tokenizer, max_tokens: int, delimiter: str = "
     Chunks a single text by a delimiter, similar to chunk_text_by_sections,
     but using the delimiter to create parts instead of latex sections.
     """
-    import re
-    
     # 1. Handle Title
     title = ""
     if add_title_prefix:
-        title_match = re.search(r'\\title\{([^}]+)\}', text_content)
-        if title_match:
-            title = f"\\title{{{title_match.group(1)}}}\n\n"
-        elif log:
+        title = extract_title_prefix(text_content)
+        if not title and log:
             log.warning("add_title_prefix is True, but no title was found.")
 
     # 2. Split text into parts
@@ -59,7 +96,7 @@ def chunk_text(text_content: str, tokenizer, max_tokens: int, delimiter: str = "
             continue
 
         # Add title to new/empty chunks
-        is_title_block = part.strip().startswith('\\title')
+        is_title_block = _is_title_block(part)
         if not current_chunk and not is_title_block:
             current_chunk = title
 
@@ -132,7 +169,6 @@ def split_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 20
     Raises:
         ValueError: If any subsection exceeds max_tokens
     """
-    import re
     subsection_pattern = r'(\\subsection\{[^}]+\})'
     parts = re.split(subsection_pattern, text_content)
     
@@ -195,7 +231,7 @@ def chunk(
             overlap_denom, 
             overlap_numer, 
             log, 
-            add_title_prefix
+            add_title_prefix,
         )
     else:
         return chunk_text(
@@ -205,7 +241,7 @@ def chunk(
             overlap=overlap,
             overlap_ratio_str=overlap_ratio_str,
             add_title_prefix=add_title_prefix,
-            log=log
+            log=log,
         )
 
 
@@ -225,18 +261,30 @@ def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048,
     Returns:
         List of text chunks and total token count
     """
-    import re
     # Extract title
     title = ""
     if add_title_prefix:
-        title_match = re.search(r'\\title\{([^}]+)\}', text_content)
-        if title_match:
-            title = f"\\title{{{title_match.group(1)}}}\n\n"
-        else:
-            raise ValueError("No title found in the text")
+        title = extract_title_prefix(text_content)
+        if not title:
+            raise ValueError(
+                "No supported title header found in text. Expected one of: "
+                "\\title{...}, Title: ..., Case Title: ..., Case Name: ..."
+            )
 
     # Find all section boundaries and split into sections
     section_pattern = r'(\\section\{[^}]+\})'
+    if not re.search(section_pattern, text_content):
+        return chunk_text(
+            text_content,
+            tokenizer,
+            max_tokens,
+            delimiter="\n\n",
+            overlap=overlap_sections,
+            overlap_ratio_str=f"{overlap_numer}_{overlap_denom}",
+            add_title_prefix=add_title_prefix,
+            log=log,
+        )
+
     parts = re.split(section_pattern, text_content)
     
     sections = []
@@ -264,7 +312,7 @@ def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048,
             continue
 
         # Handle title for the very first chunk or any new, empty chunk.
-        is_title_block = section.strip().startswith('\\title')
+        is_title_block = _is_title_block(section)
         if not current_chunk and not is_title_block:
             current_chunk = title
 
