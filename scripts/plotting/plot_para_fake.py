@@ -25,7 +25,7 @@ from scripts.plotting.plot_utils import (
 
 def get_trajectory_data(run_path, probe_type, domains, project_root):
     """
-    Returns aggregated mean log_prob and hits@10 per step.
+    Returns aggregated mean log_prob and target_rank per step.
     """
     if not run_path:
         return None
@@ -63,20 +63,10 @@ def get_trajectory_data(run_path, probe_type, domains, project_root):
             df['step'] = pd.to_numeric(df['step'], errors='coerce')
             df['log_prob'] = pd.to_numeric(df['log_prob'], errors='coerce')
             
-            if 'hit_accuracy_at_1' in df.columns:
-                df['hit_accuracy_at_1'] = pd.to_numeric(df['hit_accuracy_at_1'], errors='coerce')
+            if 'target_rank' in df.columns:
+                df['target_rank'] = pd.to_numeric(df['target_rank'], errors='coerce')
             else:
-                df['hit_accuracy_at_1'] = np.nan
-
-            if 'hit_accuracy_at_10' in df.columns:
-                df['hit_accuracy_at_10'] = pd.to_numeric(df['hit_accuracy_at_10'], errors='coerce')
-            else:
-                df['hit_accuracy_at_10'] = np.nan
-
-            if 'hit_accuracy_at_100' in df.columns:
-                df['hit_accuracy_at_100'] = pd.to_numeric(df['hit_accuracy_at_100'], errors='coerce')
-            else:
-                df['hit_accuracy_at_100'] = np.nan
+                df['target_rank'] = np.nan
 
             df.dropna(subset=['step', 'log_prob'], inplace=True)
             
@@ -91,12 +81,8 @@ def get_trajectory_data(run_path, probe_type, domains, project_root):
     combined_df = pd.concat(all_domain_dfs, ignore_index=True)
     
     metric_cols = ['log_prob']
-    if 'hit_accuracy_at_1' in combined_df.columns:
-        metric_cols.append('hit_accuracy_at_1')
-    if 'hit_accuracy_at_10' in combined_df.columns:
-        metric_cols.append('hit_accuracy_at_10')
-    if 'hit_accuracy_at_100' in combined_df.columns:
-        metric_cols.append('hit_accuracy_at_100')
+    if 'target_rank' in combined_df.columns:
+        metric_cols.append('target_rank')
 
     agg = combined_df.groupby('step')[metric_cols].mean().reset_index()
     agg = agg.sort_values('step')
@@ -110,7 +96,7 @@ def filter_steps(df):
     filtered['Exposure Steps'] = (filtered['step'] + 1) // 2
     return filtered
 
-def plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, hits_ylim):
+def plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, rank_ylim):
     print("Plotting 4-Panel Figure...")
     # Layout: [P1] [P2] [Space] [P3] [P4]
     # Ratios:  1    1    0.2     1    1
@@ -132,8 +118,8 @@ def plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, hits_
     
     for model_size, df in p1_data:
         ax1.plot(df['Exposure Steps'], df['log_prob'], color=model_colors[model_size], linestyle='-', linewidth=2, label=f"{model_size} LogProb")
-        if 'hit_accuracy_at_10' in df.columns:
-            ax1_right.plot(df['Exposure Steps'], df['hit_accuracy_at_10'], color=model_colors[model_size], linestyle=':', linewidth=2, label=f"{model_size} Hits@10")
+        if 'target_rank' in df.columns:
+            ax1_right.plot(df['Exposure Steps'], df['target_rank'], color=model_colors[model_size], linestyle=':', linewidth=2, label=f"{model_size} Target Rank")
             
     ax1.set_title("Source")
     ax1.set_xlabel("Exposure #")
@@ -141,8 +127,8 @@ def plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, hits_
     ax1_right.set_yticklabels([]) # Hide right ticks
     
     apply_ylim([ax1], lp_ylim)
-    if hits_ylim:
-        apply_ylim([ax1_right], hits_ylim)
+    if rank_ylim:
+        apply_ylim([ax1_right], rank_ylim)
     ax1.grid(True, alpha=0.1)
 
     # --- Panel 2: Para 9 Compositional ---
@@ -151,18 +137,18 @@ def plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, hits_
     
     for model_size, df in p2_data:
         ax2.plot(df['Exposure Steps'], df['log_prob'], color=model_colors[model_size], linestyle='-', linewidth=2)
-        if 'hit_accuracy_at_10' in df.columns:
-            ax2_right.plot(df['Exposure Steps'], df['hit_accuracy_at_10'], color=model_colors[model_size], linestyle=':', linewidth=2)
+        if 'target_rank' in df.columns:
+            ax2_right.plot(df['Exposure Steps'], df['target_rank'], color=model_colors[model_size], linestyle=':', linewidth=2)
 
     ax2.set_title("Para. 9")
     ax2.set_xlabel("Exposure #")
     ax2.set_yticklabels([]) # Hide left ticks
-    ax2_right.set_ylabel("Hits@10") # Show right label
+    ax2_right.set_ylabel("Target Rank") # Show right label
     # ax2_right.set_yticklabels([]) # Show right ticks (Default)
     
     apply_ylim([ax2], lp_ylim)
-    if hits_ylim:
-        apply_ylim([ax2_right], hits_ylim)
+    if rank_ylim:
+        apply_ylim([ax2_right], rank_ylim)
     ax2.grid(True, alpha=0.1)
 
     # --- Panels 3 & 4: Batch Size Scaling ---
@@ -215,7 +201,7 @@ def plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, hits_
         Line2D([0], [0], color='#d62728', lw=2, linestyle='-', label='13B'),
         Line2D([0], [0], color='#9467bd', lw=2, linestyle='-', label='32B'),
         Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Log Prob'),
-        Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Hits@10'),
+        Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Target Rank'),
     ]
     leg1 = axes[0].legend(handles=p1_legend_elements, loc='lower right', fontsize=14, frameon=True)
     leg1.get_frame().set_facecolor('none')
@@ -249,30 +235,22 @@ def plot_grokking(df_k_src, df_i_src, df_k_para, df_i_para, color_factual, color
         # Knowledge (Factual)
         if df_k is not None:
             ax.plot(df_k['Exposure Steps'], df_k['log_prob'], color=color_factual, linestyle='-', linewidth=2.5, label="Factual LogProb")
-            if 'hit_accuracy_at_1' in df_k.columns:
-                ax_right.plot(df_k['Exposure Steps'], df_k['hit_accuracy_at_1'], color=color_factual, linestyle='--', linewidth=2.0, label="Factual Hits@1")
-            if 'hit_accuracy_at_10' in df_k.columns:
-                ax_right.plot(df_k['Exposure Steps'], df_k['hit_accuracy_at_10'], color=color_factual, linestyle=':', linewidth=2.0, label="Factual Hits@10")
-            if 'hit_accuracy_at_100' in df_k.columns:
-                ax_right.plot(df_k['Exposure Steps'], df_k['hit_accuracy_at_100'], color=color_factual, linestyle='-.', linewidth=2.0, label="Factual Hits@100")
+            if 'target_rank' in df_k.columns:
+                ax_right.plot(df_k['Exposure Steps'], df_k['target_rank'], color=color_factual, linestyle=':', linewidth=2.0, label="Factual Target Rank")
 
         # Inference (Compositional)
         if df_i is not None:
             ax.plot(df_i['Exposure Steps'], df_i['log_prob'], color=color_comp, linestyle='-', linewidth=2.5, label="Comp. LogProb")
-            if 'hit_accuracy_at_1' in df_i.columns:
-                ax_right.plot(df_i['Exposure Steps'], df_i['hit_accuracy_at_1'], color=color_comp, linestyle='--', linewidth=2.0, label="Comp. Hits@1")
-            if 'hit_accuracy_at_10' in df_i.columns:
-                ax_right.plot(df_i['Exposure Steps'], df_i['hit_accuracy_at_10'], color=color_comp, linestyle=':', linewidth=2.0, label="Comp. Hits@10")
-            if 'hit_accuracy_at_100' in df_i.columns:
-                ax_right.plot(df_i['Exposure Steps'], df_i['hit_accuracy_at_100'], color=color_comp, linestyle='-.', linewidth=2.0, label="Comp. Hits@100")
+            if 'target_rank' in df_i.columns:
+                ax_right.plot(df_i['Exposure Steps'], df_i['target_rank'], color=color_comp, linestyle=':', linewidth=2.0, label="Comp. Target Rank")
 
         ax.set_title(title)
         ax.set_xlabel("Exposure #")
         ax.set_ylabel("Log Prob.")
-        ax_right.set_ylabel("Hits@10")
+        ax_right.set_ylabel("Target Rank")
         ax.grid(True, alpha=0.1)
         
-        # Scale down Hits@10 (Manual +0.5)
+        # Keep the rank axis away from zero when rank values are available.
         current_ylim = ax_right.get_ylim()
         ax_right.set_ylim(0.5, current_ylim[1] + 0.08)
         
@@ -289,9 +267,7 @@ def plot_grokking(df_k_src, df_i_src, df_k_para, df_i_para, color_factual, color
         Line2D([0], [0], color=color_factual, lw=2, linestyle='-', label='Factual'),
         Line2D([0], [0], color=color_comp, lw=2, linestyle='-', label='Compositional'),
         Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Log Prob'),
-        Line2D([0], [0], color='gray', lw=2, linestyle='--', label='Hits@1'),
-        Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Hits@10'),
-        Line2D([0], [0], color='gray', lw=2, linestyle='-.', label='Hits@100'),
+        Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Target Rank'),
     ]
     axes[1].legend(handles=traj_legend_elements, loc='lower right', fontsize='small', frameon=True)
 
@@ -430,16 +406,16 @@ def main():
 
     # Compute Limits for Panels 1 & 2
     all_logprobs = []
-    all_hits = []
+    all_ranks = []
     for _, df in p1_data + p2_data:
         all_logprobs.extend(df['log_prob'].tolist())
-        if 'hit_accuracy_at_10' in df.columns:
-            all_hits.extend(df['hit_accuracy_at_10'].dropna().tolist())
+        if 'target_rank' in df.columns:
+            all_ranks.extend(df['target_rank'].dropna().tolist())
             
     lp_ylim = compute_unified_ylim(all_logprobs)
     if lp_ylim:
         lp_ylim = (lp_ylim[0] - 1, lp_ylim[1])
-    hits_ylim = compute_unified_ylim(all_hits) if all_hits else None
+    rank_ylim = compute_unified_ylim(all_ranks) if all_ranks else None
     
     # Panels 3 & 4
     bs_data = []
@@ -473,7 +449,7 @@ def main():
     df_i_grok_para = filter_steps(df_i_grok_para)
 
     # --- Generate Plots ---
-    plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, hits_ylim)
+    plot_4panel(p1_data, p2_data, df_bs, model_colors, bs_styles, lp_ylim, rank_ylim)
     plot_grokking(df_k_grok_src, df_i_grok_src, df_k_grok_para, df_i_grok_para, color_factual, color_comp)
 
 if __name__ == "__main__":

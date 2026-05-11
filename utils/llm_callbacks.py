@@ -45,7 +45,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                  probes: List[str],
                  targets: List[str],
                  probes_df: pd.DataFrame = None,
-                 track_hits: bool = True, 
+                 track_rank: bool = True,
                  track_logprobs: bool = True,
                  batch_size: int = 8, 
                  logger=None,
@@ -64,7 +64,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         self.targets = targets
         self.probes_df = probes_df
         
-        self.track_hits = track_hits
+        self.track_rank = track_rank
         self.track_logprobs = track_logprobs
         self.batch_size = batch_size
         self.logger = logger
@@ -77,9 +77,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         self.history = {
             'log_prob': [],
             'perplexity': [],
-            'hit_accuracy_at_1': [],
-            'hit_accuracy_at_10': [],
-            'hit_accuracy_at_100': [],
+            'target_rank': [],
         }
         self.output_dir = output_dir
         self.sparse_eval = sparse_eval
@@ -136,7 +134,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         """Calculate and log per-inference-type averages and combined Inference category."""
         if self.probes_df is None or 'inference_type' not in self.probes_df.columns:
             return
-        if metric_name not in ['log_prob', 'hit_accuracy_at_10']:
+        if metric_name not in ['log_prob', 'target_rank']:
             return
 
         inference_types = self.probes_df['inference_type'].unique()
@@ -476,64 +474,47 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
 
         return log_prob, perplexity
 
-    def _calculate_hits_at_k(self, logits, input_ids, context_lengths, target_lengths, k_values: List[int]):
+    def _calculate_target_rank(self, logits, input_ids, context_lengths, target_lengths):
         """
-        Calculates the hit accuracy at various k values for multi-token targets.
+        Calculates the max 1-indexed vocabulary rank across each target sequence.
 
-        For each probe, this function computes the "hit accuracy," defined as the
-        proportion of target tokens that were correctly predicted within the top-k
-        logits. The model sees the preceding ground-truth tokens when making each
-        prediction (teacher forcing).
-
-        Args:
-            logits (torch.Tensor): The model's output shifted_logits for the batch.
-            input_ids (torch.Tensor): The shifted_labels for the batch.
-            context_lengths (torch.Tensor): The lengths of the context part of each probe (already decremented by 1).
-            target_lengths (torch.Tensor): The lengths of the target part of each probe.
-            k_values (List[int]): A list of k values for top-k evaluation.
-
-        Returns:
-            Dict[str, torch.Tensor]: A dictionary mapping each k to a tensor
-                                     of hit accuracies for the batch.
+        The model sees preceding ground-truth tokens when making each prediction
+        (teacher forcing). Lower is better; 1 means every target token was the
+        top-scoring token at its position.
         """
         batch_size = logits.shape[0]
-        hits_at_k = {f'hit_accuracy_at_{k}': [] for k in k_values}
+        ranks = []
 
         for i in range(batch_size):
-            start = context_lengths[i]
-            end = start + target_lengths[i]
+            start = int(context_lengths[i].item())
+            target_length = int(target_lengths[i].item())
+            end = start + target_length
+
+            if start < 0 or target_length <= 0 or end > logits.shape[1]:
+                ranks.append(torch.tensor(float('nan'), device=logits.device))
+                continue
             
             pred_logits = logits[i, start:end, :]
             actual_tokens = input_ids[i, start:end]
 
-            if pred_logits.shape[0] == 0:  # Handle cases with no target tokens
-                for k in k_values:
-                    hits_at_k[f'hit_accuracy_at_{k}'].append(torch.tensor(0.0, device=logits.device))
+            valid_mask = (actual_tokens != self.tokenizer.pad_token_id) & (actual_tokens != -100)
+            if pred_logits.shape[0] == 0 or not valid_mask.any():
+                ranks.append(torch.tensor(float('nan'), device=logits.device))
                 continue
-            
-            max_k = max(k_values)
-            top_k_indices = torch.topk(pred_logits, max_k, dim=-1).indices
 
-            for k in k_values:
-                # Check if the actual token is in the top k predictions for each position
-                hits = (top_k_indices[:, :k] == actual_tokens.unsqueeze(1)).any(dim=-1) # if any of the top k predictions are the actual token, then it's a hit
-                
-                # Accuracy is the mean of hits over the target token sequence
-                accuracy = hits.float().mean()
-                hits_at_k[f'hit_accuracy_at_{k}'].append(accuracy)
+            pred_logits = pred_logits[valid_mask]
+            actual_tokens = actual_tokens[valid_mask]
+            actual_logits = pred_logits.gather(1, actual_tokens.unsqueeze(1))
+            token_ranks = (pred_logits > actual_logits).sum(dim=1).float() + 1.0
+            ranks.append(token_ranks.max())
 
-        # Convert lists of tensors to a single tensor for each k
-        for k in k_values:
-            key = f'hit_accuracy_at_{k}'
-            hits_at_k[key] = torch.stack(hits_at_k[key])
-            
-        return hits_at_k
+        return torch.stack(ranks)
 
     def _evaluate_probes(self, model, return_logits=False) -> Dict[str, torch.Tensor]:
         """
-        Evaluates probes by calculating log probabilities and hit rates for targets.
+        Evaluates probes by calculating log probabilities and target ranks.
         """
-        all_metrics = { 'log_prob': [], 'perplexity': [], 'hit_accuracy_at_1': [], 'hit_accuracy_at_10': [], 'hit_accuracy_at_100': [] }
+        all_metrics = {'log_prob': [], 'perplexity': [], 'target_rank': []}
         all_logits = [] if return_logits else None
         device = model.device
         num_facts = len(self.facts)
@@ -569,17 +550,14 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 all_metrics['log_prob'].append(log_prob)
                 all_metrics['perplexity'].append(perplexity)
 
-            if self.track_hits:
-                hits = self._calculate_hits_at_k(shift_logits, shift_labels, context_lengths, target_lengths, k_values=[1, 10, 100])
-                for k, v in hits.items():
-                    all_metrics[k].append(v)
+            if self.track_rank:
+                target_rank = self._calculate_target_rank(shift_logits, shift_labels, context_lengths, target_lengths)
+                all_metrics['target_rank'].append(target_rank)
 
         metrics_to_return = {
             "log_prob": torch.cat(all_metrics['log_prob']) if self.track_logprobs and all_metrics['log_prob'] else None,
             "perplexity": torch.cat(all_metrics['perplexity']) if self.track_logprobs and all_metrics['perplexity'] else None,
-            "hit_accuracy_at_1": torch.cat(all_metrics['hit_accuracy_at_1']) if self.track_hits and all_metrics['hit_accuracy_at_1'] else None,
-            "hit_accuracy_at_10": torch.cat(all_metrics['hit_accuracy_at_10']) if self.track_hits and all_metrics['hit_accuracy_at_10'] else None,
-            "hit_accuracy_at_100": torch.cat(all_metrics['hit_accuracy_at_100']) if self.track_hits and all_metrics['hit_accuracy_at_100'] else None,
+            "target_rank": torch.cat(all_metrics['target_rank']) if self.track_rank and all_metrics['target_rank'] else None,
         }
 
         if return_logits:
@@ -780,16 +758,12 @@ class WandbSourcePanelsCallback(TrainerCallback):
     Logs source-scoped metrics for W&B workspace panels:
     - panel/<source>/factual_probes_avg
     - panel/<source>/papers/<domain>/log_prob_average
-    - panel/<source>/papers/<domain>/hits_1
-    - panel/<source>/papers/<domain>/hits_10
-    - panel/<source>/papers/<domain>/hits_100
+    - panel/<source>/papers/<domain>/target_rank_average
     - panel/<source>/papers/<domain>/mcqa_accuracy
     """
     PAPER_METRICS = (
         ("log_prob", "log_prob_average"),
-        ("hit_accuracy_at_1", "hits_1"),
-        ("hit_accuracy_at_10", "hits_10"),
-        ("hit_accuracy_at_100", "hits_100"),
+        ("target_rank", "target_rank_average"),
     )
 
     def __init__(
@@ -1081,34 +1055,22 @@ class GenerationProbeCallback(TrainerCallback):
             else:
                 print(f" > Saved evaluation plot for {dataset_name} to '{plot_path}'")
 
-class MCQAProbeCallback(BaseKnowledgeProbeCallBack):
+class MCQAProbeCallback(TrainerCallback):
     """
-    Extends BaseKnowledgeProbeCallBack with constrained-decoding MCQA evaluation.
+    Constrained-choice MCQA evaluation.
 
-    Inherits all standard probe+target metrics (log_prob, perplexity, hits@k)
-    from the base class and additionally evaluates MCQA accuracy by extracting
-    log probabilities for a constrained set of choice tokens at the last
-    position of each formatted question prompt.
-
-    Extra constructor args beyond BaseKnowledgeProbeCallBack:
-        formatted_questions: list of MCQA prompts (formatted_question + suffix)
-        correct_choice_indices: int index into choice_tokens per probe
-        choice_tokens: list of single-token strings (e.g. ["A", "B", "C", "D", "E"]
-            when prompts end with "Answer: (")
+    This callback is intentionally separate from cloze probe logprob/rank
+    metrics. It only tracks whether the correct answer choice has the highest
+    logit among the constrained choice tokens.
     """
 
     def __init__(
         self,
         tokenizer: AutoTokenizer,
-        facts: List[str],
-        probes: List[str],
-        targets: List[str],
         formatted_questions: List[str],
         correct_choice_indices: List[int],
         choice_tokens: List[str],
         probes_df: pd.DataFrame = None,
-        track_hits: bool = True,
-        track_logprobs: bool = True,
         batch_size: int = 8,
         logger=None,
         output_dir: str = "",
@@ -1117,27 +1079,22 @@ class MCQAProbeCallback(BaseKnowledgeProbeCallBack):
         sparse_eval: bool = False,
         wandb_metric_allowlist: Optional[List[str]] = None,
     ):
-        super().__init__(
-            tokenizer=tokenizer,
-            facts=facts,
-            probes=probes,
-            targets=targets,
-            probes_df=probes_df,
-            track_hits=track_hits,
-            track_logprobs=track_logprobs,
-            batch_size=batch_size,
-            logger=logger,
-            output_dir=output_dir,
-            log_prefix=log_prefix,
-            report_to_wandb=report_to_wandb,
-            sparse_eval=sparse_eval,
-            wandb_metric_allowlist=wandb_metric_allowlist,
-        )
+        self.tokenizer = tokenizer
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.formatted_questions = formatted_questions
         self.correct_choice_indices = correct_choice_indices
+        self.probes_df = probes_df
+        self.batch_size = batch_size
+        self.logger = logger
+        self.output_dir = output_dir
+        self.log_prefix = log_prefix
+        self.report_to_wandb = report_to_wandb
+        self.sparse_eval = sparse_eval
+        self.wandb_metric_allowlist = set(wandb_metric_allowlist) if wandb_metric_allowlist else None
+        self.history = {"mcqa_accuracy": []}
 
-        # Resolve choice token IDs — each must be a single token
         self.choice_tokens = choice_tokens
         self.choice_token_ids: List[int] = []
         for token_str in choice_tokens:
@@ -1154,7 +1111,6 @@ class MCQAProbeCallback(BaseKnowledgeProbeCallBack):
             f"{list(zip(choice_tokens, self.choice_token_ids))}"
         )
 
-        # Pre-tokenize MCQA prompts (separate from the cloze facts)
         self.tokenized_mcqa_prompts = tokenizer(
             formatted_questions, padding=True, return_tensors="pt",
             add_special_tokens=False,
@@ -1164,36 +1120,15 @@ class MCQAProbeCallback(BaseKnowledgeProbeCallBack):
             f"max length {self.tokenized_mcqa_prompts['input_ids'].shape[1]}"
         )
 
-        # Extend history with MCQA-specific keys
-        self.history["mcqa_accuracy"] = []
-        self.history["mcqa_correct_logprob"] = []
+    def _should_log_metric(self, metric_name: str) -> bool:
+        return self.wandb_metric_allowlist is None or metric_name in self.wandb_metric_allowlist
 
-    # ------------------------------------------------------------------
-    # Override _evaluate_probes to also run constrained-decoding
-    # ------------------------------------------------------------------
-    def _evaluate_probes(self, model, return_logits=False) -> Dict[str, torch.Tensor]:
-        result = super()._evaluate_probes(model, return_logits=return_logits)
-        if return_logits:
-            metrics, logits_out = result
-        else:
-            metrics = result
-
-        mcqa_metrics = self._evaluate_mcqa(model)
-        metrics.update(mcqa_metrics)
-
-        return (metrics, logits_out) if return_logits else metrics
-
-    # ------------------------------------------------------------------
-    # Constrained-decoding evaluation
-    # ------------------------------------------------------------------
     def _evaluate_mcqa(self, model) -> Dict[str, torch.Tensor]:
         device = model.device
         num_prompts = len(self.formatted_questions)
         choice_ids = torch.tensor(self.choice_token_ids, device=device)
 
         all_correct: List[torch.Tensor] = []
-        all_correct_logprobs: List[torch.Tensor] = []
-
         for i in range(0, num_prompts, self.batch_size):
             end_idx = min(i + self.batch_size, num_prompts)
             inputs = {
@@ -1207,32 +1142,70 @@ class MCQAProbeCallback(BaseKnowledgeProbeCallBack):
             seq_lengths = inputs["attention_mask"].sum(dim=1) - 1
             bs = logits.shape[0]
             last_logits = logits[torch.arange(bs, device=device), seq_lengths]
-
             choice_logits = last_logits[:, choice_ids]
-            choice_log_probs = torch.nn.functional.log_softmax(choice_logits, dim=-1)
-
             predicted_idx = choice_logits.argmax(dim=-1)
-
             correct_indices = torch.tensor(
                 self.correct_choice_indices[i:end_idx], device=device, dtype=torch.long,
             )
             all_correct.append((predicted_idx == correct_indices).float())
-            all_correct_logprobs.append(
-                choice_log_probs[torch.arange(bs, device=device), correct_indices]
-            )
 
-        return {
-            "mcqa_accuracy": torch.cat(all_correct),
-            "mcqa_correct_logprob": torch.cat(all_correct_logprobs),
-        }
+        if not all_correct:
+            return {"mcqa_accuracy": torch.empty(0, device=device)}
+        return {"mcqa_accuracy": torch.cat(all_correct)}
+
+    def _record_and_log(self, metrics: Dict[str, torch.Tensor], step: int, state):
+        log_data = {}
+        for metric_name, values in metrics.items():
+            self.history[metric_name].append({'step': step, 'values': values.cpu().tolist()})
+            if not self._should_log_metric(metric_name):
+                continue
+            valid_mask = ~torch.isinf(values) & ~torch.isnan(values)
+            if valid_mask.any():
+                log_data[f"{self.log_prefix}/{metric_name}_avg"] = values[valid_mask].mean().item()
+
+        if state.is_world_process_zero and log_data:
+            if self.report_to_wandb and wandb.run:
+                wandb.log(log_data, step=step)
+
+    def on_train_begin(self, args, state, control, model, **kwargs):
+        print(f"{self.__class__.__name__}: Calculating initial metrics...")
+        model.eval()
+        self._record_and_log(self._evaluate_mcqa(model), 0, state)
+        model.train()
+        print(f"{self.__class__.__name__}: Initial metrics calculated.")
+
+    def on_step_end(self, args, state, control, model, **kwargs):
+        if _should_skip_sparse_eval(self, state):
+            return
+
+        model.eval()
+        self._record_and_log(self._evaluate_mcqa(model), state.global_step, state)
+        model.train()
+
+    def on_train_end(self, args, state, control, model, **kwargs):
+        if state.is_world_process_zero:
+            self._generate_mcqa_report()
+
+    def save_results(self, output_dir: str):
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"{self.__class__.__name__}: Saving MCQA metrics to {output_dir}")
+
+        records = [
+            {'step': entry['step'], 'probe_index': i, 'mcqa_accuracy': value}
+            for entry in self.history["mcqa_accuracy"]
+            for i, value in enumerate(entry['values'])
+        ]
+        if not records:
+            print(" > No MCQA metrics to save.")
+            return
+
+        output_path = os.path.join(output_dir, f'{self.log_prefix}_metrics.csv')
+        pd.DataFrame(records).to_csv(output_path, index=False)
+        print(f" > Saved MCQA metrics to '{output_path}' with {len(records)} rows.")
 
     # ------------------------------------------------------------------
     # Additional end-of-training report
     # ------------------------------------------------------------------
-    def on_train_end(self, args, state, control, model, **kwargs):
-        super().on_train_end(args, state, control, model, **kwargs)
-        if state.is_world_process_zero:
-            self._generate_mcqa_report()
 
     def _generate_mcqa_report(self):
         if not self.history["mcqa_accuracy"]:
@@ -1246,7 +1219,7 @@ class MCQAProbeCallback(BaseKnowledgeProbeCallBack):
         initial_acc = self.history["mcqa_accuracy"][0]
 
         with open(report_path, "w") as f:
-            f.write(f"MCQA Probe Report — {self.log_prefix}\n")
+            f.write(f"MCQA Probe Report - {self.log_prefix}\n")
             f.write("=" * 60 + "\n\n")
             f.write(f"Number of probes : {len(self.formatted_questions)}\n")
             f.write(f"Number of choices: {len(self.choice_token_ids)}\n")

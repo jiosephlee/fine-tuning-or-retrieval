@@ -22,19 +22,16 @@ from scripts.plotting.plot_utils import (
 )
 
 def plot_batch_scaling_hits(df_bs, model_colors, bs_styles):
-    print("Plotting Batch Scaling Hits Figure (1/10/100)...")
+    print("Plotting Batch Scaling Target Rank Figure...")
     
-    # Layout: 3 Rows (Hits@1, Hits@10, Hits@100) x 2 Columns (Factual, Compositional)
-    # Width: 10, Height: 15 (5 per row)
+    fig = plt.figure(figsize=(10, 5))
+    gs = gridspec.GridSpec(1, 2, width_ratios=[1, 1], wspace=0.15)
     
-    fig = plt.figure(figsize=(10, 15))
-    gs = gridspec.GridSpec(3, 2, width_ratios=[1, 1], wspace=0.15, hspace=0.3)
-    
-    metrics = ["Hits@1", "Hits@10", "Hits@100"]
+    metrics = ["Target Rank"]
     probe_types = ["Factual", "Compositional"]
     
     axes_grid = []
-    for r in range(3):
+    for r in range(1):
         row_axes = []
         for c in range(2):
             row_axes.append(fig.add_subplot(gs[r, c]))
@@ -72,16 +69,7 @@ def plot_batch_scaling_hits(df_bs, model_colors, bs_styles):
             ax.set_xticks([32, 64, 128, 256])
             ax.set_xticklabels(['32', '64', '128', '256'])
             
-            # X-label only on bottom row
-            if r == 2:
-                ax.set_xlabel("Batch Size")
-            else:
-                ax.set_xticklabels([]) # Hide x-ticks for upper rows? Or keep them? 
-                # Usually better to keep them if not shared x-axis, but here x-axis is same.
-                # Let's hide labels to be cleaner, or keep them. 
-                # User didn't specify, but standard is bottom only.
-                # Actually, let's keep them for clarity as spacing is 0.3
-                pass
+            ax.set_xlabel("Batch Size")
             
             # Y-label on left column
             if c == 0:
@@ -91,8 +79,6 @@ def plot_batch_scaling_hits(df_bs, model_colors, bs_styles):
                 
             ax.grid(True, which="major", ls="-", alpha=0.1)
 
-    # Unified Y-limits per row? Or global?
-    # Usually hits metrics are 0-1, but let's compute per row.
     if not df_bs.empty:
         for r, metric in enumerate(metrics):
             row_vals = df_bs[df_bs["Metric"] == metric]["Value"].tolist()
@@ -115,10 +101,10 @@ def plot_batch_scaling_hits(df_bs, model_colors, bs_styles):
 
     plt.tight_layout()
     os.makedirs('plots', exist_ok=True)
-    out_path = os.path.join('plots', 'batch_scaling_hits.pdf')
+    out_path = os.path.join('plots', 'batch_scaling_target_rank.pdf')
     plt.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
-    print(f"Saved batch scaling hits plot to {out_path}")
+    print(f"Saved batch scaling target rank plot to {out_path}")
 
 def main():
     set_plot_style()
@@ -207,7 +193,7 @@ def main():
         "Para 9": {"linestyle": "-", "marker": "o"},
     }
 
-    # --- Data Collection (Hits@1, Hits@10, Hits@100) ---
+    # --- Data Collection (Target Rank) ---
     bs_data = []
     for model, strategies in bs_run_config.items():
         for strategy, batches in strategies.items():
@@ -220,9 +206,7 @@ def main():
                 
                 # Fetch Metrics
                 metrics_map = {
-                    "Hits@1": 'hit_accuracy_at_1',
-                    "Hits@10": 'hit_accuracy_at_10',
-                    "Hits@100": 'hit_accuracy_at_100'
+                    "Target Rank": 'target_rank',
                 }
                 
                 for m_name, col in metrics_map.items():

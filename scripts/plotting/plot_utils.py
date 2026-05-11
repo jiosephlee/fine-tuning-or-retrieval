@@ -306,7 +306,7 @@ def load_metrics(
         Repository root.
     metrics : sequence of str
         Metric columns to keep (e.g. ``("log_prob",)`` or
-        ``("log_prob", "hit_accuracy_at_10")``).
+        ``("log_prob", "target_rank")``).
     with_lima : bool
         Append LIMA probe data after the base fine-tuning steps.
     filter_file : str or None

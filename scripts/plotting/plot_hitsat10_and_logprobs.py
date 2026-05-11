@@ -17,7 +17,7 @@ from utils.llm_plotting import set_plot_style
 def aggregate_across_domains(run_path, probe_type, domains):
     """
     Aggregates probe data across multiple domains from a specific run path.
-    Adapted to capture both log_prob and hit_accuracy_at_10.
+    Adapted to capture both log_prob and target_rank.
     """
     all_domain_dfs = []
     
@@ -49,11 +49,11 @@ def aggregate_across_domains(run_path, probe_type, domains):
             df['step'] = pd.to_numeric(df['step'], errors='coerce')
             df['log_prob'] = pd.to_numeric(df['log_prob'], errors='coerce')
             
-            # check for hit_accuracy_at_10 (might be missing in some CSVs)
-            if 'hit_accuracy_at_10' in df.columns:
-                df['hit_accuracy_at_10'] = pd.to_numeric(df['hit_accuracy_at_10'], errors='coerce')
+            # check for target_rank (might be missing in older CSVs)
+            if 'target_rank' in df.columns:
+                df['target_rank'] = pd.to_numeric(df['target_rank'], errors='coerce')
             else:
-                df['hit_accuracy_at_10'] = np.nan
+                df['target_rank'] = np.nan
 
             df.dropna(subset=['step', 'log_prob'], inplace=True)
             
@@ -70,7 +70,7 @@ def aggregate_across_domains(run_path, probe_type, domains):
 
 def get_trajectory_data(run_path, probe_type, domains):
     """
-    Returns aggregated mean log_prob and hits@10 per step.
+    Returns aggregated mean log_prob and target_rank per step.
     """
     if not run_path or not os.path.isdir(run_path):
         return None
@@ -82,8 +82,8 @@ def get_trajectory_data(run_path, probe_type, domains):
     # Group by step. 
     # Crucially: Do NOT include 'step' in the value columns list, as it's the grouper.
     metric_cols = ['log_prob']
-    if 'hit_accuracy_at_10' in df.columns:
-        metric_cols.append('hit_accuracy_at_10')
+    if 'target_rank' in df.columns:
+        metric_cols.append('target_rank')
 
     agg = df.groupby('step')[metric_cols].mean().reset_index()
     agg = agg.sort_values('step')
@@ -147,7 +147,7 @@ def main():
         
         for idx, (probe_key, probe_title) in enumerate(probe_types):
             ax = axes[idx]
-            ax_right = ax.twinx() # For hits@10
+            ax_right = ax.twinx() # For target_rank
             
             # Plot data for each model size
             for model_size in ["1B", "7B", "13B"]:
@@ -164,17 +164,17 @@ def main():
                     # Log Prob (Solid, Left Axis)
                     ax.plot(df['step'], df['log_prob'], color=color, linestyle='-', linewidth=1.5, alpha=0.9, label=f"{model_size} LogProb")
                     
-                    # Hits@10 (Dashed, Right Axis)
-                    if 'hit_accuracy_at_10' in df.columns:
+                    # Target rank (Dashed, Right Axis)
+                    if 'target_rank' in df.columns:
                         # Filter out NaNs to avoid plotting gaps if some steps miss metrics
-                        valid_hits = df.dropna(subset=['hit_accuracy_at_10'])
-                        if not valid_hits.empty:
-                            ax_right.plot(valid_hits['step'], valid_hits['hit_accuracy_at_10'], color=color, linestyle='--', linewidth=1.5, alpha=0.9, label=f"{model_size} Hits@10")
+                        valid_rank = df.dropna(subset=['target_rank'])
+                        if not valid_rank.empty:
+                            ax_right.plot(valid_rank['step'], valid_rank['target_rank'], color=color, linestyle='--', linewidth=1.5, alpha=0.9, label=f"{model_size} Target Rank")
 
             ax.set_title(f"{probe_title} Probes ({method_name})")
             ax.set_xlabel("Steps")
             ax.set_ylabel("Log Probability (Solid)")
-            ax_right.set_ylabel("Hits@10 (Dashed)")
+            ax_right.set_ylabel("Target Rank (Dashed; lower is better)")
             
             # Align grids roughly if possible, or just use default
             ax.grid(True, linestyle='-', alpha=0.1)
@@ -186,7 +186,7 @@ def main():
             Line2D([0], [0], color=model_colors['7B'], lw=2, label='7B'),
             Line2D([0], [0], color=model_colors['13B'], lw=2, label='13B'),
             Line2D([0], [0], color='gray', linestyle='-', lw=2, label='Log Prob'),
-            Line2D([0], [0], color='gray', linestyle='--', lw=2, label='Hits@10'),
+            Line2D([0], [0], color='gray', linestyle='--', lw=2, label='Target Rank'),
         ]
         
         fig.legend(handles=legend_elements, loc='center right', bbox_to_anchor=(1.08, 0.5))

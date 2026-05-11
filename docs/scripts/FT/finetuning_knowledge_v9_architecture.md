@@ -230,9 +230,8 @@ V9 built-ins (set in main after parsing):
 - W&B training-loss perplexity logging disabled
 - probe metric allowlist constrained to:
   - `log_prob`
-  - `hit_accuracy_at_1`
-  - `hit_accuracy_at_10`
-  - `hit_accuracy_at_100`
+  - `target_rank`
+  - `mcqa_accuracy`
 
 ## 7) Model/Trainer Composition Layer
 

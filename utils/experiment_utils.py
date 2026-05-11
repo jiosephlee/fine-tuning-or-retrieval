@@ -56,9 +56,8 @@ def _create_mcqa_callback(
 ):
     """Create an MCQAProbeCallback from a MCQA probe DataFrame.
 
-    The DataFrame must contain the standard cloze columns (``fact``, ``probe``,
-    ``target``) **plus** MCQA-specific columns (``formatted_question``,
-    ``correct_label``).  ``correct_label`` may be ``"(D)"`` or ``"D"`` style.
+    The DataFrame must contain ``formatted_question`` and ``correct_label``.
+    ``correct_label`` may be ``"(D)"`` or ``"D"`` style.
     """
     if choice_tokens is None:
         choice_tokens = list(DEFAULT_MCQA_CHOICE_TOKENS)
@@ -80,9 +79,6 @@ def _create_mcqa_callback(
 
     return llm_callbacks.MCQAProbeCallback(
         tokenizer=tokenizer,
-        facts=mcqa_df["fact"].tolist(),
-        probes=mcqa_df["probe"].tolist(),
-        targets=mcqa_df["target"].tolist(),
         formatted_questions=formatted_questions,
         correct_choice_indices=correct_indices,
         choice_tokens=choice_tokens,
@@ -423,12 +419,13 @@ def save_probe_results(callbacks, log, args):
 
     for callback in callbacks:
         if isinstance(callback, llm_callbacks.BaseKnowledgeProbeCallBack):
-            # MCQAProbeCallback extends BaseKnowledgeProbeCallBack, so this
-            # branch covers both cloze and MCQA metrics via the shared history.
             callback.save_results(output_dir=callback.output_dir)
             log.info(f"Probe metrics for {callback.log_prefix} saved to {callback.output_dir}")
             if training_loss_callback:
                 training_loss_callback.save_results(output_dir=callback.output_dir)
+        elif isinstance(callback, llm_callbacks.MCQAProbeCallback):
+            callback.save_results(output_dir=callback.output_dir)
+            log.info(f"MCQA metrics for {callback.log_prefix} saved to {callback.output_dir}")
         elif isinstance(callback, llm_callbacks.CorpusPerplexityCallback):
             callback.save_results(output_dir=callback.output_dir)
             log.info(f"Corpus perplexity metrics for {callback.log_prefix} saved to {callback.output_dir}")

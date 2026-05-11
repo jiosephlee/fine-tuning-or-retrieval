@@ -92,8 +92,8 @@ def generate_revamped_plots(domain: str, knowledge_probes_version: str, inferenc
     # Prepare data
     mean_knowledge_log_probs = knowledge_probe_df.groupby('step')['log_prob'].mean().reset_index() if not knowledge_probe_df.empty else pd.DataFrame()
     mean_inference_log_probs = inference_probe_df.groupby('step')['log_prob'].mean().reset_index() if not inference_probe_df.empty else pd.DataFrame()
-    mean_knowledge_hits10 = knowledge_probe_df.groupby('step')['hit_accuracy_at_10'].mean().reset_index() if not knowledge_probe_df.empty and 'hit_accuracy_at_10' in knowledge_probe_df.columns else pd.DataFrame()
-    mean_inference_hits10 = inference_probe_df.groupby('step')['hit_accuracy_at_10'].mean().reset_index() if not inference_probe_df.empty and 'hit_accuracy_at_10' in inference_probe_df.columns else pd.DataFrame()
+    mean_knowledge_rank = knowledge_probe_df.groupby('step')['target_rank'].mean().reset_index() if not knowledge_probe_df.empty and 'target_rank' in knowledge_probe_df.columns else pd.DataFrame()
+    mean_inference_rank = inference_probe_df.groupby('step')['target_rank'].mean().reset_index() if not inference_probe_df.empty and 'target_rank' in inference_probe_df.columns else pd.DataFrame()
 
     # --- Plot 1a ---
     log_info("Generating Plot 1a: Mean Log Probs vs. Training Loss...")
@@ -123,17 +123,16 @@ def generate_revamped_plots(domain: str, knowledge_probes_version: str, inferenc
     plt.close()
 
     # --- Plot 1b ---
-    log_info("Generating Plot 1b: Mean Hit Accuracy @ 10 vs. Training Loss...")
+    log_info("Generating Plot 1b: Mean Target Rank vs. Training Loss...")
     fig, ax1 = plt.subplots(figsize=(14, 8))
     
     ax1.set_xlabel('Training Step')
-    ax1.set_ylabel('Absolute Mean Hit Accuracy @ 10')
-    ax1.set_ylim(0, 1)
+    ax1.set_ylabel('Mean Target Rank (lower is better)')
 
-    if not mean_knowledge_hits10.empty:
-        sns.lineplot(data=mean_knowledge_hits10, x='step', y='hit_accuracy_at_10', ax=ax1, label='Knowledge Probes Mean Hits@10', color='blue')
-    if not mean_inference_hits10.empty:
-        sns.lineplot(data=mean_inference_hits10, x='step', y='hit_accuracy_at_10', ax=ax1, label='Inference Probes Mean Hits@10', color='green')
+    if not mean_knowledge_rank.empty:
+        sns.lineplot(data=mean_knowledge_rank, x='step', y='target_rank', ax=ax1, label='Knowledge Probes Mean Target Rank', color='blue')
+    if not mean_inference_rank.empty:
+        sns.lineplot(data=mean_inference_rank, x='step', y='target_rank', ax=ax1, label='Inference Probes Mean Target Rank', color='green')
     ax1.legend(loc='upper left')
 
     if not loss_df.empty and 'chunked_perplexity' in loss_df.columns:
@@ -146,9 +145,9 @@ def generate_revamped_plots(domain: str, knowledge_probes_version: str, inferenc
         ax2.tick_params(axis='y', labelcolor='grey')
         ax2.legend(loc='upper right')
 
-    plt.title('Plot 1b: Mean Hit Accuracy @ 10 vs. Training Loss')
+    plt.title('Plot 1b: Mean Target Rank vs. Training Loss')
     plt.grid(True, which="both", ls="--")
-    plt.savefig(os.path.join(plot_output_dir, "plot_1b_mean_hits_at_10_vs_loss.png"))
+    plt.savefig(os.path.join(plot_output_dir, "plot_1b_mean_target_rank_vs_loss.png"))
     plt.close()
     
     # --- PLOT 2: Knowledge Probes by Section ---
@@ -195,13 +194,9 @@ def generate_revamped_plots(domain: str, knowledge_probes_version: str, inferenc
                 ax1 = plt.gca()
                 ax2 = ax1.twinx()
                 
-                hit_cols = [c for c in ['hit_accuracy_at_1', 'hit_accuracy_at_10', 'hit_accuracy_at_100'] if c in data.columns]
-                
-                # Plot hits on ax1
-                for col in hit_cols:
-                    sns.lineplot(data=data, x='step', y=col, ax=ax1, label=col.replace('_', ' ').title(), linestyle='--', **kwargs)
-                ax1.set_ylabel('Hit Accuracy')
-                ax1.set_ylim(0, 1)
+                if 'target_rank' in data.columns:
+                    sns.lineplot(data=data, x='step', y='target_rank', ax=ax1, label='Target Rank', linestyle='--', **kwargs)
+                ax1.set_ylabel('Target Rank (lower is better)')
                 ax1.legend(loc='upper left')
 
                 # Plot normalized log probs on ax2
@@ -257,13 +252,9 @@ def generate_revamped_plots(domain: str, knowledge_probes_version: str, inferenc
                 ax1 = plt.gca()
                 ax2 = ax1.twinx()
                 
-                hit_cols = [c for c in ['hit_accuracy_at_1', 'hit_accuracy_at_10', 'hit_accuracy_at_100'] if c in data.columns]
-                
-                # Plot hits on ax1
-                for col in hit_cols:
-                    sns.lineplot(data=data, x='step', y=col, ax=ax1, label=col.replace('_', ' ').title(), linestyle='--', **kwargs)
-                ax1.set_ylabel('Hit Accuracy')
-                ax1.set_ylim(0, 1)
+                if 'target_rank' in data.columns:
+                    sns.lineplot(data=data, x='step', y='target_rank', ax=ax1, label='Target Rank', linestyle='--', **kwargs)
+                ax1.set_ylabel('Target Rank (lower is better)')
                 ax1.legend(loc='upper left')
 
                 # Plot normalized log probs on ax2
@@ -355,8 +346,8 @@ def generate_averaged_plots(experiment_dir: str, logger=None):
     # Prepare data
     mean_knowledge_log_probs = knowledge_probe_df.groupby('step')['log_prob'].mean().reset_index() if not knowledge_probe_df.empty else pd.DataFrame()
     mean_inference_log_probs = inference_probe_df.groupby('step')['log_prob'].mean().reset_index() if not inference_probe_df.empty else pd.DataFrame()
-    mean_knowledge_hits10 = knowledge_probe_df.groupby('step')['hit_accuracy_at_10'].mean().reset_index() if not knowledge_probe_df.empty and 'hit_accuracy_at_10' in knowledge_probe_df.columns else pd.DataFrame()
-    mean_inference_hits10 = inference_probe_df.groupby('step')['hit_accuracy_at_10'].mean().reset_index() if not inference_probe_df.empty and 'hit_accuracy_at_10' in inference_probe_df.columns else pd.DataFrame()
+    mean_knowledge_rank = knowledge_probe_df.groupby('step')['target_rank'].mean().reset_index() if not knowledge_probe_df.empty and 'target_rank' in knowledge_probe_df.columns else pd.DataFrame()
+    mean_inference_rank = inference_probe_df.groupby('step')['target_rank'].mean().reset_index() if not inference_probe_df.empty and 'target_rank' in inference_probe_df.columns else pd.DataFrame()
 
     # --- Plot 1a (Averaged) ---
     log_info("Generating Averaged Plot 1a: Mean Log Probs vs. Training Loss...")
@@ -386,17 +377,16 @@ def generate_averaged_plots(experiment_dir: str, logger=None):
     plt.close()
 
     # --- Plot 1b (Averaged) ---
-    log_info("Generating Averaged Plot 1b: Mean Hit Accuracy @ 10 vs. Training Loss...")
+    log_info("Generating Averaged Plot 1b: Mean Target Rank vs. Training Loss...")
     fig, ax1 = plt.subplots(figsize=(14, 8))
     
     ax1.set_xlabel('Training Step')
-    ax1.set_ylabel('Absolute Mean Hit Accuracy @ 10 (Averaged Across Domains)')
-    ax1.set_ylim(0, 1)
+    ax1.set_ylabel('Mean Target Rank (lower is better; averaged across domains)')
 
-    if not mean_knowledge_hits10.empty:
-        sns.lineplot(data=mean_knowledge_hits10, x='step', y='hit_accuracy_at_10', ax=ax1, label='Knowledge Probes Mean Hits@10', color='blue')
-    if not mean_inference_hits10.empty:
-        sns.lineplot(data=mean_inference_hits10, x='step', y='hit_accuracy_at_10', ax=ax1, label='Inference Probes Mean Hits@10', color='green')
+    if not mean_knowledge_rank.empty:
+        sns.lineplot(data=mean_knowledge_rank, x='step', y='target_rank', ax=ax1, label='Knowledge Probes Mean Target Rank', color='blue')
+    if not mean_inference_rank.empty:
+        sns.lineplot(data=mean_inference_rank, x='step', y='target_rank', ax=ax1, label='Inference Probes Mean Target Rank', color='green')
     ax1.legend(loc='upper left')
 
     if not loss_df.empty and 'chunked_perplexity' in loss_df.columns:
@@ -409,9 +399,9 @@ def generate_averaged_plots(experiment_dir: str, logger=None):
         ax2.tick_params(axis='y', labelcolor='grey')
         ax2.legend(loc='upper right')
 
-    plt.title('Plot 1b (Averaged): Mean Hit Accuracy @ 10 vs. Training Loss')
+    plt.title('Plot 1b (Averaged): Mean Target Rank vs. Training Loss')
     plt.grid(True, which="both", ls="--")
-    plt.savefig(os.path.join(plot_output_dir, "plot_1b_avg_mean_hits_at_10_vs_loss.png"))
+    plt.savefig(os.path.join(plot_output_dir, "plot_1b_avg_mean_target_rank_vs_loss.png"))
     plt.close()
 
 

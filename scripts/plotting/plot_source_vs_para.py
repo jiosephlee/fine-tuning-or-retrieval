@@ -232,12 +232,10 @@ def main():
 
     # Plotting Helper
     def create_plot(strategy_name, output_filename):
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig, axes = plt.subplots(2, 1, figsize=(8, 10), squeeze=False)
         
         metrics = [
-            ('hit_accuracy_at_1', 'Hits@1'),
-            ('hit_accuracy_at_10', 'Hits@10'),
-            ('hit_accuracy_at_100', 'Hits@100')
+            ('target_rank', 'Target Rank')
         ]
         
         # Iterate over models
@@ -260,6 +258,8 @@ def main():
                 def plot_line(df, label, color, style, ax):
                     if df.empty:
                         return
+                    if metric_col not in df.columns:
+                        return
                     # Group by step and mean
                     grouped = df.groupby('step')[metric_col].mean()
                     ax.plot(grouped.index, grouped.values, label=label, color=color, linestyle=style, linewidth=2, alpha=1.0)
@@ -271,7 +271,7 @@ def main():
                 ax_fact.set_title(metric_name, fontsize=16)
                 # ax_fact.set_xlabel("Exposure #") # Only bottom row needs xlabel
                 if idx == 0:
-                    ax_fact.set_ylabel("Factual Accuracy", fontsize=16)
+                    ax_fact.set_ylabel("Factual Rank", fontsize=16)
                 ax_fact.tick_params(axis='both', which='major', labelsize=12)
                 ax_fact.grid(True, linestyle='--', alpha=0.7)
                 
@@ -279,7 +279,7 @@ def main():
                 # ax_comp.set_title(f"Compositional {metric_name}") # Removed title
                 ax_comp.set_xlabel("Exposure #", fontsize=16)
                 if idx == 0:
-                    ax_comp.set_ylabel("Compositional Accuracy", fontsize=16)
+                    ax_comp.set_ylabel("Compositional Rank", fontsize=16)
                 ax_comp.tick_params(axis='both', which='major', labelsize=12)
                 ax_comp.grid(True, linestyle='--', alpha=0.7)
 
@@ -297,9 +297,7 @@ def main():
             # Actually user said: "separating the compositional probes bust still used the dashed so that we don't need to write in "Compositional" in the title"
             # So maybe I should NOT put "Compositional" in the title?
             # But they are in different rows.
-            # Let's keep the titles clear: "Hits@1", etc. and maybe row label?
-            # Or just "Hits@1" on top and bottom?
-            # Let's stick to "Hits@1" as title for both, and rely on row position/ylabel.
+            # Let's keep the titles clear and rely on row position/ylabel.
         ]
         
         # Refine titles based on user comment "don't need to write in 'Compositional' in the title"
@@ -309,7 +307,7 @@ def main():
 
         # Add legend to the last plot or outside
         # Put it in the bottom right plot
-        axes[1, 2].legend(handles=legend_elements, loc='lower right', fontsize=14)
+        axes[1, 0].legend(handles=legend_elements, loc='lower right', fontsize=14)
 
         plt.tight_layout()
         output_path = os.path.join(project_root, 'plots', output_filename)
@@ -319,10 +317,10 @@ def main():
         plt.close(fig)
 
     # Generate Source Plot
-    create_plot("Source", "hits_source.pdf")
+    create_plot("Source", "rank_source.pdf")
     
     # Generate Para Plot
-    create_plot("Para", "hits_para.pdf")
+    create_plot("Para", "rank_para.pdf")
 
 if __name__ == "__main__":
     main()

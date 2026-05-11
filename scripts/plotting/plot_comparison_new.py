@@ -1,9 +1,9 @@
 """
 Lightweight replacement of plot_comparison.py focused on three plotting flows requested by the user:
 
-1) 2x2 grid: factual (left) and compositional (right) plots for three methods (source_only, para9, para9_expl), plotting log_prob and hits@10 -> results in 2x2 (logprob & hits@10) for factual and compositional (so total 2*2 plots saved separately).
+1) 2x2 grid: factual (left) and compositional (right) plots for three methods (source_only, para9, para9_expl), plotting log_prob and target_rank -> results in 2x2 (logprob & target_rank) for factual and compositional (so total 2*2 plots saved separately).
 2) Repeat using split probes: create two figures (factual and compositional) each with 4 subplots (one per probe split group) showing log_prob only.
-3) For each inference category from the original probe CSV, create a figure with four subplots (log_prob, hits@1, hits@10, hits@100) for probes filtered to that inference_type. There will be one figure per inference category.
+3) For each inference category from the original probe CSV, create a figure with two subplots (log_prob, target_rank) for probes filtered to that inference_type. There will be one figure per inference category.
 
 This script uses helpers from scripts.plotting.plot_utils where possible.
 """
@@ -70,7 +70,7 @@ def _load_metric_series(
 ):
     """
     Use aggregate_across_domains from plot_comparison.py to get per-step averages
-    of a given metric (e.g., 'log_prob', 'hit_accuracy_at_10').
+    of a given metric (e.g., 'log_prob', 'target_rank').
     """
     if not run_path or not os.path.isdir(run_path):
         return None
@@ -235,10 +235,10 @@ def plot_two_by_two(
 ):
     """
     Plot factual (knowledge) vs compositional (inference) for the three 7B runs,
-    once for log_prob and once for hits@10 (from llm_callbacks).
+    once for log_prob and once for target_rank (from llm_callbacks).
 
     - Figure 1: left=factual log_prob, right=compositional log_prob
-    - Figure 2: left=factual hits@10, right=compositional hits@10
+    - Figure 2: left=factual target_rank, right=compositional target_rank
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -270,34 +270,34 @@ def plot_two_by_two(
     plt.savefig(out_path_lp, bbox_inches="tight")
     plt.close(fig_lp)
 
-    # --- Figure 2: hits@10 ---
+    # --- Figure 2: target_rank ---
     fig_h, axes_h = plt.subplots(1, 2, figsize=(12, 4), sharey=False)
     for method in METHODS:
         run_path = _get_run_path(method["run_key"])
-        series_k = _load_metric_series(run_path, "knowledge", "hit_accuracy_at_10", DOMAINS)
-        series_i = _load_metric_series(run_path, "inference", "hit_accuracy_at_10", DOMAINS)
+        series_k = _load_metric_series(run_path, "knowledge", "target_rank", DOMAINS)
+        series_i = _load_metric_series(run_path, "inference", "target_rank", DOMAINS)
 
         if series_k is not None and not series_k.empty:
-            axes_h[0].plot(series_k["step"], series_k["hit_accuracy_at_10"], label=method["label"])
+            axes_h[0].plot(series_k["step"], series_k["target_rank"], label=method["label"])
         if series_i is not None and not series_i.empty:
-            axes_h[1].plot(series_i["step"], series_i["hit_accuracy_at_10"], label=method["label"])
+            axes_h[1].plot(series_i["step"], series_i["target_rank"], label=method["label"])
 
-    axes_h[0].set_title("Factual Probes — hits@10")
+    axes_h[0].set_title("Factual Probes — target_rank")
     axes_h[0].set_xlabel("step")
-    axes_h[0].set_ylabel("hits@10")
+    axes_h[0].set_ylabel("target_rank (lower is better)")
 
-    axes_h[1].set_title("Compositional Probes — hits@10")
+    axes_h[1].set_title("Compositional Probes — target_rank")
     axes_h[1].set_xlabel("step")
-    axes_h[1].set_ylabel("hits@10")
+    axes_h[1].set_ylabel("target_rank (lower is better)")
 
     add_legend(axes_h[0])
     add_legend(axes_h[1])
 
-    out_path_h = os.path.join(out_dir, f"factual_vs_compositional_hits10_7b_{model_id}.pdf")
+    out_path_h = os.path.join(out_dir, f"factual_vs_compositional_target_rank_7b_{model_id}.pdf")
     plt.savefig(out_path_h, bbox_inches="tight")
     plt.close(fig_h)
 
-    print(f"2x2-style plots (log_prob and hits@10) saved to {out_dir}")
+    print(f"2x2-style plots (log_prob and target_rank) saved to {out_dir}")
 
 
 def plot_two_by_two_lex_filtered(
@@ -525,12 +525,10 @@ def plot_by_inference_category(
 ):
     """
     For each inference_type category in the BOFT master probe CSV, use the BOFT
-    compositional probe metrics from all three runs, and create a 1x4 subplot
+    compositional probe metrics from all three runs, and create a 1x2 subplot
     figure:
       - log_prob
-      - hits@1
-      - hits@10
-      - hits@100
+      - target_rank
     Each subplot overlays Source, Paraphrase, and Textbooks (from their
     respective BOFT_inference_probe metrics).
     """
@@ -587,7 +585,7 @@ def plot_by_inference_category(
         return
 
     for cat in cats:
-        fig, axes = plt.subplots(1, 4, figsize=(16, 4), sharey=False)
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=False)
         has_any = False
 
         for method_label, df in method_metrics.items():
@@ -599,9 +597,7 @@ def plot_by_inference_category(
                 sub.groupby("step")[
                     [
                         "log_prob",
-                        "hit_accuracy_at_1",
-                        "hit_accuracy_at_10",
-                        "hit_accuracy_at_100",
+                        "target_rank",
                     ]
                 ]
                 .mean()
@@ -613,18 +609,14 @@ def plot_by_inference_category(
 
             has_any = True
             axes[0].plot(agg["step"], agg["log_prob"], label=method_label)
-            axes[1].plot(agg["step"], agg["hit_accuracy_at_1"], label=method_label)
-            axes[2].plot(agg["step"], agg["hit_accuracy_at_10"], label=method_label)
-            axes[3].plot(agg["step"], agg["hit_accuracy_at_100"], label=method_label)
+            axes[1].plot(agg["step"], agg["target_rank"], label=method_label)
 
         if not has_any:
             plt.close(fig)
             continue
 
         axes[0].set_title("log_prob")
-        axes[1].set_title("hits@1")
-        axes[2].set_title("hits@10")
-        axes[3].set_title("hits@100")
+        axes[1].set_title("target_rank")
 
         for a in axes:
             a.set_xlabel("step")

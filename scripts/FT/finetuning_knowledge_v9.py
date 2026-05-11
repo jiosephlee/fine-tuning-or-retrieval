@@ -521,7 +521,7 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
     lima_training_config = llm_configs.TrainingConfig(**lima_training_config_kwargs)
 
     # --- Load Probes ---
-    # v9 default: inference probes off; W&B per-paper metrics focus on log_prob + hits@1/10/100.
+    # v9 default: inference probes off; W&B per-paper metrics focus on log_prob + target_rank.
     callbacks = experiment_utils.setup_callbacks(
         domains=args.resolved_domains,
         tokenizer=tokenizer, 
@@ -830,15 +830,12 @@ if __name__ == "__main__":
     # v9 built-ins (not exposed as CLI options):
     # - no inference probes
     # - no perplexity-related W&B logging
-    # - probe W&B logging limited to log_prob + hits@1/10/100
+    # - probe W&B logging limited to log_prob + target_rank
     args.disable_inference_probes = True
     args.wandb_probe_metric_allowlist = [
         "log_prob",
-        "hit_accuracy_at_1",
-        "hit_accuracy_at_10",
-        "hit_accuracy_at_100",
+        "target_rank",
         "mcqa_accuracy",
-        "mcqa_correct_logprob",
     ]
     args.disable_corpus_perplexity_wandb = True
     args.disable_training_loss_perplexity_wandb = True
@@ -950,7 +947,7 @@ if __name__ == "__main__":
         mcqa_note = f" MCQA constrained-decoding ({args.knowledge_probes_version})." if args.mcqa_probes else ""
         log.info(
             f"W&B source panels enabled for: {args.wandb_panel_sources}. "
-            f"Per-paper metrics: log_prob_average, hits_1, hits_10, hits_100, mcqa_accuracy.{mcqa_note}"
+            f"Per-paper metrics: log_prob_average, target_rank_average, mcqa_accuracy.{mcqa_note}"
         )
 
     args.resolved_domains, args.domain_data_sources = resolve_domains_and_sources(args, log)

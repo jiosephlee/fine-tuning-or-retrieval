@@ -115,8 +115,8 @@ The paper evaluates performance during training using:
 - **Average log-probability on target spans**
   - Teacher forcing is used for multi-token target spans.
 
-- **Hits@k**
-  - Primarily `@1`, `@10`, and `@100`.
+- **Target rank**
+  - Lower is better; rank is more granular than thresholded top-k metrics.
 
 This means the repo is designed to inspect **learning dynamics over time**, not just a single endpoint score.
 

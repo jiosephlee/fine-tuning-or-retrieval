@@ -21,7 +21,7 @@ from scripts.plotting.plot_utils import (
 
 def get_trajectory_data(run_path, probe_type, domains, project_root):
     """
-    Returns aggregated mean log_prob and hits@10 per step.
+    Returns aggregated mean log_prob and target_rank per step.
     """
     if not run_path:
         return None
@@ -59,10 +59,10 @@ def get_trajectory_data(run_path, probe_type, domains, project_root):
             df['step'] = pd.to_numeric(df['step'], errors='coerce')
             df['log_prob'] = pd.to_numeric(df['log_prob'], errors='coerce')
             
-            if 'hit_accuracy_at_10' in df.columns:
-                df['hit_accuracy_at_10'] = pd.to_numeric(df['hit_accuracy_at_10'], errors='coerce')
+            if 'target_rank' in df.columns:
+                df['target_rank'] = pd.to_numeric(df['target_rank'], errors='coerce')
             else:
-                df['hit_accuracy_at_10'] = np.nan
+                df['target_rank'] = np.nan
 
             df.dropna(subset=['step', 'log_prob'], inplace=True)
             
@@ -77,15 +77,15 @@ def get_trajectory_data(run_path, probe_type, domains, project_root):
     combined_df = pd.concat(all_domain_dfs, ignore_index=True)
     
     metric_cols = ['log_prob']
-    if 'hit_accuracy_at_10' in combined_df.columns:
-        metric_cols.append('hit_accuracy_at_10')
+    if 'target_rank' in combined_df.columns:
+        metric_cols.append('target_rank')
 
     agg = combined_df.groupby('step')[metric_cols].mean().reset_index()
     agg = agg.sort_values('step')
     
     return agg
 
-def plot_2panel_factual(p1_data, p2_data, model_colors, lp_ylim, hits_ylim):
+def plot_2panel_factual(p1_data, p2_data, model_colors, lp_ylim, rank_ylim):
     print("Plotting 2-Panel Factual Figure...")
     
     # Layout: [P1] [P2]
@@ -105,8 +105,8 @@ def plot_2panel_factual(p1_data, p2_data, model_colors, lp_ylim, hits_ylim):
     
     for model_size, df in p1_data:
         ax1.plot(df['Exposure Steps'], df['log_prob'], color=model_colors[model_size], linestyle='-', linewidth=2, label=f"{model_size} LogProb")
-        if 'hit_accuracy_at_10' in df.columns:
-            ax1_right.plot(df['Exposure Steps'], df['hit_accuracy_at_10'], color=model_colors[model_size], linestyle=':', linewidth=2, label=f"{model_size} Hits@10")
+        if 'target_rank' in df.columns:
+            ax1_right.plot(df['Exposure Steps'], df['target_rank'], color=model_colors[model_size], linestyle=':', linewidth=2, label=f"{model_size} Target Rank")
             
     ax1.set_title("Source")
     ax1.set_xlabel("Exposure #")
@@ -114,8 +114,8 @@ def plot_2panel_factual(p1_data, p2_data, model_colors, lp_ylim, hits_ylim):
     ax1_right.set_yticklabels([]) # Hide right ticks
     
     apply_ylim([ax1], lp_ylim)
-    if hits_ylim:
-        apply_ylim([ax1_right], hits_ylim)
+    if rank_ylim:
+        apply_ylim([ax1_right], rank_ylim)
     ax1.grid(True, alpha=0.1)
 
     # --- Panel 2: Para 9 Factual ---
@@ -124,17 +124,17 @@ def plot_2panel_factual(p1_data, p2_data, model_colors, lp_ylim, hits_ylim):
     
     for model_size, df in p2_data:
         ax2.plot(df['Exposure Steps'], df['log_prob'], color=model_colors[model_size], linestyle='-', linewidth=2)
-        if 'hit_accuracy_at_10' in df.columns:
-            ax2_right.plot(df['Exposure Steps'], df['hit_accuracy_at_10'], color=model_colors[model_size], linestyle=':', linewidth=2)
+        if 'target_rank' in df.columns:
+            ax2_right.plot(df['Exposure Steps'], df['target_rank'], color=model_colors[model_size], linestyle=':', linewidth=2)
 
     ax2.set_title("Para. 9")
     ax2.set_xlabel("Exposure #")
     ax2.set_yticklabels([]) # Hide left ticks
-    ax2_right.set_ylabel("Hits@10") # Show right label
+    ax2_right.set_ylabel("Target Rank") # Show right label
     
     apply_ylim([ax2], lp_ylim)
-    if hits_ylim:
-        apply_ylim([ax2_right], hits_ylim)
+    if rank_ylim:
+        apply_ylim([ax2_right], rank_ylim)
     ax2.grid(True, alpha=0.1)
 
     # --- Legends ---
@@ -144,7 +144,7 @@ def plot_2panel_factual(p1_data, p2_data, model_colors, lp_ylim, hits_ylim):
         Line2D([0], [0], color='#d62728', lw=2, linestyle='-', label='13B'),
         Line2D([0], [0], color='#9467bd', lw=2, linestyle='-', label='32B'),
         Line2D([0], [0], color='gray', lw=2, linestyle='-', label='Log Prob'),
-        Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Hits@10'),
+        Line2D([0], [0], color='gray', lw=2, linestyle=':', label='Target Rank'),
     ]
     axes[0].legend(handles=p1_legend_elements, loc='lower right', fontsize='small', frameon=True)
 
@@ -233,17 +233,17 @@ def main():
 
     # Compute Limits
     all_logprobs = []
-    all_hits = []
+    all_ranks = []
     for _, df in p1_data + p2_data:
         all_logprobs.extend(df['log_prob'].tolist())
-        if 'hit_accuracy_at_10' in df.columns:
-            all_hits.extend(df['hit_accuracy_at_10'].dropna().tolist())
+        if 'target_rank' in df.columns:
+            all_ranks.extend(df['target_rank'].dropna().tolist())
             
     lp_ylim = compute_unified_ylim(all_logprobs)
-    hits_ylim = compute_unified_ylim(all_hits) if all_hits else None
+    rank_ylim = compute_unified_ylim(all_ranks) if all_ranks else None
     
     # --- Generate Plot ---
-    plot_2panel_factual(p1_data, p2_data, model_colors, lp_ylim, hits_ylim)
+    plot_2panel_factual(p1_data, p2_data, model_colors, lp_ylim, rank_ylim)
 
 if __name__ == "__main__":
     main()
