@@ -21,6 +21,7 @@ import argparse
 import wandb
 import logging
 import pandas as pd
+import torch
 # wandb.init(project="fine_tuning_study")
 # Local callback types are no longer used directly; delegated to utils.experiment_utils
 
@@ -34,6 +35,23 @@ DEFAULT_WANDB_PROJECT = "fine_tuning_study_v9"
 DEFAULT_WANDB_PANEL_SOURCES = ("legal", "arxiv", "medical")
 DEFAULT_KNOWLEDGE_PROBES_VERSION = "v13"
 REQUIRED_KNOWLEDGE_PROBE_COLUMNS = ("fact", "probe", "target")
+
+
+def distributed_world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def distributed_rank() -> int:
+    return int(os.environ.get("RANK", "0"))
+
+
+def is_world_process_zero() -> bool:
+    return distributed_rank() == 0
+
+
+def distributed_barrier() -> None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
 
 def _domain_catalog_root(source: str, args) -> str:
@@ -316,9 +334,21 @@ def construct_experiment_name(args):
 
 
 def continue_pretraining(model, tokenizer, log, args, train: bool = True):
-    assert args.effective_batch_size_for_cpt % args.device_batch_size == 0, \
-        "Effective batch size for CPT must be divisible by device batch size."
-    grad_accum_steps = args.effective_batch_size_for_cpt // args.device_batch_size
+    world_size = distributed_world_size()
+    global_micro_batch_size = args.device_batch_size * world_size
+    assert args.effective_batch_size_for_cpt % global_micro_batch_size == 0, (
+        "Effective batch size for CPT must be divisible by "
+        "device_batch_size * WORLD_SIZE."
+    )
+    grad_accum_steps = args.effective_batch_size_for_cpt // global_micro_batch_size
+    log.info(
+        "Distributed CPT batch setup: world_size=%s, per_device_batch=%s, "
+        "grad_accum_steps=%s, global_effective_batch=%s",
+        world_size,
+        args.device_batch_size,
+        grad_accum_steps,
+        args.device_batch_size * grad_accum_steps * world_size,
+    )
 
     # --- Continued Pretraining Configuration ---
     training_config_kwargs = {
@@ -334,8 +364,8 @@ def continue_pretraining(model, tokenizer, log, args, train: bool = True):
         "train_sampling_strategy": "sequential",
         "reverse_ffd_packing": False,
         "remove_unused_columns": False,
-        "packing": False,
-        "padding_free": False,
+        "packing": True,
+        "padding_free": True,
         "report_to": "wandb" if not args.test_script else "none",
         "activation_offloading": args.offload_to_cpu,
         "compile": args.compile_model,
@@ -431,7 +461,8 @@ def continue_pretraining(model, tokenizer, log, args, train: bool = True):
 
     if train:
         # --- Save Metrics and Generate Plots ---
-        experiment_utils.save_probe_results(callbacks_to_use, log, args)
+        if is_world_process_zero():
+            experiment_utils.save_probe_results(callbacks_to_use, log, args)
 
         # --- Generate Plots ---
         # Note: Plotting logic is removed as it's complex with multiple domains. 
@@ -448,9 +479,13 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
     lima_train_ds = data_preparation.prepare_lima_dataset(tokenizer, log, use_eot_token=True, cache_dir=args.cache_dir)
     log.info(f"Sample formatted training example:\\n{lima_train_ds}")
 
-    assert args.effective_batch_size_for_lima % args.device_batch_size == 0, \
-        "Effective batch size for LIMA must be divisible by device batch size."
-    grad_accum_steps = args.effective_batch_size_for_lima // args.device_batch_size
+    world_size = distributed_world_size()
+    global_micro_batch_size = args.device_batch_size * world_size
+    assert args.effective_batch_size_for_lima % global_micro_batch_size == 0, (
+        "Effective batch size for LIMA must be divisible by "
+        "device_batch_size * WORLD_SIZE."
+    )
+    grad_accum_steps = args.effective_batch_size_for_lima // global_micro_batch_size
     
     # --- LIMA Training Configuration ---
     lima_training_config_kwargs = {
@@ -541,7 +576,8 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
     trainer.train()
 
     # --- Save results ---
-    experiment_utils.save_probe_results(callbacks, log, args)
+    if is_world_process_zero():
+        experiment_utils.save_probe_results(callbacks, log, args)
     
     log.info("LIMA-based instruction tuning complete.")
     if not args.test_script:
@@ -930,9 +966,11 @@ if __name__ == "__main__":
     args.experiment_dir = experiment_dir
     os.makedirs(experiment_dir, exist_ok=True)
     hyperparameters_path = os.path.join(experiment_dir, 'hyperparameters.json')
-    with open(hyperparameters_path, 'w') as f:
-        json.dump(vars(args), f, indent=4)
-    log.info(f"Hyperparameters saved to {hyperparameters_path}")
+    if is_world_process_zero():
+        with open(hyperparameters_path, 'w') as f:
+            json.dump(vars(args), f, indent=4)
+        log.info(f"Hyperparameters saved to {hyperparameters_path}")
+    distributed_barrier()
 
     # (WandB run name will follow the experiment name so no explicit init here)
 
@@ -977,12 +1015,13 @@ if __name__ == "__main__":
     if run_cpt:
         train_cpt = not args.debug_dataloader_only
         model, tokenizer = continue_pretraining(model, tokenizer, log, args, train=train_cpt)
-        if train_cpt and args.save_local_model:
+        if train_cpt and args.save_local_model and is_world_process_zero():
             cpt_save_path = os.path.join(args.experiment_dir, args.cpt_model_subdir)
             llm_training.save_model(model, tokenizer, log, cpt_save_path)
             log.info(f"CPT checkpoint saved to {cpt_save_path}")
+        distributed_barrier()
         # Optionally push CPT model snapshot to hub
-        if train_cpt and args.push_to_hub_cpt_id:
+        if train_cpt and args.push_to_hub_cpt_id and is_world_process_zero():
             log.info(f"Pushing CPT model to hub: {args.push_to_hub_cpt_id}")
             model.push_to_hub(args.push_to_hub_cpt_id)
             tokenizer.push_to_hub(args.push_to_hub_cpt_id)
@@ -991,7 +1030,8 @@ if __name__ == "__main__":
     if args.lima_afterwards:
         lima_epochs = 1 if args.test_script else 10
         model, tokenizer = lima_training(model, tokenizer, log, args, num_train_epochs=lima_epochs)
-        if args.save_local_model:
+        if args.save_local_model and is_world_process_zero():
             lima_save_path = os.path.join(args.experiment_dir, args.lima_model_subdir)
             llm_training.save_model(model, tokenizer, log, lima_save_path)
             log.info(f"LIMA checkpoint saved to {lima_save_path}")
+        distributed_barrier()

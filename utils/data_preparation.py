@@ -606,8 +606,38 @@ def prepare_training_mix(
     original_epochs = train_cfg.num_train_epochs
     replication_factor = 1
     if unique_document_batches and original_epochs > 1:
+        if original_epochs < len(unique_document_batches):
+            log.warning(
+                "Requested %s knowledge-injection batches but data mix has %s view batches; "
+                "running one full cycle instead.",
+                original_epochs,
+                len(unique_document_batches),
+            )
+        elif original_epochs % len(unique_document_batches) != 0:
+            log.warning(
+                "Requested %s knowledge-injection batches is not divisible by %s view batches; "
+                "using floor replication.",
+                original_epochs,
+                len(unique_document_batches),
+            )
         replication_factor = int(original_epochs / len(unique_document_batches))
+        replication_factor = max(1, replication_factor)
         log.info(f"Replicating dataset {replication_factor} times.")
+
+    view_batch_sizes = [len(batch) for batch in unique_document_batches]
+    requested_batches = (
+        len(unique_document_batches) * replication_factor if unique_document_batches else 0
+    )
+    log.info(
+        "Data mix schedule: strategy=%s, view_batches=%s, view_batch_chunk_counts=%s, "
+        "requested_num_train_epochs=%s, replication_factor=%s, scheduled_view_batches=%s",
+        strategy_name,
+        len(unique_document_batches),
+        view_batch_sizes,
+        original_epochs,
+        replication_factor,
+        requested_batches,
+    )
 
     final_chunks = []
     has_track_explanations = any(len(tracks) > 0 for tracks in domain_explanation_tracks)
@@ -677,6 +707,23 @@ def prepare_training_mix(
 
     train_cfg.num_train_epochs = 1
     dataset = Dataset.from_dict({"raw_text": final_chunks})
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    global_effective_batch_size = (
+        train_cfg.per_device_train_batch_size
+        * train_cfg.gradient_accumulation_steps
+        * world_size
+    )
+    expected_steps = (
+        (len(final_chunks) + global_effective_batch_size - 1) // global_effective_batch_size
+        if global_effective_batch_size > 0
+        else 0
+    )
+    log.info(
+        "Final CPT dataset: chunks=%s, global_effective_batch_size=%s, expected_optimizer_steps=%s",
+        len(final_chunks),
+        global_effective_batch_size,
+        expected_steps,
+    )
     return dataset, train_cfg
 
 def replicate_and_interleave_tracks(
@@ -694,7 +741,12 @@ def replicate_and_interleave_tracks(
     """
     The New Way: "Track" based mixing with independent domain cycling AND multiple tracks per domain.
     """
-    effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    effective_batch_size = (
+        train_cfg.per_device_train_batch_size
+        * train_cfg.gradient_accumulation_steps
+        * world_size
+    )
     total_batches = len(doc_batches) * replication_factor
     
     if total_batches == 0: return []
@@ -734,10 +786,22 @@ def replicate_and_interleave_tracks(
 
     # --- MERGE ---
     final_chunks = []
+    scheduled_batches = 0
+    total_knowledge_chunks = 0
+    total_replay_fill_chunks = 0
+    pure_replay_batches = 0
+    max_knowledge_chunks = 0
     for i in range(total_batches):
         current_batch = track_docs[i] + track_explanations[i]
+        knowledge_chunks = len(current_batch)
+        scheduled_batches += 1
+        total_knowledge_chunks += knowledge_chunks
+        max_knowledge_chunks = max(max_knowledge_chunks, knowledge_chunks)
+        if knowledge_chunks == 0:
+            pure_replay_batches += 1
         
         if fill_with_pretraining:
+            total_replay_fill_chunks += max(0, effective_batch_size - knowledge_chunks)
             current_batch = fill_up_batch_with_pretraining_chunks(
                 current_batch, data_replay, effective_batch_size, train_cfg.context_length, tokenizer
             )
@@ -748,9 +812,21 @@ def replicate_and_interleave_tracks(
              pretraining_fill = get_pretraining_batches(
                 data_replay, pretraining_separators, effective_batch_size,
                 train_cfg.context_length, tokenizer
-            )
+             )
              final_chunks.extend(pretraining_fill)
 
+    log.info(
+        "Replay fill summary: scheduled_batches=%s, max_knowledge_chunks_per_batch=%s, "
+        "knowledge_chunks=%s, replay_fill_chunks=%s, pure_replay_batches=%s, "
+        "effective_batch_size=%s, context_length=%s",
+        scheduled_batches,
+        max_knowledge_chunks,
+        total_knowledge_chunks,
+        total_replay_fill_chunks,
+        pure_replay_batches,
+        effective_batch_size,
+        train_cfg.context_length,
+    )
     return final_chunks
 
 def replicate_and_interleave_legacy(
@@ -770,7 +846,18 @@ def replicate_and_interleave_legacy(
     them for every replication; otherwise use the ordinary document batches.
     """
     final_chunks = []
-    effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    effective_batch_size = (
+        train_cfg.per_device_train_batch_size
+        * train_cfg.gradient_accumulation_steps
+        * world_size
+    )
+
+    scheduled_batches = 0
+    total_knowledge_chunks = 0
+    total_replay_fill_chunks = 0
+    pure_replay_batches = 0
+    max_knowledge_chunks = 0
 
     for rep in range(replication_factor):
         if test_script: log.info(f"--- Creating replication {rep + 1}/{replication_factor} ---")
@@ -782,8 +869,15 @@ def replicate_and_interleave_legacy(
 
         for i, batch in enumerate(batches_for_this_rep):
             current_batch = list(batch)
+            knowledge_chunks = len(current_batch)
+            scheduled_batches += 1
+            total_knowledge_chunks += knowledge_chunks
+            max_knowledge_chunks = max(max_knowledge_chunks, knowledge_chunks)
+            if knowledge_chunks == 0:
+                pure_replay_batches += 1
             
             if fill_with_pretraining:
+                total_replay_fill_chunks += max(0, effective_batch_size - knowledge_chunks)
                 current_batch = fill_up_batch_with_pretraining_chunks(
                     current_batch, data_replay, effective_batch_size, train_cfg.context_length, tokenizer
                 )
@@ -797,7 +891,19 @@ def replicate_and_interleave_legacy(
                     train_cfg.context_length, tokenizer
                 )
                 final_chunks.extend(pretraining_fill)
-                
+
+    log.info(
+        "Replay fill summary: scheduled_batches=%s, max_knowledge_chunks_per_batch=%s, "
+        "knowledge_chunks=%s, replay_fill_chunks=%s, pure_replay_batches=%s, "
+        "effective_batch_size=%s, context_length=%s",
+        scheduled_batches,
+        max_knowledge_chunks,
+        total_knowledge_chunks,
+        total_replay_fill_chunks,
+        pure_replay_batches,
+        effective_batch_size,
+        train_cfg.context_length,
+    )
     return final_chunks
 
 def replicate_and_interleave_whole_insert_every_n(
@@ -821,7 +927,12 @@ def replicate_and_interleave_whole_insert_every_n(
     if insertion_every_n <= 0:
         raise ValueError("insertion_every_n must be a positive integer.")
 
-    effective_batch_size = train_cfg.per_device_train_batch_size * train_cfg.gradient_accumulation_steps
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    effective_batch_size = (
+        train_cfg.per_device_train_batch_size
+        * train_cfg.gradient_accumulation_steps
+        * world_size
+    )
     total_doc_batches = len(doc_batches) * replication_factor
     if total_doc_batches == 0:
         return []
@@ -848,10 +959,22 @@ def replicate_and_interleave_whole_insert_every_n(
     )
 
     final_chunks = []
+    scheduled_batch_count = 0
+    total_knowledge_chunks = 0
+    total_replay_fill_chunks = 0
+    pure_replay_batches = 0
+    max_knowledge_chunks = 0
     for batch_idx, batch in enumerate(scheduled_batches):
         current_batch = list(batch)
+        knowledge_chunks = len(current_batch)
+        scheduled_batch_count += 1
+        total_knowledge_chunks += knowledge_chunks
+        max_knowledge_chunks = max(max_knowledge_chunks, knowledge_chunks)
+        if knowledge_chunks == 0:
+            pure_replay_batches += 1
 
         if fill_with_pretraining:
+            total_replay_fill_chunks += max(0, effective_batch_size - knowledge_chunks)
             current_batch = fill_up_batch_with_pretraining_chunks(
                 current_batch, data_replay, effective_batch_size, train_cfg.context_length, tokenizer
             )
@@ -868,4 +991,16 @@ def replicate_and_interleave_whole_insert_every_n(
             )
             final_chunks.extend(pretraining_fill)
 
+    log.info(
+        "Replay fill summary: scheduled_batches=%s, max_knowledge_chunks_per_batch=%s, "
+        "knowledge_chunks=%s, replay_fill_chunks=%s, pure_replay_batches=%s, "
+        "effective_batch_size=%s, context_length=%s",
+        scheduled_batch_count,
+        max_knowledge_chunks,
+        total_knowledge_chunks,
+        total_replay_fill_chunks,
+        pure_replay_batches,
+        effective_batch_size,
+        train_cfg.context_length,
+    )
     return final_chunks

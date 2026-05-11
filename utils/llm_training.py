@@ -240,17 +240,32 @@ def fine_tune(
         content = []
         eos_token_id = tokenizer.eos_token_id
         for i, batch in enumerate(dataloader):
-            input_shape = tuple(batch["input_ids"].shape)
-            attention_shape = tuple(batch["attention_mask"].shape)
+            input_ids_batch = batch["input_ids"]
+            attention_mask_batch = batch.get("attention_mask")
+            input_shape = tuple(input_ids_batch.shape)
+            attention_shape = tuple(attention_mask_batch.shape) if attention_mask_batch is not None else None
             content.append(
                 f"===== NEW BATCH {i + 1} | input_ids shape={input_shape} | attention_mask shape={attention_shape} ====="
             )
             # Assuming 'input_ids' is the key for tokenized text
             # and we decode it back to string for inspection.
             # Process each sequence in the batch
-            for j, (input_ids, attention_mask) in enumerate(zip(batch['input_ids'], batch['attention_mask'])):
-                # Find the last non-padded token using attention mask
-                last_valid_idx = (attention_mask == 1).nonzero(as_tuple=True)[0][-1]
+            if input_ids_batch.ndim == 1:
+                input_sequences = input_ids_batch.unsqueeze(0)
+            else:
+                input_sequences = input_ids_batch
+            if attention_mask_batch is None:
+                attention_sequences = [None] * len(input_sequences)
+            elif attention_mask_batch.ndim == 1:
+                attention_sequences = attention_mask_batch.unsqueeze(0)
+            else:
+                attention_sequences = attention_mask_batch
+            for j, (input_ids, attention_mask) in enumerate(zip(input_sequences, attention_sequences)):
+                # Padding-free packing omits attention_mask; in that case every token is valid.
+                if attention_mask is None:
+                    last_valid_idx = input_ids.numel() - 1
+                else:
+                    last_valid_idx = (attention_mask == 1).nonzero(as_tuple=True)[0][-1]
                 last_token = input_ids[last_valid_idx]
                 
                 # Verify that the last token of the sequence is NOT an EOS token
@@ -274,13 +289,16 @@ def fine_tune(
     dataloader1 = trainer.get_train_dataloader()
     log.info(f"Dataloader has {len(dataloader1)} batches...")
     content1 = get_dataloader_content(dataloader1, debug=True, full_debug=full_debug)
-    with open(os.path.join(output_dir_for_debug, "debug_run_1.txt"), "w") as f:
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank_suffix = f"_rank{rank}" if world_size > 1 else ""
+    with open(os.path.join(output_dir_for_debug, f"debug_run_1{rank_suffix}.txt"), "w") as f:
         f.write("\n------\n".join(content1))
         
     log.info("Running second dataloader pass for debugging...")
     dataloader2 = trainer.get_train_dataloader()
     content2 = get_dataloader_content(dataloader2, full_debug=full_debug)
-    with open(os.path.join(output_dir_for_debug, "debug_run_2.txt"), "w") as f:
+    with open(os.path.join(output_dir_for_debug, f"debug_run_2{rank_suffix}.txt"), "w") as f:
         f.write("\n------\n".join(content2))
 
     assert content1 == content2, "Sequential sampling is not deterministic!"

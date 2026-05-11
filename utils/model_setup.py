@@ -1,3 +1,5 @@
+import os
+
 import torch
 from peft import LoraConfig as PeftLoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
@@ -45,7 +47,16 @@ def load_model_for_training(config: ModelConfig, log, use_cpu_and_gpu = False, a
     else:
         # CPU execution should use float32 for broad operator compatibility.
         dtype = torch.float32
-    device_map = 'auto' if use_cpu_and_gpu else ("cuda" if torch.cuda.is_available() else "cpu")
+    local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    is_torchrun = world_size > 1 and local_rank >= 0
+    if is_torchrun and torch.cuda.is_available() and not use_cpu_and_gpu:
+        torch.cuda.set_device(local_rank)
+        device_map = {"": local_rank}
+    elif use_cpu_and_gpu:
+        device_map = "auto"
+    else:
+        device_map = "cuda" if torch.cuda.is_available() else "cpu"
     log.info(f"Model load config: dtype={dtype}, device_map={device_map}")
 
     quant_config = None
