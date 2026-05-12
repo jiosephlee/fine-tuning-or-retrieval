@@ -21,7 +21,7 @@ def split_textbook(explanations_dir):
 
     # Extract title line (first line)
     lines = content.split("\n")
-    title_line = lines[0] if lines[0].startswith("\\title{") else ""
+    title_line = lines[0] if (lines[0].startswith("\\title{") or lines[0].startswith("Title:")) else ""
 
     # Split on chapter title lines (bare line between blank lines, before first #)
     # Pattern: the outline generates "Chapter Title\n\n# Section..."
@@ -92,6 +92,9 @@ def split_blogs(explanations_dir):
     with open(blogs_path) as f:
         content = f.read()
 
+    lines = content.split("\n")
+    title_line = lines[0] if (lines[0].startswith("\\title{") or lines[0].startswith("Title:")) else ""
+
     # Blogs start with "# Title" (h1 headers)
     parts = re.split(r'\n(?=# )', content)
     # First part might be a header/preamble before the first blog
@@ -108,6 +111,8 @@ def split_blogs(explanations_dir):
     out_dir = os.path.join(explanations_dir, "blogs")
     os.makedirs(out_dir, exist_ok=True)
     for i, blog in enumerate(blogs):
+        if title_line:
+            blog = f"{title_line}\n\n{blog}"
         path = os.path.join(out_dir, f"blog_{i+1:02d}.txt")
         with open(path, "w") as f:
             f.write(blog)
@@ -124,6 +129,9 @@ def split_stackexchange(explanations_dir):
     with open(se_path) as f:
         content = f.read()
 
+    lines = content.split("\n")
+    title_line = lines[0] if (lines[0].startswith("\\title{") or lines[0].startswith("Title:")) else ""
+
     # Q&A blocks start with "### Question Title"
     parts = re.split(r'\n(?=### )', content)
     qas = []
@@ -139,6 +147,8 @@ def split_stackexchange(explanations_dir):
     out_dir = os.path.join(explanations_dir, "stackexchange")
     os.makedirs(out_dir, exist_ok=True)
     for i, qa in enumerate(qas):
+        if title_line:
+            qa = f"{title_line}\n\n{qa}"
         path = os.path.join(out_dir, f"stack_{i+1:02d}.txt")
         with open(path, "w") as f:
             f.write(qa)

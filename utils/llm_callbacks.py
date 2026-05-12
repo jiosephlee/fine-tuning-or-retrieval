@@ -17,19 +17,23 @@ from utils import parameter_delta_metrics
 
 def _should_skip_sparse_eval(callback, state) -> bool:
     """Return True if this step should be skipped under sparse evaluation."""
-    if not callback.sparse_eval:
-        return False
-    total_steps = state.max_steps
-    if not total_steps or total_steps <= 0:
+    if callback.sparse_eval:
+        total_steps = state.max_steps
+        if not total_steps or total_steps <= 0:
+            return True
+        if not hasattr(callback, "_eval_steps"):
+            steps = [
+                max(1, int(total_steps * 0.25)),
+                max(1, int(total_steps * 0.50)),
+                max(1, int(total_steps * 0.75)),
+            ]
+            callback._eval_steps = set(steps)
+        return state.global_step not in callback._eval_steps
+
+    eval_every_n_steps = getattr(callback, "eval_every_n_steps", 1)
+    if eval_every_n_steps > 1 and state.global_step % eval_every_n_steps != 0:
         return True
-    if not hasattr(callback, "_eval_steps"):
-        steps = [
-            max(1, int(total_steps * 0.25)),
-            max(1, int(total_steps * 0.50)),
-            max(1, int(total_steps * 0.75)),
-        ]
-        callback._eval_steps = set(steps)
-    return state.global_step not in callback._eval_steps
+    return False
 
 
 class BaseKnowledgeProbeCallBack(TrainerCallback):
@@ -53,6 +57,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                  log_prefix="probe_eval",
                  report_to_wandb: bool = True,
                  sparse_eval: bool = False,
+                 eval_every_n_steps: int = 1,
                  wandb_metric_allowlist: Optional[List[str]] = None):
         
         self.tokenizer = tokenizer
@@ -81,6 +86,7 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         }
         self.output_dir = output_dir
         self.sparse_eval = sparse_eval
+        self.eval_every_n_steps = max(1, int(eval_every_n_steps or 1))
         self._precompute_token_lengths()
 
     def _precompute_token_lengths(self):
@@ -755,15 +761,16 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
 
 class WandbSourcePanelsCallback(TrainerCallback):
     """
-    Logs source-scoped metrics for W&B workspace panels:
-    - panel/<source>/factual_probes_avg
-    - panel/<source>/papers/<domain>/log_prob_average
-    - panel/<source>/papers/<domain>/target_rank_average
-    - panel/<source>/papers/<domain>/mcqa_accuracy
+    Logs source-scoped metrics for flat W&B workspace sections:
+    - <source>/<domain>_log_prob
+    - <source>/<domain>_target_rank
+    - <source>/<domain>_mcqa_accuracy
+    - <source>/log_prob_average
+    - average/log_prob_average
     """
     PAPER_METRICS = (
-        ("log_prob", "log_prob_average"),
-        ("target_rank", "target_rank_average"),
+        ("log_prob", "log_prob"),
+        ("target_rank", "target_rank"),
     )
 
     def __init__(
@@ -849,19 +856,39 @@ class WandbSourcePanelsCallback(TrainerCallback):
         logs: Dict[str, float] = {}
         paper_metrics_by_domain = self._collect_paper_metrics_by_domain(step)
 
-        factual_by_source: Dict[str, List[float]] = {src: [] for src in self.panel_sources}
+        metric_values_by_source: Dict[str, Dict[str, List[float]]] = {
+            src: {
+                "log_prob": [],
+                "target_rank": [],
+                "mcqa_accuracy": [],
+            }
+            for src in self.panel_sources
+        }
+        metric_values_global: Dict[str, List[float]] = {
+            "log_prob": [],
+            "target_rank": [],
+            "mcqa_accuracy": [],
+        }
 
         for domain, domain_metrics in paper_metrics_by_domain.items():
             source = self._source_for_domain(domain)
             for metric_name, metric_value in domain_metrics.items():
-                logs[f"panel/{source}/papers/{domain}/{metric_name}"] = metric_value
-            if "log_prob_average" in domain_metrics:
-                factual_by_source[source].append(domain_metrics["log_prob_average"])
+                logs[f"{source}/{domain}_{metric_name}"] = metric_value
+                metric_values_by_source.setdefault(source, {}).setdefault(
+                    metric_name, []
+                ).append(metric_value)
+                metric_values_global.setdefault(metric_name, []).append(metric_value)
 
-        for source, values in factual_by_source.items():
-            factual_avg = self._safe_average(values)
-            if self._valid_number(factual_avg):
-                logs[f"panel/{source}/factual_probes_avg"] = float(factual_avg)
+        for source, metric_values in metric_values_by_source.items():
+            for metric_name, values in metric_values.items():
+                avg = self._safe_average(values)
+                if self._valid_number(avg):
+                    logs[f"{source}/{metric_name}_average"] = float(avg)
+
+        for metric_name, values in metric_values_global.items():
+            avg = self._safe_average(values)
+            if self._valid_number(avg):
+                logs[f"average/{metric_name}_average"] = float(avg)
 
         return logs
 
@@ -1077,6 +1104,7 @@ class MCQAProbeCallback(TrainerCallback):
         log_prefix: str = "mcqa_probe",
         report_to_wandb: bool = True,
         sparse_eval: bool = False,
+        eval_every_n_steps: int = 1,
         wandb_metric_allowlist: Optional[List[str]] = None,
     ):
         self.tokenizer = tokenizer
@@ -1092,6 +1120,7 @@ class MCQAProbeCallback(TrainerCallback):
         self.log_prefix = log_prefix
         self.report_to_wandb = report_to_wandb
         self.sparse_eval = sparse_eval
+        self.eval_every_n_steps = max(1, int(eval_every_n_steps or 1))
         self.wandb_metric_allowlist = set(wandb_metric_allowlist) if wandb_metric_allowlist else None
         self.history = {"mcqa_accuracy": []}
 
@@ -1424,8 +1453,9 @@ class ParameterDeltaCallback(TrainerCallback):
         output_dir: str,
         storage_path: Optional[str] = None,
         include_embeddings: bool = True,
-        compute_final_alignment: bool = True,
+        compute_final_alignment: bool = False,
         sparse_milestones: bool = True,
+        record_every_n_steps: Optional[int] = None,
         report_to_wandb: bool = True,
         logger=None,
     ):
@@ -1434,17 +1464,17 @@ class ParameterDeltaCallback(TrainerCallback):
         self.include_embeddings = include_embeddings
         self.compute_final_alignment = compute_final_alignment
         self.sparse_milestones = sparse_milestones
+        self.record_every_n_steps = record_every_n_steps
         self.report_to_wandb = report_to_wandb
         self.logger = logger
 
         self.entries = []
         self.baseline = {}
-        self.scalar_rows = []
+        self.time_rows = []
         self.layer_rows = []
-        self.concentration_rows = []
         self.recorded_steps = set()
         self._milestones = None
-        self.raw_delta_dir = self._resolve_raw_delta_dir()
+        self.raw_delta_dir = self._resolve_raw_delta_dir() if self.compute_final_alignment else None
 
     def _log_info(self, message: str) -> None:
         if self.logger:
@@ -1484,18 +1514,30 @@ class ParameterDeltaCallback(TrainerCallback):
     def _should_record_step(self, step: int, state) -> bool:
         if step in self.recorded_steps:
             return False
+        if self.record_every_n_steps is not None:
+            return step > 0 and step % self.record_every_n_steps == 0
         if not self.sparse_milestones:
             return True
         return step in self._get_milestones(state)
 
     def _discover_entries(self, model) -> None:
-        entries = parameter_delta_metrics.discover_mlp_tensors(model)
-        if self.include_embeddings:
-            try:
-                entries.append(parameter_delta_metrics.discover_embedding_tensor(model))
-            except Exception as exc:
-                self._log_warning(f"ParameterDeltaCallback: skipping embeddings: {exc}")
-        self.entries = entries
+        try:
+            self.entries = parameter_delta_metrics.discover_parameter_delta_tensors(
+                model,
+                include_embeddings=self.include_embeddings,
+            )
+        except Exception:
+            if self.include_embeddings:
+                self._log_warning(
+                    "ParameterDeltaCallback: failed to discover requested tensors with embeddings; "
+                    "retrying without embeddings."
+                )
+                self.entries = parameter_delta_metrics.discover_parameter_delta_tensors(
+                    model,
+                    include_embeddings=False,
+                )
+            else:
+                raise
 
     def _record_step(self, step: int, model) -> None:
         if not self.entries:
@@ -1510,25 +1552,17 @@ class ParameterDeltaCallback(TrainerCallback):
                 raw_delta_dir=raw_delta_dir,
             )
 
-        self.scalar_rows.extend(result.scalar_rows)
+        self.time_rows.extend(result.time_rows)
         self.layer_rows.extend(result.layer_rows)
-        self.concentration_rows.extend(result.concentration_rows)
         self.recorded_steps.add(step)
         self._log_info(f"ParameterDeltaCallback: recorded parameter deltas at step {step}.")
 
         if self.report_to_wandb and wandb.run:
             log_data = {}
-            for row in result.scalar_rows:
+            for row in result.time_rows:
                 component = row["component"]
                 metric = row["metric"]
-                log_data[f"parameter_delta/{component}/{metric}/mean"] = row["mean"]
-                log_data[f"parameter_delta/{component}/{metric}/max"] = row["max"]
-            for row in result.concentration_rows:
-                component = row["component"]
-                metric = row["metric"]
-                log_data[f"parameter_delta/{component}/{metric}/top_1pct_share"] = row["top_1pct_share"]
-                log_data[f"parameter_delta/{component}/{metric}/top_5pct_share"] = row["top_5pct_share"]
-                log_data[f"parameter_delta/{component}/{metric}/gini"] = row["gini"]
+                log_data[f"parameter_delta/time/{component}/{metric}"] = row["value"]
             if log_data:
                 wandb.log(log_data, step=step)
 
@@ -1536,16 +1570,28 @@ class ParameterDeltaCallback(TrainerCallback):
         if not state.is_world_process_zero or model is None:
             return
         os.makedirs(self.output_dir, exist_ok=True)
-        if self.compute_final_alignment and os.path.isdir(self.raw_delta_dir):
+        if (
+            self.compute_final_alignment
+            and self.raw_delta_dir
+            and os.path.isdir(self.raw_delta_dir)
+        ):
             parameter_delta_metrics.cleanup_raw_delta_dir(self.raw_delta_dir)
-        if self.compute_final_alignment:
+        if self.compute_final_alignment and self.raw_delta_dir:
             os.makedirs(self.raw_delta_dir, exist_ok=True)
 
         self._discover_entries(model)
+        final_alignment_note = (
+            f"; final-alignment raw deltas will save under {self.raw_delta_dir}"
+            if self.compute_final_alignment and self.raw_delta_dir
+            else "; final-alignment raw-delta capture is disabled"
+        )
+        component_counts = {}
+        for entry in self.entries:
+            component_counts[entry.component] = component_counts.get(entry.component, 0) + 1
         self._log_info(
-            "ParameterDeltaCallback: tracking "
-            f"{len([e for e in self.entries if e.component == 'mlp'])} MLP tensors"
-            f"{' plus embeddings' if self.include_embeddings else ''}."
+            "ParameterDeltaCallback: tracking components "
+            f"{component_counts}"
+            f"{final_alignment_note}."
         )
         with torch.no_grad():
             self.baseline = parameter_delta_metrics.snapshot_baseline(self.entries)
@@ -1568,15 +1614,14 @@ class ParameterDeltaCallback(TrainerCallback):
 
         parameter_delta_metrics.save_metric_csvs(
             self.output_dir,
-            self.scalar_rows,
+            self.time_rows,
             self.layer_rows,
-            self.concentration_rows,
         )
 
         alignment_scalar = pd.DataFrame()
         alignment_layer = pd.DataFrame()
         alignment_succeeded = False
-        if self.compute_final_alignment:
+        if self.compute_final_alignment and self.raw_delta_dir:
             try:
                 alignment_scalar, alignment_layer = parameter_delta_metrics.compute_final_alignment(
                     self.raw_delta_dir,
@@ -1591,7 +1636,7 @@ class ParameterDeltaCallback(TrainerCallback):
             from utils.parameter_delta_plotting import plot_parameter_delta_outputs
 
             plot_parameter_delta_outputs(self.output_dir)
-            if alignment_succeeded:
+            if alignment_succeeded and self.raw_delta_dir:
                 parameter_delta_metrics.cleanup_raw_delta_dir(self.raw_delta_dir)
         except Exception as exc:
             self._log_warning(f"ParameterDeltaCallback: plotting failed: {exc}")

@@ -51,6 +51,7 @@ def _create_mcqa_callback(
     report_to_wandb: bool,
     sparse_eval: bool,
     wandb_metric_allowlist=None,
+    eval_every_n_steps: int = 1,
     prompt_suffix: str = DEFAULT_MCQA_PROMPT_SUFFIX,
     choice_tokens: list = None,
 ):
@@ -89,6 +90,7 @@ def _create_mcqa_callback(
         log_prefix=log_prefix,
         report_to_wandb=report_to_wandb,
         sparse_eval=sparse_eval,
+        eval_every_n_steps=eval_every_n_steps,
         wandb_metric_allowlist=wandb_metric_allowlist,
     )
 
@@ -103,6 +105,7 @@ def _create_probe_callback(
     report_to_wandb,
     sparse_eval,
     wandb_metric_allowlist=None,
+    eval_every_n_steps: int = 1,
 ):
     """Create a BaseKnowledgeProbeCallBack from a probe DataFrame."""
     return llm_callbacks.BaseKnowledgeProbeCallBack(
@@ -117,6 +120,7 @@ def _create_probe_callback(
         log_prefix=log_prefix,
         report_to_wandb=report_to_wandb,
         sparse_eval=sparse_eval,
+        eval_every_n_steps=eval_every_n_steps,
         wandb_metric_allowlist=wandb_metric_allowlist,
     )
 
@@ -151,6 +155,10 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
     disable_training_loss_perplexity_wandb = getattr(args, "disable_training_loss_perplexity_wandb", False)
     domain_sources = getattr(args, "domain_data_sources", {}) or {}
     enable_mcqa_probes = getattr(args, "mcqa_probes", False)
+    default_knowledge_probes_version = getattr(args, "knowledge_probes_version", "v13")
+    mcqa_probes_version = getattr(args, "mcqa_probes_version", default_knowledge_probes_version)
+    probe_every_n_steps = max(1, int(getattr(args, "probe_every_n_steps", 1) or 1))
+    mcqa_probe_every_n_steps = max(1, int(getattr(args, "mcqa_probe_every_n_steps", 1) or 1))
     enable_parameter_delta_tracking = getattr(args, "enable_parameter_delta_tracking", False)
     knowledge_probe_callbacks = []
     mcqa_probe_callbacks = []
@@ -169,7 +177,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
         domain_source = domain_sources.get(domain)
 
         # Knowledge probes path
-        knowledge_probes_version = args.knowledge_probes_version
+        knowledge_probes_version = default_knowledge_probes_version
         knowledge_probe_path = str(
             probe_paths.resolve_knowledge_probe_path(
                 domain,
@@ -185,6 +193,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                 output_dir_knowledge_probe, f"{domain}_knowledge_probe",
                 report_to_wandb, sparse_eval,
                 wandb_probe_metric_allowlist,
+                probe_every_n_steps,
             )
             callbacks.append(knowledge_probe_callback)
             knowledge_probe_callbacks.append(knowledge_probe_callback)
@@ -192,11 +201,11 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
         else:
             log.warning(f"Knowledge probe file not found for domain {domain} at {knowledge_probe_path}")
 
-        # MCQA probes (constrained-decoding evaluation) — version follows knowledge probes
+        # MCQA probes (constrained-decoding evaluation)
         if enable_mcqa_probes:
             mcqa_probe_path = str(
                 probe_paths.resolve_mcqa_probe_path(
-                    "facts", domain, knowledge_probes_version,
+                    "facts", domain, mcqa_probes_version,
                     domain_source=domain_source,
                 )
             )
@@ -212,12 +221,19 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                     output_dir_mcqa, f"{domain}_mcqa_probe",
                     report_to_wandb, sparse_eval,
                     wandb_probe_metric_allowlist,
+                    mcqa_probe_every_n_steps,
                 )
                 callbacks.append(mcqa_callback)
                 mcqa_probe_callbacks.append(mcqa_callback)
-                log.info(f"Loaded {len(mcqa_df)} MCQA probes from {mcqa_probe_path}")
+                log.info(
+                    f"Loaded {len(mcqa_df)} MCQA probes "
+                    f"({mcqa_probes_version}) from {mcqa_probe_path}"
+                )
             else:
-                log.warning(f"MCQA probe file not found for domain {domain} at {mcqa_probe_path}")
+                log.warning(
+                    f"MCQA probe file not found for domain {domain} "
+                    f"with version {mcqa_probes_version} at {mcqa_probe_path}"
+                )
 
         if disable_inference_probes:
             log.info(f"Skipping inference probes for domain {domain} (--disable_inference_probes).")
@@ -267,6 +283,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                         output_dir_inference_probe, prefix,
                         report_to_wandb, sparse_eval,
                         wandb_probe_metric_allowlist,
+                        probe_every_n_steps,
                     )
                     callbacks.append(inference_probe_callback)
                     log.info(f"Loaded {len(inference_probe_df)} inference probes from {inference_probe_path}")
@@ -295,6 +312,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                     output_dir_inference_probe, f"{domain}_inference_probe",
                     report_to_wandb, sparse_eval,
                     wandb_probe_metric_allowlist,
+                    probe_every_n_steps,
                 )
                 callbacks.append(inference_probe_callback)
                 log.info(f"Loaded {len(inference_probe_df)} inference probes from {inference_probe_path}")
@@ -386,8 +404,9 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                 output_dir=output_dir_parameter_delta,
                 storage_path=getattr(args, "parameter_delta_storage_path", None),
                 include_embeddings=getattr(args, "parameter_delta_include_embeddings", True),
-                compute_final_alignment=getattr(args, "parameter_delta_compute_final_alignment", True),
+                compute_final_alignment=getattr(args, "parameter_delta_compute_final_alignment", False),
                 sparse_milestones=getattr(args, "parameter_delta_sparse_milestones", True),
+                record_every_n_steps=getattr(args, "parameter_delta_every_n_steps", None),
                 report_to_wandb=(
                     report_to_wandb
                     and getattr(args, "parameter_delta_report_to_wandb", True)
@@ -395,7 +414,22 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                 logger=log,
             )
         )
-        log.info(f"Enabled ParameterDeltaCallback; outputs will save to {output_dir_parameter_delta}")
+        final_alignment_note = (
+            "final-alignment raw-delta capture enabled"
+            if getattr(args, "parameter_delta_compute_final_alignment", False)
+            else "final-alignment raw-delta capture disabled"
+        )
+        interval_note = (
+            f"record every {args.parameter_delta_every_n_steps} steps"
+            if getattr(args, "parameter_delta_every_n_steps", None)
+            else "record at sparse milestones"
+            if getattr(args, "parameter_delta_sparse_milestones", True)
+            else "record every step"
+        )
+        log.info(
+            f"Enabled ParameterDeltaCallback; outputs will save to "
+            f"{output_dir_parameter_delta} ({interval_note}; {final_alignment_note})."
+        )
     if enable_wandb_source_panels:
         callbacks.append(
             llm_callbacks.WandbSourcePanelsCallback(

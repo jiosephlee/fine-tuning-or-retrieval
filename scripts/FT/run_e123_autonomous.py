@@ -24,6 +24,7 @@ LOG_ROOT = SCRIPT_DIR / "logs" / "e123_autonomous"
 
 MODEL_ID = "allenai/OLMo-2-1124-7B"
 KNOWLEDGE_PROBES_VERSION = "v13"
+MCQA_PROBES_VERSION = "v14"
 DEFAULT_NPROC = 8
 DEFAULT_DEVICE_BATCH_SIZE = 16
 DEFAULT_EFFECTIVE_BATCH_SIZE = 128
@@ -34,6 +35,7 @@ DEFAULT_NUM_EPOCHS = 10
 
 SOURCES = ("arxiv", "legal", "medical")
 REQUIRED_PROBE_COLUMNS = ("fact", "probe", "target")
+REQUIRED_MCQA_PROBE_COLUMNS = ("formatted_question", "correct_label")
 
 
 class Condition:
@@ -48,15 +50,15 @@ CONDITIONS = (
     Condition("E2", "E2_paraphrase_all_domains", ["--num_paraphrased_texts", "9"]),
     Condition(
         "E3",
-        "E3_random_splice_all_domains",
+        "E3_granular_explanations_all_domains",
         [
             "--num_paraphrased_texts",
             "9",
             "--with_explanations",
             "--explanations_insertion_strategy",
-            "random_splice",
-            "--shuffle_seed",
-            "42",
+            "granular",
+            "--explanations_num_tracks",
+            "1",
         ],
     ),
 )
@@ -117,11 +119,11 @@ def selected_pilot_domains() -> dict[str, list[str]]:
     return {source: domains[:1] for source in SOURCES if (domains := discover_domains(source))}
 
 
-def count_probe_rows(path: Path) -> tuple[int, list[str]]:
+def count_probe_rows(path: Path, required_columns: tuple[str, ...]) -> tuple[int, list[str]]:
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         fieldnames = reader.fieldnames or []
-        missing = [column for column in REQUIRED_PROBE_COLUMNS if column not in fieldnames]
+        missing = [column for column in required_columns if column not in fieldnames]
         rows = sum(1 for _ in reader)
     return rows, missing
 
@@ -183,29 +185,59 @@ def preflight(args: argparse.Namespace) -> int:
 
     domain_report: dict[str, Any] = {}
     total_probe_rows = 0
+    total_mcqa_probe_rows = 0
     for source in SOURCES:
         domains = discover_domains(source)
-        source_report = {"domains": domains, "probe_rows": 0, "missing": [], "malformed": []}
+        source_report = {
+            "domains": domains,
+            "probe_rows": 0,
+            "mcqa_probe_rows": 0,
+            "missing": [],
+            "malformed": [],
+        }
         for domain in domains:
-            probe_path = PROJECT_ROOT / "probes" / source / domain / "facts" / "probes_v13.csv"
+            facts_dir = PROJECT_ROOT / "probes" / source / domain / "facts"
+            probe_path = facts_dir / f"probes_{KNOWLEDGE_PROBES_VERSION}.csv"
             if not probe_path.exists():
                 source_report["missing"].append(str(probe_path.relative_to(PROJECT_ROOT)))
-                continue
-            rows, missing_columns = count_probe_rows(probe_path)
-            source_report["probe_rows"] += rows
-            total_probe_rows += rows
-            if missing_columns:
-                source_report["malformed"].append(
-                    {
-                        "path": str(probe_path.relative_to(PROJECT_ROOT)),
-                        "missing_columns": missing_columns,
-                    }
+            else:
+                rows, missing_columns = count_probe_rows(probe_path, REQUIRED_PROBE_COLUMNS)
+                source_report["probe_rows"] += rows
+                total_probe_rows += rows
+                if missing_columns:
+                    source_report["malformed"].append(
+                        {
+                            "path": str(probe_path.relative_to(PROJECT_ROOT)),
+                            "missing_columns": missing_columns,
+                        }
+                    )
+
+            mcqa_probe_path = facts_dir / f"probes_{MCQA_PROBES_VERSION}_mcqa.csv"
+            if not mcqa_probe_path.exists():
+                source_report["missing"].append(str(mcqa_probe_path.relative_to(PROJECT_ROOT)))
+            else:
+                rows, missing_columns = count_probe_rows(
+                    mcqa_probe_path,
+                    REQUIRED_MCQA_PROBE_COLUMNS,
                 )
+                source_report["mcqa_probe_rows"] += rows
+                total_mcqa_probe_rows += rows
+                if missing_columns:
+                    source_report["malformed"].append(
+                        {
+                            "path": str(mcqa_probe_path.relative_to(PROJECT_ROOT)),
+                            "missing_columns": missing_columns,
+                        }
+                    )
         if source_report["missing"] or source_report["malformed"]:
-            errors.append(f"{source} has missing or malformed v13 probe files.")
+            errors.append(
+                f"{source} has missing or malformed "
+                f"{KNOWLEDGE_PROBES_VERSION}/{MCQA_PROBES_VERSION} probe files."
+            )
         domain_report[source] = source_report
     manifest["checks"]["domains"] = domain_report
     manifest["checks"]["total_probe_rows"] = total_probe_rows
+    manifest["checks"]["total_mcqa_probe_rows"] = total_mcqa_probe_rows
 
     for source in SOURCES:
         for folder in ("paraphrased", "explanations"):
@@ -239,7 +271,9 @@ def base_training_args(custom_suffix: str, num_epochs: int, args: argparse.Names
         MODEL_ID,
         "--knowledge_probes_version",
         KNOWLEDGE_PROBES_VERSION,
-        "--disable_mcqa_probes",
+        "--mcqa_probes",
+        "--mcqa_probes_version",
+        MCQA_PROBES_VERSION,
         "--num_train_epochs",
         str(num_epochs),
         "--learning_rate",
@@ -458,16 +492,36 @@ def validate_experiment_dir(experiment_dir: Path) -> list[str]:
         if not csv_has_rows(path):
             errors.append(f"empty metrics csv: {path.name}")
 
+    mcqa_metrics = list(experiment_dir.glob("*_mcqa_probe/*_mcqa_probe_metrics.csv"))
+    if not mcqa_metrics:
+        errors.append("missing MCQA probe metrics")
+    for path in mcqa_metrics:
+        if not csv_has_rows(path):
+            errors.append(f"empty MCQA metrics csv: {path.name}")
+
     parameter_delta = experiment_dir / "parameter_delta"
     if parameter_delta.exists():
-        expected = [
-            "parameter_delta_scalar_metrics.csv",
-            "parameter_delta_layer_metrics.csv",
-            "parameter_delta_concentration_metrics.csv",
-        ]
+        expected = ["parameter_delta_metrics.csv"]
         for filename in expected:
             if not (parameter_delta / filename).exists():
                 errors.append(f"missing parameter delta output: {filename}")
+        plots_dir = parameter_delta / "plots"
+        delta_metrics = (
+            "relative_delta_norm",
+            "cosine_distance",
+            "relative_delta_gini",
+            "cosine_distance_gini",
+        )
+        delta_plot_groups = ("mlp_embed", "attention")
+        expected_plots = [
+            f"{view}_{group}_{metric}.png"
+            for metric in delta_metrics
+            for group in delta_plot_groups
+            for view in ("time", "final_layer")
+        ]
+        for filename in expected_plots:
+            if not (plots_dir / filename).exists():
+                errors.append(f"missing parameter delta plot: {filename}")
     else:
         errors.append("missing parameter_delta directory")
     return errors

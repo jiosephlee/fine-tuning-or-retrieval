@@ -223,11 +223,22 @@ V9 built-ins (set in main after parsing):
 - factual knowledge probes default to `probes_v13.csv`
 - selected factual probe files are preflighted before model loading for required
   `fact`, `probe`, and `target` columns
-- MCQA probe callbacks are opt-in with `--mcqa_probes`/`--mcqa-probes` and can
-  be explicitly disabled with `--disable_mcqa_probes`/`--no-mcqa-probes`
+- MCQA probe callbacks are opt-in with `--mcqa_probes`/`--mcqa-probes`; they
+  default to `probes_v14_mcqa.csv` via `--mcqa_probes_version` and can use a
+  different version from the cloze factual probes
+- selected MCQA probe files are preflighted before model loading for required
+  `formatted_question` and `correct_label` columns when MCQA is enabled
+- MCQA can be explicitly disabled with `--disable_mcqa_probes`/`--no-mcqa-probes`
 - inference probes disabled
 - W&B corpus perplexity logging disabled
 - W&B training-loss perplexity logging disabled
+- parameter-delta tracking has two knobs:
+  - `--enable_parameter_delta_tracking` records online long-form parameter-delta
+    metrics and plots for embeddings, MLP projections, and attention projections
+  - `--parameter_delta_every_n_steps` can override sparse milestone recording
+    with a fixed step interval
+  - `--parameter_delta_compute_final_alignment` is default-off and must be set
+    to save temporary raw deltas for final-alignment metrics and plots
 - probe metric allowlist constrained to:
   - `log_prob`
   - `target_rank`

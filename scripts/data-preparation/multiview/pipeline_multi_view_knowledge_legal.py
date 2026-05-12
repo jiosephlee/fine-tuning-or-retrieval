@@ -9,6 +9,14 @@ from importlib import reload
 reload(utils)
 
 
+def extract_case_title(case_content, case_name):
+    """Return the source opinion title using the cleaned legal document format."""
+    for line in case_content.splitlines():
+        if line.startswith("Title:"):
+            return line.split(":", 1)[1].strip()
+    return case_name.replace("_", " ")
+
+
 def generate_legal_qa(case_name):
     """Generate Law Stack Exchange style Q&A for a court opinion."""
     print(f"Processing {case_name} for legal Q&A...")
@@ -20,6 +28,7 @@ def generate_legal_qa(case_name):
 
     with open(CASE_FILE_PATH, 'r') as f:
         case_content = f.read()
+    case_title = extract_case_title(case_content, case_name)
 
     # --- 1. Generate questions ---
     print("Generating Law Stack Exchange questions...")
@@ -117,7 +126,7 @@ Format your response as a Stack Exchange answer.""",
     # Use stackexchange.txt filename for compatibility with data_preparation.py
     print("Creating legal Q&A file...")
 
-    content = f"Law Stack Exchange Q&A: {case_name}\n\n"
+    content = f"Title: Stack Exchange about the opinion: {case_title}\n\n"
     for qa in qa_pairs:
         content += f"### {qa['title']}\nQuestion:\n{qa['question']}\nAnswer:\n{qa['answer']}\n\n"
 
@@ -139,6 +148,7 @@ def generate_casebook_textbook(case_name):
 
     with open(CASE_FILE_PATH, 'r') as f:
         case_content = f.read()
+    case_title = extract_case_title(case_content, case_name)
 
     # --- 1. Generate textbook outline ---
     print("Generating casebook textbook outline...")
@@ -239,7 +249,7 @@ Start with the chapter title as a header. Use '#' for the chapter title and '##'
     # Use textbook.txt filename for compatibility with data_preparation.py
     print("Assembling textbook...")
     full_content = "\n\n".join(chapter_contents)
-    full_textbook = f"A Casebook Chapter on: {case_name}\n\n{full_content}"
+    full_textbook = f"Title: Casebook chapter about the opinion: {case_title}\n\n{full_content}"
 
     output_file = os.path.join(OUTPUT_DIR, "textbook.txt")
     with open(output_file, 'w') as f:
@@ -259,6 +269,7 @@ def generate_legal_blog(case_name):
 
     with open(CASE_FILE_PATH, 'r') as f:
         case_content = f.read()
+    case_title = extract_case_title(case_content, case_name)
 
     # --- 1. Generate blog post ideas ---
     print("Generating blog post ideas...")
@@ -345,7 +356,7 @@ Description: {description}"""
     # Use blogs.txt filename for compatibility with data_preparation.py
     print("Assembling blog posts...")
     full_blogs_content = "\n\n\n\n".join(blog_contents)
-    full_blogs_content = f"Legal Commentary Blog Posts: {case_name}\n\n{full_blogs_content}"
+    full_blogs_content = f"Title: Blog about the opinion: {case_title}\n\n{full_blogs_content}"
 
     output_file = os.path.join(OUTPUT_DIR, "blogs.txt")
     with open(output_file, 'w') as f:

@@ -10,8 +10,34 @@ import pandas as pd
 import torch
 
 
-PROJECTIONS = ("gate", "up", "down")
-METRICS = ("relative_delta_norm", "cosine_distance")
+COMPONENTS = (
+    "embed_tokens",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+)
+LAYER_COMPONENTS = tuple(component for component in COMPONENTS if component != "embed_tokens")
+BASE_METRICS = ("relative_delta_norm", "cosine_distance")
+METRICS = (
+    "relative_delta_norm",
+    "cosine_distance",
+    "relative_delta_gini",
+    "cosine_distance_gini",
+)
+COMPONENT_ORIENTATIONS = {
+    "embed_tokens": "rows",
+    "gate_proj": "rows",
+    "up_proj": "rows",
+    "down_proj": "cols",
+    "q_proj": "rows",
+    "k_proj": "rows",
+    "v_proj": "rows",
+    "o_proj": "cols",
+}
 EPS = 1e-12
 
 
@@ -27,9 +53,8 @@ class TrackedTensor:
 
 @dataclass
 class StepMetricResult:
-    scalar_rows: List[Dict[str, object]]
+    time_rows: List[Dict[str, object]]
     layer_rows: List[Dict[str, object]]
-    concentration_rows: List[Dict[str, object]]
 
 
 def extract_layer_index(name: str) -> int:
@@ -85,59 +110,97 @@ def to_float32_cpu(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().to(dtype=torch.float32, device="cpu")
 
 
-def discover_mlp_tensors(model: torch.nn.Module) -> List[TrackedTensor]:
+def discover_parameter_delta_tensors(
+    model: torch.nn.Module,
+    include_embeddings: bool = True,
+) -> List[TrackedTensor]:
     entries: List[TrackedTensor] = []
     seen = set()
     for name, module in model.named_modules():
-        projection = None
-        if name.endswith(".mlp.gate_proj") or name.endswith("mlp.gate_proj"):
-            projection = "gate"
-            orientation = "rows"
-        elif name.endswith(".mlp.up_proj") or name.endswith("mlp.up_proj"):
-            projection = "up"
-            orientation = "rows"
-        elif name.endswith(".mlp.down_proj") or name.endswith("mlp.down_proj"):
-            projection = "down"
-            orientation = "cols"
-        else:
+        component = None
+        for candidate in LAYER_COMPONENTS:
+            if name.endswith(f".{candidate}") or name == candidate:
+                component = candidate
+                break
+        if component is None:
             continue
 
-        key = (projection, extract_layer_index(name))
+        key = (component, extract_layer_index(name))
         if key in seen:
             continue
         seen.add(key)
         entries.append(
             TrackedTensor(
-                component="mlp",
-                projection=projection,
+                component=component,
+                projection=component,
                 layer=key[1],
                 name=name,
-                orientation=orientation,
+                orientation=COMPONENT_ORIENTATIONS[component],
                 module=module,
             )
         )
 
     if not entries:
         raise ValueError(
-            "Did not find MLP projection modules ending with "
-            "mlp.(gate_proj|up_proj|down_proj)."
+            "Did not find tracked projection modules ending with "
+            "(gate_proj|up_proj|down_proj|q_proj|k_proj|v_proj|o_proj)."
         )
 
-    layers_by_projection: Dict[str, List[int]] = {projection: [] for projection in PROJECTIONS}
+    layers_by_component: Dict[str, List[int]] = {component: [] for component in LAYER_COMPONENTS}
     for entry in entries:
-        layers_by_projection[entry.projection].append(int(entry.layer))
-    for projection, layers in layers_by_projection.items():
+        layers_by_component[entry.component].append(int(entry.layer))
+    for component, layers in layers_by_component.items():
         if not layers:
-            raise ValueError(f"Missing MLP projection modules for {projection}.")
+            raise ValueError(f"Missing tracked projection modules for {component}.")
         ordered = sorted(layers)
         expected = list(range(ordered[-1] + 1))
         if ordered != expected:
             raise ValueError(
-                f"Layer indices for {projection} are not contiguous from 0..n_layers-1: "
+                f"Layer indices for {component} are not contiguous from 0..n_layers-1: "
                 f"{ordered[:8]} ... {ordered[-8:]}"
             )
 
-    return sorted(entries, key=lambda item: (item.projection, item.layer or 0))
+    if include_embeddings:
+        entries.append(discover_embedding_tensor(model))
+
+    return sorted(
+        entries,
+        key=lambda item: (COMPONENTS.index(item.component), -1 if item.layer is None else item.layer),
+    )
+
+
+def discover_mlp_tensors(model: torch.nn.Module) -> List[TrackedTensor]:
+    components = ("gate_proj", "up_proj", "down_proj")
+    entries: List[TrackedTensor] = []
+    seen = set()
+    for name, module in model.named_modules():
+        component = None
+        for candidate in components:
+            if name.endswith(f".{candidate}") or name == candidate:
+                component = candidate
+                break
+        if component is None:
+            continue
+        key = (component, extract_layer_index(name))
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(
+            TrackedTensor(
+                component=component,
+                projection=component,
+                layer=key[1],
+                name=name,
+                orientation=COMPONENT_ORIENTATIONS[component],
+                module=module,
+            )
+        )
+    if not entries:
+        raise ValueError(
+            "Did not find MLP projection modules ending with "
+            "mlp.(gate_proj|up_proj|down_proj)."
+        )
+    return sorted(entries, key=lambda item: (components.index(item.component), item.layer or 0))
 
 
 def discover_embedding_tensor(model: torch.nn.Module) -> TrackedTensor:
@@ -216,20 +279,6 @@ def summarize_values(values: np.ndarray) -> Dict[str, float]:
     }
 
 
-def top_share(values: np.ndarray, fraction: float) -> float:
-    finite = np.asarray(values, dtype=np.float64)
-    finite = finite[np.isfinite(finite)]
-    if finite.size == 0:
-        return np.nan
-    finite = np.abs(finite)
-    total = float(np.sum(finite))
-    if total <= EPS:
-        return 0.0
-    k = max(1, int(math.ceil(finite.size * fraction)))
-    top = np.partition(finite, -k)[-k:]
-    return float(np.sum(top) / total)
-
-
 def gini(values: np.ndarray) -> float:
     finite = np.asarray(values, dtype=np.float64)
     finite = finite[np.isfinite(finite)]
@@ -244,12 +293,44 @@ def gini(values: np.ndarray) -> float:
     return float((2.0 * np.sum(index * finite) / (n * total)) - ((n + 1.0) / n))
 
 
-def concentration_summary(values: np.ndarray) -> Dict[str, float]:
-    return {
-        "top_1pct_share": top_share(values, 0.01),
-        "top_5pct_share": top_share(values, 0.05),
-        "gini": gini(values),
+def metric_rows_from_values(
+    *,
+    view: str,
+    step: int,
+    component: str,
+    values_by_metric: Dict[str, np.ndarray],
+    layer: Optional[int] = None,
+    final_step: Optional[int] = None,
+) -> List[Dict[str, object]]:
+    rows = []
+    relative_values = flatten_finite([values_by_metric["relative_delta_norm"]])
+    cosine_values = flatten_finite([values_by_metric["cosine_distance"]])
+    metric_values = {
+        "relative_delta_norm": float(np.mean(relative_values)) if relative_values.size else np.nan,
+        "cosine_distance": float(np.mean(cosine_values)) if cosine_values.size else np.nan,
+        "relative_delta_gini": gini(relative_values),
+        "cosine_distance_gini": gini(cosine_values),
     }
+    num_values = {
+        "relative_delta_norm": int(relative_values.size),
+        "cosine_distance": int(cosine_values.size),
+        "relative_delta_gini": int(relative_values.size),
+        "cosine_distance_gini": int(cosine_values.size),
+    }
+    for metric in METRICS:
+        rows.append(
+            {
+                "view": view,
+                "step": int(step),
+                "final_step": "" if final_step is None else int(final_step),
+                "layer": "" if layer is None else int(layer),
+                "component": component,
+                "metric": metric,
+                "value": metric_values[metric],
+                "num_values": num_values[metric],
+            }
+        )
+    return rows
 
 
 def compute_step_metrics(
@@ -259,17 +340,12 @@ def compute_step_metrics(
     baseline: Dict[str, torch.Tensor],
     raw_delta_dir: Optional[str] = None,
 ) -> StepMetricResult:
-    by_projection: Dict[str, Dict[str, List[np.ndarray]]] = {
-        projection: {metric: [] for metric in METRICS}
-        for projection in PROJECTIONS
-    }
     by_component: Dict[str, Dict[str, List[np.ndarray]]] = {
-        "mlp_all": {metric: [] for metric in METRICS},
-        "embed_tokens": {metric: [] for metric in METRICS},
+        component: {metric: [] for metric in BASE_METRICS}
+        for component in COMPONENTS
     }
-    scalar_rows: List[Dict[str, object]] = []
+    time_rows: List[Dict[str, object]] = []
     layer_rows: List[Dict[str, object]] = []
-    concentration_rows: List[Dict[str, object]] = []
 
     step_raw_dir = None
     if raw_delta_dir:
@@ -286,81 +362,77 @@ def compute_step_metrics(
             np.savez_compressed(
                 os.path.join(step_raw_dir, f"{key}.npz"),
                 delta=channel_delta_tensor(ref, cmp),
-                projection=entry.projection,
+                projection=entry.component,
                 layer=-1 if entry.layer is None else int(entry.layer),
                 orientation=entry.orientation,
             )
 
         for metric, values in metrics.items():
-            if entry.component == "mlp":
-                by_projection[entry.projection][metric].append(values)
-                by_component["mlp_all"][metric].append(values)
-                row = {
-                    "step": int(step),
-                    "metric": metric,
-                    "projection": entry.projection,
-                    "layer": int(entry.layer),
-                }
-                row.update(summarize_values(values))
-                layer_rows.append(row)
-            else:
-                by_component["embed_tokens"][metric].append(values)
+            by_component[entry.component][metric].append(values)
 
-    for projection in PROJECTIONS:
-        for metric in METRICS:
-            values = flatten_finite(by_projection[projection][metric])
-            row = {
-                "step": int(step),
-                "metric": metric,
-                "component": projection,
-            }
-            row.update(summarize_values(values))
-            scalar_rows.append(row)
+        if entry.layer is not None:
+            layer_rows.extend(
+                metric_rows_from_values(
+                    view="layer_step",
+                    step=step,
+                    component=entry.component,
+                    values_by_metric=metrics,
+                    layer=int(entry.layer),
+                )
+            )
 
-    for component in ("mlp_all", "embed_tokens"):
-        for metric in METRICS:
-            arrays = by_component[component][metric]
-            if not arrays:
-                continue
-            values = flatten_finite(arrays)
-            scalar_row = {
-                "step": int(step),
-                "metric": metric,
-                "component": component,
-            }
-            scalar_row.update(summarize_values(values))
-            scalar_rows.append(scalar_row)
-
-            conc_row = {
-                "step": int(step),
-                "metric": metric,
-                "component": component,
-            }
-            conc_row.update(concentration_summary(values))
-            concentration_rows.append(conc_row)
+    for component in COMPONENTS:
+        if not by_component[component]["relative_delta_norm"]:
+            continue
+        values_by_metric = {
+            metric: flatten_finite(by_component[component][metric])
+            for metric in BASE_METRICS
+        }
+        time_rows.extend(
+            metric_rows_from_values(
+                view="time",
+                step=step,
+                component=component,
+                values_by_metric=values_by_metric,
+            )
+        )
 
     return StepMetricResult(
-        scalar_rows=scalar_rows,
+        time_rows=time_rows,
         layer_rows=layer_rows,
-        concentration_rows=concentration_rows,
     )
 
 
 def save_metric_csvs(
     output_dir: str,
-    scalar_rows: Sequence[Dict[str, object]],
+    time_rows: Sequence[Dict[str, object]],
     layer_rows: Sequence[Dict[str, object]],
-    concentration_rows: Sequence[Dict[str, object]],
 ) -> Dict[str, str]:
     os.makedirs(output_dir, exist_ok=True)
-    paths = {
-        "scalar": os.path.join(output_dir, "parameter_delta_scalar_metrics.csv"),
-        "layer": os.path.join(output_dir, "parameter_delta_layer_metrics.csv"),
-        "concentration": os.path.join(output_dir, "parameter_delta_concentration_metrics.csv"),
-    }
-    pd.DataFrame(scalar_rows).to_csv(paths["scalar"], index=False)
-    pd.DataFrame(layer_rows).to_csv(paths["layer"], index=False)
-    pd.DataFrame(concentration_rows).to_csv(paths["concentration"], index=False)
+    path = os.path.join(output_dir, "parameter_delta_metrics.csv")
+    final_step = None
+    if time_rows:
+        final_step = max(int(row["step"]) for row in time_rows)
+    elif layer_rows:
+        final_step = max(int(row["step"]) for row in layer_rows)
+
+    output_rows = []
+    for row in time_rows:
+        output_row = dict(row)
+        output_row["final_step"] = "" if final_step is None else int(final_step)
+        output_rows.append(output_row)
+    if final_step is not None:
+        for row in layer_rows:
+            if int(row["step"]) != int(final_step):
+                continue
+            output_row = dict(row)
+            output_row["view"] = "final_layer"
+            output_row["final_step"] = int(final_step)
+            output_rows.append(output_row)
+
+    columns = ["view", "step", "final_step", "layer", "component", "metric", "value", "num_values"]
+    pd.DataFrame(output_rows, columns=columns).to_csv(path, index=False)
+    paths = {"metrics": path}
     return paths
 
 
@@ -429,19 +501,15 @@ def compute_final_alignment(raw_delta_dir: str, output_dir: str) -> Tuple[pd.Dat
                         }
                     )
 
-                agg_components = [component]
-                if projection != "embed_tokens":
-                    agg_components.append("mlp_all")
-                for agg_component in agg_components:
-                    bucket = accum.setdefault(
-                        agg_component,
-                        {"dot": 0.0, "norm": 0.0, "final_norm": 0.0},
-                    )
-                    d = delta.reshape(-1)
-                    f = final_delta.reshape(-1)
-                    bucket["dot"] += float(np.dot(d, f))
-                    bucket["norm"] += float(np.dot(d, d))
-                    bucket["final_norm"] += float(np.dot(f, f))
+                bucket = accum.setdefault(
+                    component,
+                    {"dot": 0.0, "norm": 0.0, "final_norm": 0.0},
+                )
+                d = delta.reshape(-1)
+                f = final_delta.reshape(-1)
+                bucket["dot"] += float(np.dot(d, f))
+                bucket["norm"] += float(np.dot(d, d))
+                bucket["final_norm"] += float(np.dot(f, f))
 
         for component, bucket in accum.items():
             denom = math.sqrt(bucket["norm"]) * math.sqrt(bucket["final_norm"])

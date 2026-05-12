@@ -1,0 +1,74 @@
+#!/bin/bash
+
+set -euo pipefail
+
+cd "$(dirname "$0")"
+mkdir -p logs
+
+MODEL_ID="${MODEL_ID:-allenai/OLMo-2-1124-7B}"
+CONDA_ENV="${CONDA_ENV:-openrlhf}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+# In this CPT pipeline, NUM_EPOCHS is used as the target number of
+# knowledge-injection batches when >1. The local default matches E1/E2 local.
+NUM_EPOCHS="${NUM_EPOCHS:-100}"
+NUM_PARAPHRASED="${NUM_PARAPHRASED:-9}"
+DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-8}"
+EFFECTIVE_BATCH_SIZE="${EFFECTIVE_BATCH_SIZE:-128}"
+LEARNING_RATE="${LEARNING_RATE:-4e-5}"
+CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
+CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E3_granular_explanations_all_domains_local}"
+EXPLANATIONS_NUM_TRACKS="${EXPLANATIONS_NUM_TRACKS:-1}"
+MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v14}"
+USE_PARCC="${USE_PARCC:-0}"
+SAVE_LOCAL_MODEL="${SAVE_LOCAL_MODEL:-0}"
+SPARSE_CALLBACKS="${SPARSE_CALLBACKS:-0}"
+PARAMETER_DELTA_EVERY_N_STEPS="${PARAMETER_DELTA_EVERY_N_STEPS:-5}"
+PROBE_EVERY_N_STEPS="${PROBE_EVERY_N_STEPS:-2}"
+MCQA_PROBE_EVERY_N_STEPS="${MCQA_PROBE_EVERY_N_STEPS:-4}"
+
+EXTRA_ARGS=()
+if [[ "$USE_PARCC" == "1" ]]; then
+    EXTRA_ARGS+=(--parcc)
+fi
+if [[ "$SAVE_LOCAL_MODEL" == "1" ]]; then
+    EXTRA_ARGS+=(--save_local_model)
+else
+    EXTRA_ARGS+=(--no-save_local_model)
+fi
+if [[ "$SPARSE_CALLBACKS" == "1" ]]; then
+    EXTRA_ARGS+=(--no_callback_every_step)
+fi
+
+if [[ "${CONDA_DEFAULT_ENV:-}" == "$CONDA_ENV" ]]; then
+    LAUNCH=(torchrun --standalone --nproc_per_node "$NPROC_PER_NODE")
+else
+    LAUNCH=(conda run --no-capture-output -n "$CONDA_ENV" torchrun --standalone --nproc_per_node "$NPROC_PER_NODE")
+fi
+
+"${LAUNCH[@]}" finetuning_knowledge_v9.py \
+    --custom_suffix "$CUSTOM_SUFFIX" \
+    --model_id "$MODEL_ID" \
+    --knowledge_probes_version v13 \
+    --mcqa_probes \
+    --mcqa_probes_version "$MCQA_PROBES_VERSION" \
+    --num_train_epochs "$NUM_EPOCHS" \
+    --learning_rate "$LEARNING_RATE" \
+    --num_paraphrased_texts "$NUM_PARAPHRASED" \
+    --with_explanations \
+    --explanations_insertion_strategy granular \
+    --explanations_num_tracks "$EXPLANATIONS_NUM_TRACKS" \
+    --device_batch_size "$DEVICE_BATCH_SIZE" \
+    --effective_batch_size_for_cpt "$EFFECTIVE_BATCH_SIZE" \
+    --context_length_for_cpt "$CONTEXT_LENGTH" \
+    --overlap_sections \
+    --overlap_ratio 1_8 \
+    --fill_batches_with_pretraining \
+    --attn_implementation "$ATTN_IMPLEMENTATION" \
+    --gradient_checkpointing \
+    --full_finetuning \
+    --probe_every_n_steps "$PROBE_EVERY_N_STEPS" \
+    --mcqa_probe_every_n_steps "$MCQA_PROBE_EVERY_N_STEPS" \
+    --enable_parameter_delta_tracking \
+    --parameter_delta_every_n_steps "$PARAMETER_DELTA_EVERY_N_STEPS" \
+    "${EXTRA_ARGS[@]}"

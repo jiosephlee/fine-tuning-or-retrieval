@@ -17,7 +17,8 @@ conda run --no-capture-output -n openrlhf torchrun --standalone --nproc_per_node
     --custom_suffix E1_source_all_domains_fa2_packing \
     --model_id allenai/OLMo-2-1124-7B \
     --knowledge_probes_version v13 \
-    --disable_mcqa_probes \
+    --mcqa_probes \
+    --mcqa_probes_version v14 \
     --num_train_epochs 10 \
     --learning_rate 1e-5 \
     --num_paraphrased_texts 0 \

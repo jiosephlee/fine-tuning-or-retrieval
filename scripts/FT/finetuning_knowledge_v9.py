@@ -31,10 +31,12 @@ DOMAIN_OVERRIDE_ARG_BY_SOURCE = {
     "legal": "override_legal_domain",
     "medical": "override_medical_domain",
 }
-DEFAULT_WANDB_PROJECT = "fine_tuning_study_v9"
+DEFAULT_WANDB_PROJECT = "v9_refined"
 DEFAULT_WANDB_PANEL_SOURCES = ("legal", "arxiv", "medical")
 DEFAULT_KNOWLEDGE_PROBES_VERSION = "v13"
+DEFAULT_MCQA_PROBES_VERSION = "v14"
 REQUIRED_KNOWLEDGE_PROBE_COLUMNS = ("fact", "probe", "target")
+REQUIRED_MCQA_PROBE_COLUMNS = ("formatted_question", "correct_label")
 
 
 def distributed_world_size() -> int:
@@ -190,6 +192,63 @@ def validate_selected_knowledge_probes(args, log) -> None:
     )
 
 
+def validate_selected_mcqa_probes(args, log) -> None:
+    """Fail early if enabled MCQA probe files are absent or malformed."""
+    if not args.mcqa_probes:
+        return
+
+    missing_paths = []
+    malformed = []
+    total_rows = 0
+
+    for domain in args.resolved_domains:
+        domain_source = args.domain_data_sources.get(domain)
+        probe_path = probe_paths.resolve_mcqa_probe_path(
+            "facts",
+            domain,
+            args.mcqa_probes_version,
+            domain_source=domain_source,
+        )
+
+        if not os.path.exists(probe_path):
+            missing_paths.append(str(probe_path))
+            continue
+
+        probe_df = pd.read_csv(probe_path)
+        missing_columns = [
+            column for column in REQUIRED_MCQA_PROBE_COLUMNS
+            if column not in probe_df.columns
+        ]
+        if missing_columns:
+            malformed.append((str(probe_path), missing_columns))
+            continue
+
+        total_rows += len(probe_df)
+
+    if missing_paths or malformed:
+        details = []
+        if missing_paths:
+            details.append(
+                "Missing MCQA probe files:\n"
+                + "\n".join(f"  - {path}" for path in missing_paths)
+            )
+        if malformed:
+            details.append(
+                "Malformed MCQA probe files:\n"
+                + "\n".join(
+                    f"  - {path}: missing columns {columns}"
+                    for path, columns in malformed
+                )
+            )
+        raise ValueError("\n".join(details))
+
+    log.info(
+        f"Validated {total_rows} MCQA probes from "
+        f"probes_{args.mcqa_probes_version}_mcqa.csv across "
+        f"{len(args.resolved_domains)} domains."
+    )
+
+
 def construct_experiment_name(args):
     """Construct experiment path as a nested directory structure."""
     
@@ -210,6 +269,13 @@ def construct_experiment_name(args):
     
     # 3. Probes Version: e.g., 'probes_v7'
     probes_version = f"probes_{args.knowledge_probes_version}"
+    if getattr(args, "mcqa_probes", False):
+        mcqa_probes_version = getattr(
+            args,
+            "mcqa_probes_version",
+            args.knowledge_probes_version,
+        )
+        probes_version += f"_mcqa_{mcqa_probes_version}"
 
     # 4. Chunking Style: e.g., 'sec_no-ovp', 'sec_ovp_1_4', 'tok'
     if args.chunk_by_section:
@@ -617,6 +683,13 @@ if __name__ == "__main__":
         default=DEFAULT_KNOWLEDGE_PROBES_VERSION,
         help="Version of the factual knowledge probes to use.",
     )
+    parser.add_argument(
+        "--mcqa_probes_version",
+        "--mcqa-probes-version",
+        type=str,
+        default=DEFAULT_MCQA_PROBES_VERSION,
+        help="Version of the MCQA probes to use when --mcqa_probes is enabled.",
+    )
     parser.add_argument("--inference_probes_version", type=str, default="v7", help="Version of the inference probes to use.")
     parser.set_defaults(mcqa_probes=False)
     parser.add_argument(
@@ -626,7 +699,7 @@ if __name__ == "__main__":
         action="store_true",
         help=(
             "Enable constrained-decoding MCQA evaluation. "
-            "Loads probes_<knowledge_probes_version>_mcqa.csv from the facts directory."
+            "Loads probes_<mcqa_probes_version>_mcqa.csv from the facts directory."
         ),
     )
     parser.add_argument(
@@ -785,9 +858,21 @@ if __name__ == "__main__":
         help="If set, run heavy callbacks only at 25%%, 50%%, and 75%% of training instead of every step.",
     )
     parser.add_argument(
+        "--probe_every_n_steps",
+        type=int,
+        default=1,
+        help="Run cloze knowledge/inference probe callbacks every N training steps.",
+    )
+    parser.add_argument(
+        "--mcqa_probe_every_n_steps",
+        type=int,
+        default=1,
+        help="Run MCQA probe callbacks every N training steps.",
+    )
+    parser.add_argument(
         "--enable_parameter_delta_tracking",
         action="store_true",
-        help="Track parameter delta summaries and plots during training.",
+        help="Track online parameter delta summaries and plots during training.",
     )
     parser.add_argument(
         "--parameter_delta_include_embeddings",
@@ -801,20 +886,33 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Optional folder for large temporary raw delta tensors used for final-direction "
-            "alignment. A run-specific subfolder is created and deleted after plotting."
+            "alignment when --parameter_delta_compute_final_alignment is enabled. "
+            "A run-specific subfolder is created and deleted after successful plotting."
         ),
     )
     parser.add_argument(
         "--parameter_delta_compute_final_alignment",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Compute final-direction alignment plots from temporary raw delta tensors.",
+        default=False,
+        help=(
+            "Save temporary raw parameter deltas and compute final-direction alignment "
+            "metrics/plots. Disabled by default."
+        ),
     )
     parser.add_argument(
         "--parameter_delta_sparse_milestones",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Track parameter deltas at train begin, every 10%% of training, and train end.",
+    )
+    parser.add_argument(
+        "--parameter_delta_every_n_steps",
+        type=int,
+        default=None,
+        help=(
+            "Record parameter deltas every N training steps, plus train begin/end. "
+            "When set, this overrides --parameter_delta_sparse_milestones."
+        ),
     )
     parser.add_argument(
         "--parameter_delta_report_to_wandb",
@@ -902,6 +1000,9 @@ if __name__ == "__main__":
             "For whole/legacy/random_splice, leave --explanations_cycle at the default 0."
         )
 
+    if args.parameter_delta_every_n_steps is not None and args.parameter_delta_every_n_steps <= 0:
+        raise ValueError("--parameter_delta_every_n_steps must be a positive integer when set.")
+
     if (
         args.explanations_insertion_strategy == "granular"
         and args.with_specific_explanation
@@ -944,14 +1045,17 @@ if __name__ == "__main__":
 
     log.info("Inference probes are disabled.")
     if args.enable_wandb_source_panels:
-        mcqa_note = f" MCQA constrained-decoding ({args.knowledge_probes_version})." if args.mcqa_probes else ""
+        mcqa_note = f" MCQA constrained-decoding ({args.mcqa_probes_version})." if args.mcqa_probes else ""
         log.info(
             f"W&B source panels enabled for: {args.wandb_panel_sources}. "
-            f"Per-paper metrics: log_prob_average, target_rank_average, mcqa_accuracy.{mcqa_note}"
+            "Flat metrics: <source>/<document>_log_prob, "
+            "<source>/<document>_target_rank, "
+            f"<source>/<document>_mcqa_accuracy.{mcqa_note}"
         )
 
     args.resolved_domains, args.domain_data_sources = resolve_domains_and_sources(args, log)
     validate_selected_knowledge_probes(args, log)
+    validate_selected_mcqa_probes(args, log)
 
     if args.override_experiment_name:
         args.experiment_name = args.override_experiment_name

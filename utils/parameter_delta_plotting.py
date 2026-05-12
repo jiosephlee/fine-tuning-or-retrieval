@@ -1,24 +1,36 @@
 import os
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import pandas as pd
 
 from utils.llm_plotting import set_plot_style
-from utils.parameter_delta_metrics import METRICS, PROJECTIONS
+from utils.parameter_delta_metrics import COMPONENTS, LAYER_COMPONENTS, METRICS
 
 
-COMPONENT_ORDER = ["gate", "up", "down", "mlp_all", "embed_tokens"]
+PLOT_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("mlp_embed", ("embed_tokens", "gate_proj", "up_proj", "down_proj")),
+    ("attention", ("q_proj", "k_proj", "v_proj", "o_proj")),
+)
+GROUP_LABELS = {
+    "mlp_embed": "Embeddings + MLP projections",
+    "attention": "Attention projections",
+}
 COMPONENT_LABELS = {
-    "gate": "gate_proj",
-    "up": "up_proj",
-    "down": "down_proj",
-    "mlp_all": "MLP all",
     "embed_tokens": "embed_tokens",
+    "gate_proj": "gate_proj",
+    "up_proj": "up_proj",
+    "down_proj": "down_proj",
+    "q_proj": "q_proj",
+    "k_proj": "k_proj",
+    "v_proj": "v_proj",
+    "o_proj": "o_proj",
 }
 METRIC_LABELS = {
     "relative_delta_norm": "Relative delta norm",
     "cosine_distance": "Cosine distance",
+    "relative_delta_gini": "Relative delta Gini",
+    "cosine_distance_gini": "Cosine distance Gini",
 }
 
 
@@ -28,186 +40,134 @@ def _read_csv(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def _save(fig, path: str, dpi: int = 200) -> None:
+def _save(fig, path: str, dpi: int = 200) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
+    return path
 
 
-def _ordered_components(values: Iterable[str]):
+def _ordered_components(values: Iterable[str], include_embeddings: bool = True):
+    allowed = COMPONENTS if include_embeddings else LAYER_COMPONENTS
     seen = set(values)
-    ordered = [component for component in COMPONENT_ORDER if component in seen]
+    ordered = [component for component in allowed if component in seen]
     ordered.extend(sorted(seen - set(ordered)))
     return ordered
 
 
-def plot_aggregate_lines(scalar_df: pd.DataFrame, output_dir: str, value_col: str = "mean") -> None:
-    if scalar_df.empty:
-        return
+def _clean_old_combined_plots(output_dir: str) -> None:
     for metric in METRICS:
-        df = scalar_df[scalar_df["metric"] == metric]
-        if df.empty:
-            continue
-        fig, ax = plt.subplots(figsize=(9, 5), constrained_layout=True)
-        for component in _ordered_components(df["component"].dropna().astype(str)):
-            sub = df[df["component"] == component].sort_values("step")
-            ax.plot(
-                sub["step"],
-                sub[value_col],
-                marker="o",
-                linewidth=2,
-                label=COMPONENT_LABELS.get(component, component),
-            )
-        ax.set_title(f"Parameter Delta: {METRIC_LABELS.get(metric, metric)}")
-        ax.set_xlabel("Training step")
-        ax.set_ylabel(value_col)
-        ax.grid(True, alpha=0.25)
-        ax.legend(frameon=False)
-        _save(fig, os.path.join(output_dir, f"aggregate_{metric}_{value_col}.png"))
+        for filename in (f"time_{metric}.png", f"final_layer_{metric}.png"):
+            path = os.path.join(output_dir, filename)
+            if os.path.exists(path):
+                os.remove(path)
 
 
-def plot_embedding_lines(scalar_df: pd.DataFrame, output_dir: str, value_col: str = "mean") -> None:
-    if scalar_df.empty:
-        return
-    embed_df = scalar_df[scalar_df["component"] == "embed_tokens"]
-    if embed_df.empty:
-        return
+def plot_time_metrics(metrics_df: pd.DataFrame, output_dir: str) -> List[str]:
+    saved_paths: List[str] = []
+    time_df = metrics_df[metrics_df["view"] == "time"]
+    if time_df.empty:
+        return saved_paths
     for metric in METRICS:
-        df = embed_df[embed_df["metric"] == metric].sort_values("step")
-        if df.empty:
-            continue
-        fig, ax = plt.subplots(figsize=(8, 4.5), constrained_layout=True)
-        ax.plot(df["step"], df[value_col], marker="o", linewidth=2)
-        ax.set_title(f"Embedding Delta: {METRIC_LABELS.get(metric, metric)}")
-        ax.set_xlabel("Training step")
-        ax.set_ylabel(value_col)
-        ax.grid(True, alpha=0.25)
-        _save(fig, os.path.join(output_dir, f"embed_tokens_{metric}_{value_col}.png"))
-
-
-def plot_layer_lines(layer_df: pd.DataFrame, output_dir: str, value_col: str = "mean") -> None:
-    if layer_df.empty:
-        return
-    for metric in METRICS:
-        metric_df = layer_df[layer_df["metric"] == metric]
+        metric_df = time_df[time_df["metric"] == metric]
         if metric_df.empty:
             continue
-        for projection in PROJECTIONS:
-            df = metric_df[metric_df["projection"] == projection]
-            if df.empty:
+        for group_name, components in PLOT_GROUPS:
+            group_df = metric_df[metric_df["component"].isin(components)]
+            if group_df.empty:
                 continue
-            fig, ax = plt.subplots(figsize=(10, 5.5), constrained_layout=True)
-            for layer in sorted(df["layer"].dropna().unique()):
-                sub = df[df["layer"] == layer].sort_values("step")
-                ax.plot(sub["step"], sub[value_col], linewidth=1.4, alpha=0.8, label=f"L{int(layer)}")
-            ax.set_title(
-                f"{COMPONENT_LABELS.get(projection, projection)} Layer Delta: "
-                f"{METRIC_LABELS.get(metric, metric)}"
-            )
-            ax.set_xlabel("Training step")
-            ax.set_ylabel(value_col)
-            ax.grid(True, alpha=0.25)
-            ax.legend(
-                title="Layer",
-                frameon=False,
-                ncol=4,
-                fontsize=7,
-                loc="center left",
-                bbox_to_anchor=(1.01, 0.5),
-            )
-            _save(fig, os.path.join(output_dir, f"layers_{projection}_{metric}_{value_col}.png"))
-
-
-def plot_concentration(concentration_df: pd.DataFrame, output_dir: str) -> None:
-    if concentration_df.empty:
-        return
-    stats = ["top_1pct_share", "top_5pct_share", "gini"]
-    for metric in METRICS:
-        metric_df = concentration_df[concentration_df["metric"] == metric]
-        if metric_df.empty:
-            continue
-        for stat in stats:
-            if stat not in metric_df.columns:
-                continue
-            fig, ax = plt.subplots(figsize=(8.5, 4.8), constrained_layout=True)
-            for component in _ordered_components(metric_df["component"].dropna().astype(str)):
-                sub = metric_df[metric_df["component"] == component].sort_values("step")
+            fig, ax = plt.subplots(figsize=(9.5, 5.2), constrained_layout=True)
+            for component in _ordered_components(group_df["component"].dropna().astype(str)):
+                sub = group_df[group_df["component"] == component].sort_values("step")
                 ax.plot(
                     sub["step"],
-                    sub[stat],
+                    sub["value"],
                     marker="o",
                     linewidth=2,
                     label=COMPONENT_LABELS.get(component, component),
                 )
-            ax.set_title(f"Parameter Delta Concentration: {METRIC_LABELS.get(metric, metric)}")
-            ax.set_xlabel("Training step")
-            ax.set_ylabel(stat)
-            ax.grid(True, alpha=0.25)
-            ax.legend(frameon=False)
-            _save(fig, os.path.join(output_dir, f"concentration_{metric}_{stat}.png"))
-
-
-def plot_final_alignment(
-    aggregate_df: Optional[pd.DataFrame],
-    layer_df: Optional[pd.DataFrame],
-    output_dir: str,
-) -> None:
-    if aggregate_df is not None and not aggregate_df.empty:
-        fig, ax = plt.subplots(figsize=(8.5, 4.8), constrained_layout=True)
-        for component in _ordered_components(aggregate_df["component"].dropna().astype(str)):
-            sub = aggregate_df[aggregate_df["component"] == component].sort_values("step")
-            ax.plot(
-                sub["step"],
-                sub["alignment"],
-                marker="o",
-                linewidth=2,
-                label=COMPONENT_LABELS.get(component, component),
+            metric_label = METRIC_LABELS.get(metric, metric)
+            ax.set_title(
+                f"Parameter Delta Over Training: {metric_label} "
+                f"({GROUP_LABELS.get(group_name, group_name)})"
             )
-        ax.set_title("Final-Direction Alignment")
-        ax.set_xlabel("Training step")
-        ax.set_ylabel("cos(delta_t, delta_final)")
-        ax.set_ylim(-1.05, 1.05)
-        ax.grid(True, alpha=0.25)
-        ax.legend(frameon=False)
-        _save(fig, os.path.join(output_dir, "final_alignment_aggregate.png"))
+            ax.set_xlabel("Training step")
+            ax.set_ylabel(metric_label)
+            ax.grid(True, alpha=0.25)
+            ax.legend(frameon=False, ncol=2)
+            saved_paths.append(
+                _save(fig, os.path.join(output_dir, f"time_{group_name}_{metric}.png"))
+            )
+    return saved_paths
 
-    if layer_df is None or layer_df.empty:
-        return
-    for projection in PROJECTIONS:
-        df = layer_df[layer_df["projection"] == projection]
-        if df.empty:
+
+def plot_final_layer_metrics(metrics_df: pd.DataFrame, output_dir: str) -> List[str]:
+    saved_paths: List[str] = []
+    layer_df = metrics_df[
+        (metrics_df["view"] == "final_layer")
+        & (metrics_df["component"] != "embed_tokens")
+    ]
+    if layer_df.empty:
+        return saved_paths
+    for metric in METRICS:
+        metric_df = layer_df[layer_df["metric"] == metric]
+        if metric_df.empty:
             continue
-        fig, ax = plt.subplots(figsize=(10, 5.5), constrained_layout=True)
-        for layer in sorted(df["layer"].dropna().unique()):
-            sub = df[df["layer"] == layer].sort_values("step")
-            ax.plot(sub["step"], sub["alignment"], linewidth=1.4, alpha=0.8, label=f"L{int(layer)}")
-        ax.set_title(f"{COMPONENT_LABELS.get(projection, projection)} Final-Direction Alignment")
-        ax.set_xlabel("Training step")
-        ax.set_ylabel("cos(delta_t, delta_final)")
-        ax.set_ylim(-1.05, 1.05)
-        ax.grid(True, alpha=0.25)
-        ax.legend(
-            title="Layer",
-            frameon=False,
-            ncol=4,
-            fontsize=7,
-            loc="center left",
-            bbox_to_anchor=(1.01, 0.5),
-        )
-        _save(fig, os.path.join(output_dir, f"final_alignment_layers_{projection}.png"))
+        for group_name, components in PLOT_GROUPS:
+            group_df = metric_df[metric_df["component"].isin(components)]
+            if group_df.empty:
+                continue
+            fig, ax = plt.subplots(figsize=(9.5, 5.2), constrained_layout=True)
+            for component in _ordered_components(
+                group_df["component"].dropna().astype(str),
+                include_embeddings=False,
+            ):
+                sub = group_df[group_df["component"] == component].sort_values("layer")
+                ax.plot(
+                    sub["layer"],
+                    sub["value"],
+                    marker="o",
+                    linewidth=2,
+                    label=COMPONENT_LABELS.get(component, component),
+                )
+            metric_label = METRIC_LABELS.get(metric, metric)
+            ax.set_title(
+                f"Final Parameter Delta By Layer: {metric_label} "
+                f"({GROUP_LABELS.get(group_name, group_name)})"
+            )
+            ax.set_xlabel("Layer")
+            ax.set_ylabel(metric_label)
+            ax.grid(True, alpha=0.25)
+            ax.legend(frameon=False, ncol=2)
+            saved_paths.append(
+                _save(fig, os.path.join(output_dir, f"final_layer_{group_name}_{metric}.png"))
+            )
+    return saved_paths
 
 
-def plot_parameter_delta_outputs(output_dir: str, plots_dir: Optional[str] = None) -> None:
+def expected_split_plot_filenames() -> List[str]:
+    filenames = []
+    for metric in METRICS:
+        for group_name, _ in PLOT_GROUPS:
+            filenames.append(f"time_{group_name}_{metric}.png")
+            filenames.append(f"final_layer_{group_name}_{metric}.png")
+    return filenames
+
+
+def plot_parameter_delta_outputs(
+    output_dir: str,
+    plots_dir: Optional[str] = None,
+    clean_old_combined: bool = True,
+) -> List[str]:
     set_plot_style()
     plots_dir = plots_dir or os.path.join(output_dir, "plots")
-    scalar_df = _read_csv(os.path.join(output_dir, "parameter_delta_scalar_metrics.csv"))
-    layer_df = _read_csv(os.path.join(output_dir, "parameter_delta_layer_metrics.csv"))
-    concentration_df = _read_csv(os.path.join(output_dir, "parameter_delta_concentration_metrics.csv"))
-    alignment_scalar_df = _read_csv(os.path.join(output_dir, "parameter_delta_final_alignment_scalar.csv"))
-    alignment_layer_df = _read_csv(os.path.join(output_dir, "parameter_delta_final_alignment_layer.csv"))
+    metrics_df = _read_csv(os.path.join(output_dir, "parameter_delta_metrics.csv"))
+    if metrics_df.empty:
+        return []
 
-    plot_aggregate_lines(scalar_df, plots_dir)
-    plot_embedding_lines(scalar_df, plots_dir)
-    plot_layer_lines(layer_df, plots_dir)
-    plot_concentration(concentration_df, plots_dir)
-    plot_final_alignment(alignment_scalar_df, alignment_layer_df, plots_dir)
+    saved_paths = []
+    saved_paths.extend(plot_time_metrics(metrics_df, plots_dir))
+    saved_paths.extend(plot_final_layer_metrics(metrics_df, plots_dir))
+    if saved_paths and clean_old_combined:
+        _clean_old_combined_plots(plots_dir)
+    return saved_paths

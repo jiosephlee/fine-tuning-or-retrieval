@@ -9,6 +9,14 @@ from importlib import reload
 reload(utils)
 
 
+def extract_case_title(case_content, case_name):
+    """Return the source case title using the cleaned medical document format."""
+    for line in case_content.splitlines():
+        if line.startswith("Title:"):
+            return line.split(":", 1)[1].strip()
+    return case_name.replace("_", " ")
+
+
 def generate_teaching_qa(case_name):
     """Generate NEJM Clinical Pearls & Morning Report style teaching Q&A for a medical case report."""
     print(f"Processing {case_name} for teaching Q&A...")
@@ -20,6 +28,7 @@ def generate_teaching_qa(case_name):
 
     with open(CASE_FILE_PATH, 'r') as f:
         case_content = f.read()
+    case_title = extract_case_title(case_content, case_name)
 
     # --- 1. Generate teaching questions ---
     print("Generating clinical teaching questions...")
@@ -120,7 +129,7 @@ Question: {question['question']}
     # Use stackexchange.txt filename for compatibility with data_preparation.py
     print("Creating teaching Q&A file...")
 
-    content = f"Clinical Pearls & Morning Report: {case_name}\n\n"
+    content = f"Title: Clinical Q&A about the case report: {case_title}\n\n"
     for qa in qa_pairs:
         content += f"### [{qa['category']}] {qa['question']}\n\n"
         content += f"{qa['answer']}\n\n"
@@ -143,6 +152,7 @@ def generate_case_textbook(case_name):
 
     with open(CASE_FILE_PATH, 'r') as f:
         case_content = f.read()
+    case_title = extract_case_title(case_content, case_name)
 
     # --- 1. Generate section outline for one chapter ---
     print("Generating textbook section outline...")
@@ -234,7 +244,7 @@ Start with the section title as a '##' header.""",
     # --- 3. Concatenate and save ---
     print("Assembling textbook chapter...")
     full_content = "\n\n".join(section_contents)
-    full_textbook = f"# Case-Based Textbook Chapter: {case_name}\n\n{full_content}"
+    full_textbook = f"Title: Textbook chapter about the case report: {case_title}\n\n{full_content}"
 
     output_file = os.path.join(OUTPUT_DIR, "textbook.txt")
     with open(output_file, 'w') as f:
@@ -254,6 +264,7 @@ def generate_clinical_blog(case_name):
 
     with open(CASE_FILE_PATH, 'r') as f:
         case_content = f.read()
+    case_title = extract_case_title(case_content, case_name)
 
     # --- 1. Generate blog post ideas ---
     print("Generating blog post ideas...")
@@ -343,7 +354,7 @@ Description: {description}"""
     # Use blogs.txt filename for compatibility with data_preparation.py
     print("Assembling blog posts...")
     full_blogs_content = "\n\n\n\n".join(blog_contents)
-    full_blogs_content = f"Clinical Education Blog Posts: {case_name}\n\n{full_blogs_content}"
+    full_blogs_content = f"Title: Blog about the case report: {case_title}\n\n{full_blogs_content}"
 
     output_file = os.path.join(OUTPUT_DIR, "blogs.txt")
     with open(output_file, 'w') as f:
