@@ -20,6 +20,7 @@ CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
 CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E2_paraphrase_all_domains_local}"
 MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v14}"
+MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 USE_PARCC="${USE_PARCC:-0}"
 SAVE_LOCAL_MODEL="${SAVE_LOCAL_MODEL:-0}"
 SPARSE_CALLBACKS="${SPARSE_CALLBACKS:-0}"
@@ -52,6 +53,7 @@ fi
     --knowledge_probes_version v13 \
     --mcqa_probes \
     --mcqa_probes_version "$MCQA_PROBES_VERSION" \
+    --mcqa_prompt_column "$MCQA_PROMPT_COLUMN" \
     --num_train_epochs "$NUM_EPOCHS" \
     --learning_rate "$LEARNING_RATE" \
     --overlap_sections \

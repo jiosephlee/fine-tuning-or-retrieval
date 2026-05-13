@@ -7,6 +7,7 @@ mkdir -p logs
 
 PROBE_EVERY_N_STEPS="${PROBE_EVERY_N_STEPS:-2}"
 MCQA_PROBE_EVERY_N_STEPS="${MCQA_PROBE_EVERY_N_STEPS:-4}"
+MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 
 conda run --no-capture-output -n openrlhf torchrun --standalone --nproc_per_node 8 finetuning_knowledge_v9.py \
     --custom_suffix E1_source_all_domains_fa2_packing \
@@ -14,6 +15,7 @@ conda run --no-capture-output -n openrlhf torchrun --standalone --nproc_per_node
     --knowledge_probes_version v13 \
     --mcqa_probes \
     --mcqa_probes_version v14 \
+    --mcqa_prompt_column "$MCQA_PROMPT_COLUMN" \
     --num_train_epochs 100 \
     --learning_rate 4e-5 \
     --num_paraphrased_texts 0 \
