@@ -15,6 +15,12 @@ from tqdm import tqdm
 from utils import parameter_delta_metrics
 
 
+def _is_world_process_zero() -> bool:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
+
+
 def _should_skip_sparse_eval(callback, state) -> bool:
     """Return True if this step should be skipped under sparse evaluation."""
     if callback.sparse_eval:
@@ -169,11 +175,31 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
                 combined_avg = combined_values[combined_valid_mask].mean().item()
                 log_data[f"{self.log_prefix}/{metric_name}_by_type/Inference"] = combined_avg
 
+    def _should_log_probe_debug(self) -> bool:
+        return self.logger is not None and _is_world_process_zero()
+
+    def _debug_step_label(self, step: Optional[int]) -> str:
+        return f"step={step}" if step is not None else "step=unknown"
+
+    def _short_debug_text(self, value: Any, max_chars: int = 500) -> str:
+        text = repr("" if value is None else str(value))
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars - 3] + "..."
+
+    def _log_probe_debug_context(self, probe_idx: int) -> None:
+        if probe_idx < 0 or probe_idx >= len(self.probes):
+            return
+        self.logger.warning("  - Probe index: %s", probe_idx)
+        self.logger.warning("  - Probe: %s", self._short_debug_text(self.probes[probe_idx]))
+        self.logger.warning("  - Target: %s", self._short_debug_text(self.targets[probe_idx]))
+        self.logger.warning("  - Fact: %s", self._short_debug_text(self.facts[probe_idx]))
+
     def on_train_begin(self, args, state, control, model, **kwargs):
         """Calculate initial metrics before training starts."""
         print(f"{self.__class__.__name__}: Calculating initial metrics...")
         model.eval()
-        self.initial_metrics = self._evaluate_probes(model)
+        self.initial_metrics = self._evaluate_probes(model, step=0)
         
         # Log initial metrics to history at step 0
         step = 0
@@ -216,9 +242,9 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             return
 
         model.eval()
-        current_metrics = self._evaluate_probes(model)
-        log_data = {}
         step = state.global_step
+        current_metrics = self._evaluate_probes(model, step=step)
+        log_data = {}
 
         for metric_name, values in current_metrics.items():
             if values is None:
@@ -434,7 +460,15 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             
         return mask
     
-    def _calculate_log_probs(self, logits, labels, context_lengths, target_lengths):
+    def _calculate_log_probs(
+        self,
+        logits,
+        labels,
+        context_lengths,
+        target_lengths,
+        batch_start_idx: int = 0,
+        step: Optional[int] = None,
+    ):
         full_lengths = context_lengths + target_lengths
         target_mask = self._get_target_mask(labels, context_lengths, target_lengths, full_lengths)
         
@@ -455,26 +489,42 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
         if not torch.equal(num_tokens_target.long(), target_lengths):
             # Find the indices where the mismatch occurs
             mismatch_indices = torch.where(num_tokens_target.long() != target_lengths)[0]
-            for i in mismatch_indices:
-                self.logger.warning(f"Number of tokens target mismatch for a probe in batch.")
-                # Note: The original probe index would require passing the batch start index 'i' down to this function.
-                # For now, we log information about the mismatched sample within the current batch.
-                self.logger.warning(f"  - Mismatch at batch index: {i.item()}")
-                self.logger.warning(f"  - Expected target length: {target_lengths[i].item()}")
-                self.logger.warning(f"  - Calculated target tokens: {num_tokens_target[i].long().item()}")
-                
-                # To get the original text, we would need to pass the original data down.
-                # This is a placeholder for what we would want to log.
-                # self.logger.warning(f"  - Target Text: {self.targets[original_index]}")
+            if self._should_log_probe_debug():
+                for i in mismatch_indices:
+                    probe_idx = batch_start_idx + i.item()
+                    self.logger.warning(
+                        "%s: true target-token count mismatch (%s, batch_start=%s, batch_index=%s)",
+                        self.log_prefix,
+                        self._debug_step_label(step),
+                        batch_start_idx,
+                        i.item(),
+                    )
+                    self.logger.warning("  - Expected target length: %s", target_lengths[i].item())
+                    self.logger.warning("  - Calculated target tokens: %s", num_tokens_target[i].long().item())
+                    target_token_ids = labels[
+                        i,
+                        int(context_lengths[i].item()):int(context_lengths[i].item()) + int(target_lengths[i].item()),
+                    ]
+                    self.logger.warning("  - Original target token IDs: %s", target_token_ids.tolist())
+                    self.logger.warning("  - Tokenizer pad_token_id: %s", self.tokenizer.pad_token_id)
+                    self._log_probe_debug_context(probe_idx)
 
-                # Log token information
-                target_token_ids = labels[i, int(context_lengths[i].item()):int(context_lengths[i].item()) + int(target_lengths[i].item())]
-                self.logger.warning(f"  - Original Target Token IDs: {target_token_ids.tolist()}")
-                self.logger.warning(f"  - Tokenizer pad_token_id: {self.tokenizer.pad_token_id}")
-
-        # assert that num_tokens_target is the same as non-zero in the loss_target
-        if not torch.equal(num_tokens_target.long(), (loss_target != 0).sum(dim=1)):
-            self.logger.warning("Number of tokens target mismatch")
+        target_token_mask = labels_masked != -100
+        zero_loss_target_mask = target_token_mask & (loss_target == 0)
+        zero_loss_counts = zero_loss_target_mask.sum(dim=1)
+        if zero_loss_counts.any() and self._should_log_probe_debug():
+            affected = torch.where(zero_loss_counts > 0)[0]
+            affected_probe_indices = [batch_start_idx + idx.item() for idx in affected]
+            self.logger.warning(
+                "%s: target tokens with exactly zero loss detected (%s, batch_start=%s). "
+                "This is usually numeric/model-confidence saturation, not a token span mismatch.",
+                self.log_prefix,
+                self._debug_step_label(step),
+                batch_start_idx,
+            )
+            self.logger.warning("  - Affected probe indices: %s", affected_probe_indices)
+            self.logger.warning("  - Zero-loss target-token counts: %s", zero_loss_counts[affected].tolist())
+            self.logger.warning("  - Target lengths: %s", target_lengths[affected].tolist())
         mean_nll_target = sum_loss_target / num_tokens_target
         perplexity = torch.exp(mean_nll_target)
 
@@ -516,7 +566,12 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
 
         return torch.stack(ranks)
 
-    def _evaluate_probes(self, model, return_logits=False) -> Dict[str, torch.Tensor]:
+    def _evaluate_probes(
+        self,
+        model,
+        return_logits: bool = False,
+        step: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
         Evaluates probes by calculating log probabilities and target ranks.
         """
@@ -547,12 +602,40 @@ class BaseKnowledgeProbeCallBack(TrainerCallback):
             target_lengths = self.target_lengths[i:end_index].to(device)
             # assert, one more time, that the lengths are correct
             if not torch.equal(context_lengths + target_lengths, attention_mask.sum(dim=1)):
-                self.logger.warning("Length mismatch between context and target lengths and fact lengths")
+                if self._should_log_probe_debug():
+                    expected_lengths = context_lengths + target_lengths
+                    actual_lengths = attention_mask.sum(dim=1)
+                    mismatch_indices = torch.where(expected_lengths != actual_lengths)[0]
+                    for batch_idx in mismatch_indices:
+                        probe_idx = i + batch_idx.item()
+                        self.logger.warning(
+                            "%s: context+target length does not match fact length "
+                            "(%s, batch_start=%s, batch_index=%s)",
+                            self.log_prefix,
+                            self._debug_step_label(step),
+                            i,
+                            batch_idx.item(),
+                        )
+                        self.logger.warning(
+                            "  - context_len=%s target_len=%s expected_fact_len=%s actual_fact_len=%s",
+                            context_lengths[batch_idx].item(),
+                            target_lengths[batch_idx].item(),
+                            expected_lengths[batch_idx].item(),
+                            actual_lengths[batch_idx].item(),
+                        )
+                        self._log_probe_debug_context(probe_idx)
             # Now that we've shifted the logits, we need to change the context lengths by -1 to account for the shift
             context_lengths = context_lengths - 1
             
             if self.track_logprobs:
-                log_prob, perplexity = self._calculate_log_probs(shift_logits, shift_labels, context_lengths, target_lengths)
+                log_prob, perplexity = self._calculate_log_probs(
+                    shift_logits,
+                    shift_labels,
+                    context_lengths,
+                    target_lengths,
+                    batch_start_idx=i,
+                    step=step,
+                )
                 all_metrics['log_prob'].append(log_prob)
                 all_metrics['perplexity'].append(perplexity)
 
