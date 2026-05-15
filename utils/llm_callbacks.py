@@ -847,24 +847,33 @@ class WandbSourcePanelsCallback(TrainerCallback):
     Logs source-scoped metrics for flat W&B workspace sections:
     - <source>/<domain>_log_prob
     - <source>/<domain>_target_rank
+    - <source>/<domain>_inference_log_prob
+    - <source>/<domain>_inference_target_rank
     - <source>/<domain>_mcqa_accuracy
     - <source>/log_prob_average
+    - <source>/inference_log_prob_average
     - average/log_prob_average
     """
     PAPER_METRICS = (
         ("log_prob", "log_prob"),
         ("target_rank", "target_rank"),
     )
+    INFERENCE_METRICS = (
+        ("log_prob", "inference_log_prob"),
+        ("target_rank", "inference_target_rank"),
+    )
 
     def __init__(
         self,
         knowledge_callbacks: List[BaseKnowledgeProbeCallBack],
+        inference_callbacks: Optional[List[BaseKnowledgeProbeCallBack]] = None,
         mcqa_callbacks: Optional[List["MCQAProbeCallback"]] = None,
         domain_sources: Optional[Dict[str, str]] = None,
         panel_sources: Optional[List[str]] = None,
         report_to_wandb: bool = True,
     ):
         self.knowledge_callbacks = knowledge_callbacks
+        self.inference_callbacks = inference_callbacks or []
         self.mcqa_callbacks = mcqa_callbacks or []
         self.domain_sources = domain_sources or {}
         self.panel_sources = panel_sources or ["legal", "arxiv", "medical"]
@@ -885,12 +894,19 @@ class WandbSourcePanelsCallback(TrainerCallback):
             return None
         return float(sum(finite) / len(finite))
 
+    @staticmethod
+    def _base_domain_for_source_lookup(domain: str) -> str:
+        for prefix in ("train_", "test_"):
+            if domain.startswith(prefix):
+                return domain[len(prefix):]
+        return domain
+
     def _source_for_domain(self, domain: str) -> str:
-        source = self.domain_sources.get(domain, "arxiv")
+        source = self.domain_sources.get(self._base_domain_for_source_lookup(domain), "arxiv")
         return source if source in self.panel_sources else "arxiv"
 
     def _domain_from_prefix(self, log_prefix: str) -> Optional[str]:
-        for suffix in ("_knowledge_probe", "_mcqa_probe"):
+        for suffix in ("_knowledge_probe", "_inference_probe", "_mcqa_probe"):
             if log_prefix.endswith(suffix):
                 return log_prefix[: -len(suffix)]
         return None
@@ -920,6 +936,23 @@ class WandbSourcePanelsCallback(TrainerCallback):
             if domain_metrics:
                 per_domain[domain] = domain_metrics
 
+        # Cloze-style inference/compositional probes.
+        for callback in self.inference_callbacks:
+            domain = self._domain_from_prefix(getattr(callback, "log_prefix", ""))
+            if not domain:
+                continue
+            domain_metrics = {}
+            for history_name, panel_name in self.INFERENCE_METRICS:
+                metric_entries = callback.history.get(history_name, [])
+                entry = self._entry_for_step(metric_entries, step)
+                if not entry:
+                    continue
+                avg = self._safe_average(entry.get("values", []))
+                if self._valid_number(avg):
+                    domain_metrics[panel_name] = float(avg)
+            if domain_metrics:
+                per_domain.setdefault(domain, {}).update(domain_metrics)
+
         # MCQA constrained-decoding accuracy
         for callback in self.mcqa_callbacks:
             domain = self._domain_from_prefix(getattr(callback, "log_prefix", ""))
@@ -943,6 +976,8 @@ class WandbSourcePanelsCallback(TrainerCallback):
             src: {
                 "log_prob": [],
                 "target_rank": [],
+                "inference_log_prob": [],
+                "inference_target_rank": [],
                 "mcqa_accuracy": [],
             }
             for src in self.panel_sources
@@ -950,6 +985,8 @@ class WandbSourcePanelsCallback(TrainerCallback):
         metric_values_global: Dict[str, List[float]] = {
             "log_prob": [],
             "target_rank": [],
+            "inference_log_prob": [],
+            "inference_target_rank": [],
             "mcqa_accuracy": [],
         }
 

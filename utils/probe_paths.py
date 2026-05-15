@@ -64,11 +64,16 @@ def get_all_domains_from_probe_kind(probe_kind: str = "facts") -> List[str]:
     return sorted(domains)
 
 
-def resolve_knowledge_probe_path(domain: str, version: str, domain_source: Optional[str] = None) -> Path:
+def resolve_knowledge_probe_path(
+    domain: str,
+    version: str,
+    domain_source: Optional[str] = None,
+    filename_suffix: str = "",
+) -> Path:
     base_dir = resolve_probe_dir("facts", domain, domain_source)
     if _version_number(version) >= 8:
-        return base_dir / f"probes_{version}.csv"
-    return base_dir / f"{domain}_knowledge_probes_{version}.csv"
+        return base_dir / f"probes_{version}{filename_suffix}.csv"
+    return base_dir / f"{domain}_knowledge_probes_{version}{filename_suffix}.csv"
 
 
 def resolve_inference_probe_candidates(

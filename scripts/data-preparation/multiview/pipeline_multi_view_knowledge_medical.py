@@ -1,6 +1,7 @@
 import os
 import json
 import sys
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 sys.path.append('../../')
@@ -15,6 +16,23 @@ def extract_case_title(case_content, case_name):
         if line.startswith("Title:"):
             return line.split(":", 1)[1].strip()
     return case_name.replace("_", " ")
+
+
+def reset_granular_dir(output_dir, subfolder):
+    granular_dir = os.path.join(output_dir, subfolder)
+    if os.path.isdir(granular_dir):
+        shutil.rmtree(granular_dir)
+    os.makedirs(granular_dir, exist_ok=True)
+    return granular_dir
+
+
+def write_granular_files(output_dir, subfolder, filename_template, texts):
+    granular_dir = reset_granular_dir(output_dir, subfolder)
+    for i, text in enumerate(texts, start=1):
+        path = os.path.join(granular_dir, filename_template.format(i=i))
+        with open(path, "w") as f:
+            f.write(text)
+    print(f"Saved {len(texts)} files to {granular_dir}/")
 
 
 def generate_teaching_qa(case_name):
@@ -33,14 +51,12 @@ def generate_teaching_qa(case_name):
     # --- 1. Generate teaching questions ---
     print("Generating clinical teaching questions...")
     prompt_questions = {
-        'system': """You are a senior attending physician preparing a teaching session based on this clinical case report. You are creating a set of questions for residents and medical students in the style of NEJM Clinical Pearls & Morning Reports.
+        'system': """You are a senior attending physician preparing a teaching session based on this clinical case report. You are creating 5-10 questions for residents and medical students in the style of NEJM Clinical Pearls & Morning Reports.
 
 Your questions should:
-- Cover the key clinical reasoning steps in this case (differential diagnosis, workup, diagnosis, management)
-- Vary in difficulty from straightforward recall to deeper clinical reasoning
-- Include questions about the underlying pathophysiology and mechanism of disease
-- Test understanding of diagnostic criteria and when to suspect this condition
-- Address management decisions and their rationale
+- Vary in complexity, from straightforward clinical recall to deeper diagnostic and management reasoning
+- Vary in topics, from clinical reasoning and pathophysiology to the facts, workup, diagnosis, and management decisions in the case
+- Be as mutually exclusive and non-redundant as possible in terms of the clinical issues they cover, while covering all the key medical issues of the case as much as possible
 - Be self-contained and unambiguous
 
 For each question, provide:
@@ -93,11 +109,11 @@ Example:
             'system': """You are a senior attending physician answering a clinical teaching question during a morning report or case conference. Provide a clear, educational answer in the style of NEJM Clinical Pearls & Morning Reports.
 
 Your answer should:
-- Be concise and to the point, as in a real teaching session
-- Provide the clinical reasoning, not just the fact
-- Connect to broader clinical principles when relevant
-- Be written in prose, not bullet points
-- Stay grounded in the case report — do not introduce information inconsistent with the case
+- Directly address the clinical question
+- Explain the relevant clinical reasoning, pathophysiology, diagnostic standard, or management principle
+- Reference the case report to support your explanation; stay grounded in the case report; do not introduce details inconsistent with the case
+- Be written in prose, concise, and to the point
+- Be accessible to medical students and residents while remaining clinically precise
 
 Format your response as a direct, authoritative clinical teaching answer.""",
             'user': f"""### Clinical Teaching Question
@@ -111,7 +127,7 @@ Question: {question['question']}
         answer_text = utils.query_llm(
             prompt_answer,
             model='gpt-5-mini',
-            reasoning_effort="low",
+            reasoning_effort="medium",
             system_prompt_included=True,
             max_tokens=2000
         )
@@ -140,6 +156,13 @@ Question: {question['question']}
 
     print(f"Saved teaching Q&A to {output_file}")
 
+    title_line = f"Title: Clinical Q&A about the case report: {case_title}"
+    granular_qas = [
+        f"{title_line}\n\n### [{qa['category']}] {qa['question']}\n\n{qa['answer']}"
+        for qa in qa_pairs
+    ]
+    write_granular_files(OUTPUT_DIR, "stackexchange", "stack_{i:02d}.txt", granular_qas)
+
 
 def generate_case_textbook(case_name):
     """Generate a case-based medical textbook chapter (Case Files / Harrison's style) for a clinical case report."""
@@ -158,20 +181,28 @@ def generate_case_textbook(case_name):
     print("Generating textbook section outline...")
     prompt_outline = {
         'system': """### Instructions
-You will be given a clinical case report. Your task is to create an outline of sections for a single textbook chapter in the style of Lange Case Files or Harrison's Principles of Internal Medicine. The chapter uses this case to teach the underlying medicine.
+You will be given a clinical case report and your task is to create a detailed outline for a textbook that comprehensively explains the given case report. But, it should go beyond merely summarizing and explaining, and be a proper pedagogical textbook that aims to fully educate the reader on what the case is about. The textbook should be aimed at medical students or residents who have a basic understanding of medicine.
 
-This is one chapter with 5-6 sections — NOT multiple chapters. Think of it like the sections within a single Case Files case (e.g., Clinical Approach, Pathophysiology, Differential Diagnosis, Diagnostic Workup, Management, Clinical Pearls). Keep it to 5-6 substantial sections, not 10+.
+The textbook should:
+- Contain exactly 4 to 6 sections
+- Break down the case report into coherent sections that follow the case's clinical logic
+- Plan sections to be mutually exclusive and non-redundant while preserving high coverage of the presentation, differential diagnosis, workup, diagnostic reasoning, management decisions, outcome, and clinical significance
+- Each section should have a distinct focus and role
+- Cover the pathophysiology and background medicine needed to understand the case, but avoid broad textbook-review detours that are not necessary for this case
+- Explain how clinicians moved from presentation to diagnosis and treatment
+- Ensure a logical flow from case presentation to diagnostic reasoning, treatment decisions, outcome, and clinical lessons
+- Be comprehensive but concise and to the point; do not create unnecessary sections
 
 For each section, provide:
 - A title
 - A description of what the section covers
-- A list of key points to address
+- A list of subtopics to cover
 
 ### Output Format
 Provide the output as a JSON object with a single key "sections", which is a list of section objects. Each section object must have:
 - "section_title": A string for the section title
 - "description": A string describing the section's content
-- "key_points": A list of strings, each a key point to cover""",
+- "subtopics": A list of strings, each a subtopic to cover""",
         'user': f"### Clinical Case Report\n{case_content}"
     }
 
@@ -205,21 +236,23 @@ Provide the output as a JSON object with a single key "sections", which is a lis
 
         section_outline_text = f"### Section Title\n\n{section_info['section_title']}\n"
         section_outline_text += f"## Description\n\n{section_info['description']}\n"
-        section_outline_text += "## Key Points\n"
-        for point in section_info['key_points']:
+        section_outline_text += "## Subtopics\n"
+        for point in section_info['subtopics']:
             section_outline_text += f"- {point}\n"
 
         prompt_section = {
             'system': """### Instructions
-You will be given a section title, description, and key points for a section within a case-based medical textbook chapter. Write this section as it would appear in a Lange Case Files or Harrison's-style textbook.
+You will be given a section title, description, and subtopics for a textbook-style explanation of a clinical case report. Write this section for a medical student or resident who is learning how to understand the case report.
 
 The section should:
-- Be written in authoritative but accessible medical prose, aimed at medical students and residents
-- Teach the underlying medicine through the case — the case is the vehicle, not the destination
-- Explain clinical concepts with enough depth that a student could apply them to new patients
-- Write in full prose paragraphs — this is a textbook, not an outline or reference card
-- Be comprehensive, dedicating multiple paragraphs where the topic warrants it
-- Stay grounded in the case report for case-specific claims, but explain broader medical context
+- Explain the assigned part of the case report clearly and pedagogically
+- Teach the clinical concepts, pathophysiology, diagnostic standards, and management principles needed to understand this part of the case
+- Stay centered on the case report: presentation, labs, imaging or pathology, diagnostic reasoning, treatment decisions, outcome, and clinical lessons
+- Explain broader medical context only when it is necessary to understand the case
+- Avoid turning the section into a general review article on the disease
+- Write in full prose paragraphs (this is a textbook, not an outline or reference card)
+- Be concise and to the point
+- Stay grounded in the case report; do not introduce case-specific claims or management decisions not supported by the report or necessary context
 
 Start with the section title as a '##' header.""",
             'user': f"""### Clinical Case Report
@@ -252,6 +285,13 @@ Start with the section title as a '##' header.""",
 
     print(f"Saved textbook chapter to {output_file}")
 
+    title_line = f"Title: Textbook chapter about the case report: {case_title}"
+    granular_sections = [
+        f"{title_line}\n\nChapter {i}: {section.strip()}"
+        for i, section in enumerate(section_contents, start=1)
+    ]
+    write_granular_files(OUTPUT_DIR, "textbooks", "chapter_{i}.txt", granular_sections)
+
 
 def generate_clinical_blog(case_name):
     """Generate FOAM-style clinical blog posts for a medical case report."""
@@ -270,12 +310,11 @@ def generate_clinical_blog(case_name):
     print("Generating blog post ideas...")
     prompt_blog_ideas = {
         'system': """### Instructions
-You are a physician who writes for a clinical education blog (like EMCrit, Life in the Fast Lane, or Rebel EM). Based on the provided clinical case report, generate a list of a few blog posts that would be interesting to fellow clinicians. Each should focus on a different clinical teaching point from the case.
+You are a physician who writes for a clinical education blog (like EMCrit, Life in the Fast Lane, or Rebel EM). Based on the provided clinical case report, generate 4 to 6 blog posts that would be interesting to fellow clinicians. Each should focus on a different clinical teaching point from the case.
 
 Blog ideas should:
-- Highlight what makes this case surprising, unusual, or instructive
-- Focus on clinical pearls, diagnostic pitfalls, or management controversies
-- Be the kind of post an emergency physician or internist would share with colleagues
+- Analyze the clinical significance of the case, or discuss diagnostic or management tensions, or consider how it fits into broader clinical practice trends, or any other aspect of the case that is interesting and relevant to clinicians and educators
+- Be as mutually exclusive and non-redundant as possible in terms of the medical issues they cover, while covering all important aspects as much as possible
 
 For each blog idea, provide:
 - A `title` (catchy but clinical)
@@ -325,8 +364,7 @@ As you write the blog post:
 - Write in a conversational but clinically rigorous tone
 - Lead with what makes this case interesting or surprising
 - Include clinical pearls and take-home points
-- Write in prose paragraphs, use bullet points only for key take-home messages
-- Keep it concise — FOAM posts are typically focused and punchy
+- Write in prose paragraphs, use bullet points only for key take-home messages, but stay concise and to the point
 - Stay grounded in the case report — do not fabricate clinical details
 
 Start with the blog title as a markdown header. Use '##' for sections.""",
@@ -341,7 +379,7 @@ Description: {description}"""
         blog_content = utils.query_llm(
             prompt_blog_content,
             model='gpt-5-mini',
-            reasoning_effort="low",
+            reasoning_effort="medium",
             system_prompt_included=True,
             max_tokens=4000
         )
@@ -362,21 +400,49 @@ Description: {description}"""
 
     print(f"Saved blog posts to {output_file}")
 
+    title_line = f"Title: Blog about the case report: {case_title}"
+    granular_blogs = [
+        f"{title_line}\n\n{blog.strip()}"
+        for blog in blog_contents
+    ]
+    write_granular_files(OUTPUT_DIR, "blogs", "blog_{i:02d}.txt", granular_blogs)
 
-def process_cases(case_names=None):
+
+PART_GENERATORS = {
+    "textbook": generate_case_textbook,
+    "qa": generate_teaching_qa,
+    "blog": generate_clinical_blog,
+}
+DEFAULT_PART_ORDER = ["qa", "textbook", "blog"]
+
+
+def resolve_parts(parts):
+    if not parts or "all" in parts:
+        return DEFAULT_PART_ORDER
+    return parts
+
+
+def process_cases(case_names=None, parts=None):
     if case_names is None:
         input_dir = "../../data/medical/cleaned/"
         case_names = [os.path.splitext(f)[0] for f in os.listdir(input_dir) if f.endswith('.txt')]
 
+    selected_parts = resolve_parts(parts)
     for case_name in case_names:
-        generate_teaching_qa(case_name)
-        generate_case_textbook(case_name)
-        generate_clinical_blog(case_name)
+        for part in selected_parts:
+            PART_GENERATORS[part](case_name)
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--cases', nargs='+', help='Case names to process. If not provided, all cases are processed.')
+    parser.add_argument(
+        '--parts',
+        nargs='+',
+        choices=['textbook', 'qa', 'blog', 'all'],
+        default=['all'],
+        help='Pipeline parts to run. Default: all.'
+    )
     args = parser.parse_args()
-    process_cases(args.cases)
+    process_cases(args.cases, args.parts)

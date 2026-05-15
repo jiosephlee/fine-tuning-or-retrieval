@@ -12,10 +12,9 @@ This experiment implements a new granular analysis framework for studying the im
 - Files are loaded from subfolders (e.g., `DPO/blogs/`, `DPO/stackexchange/`)
 - Explanations are appended to paraphrase content, then filled with pretraining data
 
-### 2. New Command-Line Arguments
+### 2. Command-Line Arguments
 
-- `--granular_explanation_analysis`: Enable subfolder-based loading
-- `--explanation_tail_docs N`: Load first N files and distribute across last N document types
+- `--granular_explanations_cycle N`: Load first N files and cycle them across document types
 - `--with_specific_explanation {blogs,stackexchange}`: Type of explanation
 
 ### 3. Experiment Structure
@@ -62,7 +61,7 @@ cd scripts/FT
 
 ### Manual Invocation Example
 ```bash
-python finetuning_knowledge_v8.py \
+python finetuning_knowledge_v9.py \
     --model_id allenai/OLMo-2-1124-7B \
     --num_train_epochs 200 \
     --learning_rate 1e-5 \
@@ -72,11 +71,10 @@ python finetuning_knowledge_v8.py \
     --num_paraphrased_texts 9 \
     --override_domains DPO \
     --with_specific_explanation stackexchange \
-    --explanation_tail_docs 8 \
+    --granular_explanations_cycle 8 \
     --full_finetuning \
     --constant_lr \
     --fill_batches_with_pretraining \
-    --granular_explanation_analysis \
     --custom_suffix "stack_8posts"
 ```
 
@@ -115,7 +113,7 @@ Example: `para9_expl_stackexchange_n8_tail8`
 ## Implementation Files
 
 - **data_preparation.py**: Core loading logic with granular analysis support
-- **finetuning_knowledge_v8.py**: Training script with new arguments
+- **finetuning_knowledge_v9.py**: Training script with new arguments
 - **E63_7B_granular_explanations.sh**: Full experiment suite
 - **E63_7B_granular_explanations_test.sh**: Quick test version
 
@@ -125,4 +123,3 @@ Example: `para9_expl_stackexchange_n8_tail8`
 - Effective batch size is 64 for all experiments
 - Each explanation chunk is treated as independent content appended to its assigned document-type batch
 - The `--fill_batches_with_pretraining` flag ensures all batches reach the target size
-

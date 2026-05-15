@@ -2,11 +2,11 @@
 
 ## Summary of Changes
 
-### 1. ✅ "Full" Mode for `explanations_cycle`
+### 1. ✅ "Full" Mode for `granular_explanations_cycle`
 Load **ALL** available files from subfolders dynamically (varies per domain).
 
 ```bash
---explanations_cycle full
+--granular_explanations_cycle full
 ```
 
 ### 2. ✅ Granular Analysis with Textbooks
@@ -16,7 +16,7 @@ Correctly loads from any subfolder structure, including:
 - `BOFT/blogs/blog_05.txt`
 
 ### 3. ✅ Removed `explanation_tail_docs`
-The old tail strategy is **completely removed**. Use `explanations_cycle` instead.
+The old tail strategy is **completely removed**. Use `granular_explanations_cycle` instead.
 
 ### 4. ✅ Multiple Explanation Types
 Stack multiple cycles from different subfolders:
@@ -27,32 +27,27 @@ Stack multiple cycles from different subfolders:
 
 ## Command-Line Arguments
 
-### `--explanations_cycle {N|"full"}`
+### `--granular_explanations_cycle {N|"full"}`
 - **Integer N**: Load first N files and cycle through them
 - **"full"**: Load ALL available files from the subfolder(s)
-- Example: `--explanations_cycle 3` or `--explanations_cycle full`
+- Example: `--granular_explanations_cycle 3` or `--granular_explanations_cycle full`
 
 ### `--with_specific_explanation TYPE [TYPE ...]`
 - Can specify **one or multiple** explanation types
 - Examples:
   - Single: `--with_specific_explanation stackexchange`
   - Multiple: `--with_specific_explanation blogs stackexchange`
-- **Requirement**: When using multiple types, **must** also set `--explanations_cycle`
-
-### `--granular_explanation_analysis`
-- Enable subfolder-based loading
-- Without this flag, uses legacy single-file mode (e.g., `blogs.txt`)
+- **Requirement**: When using multiple types, **must** also set `--granular_explanations_cycle`
 
 ## Usage Examples
 
 ### Example 1: Fixed Number of Files
 ```bash
-python finetuning_knowledge_v8.py \
+python finetuning_knowledge_v9.py \
     --num_paraphrased_texts 19 \
     --override_domains DPO \
     --with_specific_explanation stackexchange \
-    --explanations_cycle 3 \
-    --granular_explanation_analysis \
+    --granular_explanations_cycle 3 \
     --fill_batches_with_pretraining
 ```
 
@@ -60,12 +55,11 @@ python finetuning_knowledge_v8.py \
 
 ### Example 2: All Available Files (Dynamic)
 ```bash
-python finetuning_knowledge_v8.py \
+python finetuning_knowledge_v9.py \
     --num_paraphrased_texts 19 \
     --override_domains DPO 1_58 BOFT \
     --with_specific_explanation textbooks \
-    --explanations_cycle full \
-    --granular_explanation_analysis \
+    --granular_explanations_cycle full \
     --fill_batches_with_pretraining
 ```
 
@@ -77,12 +71,11 @@ python finetuning_knowledge_v8.py \
 
 ### Example 3: Multiple Explanation Types (Stacked Cycles)
 ```bash
-python finetuning_knowledge_v8.py \
+python finetuning_knowledge_v9.py \
     --num_paraphrased_texts 19 \
     --override_domains DPO \
     --with_specific_explanation blogs stackexchange \
-    --explanations_cycle 6 \
-    --granular_explanation_analysis \
+    --granular_explanations_cycle 6 \
     --fill_batches_with_pretraining
 ```
 
@@ -93,12 +86,11 @@ python finetuning_knowledge_v8.py \
 
 ### Example 4: All Files from Multiple Types
 ```bash
-python finetuning_knowledge_v8.py \
+python finetuning_knowledge_v9.py \
     --num_paraphrased_texts 19 \
     --override_domains DPO 1_58 \
     --with_specific_explanation blogs stackexchange textbooks \
-    --explanations_cycle full \
-    --granular_explanation_analysis \
+    --granular_explanations_cycle full \
     --fill_batches_with_pretraining
 ```
 
@@ -174,17 +166,17 @@ The experiment name automatically includes:
    --with_specific_explanation blogs stackexchange
    
    # ✅ CORRECT
-   --with_specific_explanation blogs stackexchange --explanations_cycle 6
+   --with_specific_explanation blogs stackexchange --granular_explanations_cycle 6
    ```
 
-2. **explanations_cycle must be valid**:
+2. **granular_explanations_cycle must be valid**:
    ```bash
    # ✅ Valid values
-   --explanations_cycle 3
-   --explanations_cycle full
+   --granular_explanations_cycle 3
+   --granular_explanations_cycle full
    
    # ❌ Invalid
-   --explanations_cycle auto  # Error: must be integer or "full"
+   --granular_explanations_cycle auto  # Error: must be integer or "full"
    ```
 
 ## Technical Implementation
@@ -193,8 +185,8 @@ The experiment name automatically includes:
 
 1. **Determine subfolder(s)**: Based on `--with_specific_explanation`
 2. **Load files**:
-   - If `explanations_cycle == "full"`: Load ALL .txt files from subfolder(s)
-   - If `explanations_cycle == N`: Load first N .txt files across all subfolders
+   - If `granular_explanations_cycle == "full"`: Load ALL .txt files from subfolder(s)
+   - If `granular_explanations_cycle == N`: Load first N .txt files across all subfolders
 3. **Sort**: Files are sorted alphabetically for deterministic order
 4. **Chunk**: Each file is chunked independently
 5. **Distribute**: Cycle through chunks using modulo operation
@@ -223,10 +215,10 @@ When using multiple types (e.g., `blogs stackexchange`):
 --explanation_tail_docs 8
 ```
 
-### New: `explanations_cycle`
+### New: `granular_explanations_cycle`
 ```bash
 # Use this instead
---explanations_cycle 8
+--granular_explanations_cycle 8
 ```
 
 **Key difference**: Old approach left gaps (only last N batches). New approach cycles through ALL batches with no gaps.
@@ -243,4 +235,3 @@ When using multiple types (e.g., `blogs stackexchange`):
 - **`E63_7B_granular_cycle_slurm.sh`**: SLURM script for cluster
 - **`E63_examples.sh`**: Various usage examples
 - **`E63_UPDATED_README.md`**: This file
-

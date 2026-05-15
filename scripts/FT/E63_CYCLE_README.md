@@ -17,7 +17,7 @@ The new **explanations cycle** strategy distributes explanation documents across
   Batch 9: Expl 3
   ```
 
-### New: `explanations_cycle` (RECOMMENDED)
+### New: `granular_explanations_cycle` (RECOMMENDED)
 - Explanations on **EVERY** document type
 - **No gaps** - continuous cycling
 - Example with 3 explanations, 20 doc types (source + 19 paraphrases):
@@ -41,7 +41,7 @@ The new **explanations cycle** strategy distributes explanation documents across
 ## New Command-Line Argument
 
 ```bash
---explanations_cycle N
+--granular_explanations_cycle N
 ```
 
 Where `N` is the number of explanation files to load and cycle through.
@@ -50,7 +50,7 @@ Where `N` is the number of explanation files to load and cycle through.
 
 ### Manual Invocation
 ```bash
-python finetuning_knowledge_v8.py \
+python finetuning_knowledge_v9.py \
     --model_id allenai/OLMo-2-1124-7B \
     --num_train_epochs 100 \
     --learning_rate 2e-5 \
@@ -60,10 +60,9 @@ python finetuning_knowledge_v8.py \
     --num_paraphrased_texts 19 \
     --override_domains DPO \
     --with_specific_explanation stackexchange \
-    --explanations_cycle 3 \
+    --granular_explanations_cycle 3 \
     --full_finetuning \
     --fill_batches_with_pretraining \
-    --granular_explanation_analysis \
     --attn_implementation sdpa \
     --gradient_checkpointing \
     --compile_model
@@ -82,7 +81,7 @@ The SLURM script runs 4 experiments:
 
 ## Batch Structure Example
 
-With `num_paraphrased_texts=19` (20 total doc types) and `explanations_cycle=3`:
+With `num_paraphrased_texts=19` (20 total doc types) and `granular_explanations_cycle=3`:
 
 ```
 Exposure 1:
@@ -129,8 +128,6 @@ for doc_idx in range(num_doc_types):
 ```
 
 ### Compatibility
-- Works with `--granular_explanation_analysis` for subfolder loading
 - Works with `--fill_batches_with_pretraining` for batch filling
 - Compatible with all existing domain and paraphrase settings
 - The old `--explanation_tail_docs` is preserved for backwards compatibility but deprecated
-

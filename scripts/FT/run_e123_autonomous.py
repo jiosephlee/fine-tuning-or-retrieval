@@ -27,7 +27,7 @@ KNOWLEDGE_PROBES_VERSION = "v13"
 MCQA_PROBES_VERSION = "v14"
 DEFAULT_NPROC = 8
 DEFAULT_DEVICE_BATCH_SIZE = 16
-DEFAULT_EFFECTIVE_BATCH_SIZE = 128
+DEFAULT_EFFECTIVE_BATCH_SIZE = 256
 DEFAULT_CONTEXT_LENGTH = 4096
 DEFAULT_LEARNING_RATE = "1e-5"
 DEFAULT_ATTN_IMPLEMENTATION = "sdpa"
@@ -49,15 +49,58 @@ CONDITIONS = (
     Condition("E1", "E1_source_all_domains", ["--num_paraphrased_texts", "0"]),
     Condition("E2", "E2_paraphrase_all_domains", ["--num_paraphrased_texts", "9"]),
     Condition(
+        "E1D",
+        "E1_source_docmatch_expl_all_domains",
+        [
+            "--num_paraphrased_texts",
+            "0",
+            "--document_track_baseline",
+            "--document_match_specific_explanation",
+            "textbooks",
+            "blogs",
+            "stackexchange",
+            "--granular_explanations_cycle",
+            "full",
+            "--explanations_insertion_strategy",
+            "granular",
+            "--granular_explanations_num_tracks",
+            "1",
+        ],
+    ),
+    Condition(
+        "E2D",
+        "E2_paraphrase_docmatch_expl_all_domains",
+        [
+            "--num_paraphrased_texts",
+            "9",
+            "--document_track_baseline",
+            "--document_match_specific_explanation",
+            "textbooks",
+            "blogs",
+            "stackexchange",
+            "--granular_explanations_cycle",
+            "full",
+            "--explanations_insertion_strategy",
+            "granular",
+            "--granular_explanations_num_tracks",
+            "1",
+        ],
+    ),
+    Condition(
         "E3",
         "E3_granular_explanations_all_domains",
         [
             "--num_paraphrased_texts",
             "9",
-            "--with_explanations",
+            "--with_specific_explanation",
+            "textbooks",
+            "blogs",
+            "stackexchange",
+            "--granular_explanations_cycle",
+            "full",
             "--explanations_insertion_strategy",
             "granular",
-            "--explanations_num_tracks",
+            "--granular_explanations_num_tracks",
             "1",
         ],
     ),
@@ -341,7 +384,7 @@ def build_command(
         if args.fast_pilot:
             if "--enable_parameter_delta_tracking" in train_args:
                 train_args.remove("--enable_parameter_delta_tracking")
-            if condition.name in {"E2", "E3"}:
+            if condition.name in {"E2", "E2D", "E3"}:
                 replace_arg_value(train_args, "--num_paraphrased_texts", str(args.pilot_num_paraphrased))
 
     if retry_index >= 2:
@@ -607,7 +650,7 @@ def main() -> int:
     parser.add_argument("--device_batch_size", type=int, default=DEFAULT_DEVICE_BATCH_SIZE)
     parser.add_argument("--effective_batch_size", type=int, default=DEFAULT_EFFECTIVE_BATCH_SIZE)
     parser.add_argument("--context_length", type=int, default=DEFAULT_CONTEXT_LENGTH)
-    parser.add_argument("--condition", choices=["all", "E1", "E2", "E3"], default="all")
+    parser.add_argument("--condition", choices=["all", "E1", "E2", "E1D", "E2D", "E3"], default="all")
     parser.add_argument("--auto_retry", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fast_pilot", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pilot_num_paraphrased", type=int, default=1)

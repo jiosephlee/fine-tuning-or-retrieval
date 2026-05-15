@@ -45,9 +45,9 @@ strategy_args = {
     "explanation_every_round": False,
     "shuffle_chunks": False,
     "shuffle_seed": 42,
-    "explanations_cycle": "full",  # Use 3 files from each type
-    "explanations_num_tracks": 2,
-    "granular_explanation_analysis": True,
+    "granular_explanations_cycle": "full",  # Use all files from each type
+    "granular_explanations_num_tracks": 2,
+    "explanations_insertion_strategy": "granular",
 }
 
 log.info("Preparing training mix...")

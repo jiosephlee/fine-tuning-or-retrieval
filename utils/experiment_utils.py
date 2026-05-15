@@ -156,11 +156,13 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
     domain_sources = getattr(args, "domain_data_sources", {}) or {}
     enable_mcqa_probes = getattr(args, "mcqa_probes", False)
     default_knowledge_probes_version = getattr(args, "knowledge_probes_version", "v13")
+    knowledge_probe_filename_suffix = getattr(args, "knowledge_probe_filename_suffix", "")
     mcqa_probes_version = getattr(args, "mcqa_probes_version", default_knowledge_probes_version)
     probe_every_n_steps = max(1, int(getattr(args, "probe_every_n_steps", 1) or 1))
     mcqa_probe_every_n_steps = max(1, int(getattr(args, "mcqa_probe_every_n_steps", 1) or 1))
     enable_parameter_delta_tracking = getattr(args, "enable_parameter_delta_tracking", False)
     knowledge_probe_callbacks = []
+    inference_probe_callbacks = []
     mcqa_probe_callbacks = []
 
     if not domains:
@@ -183,6 +185,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                 domain,
                 knowledge_probes_version,
                 domain_source=domain_source,
+                filename_suffix=knowledge_probe_filename_suffix,
             )
         )
 
@@ -286,6 +289,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                         probe_every_n_steps,
                     )
                     callbacks.append(inference_probe_callback)
+                    inference_probe_callbacks.append(inference_probe_callback)
                     log.info(f"Loaded {len(inference_probe_df)} inference probes from {inference_probe_path}")
             else:
                 path1, path2 = [
@@ -315,6 +319,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                     probe_every_n_steps,
                 )
                 callbacks.append(inference_probe_callback)
+                inference_probe_callbacks.append(inference_probe_callback)
                 log.info(f"Loaded {len(inference_probe_df)} inference probes from {inference_probe_path}")
 
         # Corpus perplexity callback
@@ -434,6 +439,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
         callbacks.append(
             llm_callbacks.WandbSourcePanelsCallback(
                 knowledge_callbacks=knowledge_probe_callbacks,
+                inference_callbacks=inference_probe_callbacks,
                 mcqa_callbacks=mcqa_probe_callbacks,
                 domain_sources=domain_sources,
                 panel_sources=panel_sources,

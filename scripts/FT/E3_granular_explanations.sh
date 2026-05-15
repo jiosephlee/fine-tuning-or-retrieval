@@ -27,6 +27,8 @@ LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E3_granular_explanations_all_domains}"
+EXPLANATION_TYPES="${EXPLANATION_TYPES:-textbooks}"
+EXPLANATIONS_CYCLE="${EXPLANATIONS_CYCLE:-full}"
 EXPLANATIONS_NUM_TRACKS="${EXPLANATIONS_NUM_TRACKS:-1}"
 MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v14}"
 USE_PARCC="${USE_PARCC:-0}"
@@ -44,6 +46,7 @@ fi
 if [[ "$SPARSE_CALLBACKS" == "1" ]]; then
     EXTRA_ARGS+=(--no_callback_every_step)
 fi
+read -r -a EXPLANATION_TYPE_ARGS <<< "$EXPLANATION_TYPES"
 
 if [[ "${CONDA_DEFAULT_ENV:-}" == "$CONDA_ENV" ]]; then
     LAUNCH=(torchrun --standalone --nproc_per_node "$NPROC_PER_NODE")
@@ -60,9 +63,10 @@ fi
     --num_train_epochs "$NUM_EPOCHS" \
     --learning_rate "$LEARNING_RATE" \
     --num_paraphrased_texts "$NUM_PARAPHRASED" \
-    --with_explanations \
+    --with_specific_explanation "${EXPLANATION_TYPE_ARGS[@]}" \
+    --granular_explanations_cycle "$EXPLANATIONS_CYCLE" \
     --explanations_insertion_strategy granular \
-    --explanations_num_tracks "$EXPLANATIONS_NUM_TRACKS" \
+    --granular_explanations_num_tracks "$EXPLANATIONS_NUM_TRACKS" \
     --device_batch_size "$DEVICE_BATCH_SIZE" \
     --effective_batch_size_for_cpt "$EFFECTIVE_BATCH_SIZE" \
     --context_length_for_cpt "$CONTEXT_LENGTH" \

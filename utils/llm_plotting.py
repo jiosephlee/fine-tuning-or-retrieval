@@ -9,6 +9,56 @@ import re
 from utils import probe_paths
 
 
+def _read_csv_if_exists(path: str) -> pd.DataFrame:
+    return pd.read_csv(path) if os.path.exists(path) else pd.DataFrame()
+
+
+def _mean_by_step(df: pd.DataFrame, metric: str) -> pd.DataFrame:
+    if df.empty or metric not in df.columns:
+        return pd.DataFrame()
+    return df.groupby('step')[metric].mean().reset_index()
+
+
+def _load_probe_metric_csvs(probe_dir: str, file_suffix: str) -> pd.DataFrame:
+    """Load one or more metric CSVs from a probe result directory."""
+    if not os.path.isdir(probe_dir):
+        return pd.DataFrame()
+
+    metric_paths = sorted(
+        os.path.join(probe_dir, name)
+        for name in os.listdir(probe_dir)
+        if name.endswith(file_suffix)
+    )
+    if not metric_paths:
+        return pd.DataFrame()
+
+    dfs = []
+    for path in metric_paths:
+        df = pd.read_csv(path)
+        if not df.empty:
+            df = df.copy()
+            df['metric_file'] = os.path.basename(path)
+            dfs.append(df)
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+
+def _load_inference_probe_metadata(domain: str, inference_probes_version: str) -> pd.DataFrame:
+    domain_source = probe_paths.infer_domain_source(domain)
+    path1, path2 = [
+        str(path)
+        for path in probe_paths.resolve_inference_probe_candidates(
+            domain,
+            inference_probes_version,
+            domain_source=domain_source,
+        )
+    ]
+    if os.path.exists(path1):
+        return pd.read_csv(path1)
+    if os.path.exists(path2):
+        return pd.read_csv(path2)
+    return pd.DataFrame()
+
+
 def set_plot_style():
     """
     Sets a consistent academic-style plotting theme using matplotlib's classic style.
@@ -32,7 +82,14 @@ def plot_textbook_insertion_lines(fig, max_step, vline_interval):
         plt.axvline(x=i * vline_interval, color='grey', linestyle='--', alpha=0.5)
 
 
-def generate_revamped_plots(domain: str, knowledge_probes_version: str, inference_probes_version: str, experiment_dir: str, logger=None):
+def generate_revamped_plots(
+    domain: str,
+    knowledge_probes_version: str,
+    inference_probes_version: str,
+    experiment_dir: str,
+    logger=None,
+    knowledge_probe_filename_suffix: str = "",
+):
     """
     Generates a new, simplified set of plots for knowledge and inference probes.
     """
@@ -51,11 +108,12 @@ def generate_revamped_plots(domain: str, knowledge_probes_version: str, inferenc
     log_info("Loading dataframes for revamped plotting...")
     
     # Probe metrics
-    knowledge_probe_metrics_path = os.path.join(experiment_dir, f"{domain}_knowledge_probe", f"{domain}_knowledge_probe_metrics.csv")
-    inference_probe_metrics_path = os.path.join(experiment_dir, f"{domain}_inference_probe", f"{domain}_inference_probe_metrics.csv")
+    knowledge_probe_dir = os.path.join(experiment_dir, f"{domain}_knowledge_probe")
+    inference_probe_dir = os.path.join(experiment_dir, f"{domain}_inference_probe")
+    knowledge_probe_metrics_path = os.path.join(knowledge_probe_dir, f"{domain}_knowledge_probe_metrics.csv")
     
-    knowledge_probe_df = pd.read_csv(knowledge_probe_metrics_path) if os.path.exists(knowledge_probe_metrics_path) else pd.DataFrame()
-    inference_probe_df = pd.read_csv(inference_probe_metrics_path) if os.path.exists(inference_probe_metrics_path) else pd.DataFrame()
+    knowledge_probe_df = _read_csv_if_exists(knowledge_probe_metrics_path)
+    inference_probe_df = _load_probe_metric_csvs(inference_probe_dir, "_inference_probe_metrics.csv")
 
     if knowledge_probe_df.empty and inference_probe_df.empty:
         log_info("No probe metrics found. Skipping plotting.")
@@ -63,23 +121,22 @@ def generate_revamped_plots(domain: str, knowledge_probes_version: str, inferenc
 
     # Training loss
     training_loss_path = os.path.join(experiment_dir, "training_loss_perplexity_metrics.csv")
-    loss_df = pd.read_csv(training_loss_path) if os.path.exists(training_loss_path) else pd.DataFrame()
+    loss_df = _read_csv_if_exists(training_loss_path)
 
     # Knowledge Probes CSV for facts and sections
-    knowledge_probes_path = str(probe_paths.resolve_knowledge_probe_path(domain, knowledge_probes_version))
-    knowledge_probes_csv = pd.read_csv(knowledge_probes_path) if os.path.exists(knowledge_probes_path) else pd.DataFrame()
+    domain_source = probe_paths.infer_domain_source(domain)
+    knowledge_probes_path = str(
+        probe_paths.resolve_knowledge_probe_path(
+            domain,
+            knowledge_probes_version,
+            domain_source=domain_source,
+            filename_suffix=knowledge_probe_filename_suffix,
+        )
+    )
+    knowledge_probes_csv = _read_csv_if_exists(knowledge_probes_path)
     
     # Inference Probes CSV for facts
-    path1, path2 = [
-        str(path) for path in probe_paths.resolve_inference_probe_candidates(domain, inference_probes_version)
-    ]
-    if os.path.exists(path1):
-        inference_probes_path = path1
-    elif os.path.exists(path2):
-        inference_probes_path = path2
-    else:
-        inference_probes_path = None
-    inference_probes_csv = pd.read_csv(inference_probes_path) if inference_probes_path and os.path.exists(inference_probes_path) else pd.DataFrame()
+    inference_probes_csv = _load_inference_probe_metadata(domain, inference_probes_version)
 
     # Map sections to knowledge_probe_df
     if not knowledge_probe_df.empty and not knowledge_probes_csv.empty and 'section' in knowledge_probes_csv.columns:
@@ -90,10 +147,10 @@ def generate_revamped_plots(domain: str, knowledge_probes_version: str, inferenc
     log_info("Generating Plot 1: Combined Probes vs. Training Loss...")
     
     # Prepare data
-    mean_knowledge_log_probs = knowledge_probe_df.groupby('step')['log_prob'].mean().reset_index() if not knowledge_probe_df.empty else pd.DataFrame()
-    mean_inference_log_probs = inference_probe_df.groupby('step')['log_prob'].mean().reset_index() if not inference_probe_df.empty else pd.DataFrame()
-    mean_knowledge_rank = knowledge_probe_df.groupby('step')['target_rank'].mean().reset_index() if not knowledge_probe_df.empty and 'target_rank' in knowledge_probe_df.columns else pd.DataFrame()
-    mean_inference_rank = inference_probe_df.groupby('step')['target_rank'].mean().reset_index() if not inference_probe_df.empty and 'target_rank' in inference_probe_df.columns else pd.DataFrame()
+    mean_knowledge_log_probs = _mean_by_step(knowledge_probe_df, 'log_prob')
+    mean_inference_log_probs = _mean_by_step(inference_probe_df, 'log_prob')
+    mean_knowledge_rank = _mean_by_step(knowledge_probe_df, 'target_rank')
+    mean_inference_rank = _mean_by_step(inference_probe_df, 'target_rank')
 
     # --- Plot 1a ---
     log_info("Generating Plot 1a: Mean Log Probs vs. Training Loss...")
@@ -230,23 +287,36 @@ def generate_revamped_plots(domain: str, knowledge_probes_version: str, inferenc
             plt.close()
 
     # --- PLOT 4: Disaggregated Inference Probes ---
-    if not inference_probe_df.empty:
+    if not inference_probe_df.empty and 'log_prob' in inference_probe_df.columns:
         log_info("Generating Plot 4: Disaggregated Inference Probes...")
         
-        unique_probes = inference_probe_df['probe_index'].unique()
+        split_metric_files = (
+            'metric_file' in inference_probe_df.columns
+            and inference_probe_df['metric_file'].nunique() > 1
+        )
+        facet_col = 'plot_probe_id' if split_metric_files else 'probe_index'
+        plot_df = inference_probe_df.copy()
+        if split_metric_files:
+            plot_df[facet_col] = (
+                plot_df['metric_file'].str.replace('_metrics.csv', '', regex=False)
+                + '#'
+                + plot_df['probe_index'].astype(str)
+            )
+
+        unique_probes = plot_df[facet_col].unique()
         if len(unique_probes) > 0:
             num_probes_to_plot = min(10, len(unique_probes))
             random_probes = np.random.choice(unique_probes, num_probes_to_plot, replace=False)
             
-            sample_df = inference_probe_df[inference_probe_df['probe_index'].isin(random_probes)].copy()
+            sample_df = plot_df[plot_df[facet_col].isin(random_probes)].copy()
 
             # Normalize log_prob for each probe
             scaler = MinMaxScaler()
-            sample_df['normalized_log_prob'] = sample_df.groupby('probe_index')['log_prob'].transform(
+            sample_df['normalized_log_prob'] = sample_df.groupby(facet_col)['log_prob'].transform(
                 lambda x: scaler.fit_transform(x.values.reshape(-1, 1)).flatten() if len(x.values) > 1 else x
             )
 
-            g = sns.FacetGrid(sample_df, col="probe_index", col_wrap=2, height=4, aspect=1.5, sharex=True, sharey=False)
+            g = sns.FacetGrid(sample_df, col=facet_col, col_wrap=2, height=4, aspect=1.5, sharex=True, sharey=False)
 
             def plot_dual_axis_inference(data, **kwargs):
                 ax1 = plt.gca()
@@ -267,7 +337,7 @@ def generate_revamped_plots(domain: str, knowledge_probes_version: str, inferenc
             g.map_dataframe(plot_dual_axis_inference)
 
             # Set titles with facts
-            if not inference_probes_csv.empty and 'fact' in inference_probes_csv.columns:
+            if not split_metric_files and not inference_probes_csv.empty and 'fact' in inference_probes_csv.columns:
                 for ax, probe_idx in zip(g.axes.flat, g.col_names):
                     probe_idx = int(probe_idx)
                     if probe_idx in inference_probes_csv.index:
@@ -322,12 +392,14 @@ def generate_averaged_plots(experiment_dir: str, logger=None):
 
     for domain in domains:
         knowledge_path = os.path.join(experiment_dir, f"{domain}_knowledge_probe", f"{domain}_knowledge_probe_metrics.csv")
-        if os.path.exists(knowledge_path):
-            all_knowledge_dfs.append(pd.read_csv(knowledge_path))
+        knowledge_df = _read_csv_if_exists(knowledge_path)
+        if not knowledge_df.empty:
+            all_knowledge_dfs.append(knowledge_df)
         
-        inference_path = os.path.join(experiment_dir, f"{domain}_inference_probe", f"{domain}_inference_probe_metrics.csv")
-        if os.path.exists(inference_path):
-            all_inference_dfs.append(pd.read_csv(inference_path))
+        inference_dir = os.path.join(experiment_dir, f"{domain}_inference_probe")
+        inference_df = _load_probe_metric_csvs(inference_dir, "_inference_probe_metrics.csv")
+        if not inference_df.empty:
+            all_inference_dfs.append(inference_df)
 
     knowledge_probe_df = pd.concat(all_knowledge_dfs) if all_knowledge_dfs else pd.DataFrame()
     inference_probe_df = pd.concat(all_inference_dfs) if all_inference_dfs else pd.DataFrame()
@@ -338,16 +410,16 @@ def generate_averaged_plots(experiment_dir: str, logger=None):
 
     # Training loss
     training_loss_path = os.path.join(experiment_dir, "training_loss_perplexity_metrics.csv")
-    loss_df = pd.read_csv(training_loss_path) if os.path.exists(training_loss_path) else pd.DataFrame()
+    loss_df = _read_csv_if_exists(training_loss_path)
 
     # --- Plot 1: Combined Probes vs. Training Loss (Averaged) ---
     log_info("Generating Averaged Plot 1: Combined Probes vs. Training Loss...")
     
     # Prepare data
-    mean_knowledge_log_probs = knowledge_probe_df.groupby('step')['log_prob'].mean().reset_index() if not knowledge_probe_df.empty else pd.DataFrame()
-    mean_inference_log_probs = inference_probe_df.groupby('step')['log_prob'].mean().reset_index() if not inference_probe_df.empty else pd.DataFrame()
-    mean_knowledge_rank = knowledge_probe_df.groupby('step')['target_rank'].mean().reset_index() if not knowledge_probe_df.empty and 'target_rank' in knowledge_probe_df.columns else pd.DataFrame()
-    mean_inference_rank = inference_probe_df.groupby('step')['target_rank'].mean().reset_index() if not inference_probe_df.empty and 'target_rank' in inference_probe_df.columns else pd.DataFrame()
+    mean_knowledge_log_probs = _mean_by_step(knowledge_probe_df, 'log_prob')
+    mean_inference_log_probs = _mean_by_step(inference_probe_df, 'log_prob')
+    mean_knowledge_rank = _mean_by_step(knowledge_probe_df, 'target_rank')
+    mean_inference_rank = _mean_by_step(inference_probe_df, 'target_rank')
 
     # --- Plot 1a (Averaged) ---
     log_info("Generating Averaged Plot 1a: Mean Log Probs vs. Training Loss...")

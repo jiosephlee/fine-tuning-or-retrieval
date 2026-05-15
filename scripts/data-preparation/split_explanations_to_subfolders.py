@@ -6,7 +6,53 @@ granular_explanation_analysis mode.
 """
 import os
 import re
+import shutil
 import sys
+
+
+HYPHEN_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2015\u2212\ufe58\ufe63\uff0d"
+QUOTE_CHARS = "\"'\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f\u00ab\u00bb"
+
+
+def title_pattern(title):
+    """Return a regex pattern for a title, tolerant to whitespace and hyphen variants."""
+    pieces = []
+    for ch in title:
+        if ch.isspace():
+            pieces.append(r"\s+")
+        elif ch in HYPHEN_CHARS:
+            pieces.append(f"[{re.escape(HYPHEN_CHARS)}]")
+        elif ch in QUOTE_CHARS:
+            pieces.append(f"[{re.escape(QUOTE_CHARS)}]")
+        else:
+            pieces.append(re.escape(ch))
+    return "".join(pieces)
+
+
+def load_outline_titles(explanations_dir, outline_filename, key, title_key):
+    outline_path = os.path.join(explanations_dir, outline_filename)
+    if not os.path.exists(outline_path):
+        return []
+    import json
+    with open(outline_path) as f:
+        outline_data = json.load(f)
+    if isinstance(outline_data, dict):
+        outline_data = outline_data.get(key, [])
+    return [item.get(title_key) for item in outline_data if item.get(title_key)]
+
+
+def split_by_outline_titles(content, titles):
+    boundaries = []
+    for title in titles:
+        pattern = r'\n(?:#{1,6}\s+)?' + title_pattern(title) + r'\s*\n'
+        match = re.search(pattern, content, flags=re.IGNORECASE)
+        if match:
+            boundaries.append(match.start() + 1)
+    chunks = []
+    for i, start in enumerate(boundaries):
+        end = boundaries[i + 1] if i + 1 < len(boundaries) else len(content)
+        chunks.append(content[start:end].strip())
+    return chunks
 
 
 def split_textbook(explanations_dir):
@@ -27,39 +73,12 @@ def split_textbook(explanations_dir):
     # Pattern: the outline generates "Chapter Title\n\n# Section..."
     # But the combined textbook joins chapters with \n\n
     # Look at the outline to find chapter titles
-    outline_path = os.path.join(explanations_dir, "textbook_outline.json")
-    if os.path.exists(outline_path):
-        import json
-        with open(outline_path) as f:
-            outline = json.load(f)
-        if isinstance(outline, dict):
-            if "outline" in outline:
-                outline = outline["outline"]
-            elif "sections" in outline:
-                outline = outline["sections"]
-        # Support both chapter_title (arxiv/legal) and section_title (medical)
-        chapter_titles = [ch.get("chapter_title") or ch.get("section_title") for ch in outline]
-    else:
-        # Fallback: find lines that look like chapter titles (non-# lines between sections)
-        chapter_titles = []
+    chapter_titles = load_outline_titles(explanations_dir, "textbook_outline.json", "outline", "chapter_title")
+    if not chapter_titles:
+        chapter_titles = load_outline_titles(explanations_dir, "textbook_outline.json", "sections", "section_title")
 
-    # Split by finding chapter title occurrences in the text
-    chapters = []
     if chapter_titles:
-        for i, title in enumerate(chapter_titles):
-            escaped = re.escape(title)
-            # Match title with optional leading markdown header (e.g., "# " or "## ")
-            pattern = r'(?:#+ )?' + escaped
-            # Find position of this title in the content
-            match = re.search(r'\n' + pattern + r'\n', content)
-            if match:
-                chapters.append(match.start() + 1)  # +1 to skip the \n before
-
-        # Extract chapter content between boundaries
-        chapter_contents = []
-        for i, start in enumerate(chapters):
-            end = chapters[i + 1] if i + 1 < len(chapters) else len(content)
-            chapter_contents.append(content[start:end].strip())
+        chapter_contents = split_by_outline_titles(content, chapter_titles)
     else:
         print(f"  No outline found, skipping textbook split")
         return
@@ -69,6 +88,8 @@ def split_textbook(explanations_dir):
         return
 
     out_dir = os.path.join(explanations_dir, "textbooks")
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     for i, ch in enumerate(chapter_contents):
         ch = ch.strip()
@@ -95,20 +116,28 @@ def split_blogs(explanations_dir):
     lines = content.split("\n")
     title_line = lines[0] if (lines[0].startswith("\\title{") or lines[0].startswith("Title:")) else ""
 
-    # Blogs start with "# Title" (h1 headers)
-    parts = re.split(r'\n(?=# )', content)
-    # First part might be a header/preamble before the first blog
-    blogs = []
-    for part in parts:
-        part = part.strip()
-        if part.startswith("# "):
-            blogs.append(part)
+    def split_by_h1_headers():
+        parts = re.split(r'\n(?=# )', content)
+        return [part.strip() for part in parts if part.strip().startswith("# ")]
+
+    blog_titles = load_outline_titles(explanations_dir, "blog_outline.json", "blogs", "title")
+    blogs = split_by_outline_titles(content, blog_titles) if blog_titles else []
+    if blog_titles and len(blogs) != len(blog_titles):
+        h1_blogs = split_by_h1_headers()
+        if len(h1_blogs) > len(blogs):
+            blogs = h1_blogs
+    if not blogs:
+        # Blogs often start with "# Title" (h1 headers); this fallback preserves
+        # legacy behavior for outputs without a usable outline.
+        blogs = split_by_h1_headers()
 
     if not blogs:
         print(f"  No blogs found in blogs.txt, skipping")
         return
 
     out_dir = os.path.join(explanations_dir, "blogs")
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     for i, blog in enumerate(blogs):
         if title_line:
@@ -145,6 +174,8 @@ def split_stackexchange(explanations_dir):
         return
 
     out_dir = os.path.join(explanations_dir, "stackexchange")
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     for i, qa in enumerate(qas):
         if title_line:
@@ -155,15 +186,27 @@ def split_stackexchange(explanations_dir):
     print(f"  stackexchange/: {len(qas)} Q&As")
 
 
-def process_paper(paper_name, base_dir):
+PART_SPLITTERS = {
+    "textbook": split_textbook,
+    "blog": split_blogs,
+    "stackexchange": split_stackexchange,
+}
+
+
+def resolve_parts(parts):
+    if not parts or "all" in parts:
+        return list(PART_SPLITTERS)
+    return parts
+
+
+def process_paper(paper_name, base_dir, parts=None):
     explanations_dir = os.path.join(base_dir, paper_name)
     if not os.path.isdir(explanations_dir):
         print(f"Skipping {paper_name}: no explanations directory")
         return
     print(f"Processing {paper_name}...")
-    split_textbook(explanations_dir)
-    split_blogs(explanations_dir)
-    split_stackexchange(explanations_dir)
+    for part in resolve_parts(parts):
+        PART_SPLITTERS[part](explanations_dir)
 
 
 if __name__ == "__main__":
@@ -172,6 +215,13 @@ if __name__ == "__main__":
     parser.add_argument("--papers", nargs="+", help="Paper names to process")
     parser.add_argument("--base_dir", default="../../data/arxiv/explanations/",
                         help="Base explanations directory")
+    parser.add_argument(
+        "--parts",
+        nargs="+",
+        choices=["textbook", "blog", "stackexchange", "all"],
+        default=["all"],
+        help="Explanation subfolders to rebuild. Default: all."
+    )
     args = parser.parse_args()
 
     if args.papers:
@@ -181,4 +231,4 @@ if __name__ == "__main__":
                        if os.path.isdir(os.path.join(args.base_dir, d))]
 
     for name in sorted(paper_names):
-        process_paper(name, args.base_dir)
+        process_paper(name, args.base_dir, args.parts)

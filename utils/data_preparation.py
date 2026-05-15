@@ -267,22 +267,40 @@ def prepare_training_mix(
     use_raw = strategy_args.get("use_raw", False)
     shuffle_chunks_flag = strategy_args.get("shuffle_chunks", False)
     shuffle_seed = strategy_args.get("shuffle_seed", 42)
-    explanations_cycle = strategy_args.get("explanations_cycle", 0)
+    granular_explanations_cycle = strategy_args.get(
+        "granular_explanations_cycle",
+        strategy_args.get("explanations_cycle", 0),
+    )
     try:
-        explanations_num_tracks = int(strategy_args.get("explanations_num_tracks", 1))
+        granular_explanations_num_tracks = int(
+            strategy_args.get(
+                "granular_explanations_num_tracks",
+                strategy_args.get("explanations_num_tracks", 1),
+            )
+        )
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"--explanations_num_tracks must be a positive integer, got: {strategy_args.get('explanations_num_tracks')}"
+            "--granular_explanations_num_tracks must be a positive integer, got: "
+            f"{strategy_args.get('granular_explanations_num_tracks', strategy_args.get('explanations_num_tracks'))}"
         ) from exc
-    if explanations_num_tracks <= 0:
-        raise ValueError(f"--explanations_num_tracks must be a positive integer, got: {explanations_num_tracks}")
+    if granular_explanations_num_tracks <= 0:
+        raise ValueError(f"--granular_explanations_num_tracks must be a positive integer, got: {granular_explanations_num_tracks}")
     explanations_insertion_strategy = strategy_args.get("explanations_insertion_strategy", "granular")
-    explanations_insert_every_n = int(strategy_args.get("explanations_insert_every_n", 1))
+    whole_explanations_insert_every_n = int(
+        strategy_args.get(
+            "whole_explanations_insert_every_n",
+            strategy_args.get("explanations_insert_every_n", 1),
+        )
+    )
     fill_chunk_gaps = strategy_args.get("fill_chunk_gaps", True)
     chunk_gap_threshold = strategy_args.get("fill_chunk_gap_threshold", 1000)
     pretraining_separators = int(strategy_args.get("separate_batches_with_pretraining", 0))
     fill_with_pretraining = strategy_args.get("fill_batches_with_pretraining", True)
     domain_data_sources = strategy_args.get("domain_data_sources", {}) or {}
+    document_track_baseline = bool(strategy_args.get("document_track_baseline", False))
+    document_match_specific_explanation = strategy_args.get("document_match_specific_explanation", None)
+    if isinstance(document_match_specific_explanation, list) and len(document_match_specific_explanation) == 1:
+        document_match_specific_explanation = document_match_specific_explanation[0]
 
     # --- Helper Functions ---
     def _chunk(text: str) -> List[str]:
@@ -398,13 +416,15 @@ def prepare_training_mix(
     log.info(f"Domain data sources: {domain_data_sources}")
     
     num_paraphrased_texts = strategy_args.get("num_paraphrased_texts", 0)
-    with_explanations = "WithExplanations" in strategy_name
+    include_explanations = specific_explanation_type is not None or "WithSpecificExplanations" in strategy_name
     
     unique_document_batches = [[] for _ in range(1 + num_paraphrased_texts)]
-    unique_document_batches_with_explanations = None
+    explanation_spliced_document_batches = None
     
     # Granular strategy structure: List of Domains -> List of Tracks -> List of Chunks
     domain_explanation_tracks = [] 
+    # Document-match baseline structure: same track shape as explanations, but document chunks only.
+    domain_document_match_tracks = []
     # Whole strategy structure: List of Domains -> Explanation-only batch chunks
     domain_whole_explanation_batches = []
 
@@ -456,24 +476,115 @@ def prepare_training_mix(
 
         # --- 2. Load Explanations ---
         current_domain_tracks = [] # Granular strategy only
+        current_domain_document_match_tracks = [] # Document baseline only
         current_domain_whole_batch = [] # Whole strategy only
+
+        def _select_granular_explanation_files(explanation_dir: str, explanation_types_arg):
+            files_to_load = {}
+            if not explanation_types_arg:
+                return files_to_load
+            explanation_types = explanation_types_arg if isinstance(explanation_types_arg, list) else [explanation_types_arg]
+            for expl_type in explanation_types:
+                subfolder_path = os.path.join(explanation_dir, expl_type)
+                if os.path.isdir(subfolder_path):
+                    all_files = sorted([f for f in os.listdir(subfolder_path) if f.endswith('.txt')])
+                    if granular_explanations_cycle == "full":
+                        type_files = [os.path.join(expl_type, f) for f in all_files]
+                    elif isinstance(granular_explanations_cycle, int) and granular_explanations_cycle > 0:
+                        type_files = [os.path.join(expl_type, f) for f in all_files[:granular_explanations_cycle]]
+                    else:
+                        type_files = []
+                    files_to_load[expl_type] = type_files
+            return files_to_load
+
+        def _load_granular_type_objects(explanation_dir: str, files_to_load: dict):
+            type_objects = {}
+            for expl_type, file_list in files_to_load.items():
+                objs = []
+                for filename in file_list:
+                    file_path = os.path.join(explanation_dir, filename)
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        file_chunks = _chunk_explanation(f.read())
+                    if times_explanations > 1 and file_chunks:
+                        file_chunks = file_chunks * times_explanations
+                    objs.append((filename, file_chunks))
+                type_objects[expl_type] = objs
+            return type_objects
+
+        def _create_granular_pool_from_objects(obj_dict):
+            pool = []
+            max_len = max([len(x) for x in obj_dict.values()]) if obj_dict else 0
+            for idx in range(max_len):
+                step_chunks = []
+                for _, e_list in obj_dict.items():
+                    if not e_list:
+                        continue
+                    _, ch = e_list[idx % len(e_list)]
+                    step_chunks.extend(ch)
+                if step_chunks:
+                    pool.append(step_chunks)
+            return pool
+
+        def _create_document_match_pool_from_objects(obj_dict, document_chunks: List[str]):
+            pool = []
+            if not document_chunks:
+                return pool
+            max_len = max([len(x) for x in obj_dict.values()]) if obj_dict else 0
+            document_iterator = cycle(document_chunks)
+            for idx in range(max_len):
+                target_chunks = 0
+                for _, e_list in obj_dict.items():
+                    if not e_list:
+                        continue
+                    _, ch = e_list[idx % len(e_list)]
+                    target_chunks += len(ch)
+                if target_chunks > 0:
+                    pool.append([next(document_iterator) for _ in range(target_chunks)])
+            return pool
+
+        if document_track_baseline:
+            explanation_dir = f'../../data/{domain_source}/explanations/{domain}/'
+            files_to_load = _select_granular_explanation_files(
+                explanation_dir,
+                document_match_specific_explanation,
+            )
+            type_objects = _load_granular_type_objects(explanation_dir, files_to_load)
+            document_replay_chunks = list(source_chunks)
+            if num_paraphrased_texts > 0:
+                for chunks in paraphrased_chunks_by_doc:
+                    document_replay_chunks.extend(chunks)
+
+            for track_idx in range(granular_explanations_num_tracks):
+                track_objects = {}
+                for e_type, e_list in type_objects.items():
+                    if not e_list:
+                        track_objects[e_type] = []
+                        continue
+                    offset = (track_idx * len(e_list)) // granular_explanations_num_tracks
+                    track_objects[e_type] = e_list if offset == 0 else e_list[offset:] + e_list[:offset]
+
+                track_pool = _create_document_match_pool_from_objects(track_objects, document_replay_chunks)
+                if track_pool:
+                    current_domain_document_match_tracks.append(track_pool)
+            if current_domain_document_match_tracks:
+                matched_chunks = sum(
+                    len(step)
+                    for track_pool in current_domain_document_match_tracks
+                    for step in track_pool
+                )
+                log.info(
+                    f"Domain {domain}: built document-match baseline tracks "
+                    f"({len(current_domain_document_match_tracks)} tracks, {matched_chunks} scheduled replay chunks)."
+                )
         
-        if with_explanations:
+        if include_explanations:
             explanation_dir = f'../../data/{domain_source}/explanations/{domain}/'
             files_to_load = {}
             use_subfolder_loading = explanations_insertion_strategy == "granular"
 
             # Identify files
             if use_subfolder_loading and specific_explanation_type:
-                explanation_types = specific_explanation_type if isinstance(specific_explanation_type, list) else [specific_explanation_type]
-                for expl_type in explanation_types:
-                    subfolder_path = os.path.join(explanation_dir, expl_type)
-                    if os.path.isdir(subfolder_path):
-                        all_files = sorted([f for f in os.listdir(subfolder_path) if f.endswith('.txt')])
-                        if explanations_cycle == "full": type_files = [os.path.join(expl_type, f) for f in all_files]
-                        elif isinstance(explanations_cycle, int) and explanations_cycle > 0: type_files = [os.path.join(expl_type, f) for f in all_files[:explanations_cycle]]
-                        else: type_files = []
-                        files_to_load[expl_type] = type_files
+                files_to_load = _select_granular_explanation_files(explanation_dir, specific_explanation_type)
             else:
                 # Whole + legacy use flat explanation files in the domain root.
                 # Normalize common aliases so "textbooks" maps to "textbook.txt".
@@ -513,11 +624,11 @@ def prepare_training_mix(
                 if times_explanations > 1 and splice_expl_chunks:
                     splice_expl_chunks = splice_expl_chunks * times_explanations
 
-                if unique_document_batches_with_explanations is None:
-                    unique_document_batches_with_explanations = [[] for _ in range(len(unique_document_batches))]
+                if explanation_spliced_document_batches is None:
+                    explanation_spliced_document_batches = [[] for _ in range(len(unique_document_batches))]
 
                 _extend_spliced_document_batches(
-                    target_batches=unique_document_batches_with_explanations,
+                    target_batches=explanation_spliced_document_batches,
                     source_chunks=source_chunks,
                     paraphrased_chunks_by_doc=paraphrased_chunks_by_doc,
                     explanation_chunks=splice_expl_chunks,
@@ -527,57 +638,32 @@ def prepare_training_mix(
                 )
             elif explanations_insertion_strategy in ("granular", "whole"):
                 # Build base objects {type: [(filename, chunks)]}
-                type_objects = {}
-                for expl_type, file_list in files_to_load.items():
-                    objs = []
-                    for filename in file_list:
-                        file_path = os.path.join(explanation_dir, filename)
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            file_chunks = _chunk_explanation(f.read())
-                        if times_explanations > 1 and file_chunks:
-                            file_chunks = file_chunks * times_explanations
-                        objs.append((filename, file_chunks))
-                    type_objects[expl_type] = objs
+                type_objects = _load_granular_type_objects(explanation_dir, files_to_load)
 
                 if explanations_insertion_strategy == "granular":
-                    # Helper to flatten objects into a pool
-                    def create_pool_from_objects(obj_dict):
-                        pool = []
-                        max_len = max([len(x) for x in obj_dict.values()]) if obj_dict else 0
-                        for idx in range(max_len):
-                            step_chunks = []
-                            for _, e_list in obj_dict.items():
-                                if not e_list:
-                                    continue
-                                _, ch = e_list[idx % len(e_list)]
-                                step_chunks.extend(ch)
-                            if step_chunks:
-                                pool.append(step_chunks)
-                        return pool
-
                     # Generalized Track Construction:
                     # track_idx=0 is the main cycle, and subsequent tracks are phase-offset cycles.
                     # Offset rule is floor(track_idx * len(type_files) / num_tracks), so:
                     # - num_tracks=2 -> offset by half
                     # - num_tracks=3 -> offsets around one-third and two-thirds
-                    for track_idx in range(explanations_num_tracks):
+                    for track_idx in range(granular_explanations_num_tracks):
                         track_objects = {}
                         for e_type, e_list in type_objects.items():
                             if not e_list:
                                 track_objects[e_type] = []
                                 continue
 
-                            offset = (track_idx * len(e_list)) // explanations_num_tracks
+                            offset = (track_idx * len(e_list)) // granular_explanations_num_tracks
                             if offset == 0:
                                 track_objects[e_type] = e_list
                             else:
                                 track_objects[e_type] = e_list[offset:] + e_list[:offset]
 
-                        track_pool = create_pool_from_objects(track_objects)
+                        track_pool = _create_granular_pool_from_objects(track_objects)
                         if track_pool:
                             if track_idx > 0:
                                 log.info(
-                                    f"Domain {domain}: Adding OFFSET track {track_idx + 1}/{explanations_num_tracks} "
+                                    f"Domain {domain}: Adding OFFSET track {track_idx + 1}/{granular_explanations_num_tracks} "
                                     f"(size {len(track_pool)})."
                                 )
                             current_domain_tracks.append(track_pool)
@@ -594,6 +680,7 @@ def prepare_training_mix(
 
         # Append explanation structures for this domain
         domain_explanation_tracks.append(current_domain_tracks)
+        domain_document_match_tracks.append(current_domain_document_match_tracks)
         domain_whole_explanation_batches.append(current_domain_whole_batch)
 
     # --- 3. Replay & Replications ---
@@ -641,16 +728,17 @@ def prepare_training_mix(
 
     final_chunks = []
     has_track_explanations = any(len(tracks) > 0 for tracks in domain_explanation_tracks)
+    has_document_match_tracks = any(len(tracks) > 0 for tracks in domain_document_match_tracks)
     has_whole_explanations = any(len(chunks) > 0 for chunks in domain_whole_explanation_batches)
 
     if explanations_insertion_strategy == "whole" and has_whole_explanations:
-        if explanations_insert_every_n <= 0:
-            raise ValueError("--explanations_insert_every_n must be a positive integer when using strategy 'whole'.")
+        if whole_explanations_insert_every_n <= 0:
+            raise ValueError("--whole_explanations_insert_every_n must be a positive integer when using strategy 'whole'.")
         log.info("Using WHOLE Method (Insert explanation-only batch every N document batches).")
         final_chunks = replicate_and_interleave_whole_insert_every_n(
             doc_batches=unique_document_batches,
             domain_whole_explanation_batches=domain_whole_explanation_batches,
-            insertion_every_n=explanations_insert_every_n,
+            insertion_every_n=whole_explanations_insert_every_n,
             replication_factor=replication_factor,
             data_replay=data_replay,
             pretraining_separators=pretraining_separators,
@@ -660,11 +748,21 @@ def prepare_training_mix(
             test_script=test_script,
             fill_with_pretraining=fill_with_pretraining,
         )
-    elif has_track_explanations:
+    elif has_track_explanations or has_document_match_tracks:
+        track_batches = domain_explanation_tracks
+        if has_document_match_tracks:
+            if has_track_explanations:
+                track_batches = [
+                    explanation_tracks + document_tracks
+                    for explanation_tracks, document_tracks
+                    in zip(domain_explanation_tracks, domain_document_match_tracks)
+                ]
+            else:
+                track_batches = domain_document_match_tracks
         log.info("Using NEW Track Method (Independent Domain Tracks).")
         final_chunks = replicate_and_interleave_tracks(
             doc_batches=unique_document_batches,
-            domain_explanation_tracks=domain_explanation_tracks,
+            domain_explanation_tracks=track_batches,
             replication_factor=replication_factor,
             data_replay=data_replay,
             pretraining_separators=pretraining_separators,
@@ -678,7 +776,7 @@ def prepare_training_mix(
         log.info("Using LEGACY Method (Coupled Batches).")
         final_chunks = replicate_and_interleave_legacy(
             unique_document_batches=unique_document_batches,
-            unique_document_batches_with_explanations=unique_document_batches_with_explanations,
+            explanation_spliced_document_batches=explanation_spliced_document_batches,
             replication_factor=replication_factor,
             data_replay=data_replay,
             pretraining_separators=pretraining_separators,
@@ -831,7 +929,7 @@ def replicate_and_interleave_tracks(
 
 def replicate_and_interleave_legacy(
     unique_document_batches: List[List[str]],
-    unique_document_batches_with_explanations: Optional[List[List[str]]],
+    explanation_spliced_document_batches: Optional[List[List[str]]],
     replication_factor: int,
     data_replay: PretrainingDataReplay,
     pretraining_separators: int,
@@ -864,8 +962,8 @@ def replicate_and_interleave_legacy(
         
         batches_for_this_rep = unique_document_batches
         
-        if unique_document_batches_with_explanations:
-            batches_for_this_rep = unique_document_batches_with_explanations
+        if explanation_spliced_document_batches:
+            batches_for_this_rep = explanation_spliced_document_batches
 
         for i, batch in enumerate(batches_for_this_rep):
             current_batch = list(batch)
