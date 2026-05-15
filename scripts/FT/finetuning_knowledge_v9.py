@@ -239,6 +239,8 @@ def validate_selected_mcqa_probes(args, log) -> None:
     missing_paths = []
     malformed = []
     total_rows = 0
+    mcqa_prompt_column = getattr(args, "mcqa_prompt_column", "formatted_question")
+    required_columns = tuple(dict.fromkeys(REQUIRED_MCQA_PROBE_COLUMNS + (mcqa_prompt_column,)))
 
     for domain in args.resolved_domains:
         domain_source = args.domain_data_sources.get(domain)
@@ -255,7 +257,7 @@ def validate_selected_mcqa_probes(args, log) -> None:
 
         probe_df = pd.read_csv(probe_path)
         missing_columns = [
-            column for column in REQUIRED_MCQA_PROBE_COLUMNS
+            column for column in required_columns
             if column not in probe_df.columns
         ]
         if missing_columns:
@@ -283,8 +285,8 @@ def validate_selected_mcqa_probes(args, log) -> None:
 
     log.info(
         f"Validated {total_rows} MCQA probes from "
-        f"probes_{args.mcqa_probes_version}_mcqa.csv across "
-        f"{len(args.resolved_domains)} domains."
+        f"probes_{args.mcqa_probes_version}_mcqa.csv using prompt column "
+        f"'{mcqa_prompt_column}' across {len(args.resolved_domains)} domains."
     )
 
 
@@ -396,6 +398,13 @@ def construct_experiment_name(args):
             args.knowledge_probes_version,
         )
         probes_version += f"_mcqa_{mcqa_probes_version}"
+        mcqa_prompt_column = getattr(args, "mcqa_prompt_column", "formatted_question")
+        if mcqa_prompt_column != "formatted_question":
+            prompt_tag = "".join(
+                char if char.isalnum() or char in {"_", "-"} else "_"
+                for char in mcqa_prompt_column
+            )
+            probes_version += f"_prompt_{prompt_tag}"
 
     # 4. Chunking Style: e.g., 'sec_no-ovp', 'sec_ovp_1_4', 'tok'
     if args.chunk_by_section:
@@ -840,6 +849,16 @@ if __name__ == "__main__":
         type=str,
         default=DEFAULT_MCQA_PROBES_VERSION,
         help="Version of the MCQA probes to use when --mcqa_probes is enabled.",
+    )
+    parser.add_argument(
+        "--mcqa_prompt_column",
+        "--mcqa-prompt-column",
+        type=str,
+        default="formatted_question",
+        help=(
+            "CSV column to use as the MCQA prompt before appending the constrained "
+            "answer suffix. Use formatted_question_5shot for the fixed 5-shot prompt."
+        ),
     )
     parser.add_argument("--inference_probes_version", type=str, default="v7", help="Version of the inference probes to use.")
     parser.add_argument(

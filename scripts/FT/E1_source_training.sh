@@ -19,6 +19,7 @@ conda run --no-capture-output -n openrlhf torchrun --standalone --nproc_per_node
     --knowledge_probes_version v13 \
     --mcqa_probes \
     --mcqa_probes_version v14 \
+    --mcqa_prompt_column formatted_question_5shot \
     --num_train_epochs 10 \
     --learning_rate 1e-5 \
     --num_paraphrased_texts 0 \

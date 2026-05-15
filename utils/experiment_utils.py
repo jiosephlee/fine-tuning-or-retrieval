@@ -53,18 +53,24 @@ def _create_mcqa_callback(
     wandb_metric_allowlist=None,
     eval_every_n_steps: int = 1,
     prompt_suffix: str = DEFAULT_MCQA_PROMPT_SUFFIX,
+    prompt_column: str = "formatted_question",
     choice_tokens: list = None,
 ):
     """Create an MCQAProbeCallback from a MCQA probe DataFrame.
 
-    The DataFrame must contain ``formatted_question`` and ``correct_label``.
+    The DataFrame must contain the selected prompt column and ``correct_label``.
     ``correct_label`` may be ``"(D)"`` or ``"D"`` style.
     """
     if choice_tokens is None:
         choice_tokens = list(DEFAULT_MCQA_CHOICE_TOKENS)
+    if prompt_column not in mcqa_df.columns:
+        raise ValueError(
+            f"MCQA prompt column '{prompt_column}' not found. "
+            f"Available columns: {list(mcqa_df.columns)}"
+        )
 
     formatted_questions = [
-        str(row["formatted_question"]).strip() + prompt_suffix
+        str(row[prompt_column]).strip() + prompt_suffix
         for _, row in mcqa_df.iterrows()
     ]
     correct_indices = []
@@ -158,6 +164,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
     default_knowledge_probes_version = getattr(args, "knowledge_probes_version", "v13")
     knowledge_probe_filename_suffix = getattr(args, "knowledge_probe_filename_suffix", "")
     mcqa_probes_version = getattr(args, "mcqa_probes_version", default_knowledge_probes_version)
+    mcqa_prompt_column = getattr(args, "mcqa_prompt_column", "formatted_question")
     probe_every_n_steps = max(1, int(getattr(args, "probe_every_n_steps", 1) or 1))
     mcqa_probe_every_n_steps = max(1, int(getattr(args, "mcqa_probe_every_n_steps", 1) or 1))
     enable_parameter_delta_tracking = getattr(args, "enable_parameter_delta_tracking", False)
@@ -225,6 +232,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                     report_to_wandb, sparse_eval,
                     wandb_probe_metric_allowlist,
                     mcqa_probe_every_n_steps,
+                    prompt_column=mcqa_prompt_column,
                 )
                 callbacks.append(mcqa_callback)
                 mcqa_probe_callbacks.append(mcqa_callback)

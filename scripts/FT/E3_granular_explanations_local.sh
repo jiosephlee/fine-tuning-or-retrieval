@@ -20,6 +20,7 @@ ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
 CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E3_granular_explanations_all_domains_local}"
 EXPLANATION_TYPES="${EXPLANATION_TYPES:-textbooks}"
 MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v14}"
+MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 USE_PARCC="${USE_PARCC:-0}"
 SAVE_LOCAL_MODEL="${SAVE_LOCAL_MODEL:-0}"
 SPARSE_CALLBACKS="${SPARSE_CALLBACKS:-0}"
@@ -55,6 +56,7 @@ fi
     --knowledge_probes_version v13 \
     --mcqa_probes \
     --mcqa_probes_version "$MCQA_PROBES_VERSION" \
+    --mcqa_prompt_column "$MCQA_PROMPT_COLUMN" \
     --num_train_epochs "$NUM_EPOCHS" \
     --learning_rate "$LEARNING_RATE" \
     --num_paraphrased_texts "$NUM_PARAPHRASED" \
