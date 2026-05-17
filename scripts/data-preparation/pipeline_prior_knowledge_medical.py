@@ -28,6 +28,8 @@ def generate_prior_knowledge(case_name):
         'system': """### Instructions
 You are an expert medical educator. Based on the provided clinical case report, create a list of textbook chapters that would provide all the necessary prior knowledge to understand this case. The chapters should not describe the specific patient or case details, but rather the foundational medical concepts upon which understanding the case depends.
 
+The chapters should not describe the specific patient, chronology, diagnostic workup, treatment course, outcome, or novel clinical/laboratory observations of the case itself. They should cover general foundational medical knowledge only.
+
 Consider prerequisite knowledge across these areas as relevant:
 - Anatomy and physiology of affected organ systems
 - Pathophysiology of the conditions discussed
@@ -93,6 +95,8 @@ You will be given a chapter title, description, and subtopics from a medical tex
 
 The chapter should be comprehensive and clinically oriented. Begin with an introduction to the chapter, then cover each subtopic in turn. Don't just briefly describe the subtopics, but rather elaborate on the concepts at full length. Emphasize pathophysiology, clinical reasoning, and the connections between basic science and clinical practice. Dedicate multiple paragraphs to each subtopic. Write in full prose, rather than bullet points.
 
+Do not discuss the specific patient, chronology, diagnostic workup, treatment course, outcome, or novel clinical/laboratory observations of the source case. The chapter should teach general prior knowledge only.
+
 Separate each subtopic with a section header "#".
 
 Where relevant, include normal reference ranges for lab values, key diagnostic criteria, and clinical decision points. Write all mathematical notation in LaTeX only e.g. "$x^2$" or "$\\pi$". Do not use unicode mathematical characters.""",
@@ -157,15 +161,15 @@ Where relevant, include normal reference ranges for lab values, key diagnostic c
 
 
 def process_cases():
-    manifest_path = "../../data/medical/raw/manifest.json"
-    with open(manifest_path, 'r') as f:
-        manifest = json.load(f)
+    input_dir = "../../data/medical/raw/"
+    case_names = sorted(
+        os.path.splitext(filename)[0]
+        for filename in os.listdir(input_dir)
+        if filename.endswith(".txt")
+    )
+    print(f"Found {len(case_names)} local medical raw case files.\n")
 
-    saved_cases = [entry for entry in manifest if entry.get("status") == "saved"]
-    print(f"Found {len(saved_cases)} saved cases in manifest.\n")
-
-    for entry in saved_cases:
-        case_name = entry["filename"]
+    for case_name in case_names:
         output_dir = f"../../data/medical/prior_knowledge/{case_name}/"
         if os.path.exists(os.path.join(output_dir, "textbook.txt")):
             print(f"Skipping {case_name} (already generated).")

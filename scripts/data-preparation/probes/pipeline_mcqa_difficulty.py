@@ -1,8 +1,9 @@
 """
 Pipeline: Convert Existing Probes to MCQA Format (v1)
 
-Takes existing fact probe CSVs (e.g. probes_v9.csv) and generates MCQA versions
-by creating hard distractors for each probe. Works across all domains.
+Takes existing fact or inference probe CSVs (e.g. probes_v9.csv) and generates
+MCQA versions by creating hard distractors for each probe. Works across all
+domains.
 
 Step 0 (default): GPT-5.4-mini pre-filters probes unsuitable for MCQA, rejecting:
 tautological/circular probes, targets that appear verbatim in the probe, trivially
@@ -17,6 +18,7 @@ Outputs:
 Usage:
     cd scripts/data-preparation
     python pipeline_mcqa_difficulty.py --probe_type facts --probe_version v10 --output_version v11
+    python pipeline_mcqa_difficulty.py --probe_type inference --probe_version v11 --output_version v12
     python pipeline_mcqa_difficulty.py --probe_type facts --probe_version v10 --output_version v11 --filter DPO
     python pipeline_mcqa_difficulty.py --probe_type facts --probe_version v10 --output_version v11 --skip_filtering
     python pipeline_mcqa_difficulty.py --probe_type facts --probe_version v13 --output_version v14_restored --filter DPO --row_indices_file restore_indices_v14.txt --skip_filtering
@@ -27,6 +29,8 @@ import os
 import sys
 import json
 import random
+import ast
+import re
 from pathlib import Path
 import pandas as pd
 import concurrent.futures
@@ -56,12 +60,61 @@ Accept when target is a concept, method, dataset, model, date, number, proper no
 Return compact JSON: {"s":true} if suitable, else {"s":false,"r":"<=10 word reason"}."""
 
 
+INFERENCE_MCQA_FILTER_PROMPT = r"""Decide if this composition inference probe can become a 5-option MCQA.
+
+The probe is an existing cloze-style inference probe. The target is the correct inferred completion.
+
+Reject if any apply:
+- Not enough option space: yes/no, true/false, increase/decrease, before/after, present/absent, or another binary answer space.
+- Tautological/circular: target restates or is strongly implied by the probe wording.
+- Target appears verbatim in the probe itself. Do not reject target overlap with source/context; source is not shown to the evaluated model.
+- Too trivial/generic: single common word, vague adjective, generic phrase completion, or low-concept target with weak distractors.
+- The target is too long or clause-like for clean options.
+- Meaningful distractors would be arbitrary, obviously wrong, or mostly stylistic variants.
+- Incorrect: probe+target do not match the source facts or derivation.
+
+Accept when the target is a specific inferred mechanism, condition, consequence, exclusion, procedural result, method, concept, or phrase, and plausible related distractors exist.
+
+Return compact JSON: {"s":true} if suitable, else {"s":false,"r":"<=10 word reason"}."""
+
+
+def _parse_text_list(value) -> list[str]:
+    """Parse source_facts columns that may be stored as lists or list-like strings."""
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    try:
+        parsed = ast.literal_eval(text)
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+    except (ValueError, SyntaxError):
+        pass
+    return [text]
+
+
 def _extract_preceding_context(row: pd.Series, preceding_words: int = 200, following_words: int = 100) -> str:
     """Return the source fact with surrounding context from the section text.
 
     Includes up to *preceding_words* before the fact and *following_words* after it.
     Falls back to the fact if it cannot be located.
     """
+    source_facts = []
+    for col in ('source_facts', 'source_fact(s)', 'text_sentences'):
+        if col in row.index:
+            source_facts = _parse_text_list(row.get(col))
+            if source_facts:
+                break
+    if source_facts:
+        context = "\n".join(source_facts)
+        derivation = str(row.get('derivation', '')).strip()
+        if derivation and derivation.lower() != 'nan':
+            context += f"\nDerivation: {derivation}"
+        return context
+
     fact = str(row.get('raw_knowledge_statement', row.get('fact', ''))).strip()
     for col in ('section_text', 'subsection_text'):
         haystack = str(row.get(col, '')).strip()
@@ -77,17 +130,27 @@ def _extract_preceding_context(row: pd.Series, preceding_words: int = 200, follo
     return fact
 
 
-def filter_probe_for_mcqa(row: pd.Series) -> dict:
+def filter_probe_for_mcqa(row: pd.Series, probe_type: str = 'facts') -> dict:
     """Check whether a single probe is suitable for MCQA conversion."""
     target = str(row['target']).strip()
     probe = str(row['probe']).strip()
     source_with_context = _extract_preceding_context(row, preceding_words=75, following_words=25)
+    system_prompt = INFERENCE_MCQA_FILTER_PROMPT if probe_type == 'inference' else MCQA_FILTER_PROMPT
+    user_prompt = (f"q: {probe}\n"
+                   f"a: {target}\n"
+                   f"src: {source_with_context}")
+    if probe_type == 'inference':
+        original_question = str(row.get('question', '')).strip()
+        derivation = str(row.get('derivation', '')).strip()
+        user_prompt = (f"q: {probe}\n"
+                       f"a: {target}\n"
+                       f"original_question: {original_question}\n"
+                       f"derivation: {derivation}\n"
+                       f"src: {source_with_context}")
 
     prompt = {
-        'system': MCQA_FILTER_PROMPT,
-        'user': (f"q: {probe}\n"
-                 f"a: {target}\n"
-                 f"src: {source_with_context}")
+        'system': system_prompt,
+        'user': user_prompt,
     }
 
     try:
@@ -123,17 +186,43 @@ Distractor rules:
 Return compact JSON: {"d":["...","...","...","..."]}."""
 
 
-def generate_distractors(row: pd.Series) -> list | None:
+INFERENCE_DISTRACTOR_PROMPT = r"""Generate 4 plausible but wrong MCQA distractors for a composition inference probe.
+
+The probe is an existing cloze-style inference probe. Each option should naturally complete the probe.
+
+Distractor rules:
+- Use plausible alternative inferred conclusions, not random wrong answers.
+- Use common confusions, nearby source-context concepts, or tempting reasoning errors.
+- Include at least one wrong nearby source-context concept.
+- Match target length, style, specificity, and domain vocabulary where possible.
+- Avoid duplicates, obviously wrong options, and anything arguably correct.
+- Do not create yes/no or all/none-of-the-above options.
+- There must be exactly one correct answer: the target.
+
+Return compact JSON: {"d":["...","...","...","..."]}."""
+
+
+def generate_distractors(row: pd.Series, probe_type: str = 'facts') -> list | None:
     """Generate 4 hard distractors for a single probe using source context."""
     target = str(row['target']).strip()
     probe = str(row['probe']).strip()
     source_with_context = _extract_preceding_context(row, preceding_words=100, following_words=25)
+    system_prompt = INFERENCE_DISTRACTOR_PROMPT if probe_type == 'inference' else DISTRACTOR_PROMPT
+    user_prompt = (f"q: {probe}\n"
+                   f"a: {target}\n"
+                   f"src: {source_with_context}")
+    if probe_type == 'inference':
+        original_question = str(row.get('question', '')).strip()
+        derivation = str(row.get('derivation', '')).strip()
+        user_prompt = (f"q: {probe}\n"
+                       f"a: {target}\n"
+                       f"original_question: {original_question}\n"
+                       f"derivation: {derivation}\n"
+                       f"src: {source_with_context}")
 
     prompt = {
-        'system': DISTRACTOR_PROMPT,
-        'user': (f"q: {probe}\n"
-                 f"a: {target}\n"
-                 f"src: {source_with_context}")
+        'system': system_prompt,
+        'user': user_prompt,
     }
 
     try:
@@ -165,7 +254,19 @@ Pass only if all apply:
 Return compact JSON: {"p":true} if it passes, else {"p":false}."""
 
 
-def verify_mcqa(probe: str, target: str, distractors: list) -> bool:
+INFERENCE_VERIFY_PROMPT = r"""Verify this composition inference MCQA.
+
+Pass only if all apply:
+- Intended option is clearly correct.
+- No distractor is arguably correct.
+- Distractors are plausible inferred alternatives.
+- Answer is not leaked or made trivial by the question wording.
+- There is exactly one correct answer.
+
+Return compact JSON: {"p":true} if it passes, else {"p":false}."""
+
+
+def verify_mcqa(probe: str, target: str, distractors: list, probe_type: str = 'facts') -> bool:
     """Verify the MCQA has exactly one correct answer."""
     options = [target] + distractors
     random.shuffle(options)
@@ -174,7 +275,7 @@ def verify_mcqa(probe: str, target: str, distractors: list) -> bool:
     formatted_options = '\n'.join(f"{labels[i]} {opt}" for i, opt in enumerate(options))
 
     prompt = {
-        'system': VERIFY_PROMPT,
+        'system': INFERENCE_VERIFY_PROMPT if probe_type == 'inference' else VERIFY_PROMPT,
         'user': f"q: {probe}\n{formatted_options}\nintended: {correct_label}"
     }
 
@@ -192,6 +293,15 @@ def verify_mcqa(probe: str, target: str, distractors: list) -> bool:
 # ─────────────────────────────────────────────────────────────
 # Step 3: Format final MCQA
 # ─────────────────────────────────────────────────────────────
+
+def probe_leaks_target(probe: str, target: str) -> bool:
+    """Return true when the prompt text contains the answer verbatim."""
+    probe = re.sub(r'\s+', ' ', str(probe).lower()).strip()
+    target = re.sub(r'\s+', ' ', str(target).lower()).strip()
+    if not target:
+        return False
+    return re.search(rf'(?<!\w){re.escape(target)}(?!\w)', probe) is not None
+
 
 def format_mcqa_row(row: pd.Series, distractors: list) -> dict:
     """Create the final MCQA entry with shuffled options."""
@@ -223,6 +333,10 @@ def format_mcqa_row(row: pd.Series, distractors: list) -> dict:
     }
     if 'source_row_0based' in row.index:
         output['source_row_0based'] = row.get('source_row_0based', '')
+    for col in ('inference_type', 'source_fact(s)', 'source_facts', 'text_sentences',
+                'derivation', 'question', 'answer'):
+        if col in row.index:
+            output[col] = row.get(col, '')
     return output
 
 
@@ -369,7 +483,7 @@ def process_domain(domain: str, probe_type: str, probe_version: str,
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {
-                executor.submit(filter_probe_for_mcqa, row): idx
+                executor.submit(filter_probe_for_mcqa, row, probe_type): idx
                 for idx, (_, row) in enumerate(df.iterrows())
             }
             for future in tqdm(concurrent.futures.as_completed(future_to_idx),
@@ -421,7 +535,7 @@ def process_domain(domain: str, probe_type: str, probe_version: str,
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_idx = {
-            executor.submit(generate_distractors, row): idx
+            executor.submit(generate_distractors, row, probe_type): idx
             for idx, (_, row) in enumerate(df.iterrows())
         }
         for future in tqdm(concurrent.futures.as_completed(future_to_idx),
@@ -443,7 +557,7 @@ def process_domain(domain: str, probe_type: str, probe_version: str,
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_pair = {
             executor.submit(verify_mcqa, str(df.iloc[idx]['probe']).strip(),
-                          str(df.iloc[idx]['target']).strip(), distractors): (idx, distractors)
+                          str(df.iloc[idx]['target']).strip(), distractors, probe_type): (idx, distractors)
             for idx, distractors in valid_pairs
         }
         for future in tqdm(concurrent.futures.as_completed(future_to_pair),
@@ -459,9 +573,15 @@ def process_domain(domain: str, probe_type: str, probe_version: str,
 
     # Step 3: Format
     mcqa_rows = []
+    leakage_dropped = 0
     for idx, distractors in verified_pairs:
         row = df.iloc[idx]
+        if probe_leaks_target(row['probe'], row['target']):
+            leakage_dropped += 1
+            continue
         mcqa_rows.append(format_mcqa_row(row, distractors))
+    if leakage_dropped:
+        print(f"Dropped {leakage_dropped} verified MCQA questions with target leakage in probe text.")
 
     mcqa_df = pd.DataFrame(mcqa_rows)
     if mcqa_df.empty:
@@ -469,6 +589,8 @@ def process_domain(domain: str, probe_type: str, probe_version: str,
             'probe', 'target', 'correct_label', 'formatted_question',
             'option_a', 'option_b', 'option_c', 'option_d', 'option_e',
             'distractors', 'fact', 'raw_knowledge_statement', 'section',
+            *(['inference_type', 'source_fact(s)', 'source_facts', 'text_sentences',
+               'derivation', 'question', 'answer'] if probe_type == 'inference' else []),
             *(['source_row_0based'] if 'source_row_0based' in df.columns else [])
         ])
 
@@ -486,7 +608,9 @@ def process_domain(domain: str, probe_type: str, probe_version: str,
         f.write(f"Probes after MCQA filter ({output_version}): {len(df)}\n")
         f.write(f"Distractors generated: {len(valid_pairs)}\n")
         f.write(f"Passed verification: {len(verified_pairs)}\n")
-        f.write(f"Conversion rate: {100*len(verified_pairs)/len(df):.1f}%\n")
+        f.write(f"Dropped target leakage: {leakage_dropped}\n")
+        f.write(f"Final MCQA probes: {len(mcqa_df)}\n")
+        f.write(f"Conversion rate: {100*len(mcqa_df)/len(df):.1f}%\n")
     print(f"Saved metrics to {metrics_path}")
 
 

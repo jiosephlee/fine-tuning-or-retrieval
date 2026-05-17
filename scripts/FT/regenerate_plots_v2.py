@@ -33,6 +33,23 @@ def main():
         action="store_true",
         help="Alias for --knowledge_probe_variant low_overlap_strict.",
     )
+    parser.add_argument(
+        "--paraphrased_knowledge_probes",
+        action="store_true",
+        help="Accepted for compatibility with training commands; paraphrased metrics are auto-detected from result files.",
+    )
+    parser.add_argument(
+        "--paraphrased_knowledge_probes_version",
+        type=str,
+        default=None,
+        help="Accepted for compatibility with training commands.",
+    )
+    parser.add_argument(
+        "--paraphrased_knowledge_probe_filename_suffix",
+        type=str,
+        default=None,
+        help="Accepted for compatibility with training commands.",
+    )
     parser.add_argument("--inference_probes_version", type=str, default="v7", help="Version of the inference probes.")
     
     args = parser.parse_args()

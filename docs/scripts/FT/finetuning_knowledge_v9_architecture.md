@@ -131,7 +131,42 @@ Granular explanation tracks:
 - Mixing: `replicate_and_interleave_tracks(...)` keeps document batches intact
   and appends chunks from every active explanation track to every document
   batch.
-- Constraint: `--explanations_num_tracks` is only valid for `granular`.
+- Granularity: `--explanation_granularity file` keeps the existing
+  one-file-per-step schedule. `--explanation_granularity chunk` flattens
+  selected explanation chunks and schedules
+  `--explanation_track_size_by_chunk` chunks per step, default `4`, with a
+  final partial step allowed.
+- Source-relative matching: `--match_explanation_source_replay` appends a
+  source/paraphrase replay track for every active explanation track. Each replay
+  step has the same chunk count as the corresponding explanation step for that
+  domain, so a domain with 23 explanation chunks in a cycle also receives 23
+  matched source/paraphrase chunks in that cycle.
+- Baseline document matching: E1/E2 should use `--document_track_baseline`
+  instead of `--match_explanation_source_replay`. This adds no explanations;
+  it only replays source/paraphrase chunks using the granular explanation file
+  schedule named by `--document_match_specific_explanation`, so document
+  exposure can be matched against E3 without switching to chunk-granularity
+  scheduling.
+- MCQA probe memory: MCQA uses `--mcqa_probe_batch_size`, separate from
+  `--device_batch_size`, because few-shot MCQA prompts produce large full-logit
+  tensors during callback evaluation. E1/E2/E3 scripts default this to `32`.
+- Constraint: explanation track count is valid for `granular` and
+  `granular_queue`.
+
+Granular queue explanation tracks:
+
+- Trigger: `--with_specific_explanation`, with
+  `--explanations_insertion_strategy granular_queue`.
+- File layout: loads all `.txt` files from selected subfolders under
+  `data/<source>/explanations/<domain>/<type>/`.
+- Track control: `--granular_explanations_num_tracks K` creates `K` queue
+  tracks. Selected files are pooled across types, shuffled with `--shuffle_seed`
+  plus domain context for deterministic tie-breaking, sorted by chunk count,
+  then aligned so long files are paired with short files in the same batch.
+- Unit: defaults to each explanation file as one queued item. With
+  `--explanation_granularity chunk`, selected explanation chunks are grouped
+  by `--explanation_track_size_by_chunk` instead.
+- Constraint: `--granular_explanations_cycle` is not used for this mode.
 
 Whole explanation insertion:
 

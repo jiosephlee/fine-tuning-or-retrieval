@@ -850,6 +850,7 @@ class WandbSourcePanelsCallback(TrainerCallback):
     - <source>/<domain>_inference_log_prob
     - <source>/<domain>_inference_target_rank
     - <source>/<domain>_mcqa_accuracy
+    - <source>/<domain>_inference_mcqa_accuracy
     - <source>/log_prob_average
     - <source>/inference_log_prob_average
     - average/log_prob_average
@@ -862,19 +863,27 @@ class WandbSourcePanelsCallback(TrainerCallback):
         ("log_prob", "inference_log_prob"),
         ("target_rank", "inference_target_rank"),
     )
+    PARAPHRASED_KNOWLEDGE_METRICS = (
+        ("log_prob", "paraphrased_log_prob"),
+        ("target_rank", "paraphrased_target_rank"),
+    )
 
     def __init__(
         self,
         knowledge_callbacks: List[BaseKnowledgeProbeCallBack],
+        paraphrased_knowledge_callbacks: Optional[List[BaseKnowledgeProbeCallBack]] = None,
         inference_callbacks: Optional[List[BaseKnowledgeProbeCallBack]] = None,
         mcqa_callbacks: Optional[List["MCQAProbeCallback"]] = None,
+        inference_mcqa_callbacks: Optional[List["MCQAProbeCallback"]] = None,
         domain_sources: Optional[Dict[str, str]] = None,
         panel_sources: Optional[List[str]] = None,
         report_to_wandb: bool = True,
     ):
         self.knowledge_callbacks = knowledge_callbacks
+        self.paraphrased_knowledge_callbacks = paraphrased_knowledge_callbacks or []
         self.inference_callbacks = inference_callbacks or []
         self.mcqa_callbacks = mcqa_callbacks or []
+        self.inference_mcqa_callbacks = inference_mcqa_callbacks or []
         self.domain_sources = domain_sources or {}
         self.panel_sources = panel_sources or ["legal", "arxiv", "medical"]
         self.report_to_wandb = report_to_wandb
@@ -906,7 +915,13 @@ class WandbSourcePanelsCallback(TrainerCallback):
         return source if source in self.panel_sources else "arxiv"
 
     def _domain_from_prefix(self, log_prefix: str) -> Optional[str]:
-        for suffix in ("_knowledge_probe", "_inference_probe", "_mcqa_probe"):
+        for suffix in (
+            "_inference_mcqa_probe",
+            "_knowledge_probe_paraphrased",
+            "_knowledge_probe",
+            "_inference_probe",
+            "_mcqa_probe",
+        ):
             if log_prefix.endswith(suffix):
                 return log_prefix[: -len(suffix)]
         return None
@@ -935,6 +950,23 @@ class WandbSourcePanelsCallback(TrainerCallback):
                     domain_metrics[panel_name] = float(avg)
             if domain_metrics:
                 per_domain[domain] = domain_metrics
+
+        # Paraphrased factual cloze probes.
+        for callback in self.paraphrased_knowledge_callbacks:
+            domain = self._domain_from_prefix(getattr(callback, "log_prefix", ""))
+            if not domain:
+                continue
+            domain_metrics = {}
+            for history_name, panel_name in self.PARAPHRASED_KNOWLEDGE_METRICS:
+                metric_entries = callback.history.get(history_name, [])
+                entry = self._entry_for_step(metric_entries, step)
+                if not entry:
+                    continue
+                avg = self._safe_average(entry.get("values", []))
+                if self._valid_number(avg):
+                    domain_metrics[panel_name] = float(avg)
+            if domain_metrics:
+                per_domain.setdefault(domain, {}).update(domain_metrics)
 
         # Cloze-style inference/compositional probes.
         for callback in self.inference_callbacks:
@@ -966,6 +998,19 @@ class WandbSourcePanelsCallback(TrainerCallback):
             if self._valid_number(avg):
                 per_domain.setdefault(domain, {})["mcqa_accuracy"] = float(avg)
 
+        # Inference MCQA constrained-decoding accuracy
+        for callback in self.inference_mcqa_callbacks:
+            domain = self._domain_from_prefix(getattr(callback, "log_prefix", ""))
+            if not domain:
+                continue
+            acc_entries = callback.history.get("mcqa_accuracy", [])
+            entry = self._entry_for_step(acc_entries, step)
+            if not entry:
+                continue
+            avg = self._safe_average(entry.get("values", []))
+            if self._valid_number(avg):
+                per_domain.setdefault(domain, {})["inference_mcqa_accuracy"] = float(avg)
+
         return per_domain
 
     def _build_logs_for_step(self, step: int) -> Dict[str, float]:
@@ -976,18 +1021,24 @@ class WandbSourcePanelsCallback(TrainerCallback):
             src: {
                 "log_prob": [],
                 "target_rank": [],
+                "paraphrased_log_prob": [],
+                "paraphrased_target_rank": [],
                 "inference_log_prob": [],
                 "inference_target_rank": [],
                 "mcqa_accuracy": [],
+                "inference_mcqa_accuracy": [],
             }
             for src in self.panel_sources
         }
         metric_values_global: Dict[str, List[float]] = {
             "log_prob": [],
             "target_rank": [],
+            "paraphrased_log_prob": [],
+            "paraphrased_target_rank": [],
             "inference_log_prob": [],
             "inference_target_rank": [],
             "mcqa_accuracy": [],
+            "inference_mcqa_accuracy": [],
         }
 
         for domain, domain_metrics in paper_metrics_by_domain.items():
@@ -1243,6 +1294,7 @@ class MCQAProbeCallback(TrainerCallback):
         self.eval_every_n_steps = max(1, int(eval_every_n_steps or 1))
         self.wandb_metric_allowlist = set(wandb_metric_allowlist) if wandb_metric_allowlist else None
         self.history = {"mcqa_accuracy": []}
+        self.predictions_history: List[Dict] = []
 
         self.choice_tokens = choice_tokens
         self.choice_token_ids: List[int] = []
@@ -1260,10 +1312,16 @@ class MCQAProbeCallback(TrainerCallback):
             f"{list(zip(choice_tokens, self.choice_token_ids))}"
         )
 
-        self.tokenized_mcqa_prompts = tokenizer(
-            formatted_questions, padding=True, return_tensors="pt",
-            add_special_tokens=False,
-        )
+        original_padding_side = getattr(tokenizer, "padding_side", "right")
+        tokenizer.padding_side = "left"
+        try:
+            self.tokenized_mcqa_prompts = tokenizer(
+                formatted_questions, padding=True, return_tensors="pt",
+                add_special_tokens=False,
+            )
+        finally:
+            tokenizer.padding_side = original_padding_side
+        self._supports_logits_to_keep = None
         print(
             f"MCQAProbeCallback: {len(formatted_questions)} MCQA prompts, "
             f"max length {self.tokenized_mcqa_prompts['input_ids'].shape[1]}"
@@ -1278,6 +1336,7 @@ class MCQAProbeCallback(TrainerCallback):
         choice_ids = torch.tensor(self.choice_token_ids, device=device)
 
         all_correct: List[torch.Tensor] = []
+        all_predicted: List[torch.Tensor] = []
         for i in range(0, num_prompts, self.batch_size):
             end_idx = min(i + self.batch_size, num_prompts)
             inputs = {
@@ -1285,22 +1344,39 @@ class MCQAProbeCallback(TrainerCallback):
                 "attention_mask": self.tokenized_mcqa_prompts["attention_mask"][i:end_idx].to(device),
             }
 
-            with torch.no_grad():
-                logits = model(**inputs).logits
+            forward_kwargs = {}
+            if self._supports_logits_to_keep is not False:
+                forward_kwargs["logits_to_keep"] = 1
 
-            seq_lengths = inputs["attention_mask"].sum(dim=1) - 1
-            bs = logits.shape[0]
-            last_logits = logits[torch.arange(bs, device=device), seq_lengths]
+            with torch.inference_mode():
+                try:
+                    logits = model(**inputs, **forward_kwargs).logits
+                    if forward_kwargs:
+                        self._supports_logits_to_keep = True
+                except TypeError as exc:
+                    if "logits_to_keep" not in str(exc):
+                        raise
+                    self._supports_logits_to_keep = False
+                    logits = model(**inputs).logits
+
+            last_logits = logits[:, -1]
             choice_logits = last_logits[:, choice_ids]
             predicted_idx = choice_logits.argmax(dim=-1)
             correct_indices = torch.tensor(
                 self.correct_choice_indices[i:end_idx], device=device, dtype=torch.long,
             )
             all_correct.append((predicted_idx == correct_indices).float())
+            all_predicted.append(predicted_idx)
 
         if not all_correct:
-            return {"mcqa_accuracy": torch.empty(0, device=device)}
-        return {"mcqa_accuracy": torch.cat(all_correct)}
+            return {
+                "mcqa_accuracy": torch.empty(0, device=device),
+                "predicted_idx": torch.empty(0, device=device, dtype=torch.long),
+            }
+        return {
+            "mcqa_accuracy": torch.cat(all_correct),
+            "predicted_idx": torch.cat(all_predicted),
+        }
 
     def _record_and_log(self, metrics: Dict[str, torch.Tensor], step: int, state):
         log_data = {}
@@ -1316,10 +1392,19 @@ class MCQAProbeCallback(TrainerCallback):
             if self.report_to_wandb and wandb.run:
                 wandb.log(log_data, step=step)
 
+    def _evaluate_and_record(self, model, step: int, state):
+        metrics = self._evaluate_mcqa(model)
+        predicted = metrics.pop("predicted_idx", None)
+        if predicted is not None:
+            self.predictions_history.append(
+                {"step": step, "values": predicted.cpu().tolist()}
+            )
+        self._record_and_log(metrics, step, state)
+
     def on_train_begin(self, args, state, control, model, **kwargs):
         print(f"{self.__class__.__name__}: Calculating initial metrics...")
         model.eval()
-        self._record_and_log(self._evaluate_mcqa(model), 0, state)
+        self._evaluate_and_record(model, 0, state)
         model.train()
         print(f"{self.__class__.__name__}: Initial metrics calculated.")
 
@@ -1328,7 +1413,7 @@ class MCQAProbeCallback(TrainerCallback):
             return
 
         model.eval()
-        self._record_and_log(self._evaluate_mcqa(model), state.global_step, state)
+        self._evaluate_and_record(model, state.global_step, state)
         model.train()
 
     def on_train_end(self, args, state, control, model, **kwargs):
@@ -1339,11 +1424,27 @@ class MCQAProbeCallback(TrainerCallback):
         os.makedirs(output_dir, exist_ok=True)
         print(f"{self.__class__.__name__}: Saving MCQA metrics to {output_dir}")
 
-        records = [
-            {'step': entry['step'], 'probe_index': i, 'mcqa_accuracy': value}
-            for entry in self.history["mcqa_accuracy"]
-            for i, value in enumerate(entry['values'])
-        ]
+        predictions_by_step = {entry['step']: entry['values'] for entry in self.predictions_history}
+        records = []
+        for entry in self.history["mcqa_accuracy"]:
+            step = entry['step']
+            preds = predictions_by_step.get(step, [None] * len(entry['values']))
+            for i, value in enumerate(entry['values']):
+                pred_idx = preds[i] if i < len(preds) else None
+                pred_label = (
+                    self.choice_tokens[pred_idx] if pred_idx is not None else None
+                )
+                correct_idx = (
+                    self.correct_choice_indices[i] if i < len(self.correct_choice_indices) else None
+                )
+                records.append({
+                    'step': step,
+                    'probe_index': i,
+                    'mcqa_accuracy': value,
+                    'predicted_idx': pred_idx,
+                    'predicted_label': pred_label,
+                    'correct_idx': correct_idx,
+                })
         if not records:
             print(" > No MCQA metrics to save.")
             return
@@ -1387,12 +1488,52 @@ class MCQAProbeCallback(TrainerCallback):
                 f"(step {final_acc['step']})\n\n"
             )
 
+            final_preds = None
+            if self.predictions_history:
+                last_pred_entry = self.predictions_history[-1]
+                if last_pred_entry["step"] == final_acc["step"]:
+                    final_preds = last_pred_entry["values"]
+
+            num_choices = len(self.choice_token_ids)
+            if final_preds is not None:
+                pred_counts = [0] * num_choices
+                for p in final_preds:
+                    if 0 <= p < num_choices:
+                        pred_counts[p] += 1
+                total = max(1, sum(pred_counts))
+                f.write("Predicted-choice distribution (final):\n")
+                for i, tok in enumerate(self.choice_tokens):
+                    f.write(
+                        f"  {tok}: {pred_counts[i]:4d} ({100*pred_counts[i]/total:5.1f}%)\n"
+                    )
+                # Per-correct-label accuracy breakdown
+                per_label_total = [0] * num_choices
+                per_label_correct = [0] * num_choices
+                for i, p in enumerate(final_preds):
+                    if i >= len(self.correct_choice_indices):
+                        break
+                    c = self.correct_choice_indices[i]
+                    per_label_total[c] += 1
+                    if p == c:
+                        per_label_correct[c] += 1
+                f.write("\nAccuracy by correct label (final):\n")
+                for i, tok in enumerate(self.choice_tokens):
+                    denom = per_label_total[i]
+                    acc = per_label_correct[i] / denom if denom else 0.0
+                    f.write(f"  {tok}: {per_label_correct[i]:3d}/{denom:3d} = {acc:.3f}\n")
+                f.write("\n")
+
             wrong_indices = (final_vals == 0).nonzero(as_tuple=True)[0]
             if wrong_indices.numel() > 0:
                 f.write(f"Incorrectly answered probes ({wrong_indices.numel()}):\n")
                 f.write("-" * 40 + "\n")
                 for idx in wrong_indices[:20]:
                     idx_int = idx.item()
+                    pred_label = ""
+                    if final_preds is not None and idx_int < len(final_preds):
+                        p = final_preds[idx_int]
+                        if 0 <= p < num_choices:
+                            pred_label = self.choice_tokens[p]
                     if self.probes_df is not None and idx_int < len(self.probes_df):
                         row = self.probes_df.iloc[idx_int]
                         f.write(
@@ -1400,13 +1541,15 @@ class MCQAProbeCallback(TrainerCallback):
                             f"{str(row.get('probe', ''))[:120]}...\n"
                         )
                         f.write(
-                            f"    Correct: {row.get('correct_label', '')}\n\n"
+                            f"    Correct: {row.get('correct_label', '')} | "
+                            f"Predicted: ({pred_label})\n\n"
                         )
                     else:
                         f.write(
                             f"  Probe {idx_int}: "
-                            f"{self.formatted_questions[idx_int][:120]}...\n\n"
+                            f"{self.formatted_questions[idx_int][:120]}...\n"
                         )
+                        f.write(f"    Predicted: ({pred_label})\n\n")
 
         print(f" > Saved MCQA report to '{report_path}'")
 

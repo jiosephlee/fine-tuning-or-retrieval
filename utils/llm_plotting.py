@@ -111,11 +111,15 @@ def generate_revamped_plots(
     knowledge_probe_dir = os.path.join(experiment_dir, f"{domain}_knowledge_probe")
     inference_probe_dir = os.path.join(experiment_dir, f"{domain}_inference_probe")
     knowledge_probe_metrics_path = os.path.join(knowledge_probe_dir, f"{domain}_knowledge_probe_metrics.csv")
+    paraphrased_knowledge_probe_metrics_path = os.path.join(
+        knowledge_probe_dir, f"{domain}_knowledge_probe_paraphrased_metrics.csv"
+    )
     
     knowledge_probe_df = _read_csv_if_exists(knowledge_probe_metrics_path)
+    paraphrased_knowledge_probe_df = _read_csv_if_exists(paraphrased_knowledge_probe_metrics_path)
     inference_probe_df = _load_probe_metric_csvs(inference_probe_dir, "_inference_probe_metrics.csv")
 
-    if knowledge_probe_df.empty and inference_probe_df.empty:
+    if knowledge_probe_df.empty and paraphrased_knowledge_probe_df.empty and inference_probe_df.empty:
         log_info("No probe metrics found. Skipping plotting.")
         return
 
@@ -148,8 +152,10 @@ def generate_revamped_plots(
     
     # Prepare data
     mean_knowledge_log_probs = _mean_by_step(knowledge_probe_df, 'log_prob')
+    mean_paraphrased_knowledge_log_probs = _mean_by_step(paraphrased_knowledge_probe_df, 'log_prob')
     mean_inference_log_probs = _mean_by_step(inference_probe_df, 'log_prob')
     mean_knowledge_rank = _mean_by_step(knowledge_probe_df, 'target_rank')
+    mean_paraphrased_knowledge_rank = _mean_by_step(paraphrased_knowledge_probe_df, 'target_rank')
     mean_inference_rank = _mean_by_step(inference_probe_df, 'target_rank')
 
     # --- Plot 1a ---
@@ -161,6 +167,8 @@ def generate_revamped_plots(
     
     if not mean_knowledge_log_probs.empty:
         sns.lineplot(data=mean_knowledge_log_probs, x='step', y='log_prob', ax=ax1, label='Knowledge Probes Mean Log Probs', color='blue')
+    if not mean_paraphrased_knowledge_log_probs.empty:
+        sns.lineplot(data=mean_paraphrased_knowledge_log_probs, x='step', y='log_prob', ax=ax1, label='Paraphrased Knowledge Probes Mean Log Probs', color='orange')
     if not mean_inference_log_probs.empty:
         sns.lineplot(data=mean_inference_log_probs, x='step', y='log_prob', ax=ax1, label='Inference Probes Mean Log Probs', color='green')
     ax1.legend(loc='upper left')
@@ -188,6 +196,8 @@ def generate_revamped_plots(
 
     if not mean_knowledge_rank.empty:
         sns.lineplot(data=mean_knowledge_rank, x='step', y='target_rank', ax=ax1, label='Knowledge Probes Mean Target Rank', color='blue')
+    if not mean_paraphrased_knowledge_rank.empty:
+        sns.lineplot(data=mean_paraphrased_knowledge_rank, x='step', y='target_rank', ax=ax1, label='Paraphrased Knowledge Probes Mean Target Rank', color='orange')
     if not mean_inference_rank.empty:
         sns.lineplot(data=mean_inference_rank, x='step', y='target_rank', ax=ax1, label='Inference Probes Mean Target Rank', color='green')
     ax1.legend(loc='upper left')
@@ -388,6 +398,7 @@ def generate_averaged_plots(experiment_dir: str, logger=None):
         return
 
     all_knowledge_dfs = []
+    all_paraphrased_knowledge_dfs = []
     all_inference_dfs = []
 
     for domain in domains:
@@ -395,6 +406,15 @@ def generate_averaged_plots(experiment_dir: str, logger=None):
         knowledge_df = _read_csv_if_exists(knowledge_path)
         if not knowledge_df.empty:
             all_knowledge_dfs.append(knowledge_df)
+
+        paraphrased_knowledge_path = os.path.join(
+            experiment_dir,
+            f"{domain}_knowledge_probe",
+            f"{domain}_knowledge_probe_paraphrased_metrics.csv",
+        )
+        paraphrased_knowledge_df = _read_csv_if_exists(paraphrased_knowledge_path)
+        if not paraphrased_knowledge_df.empty:
+            all_paraphrased_knowledge_dfs.append(paraphrased_knowledge_df)
         
         inference_dir = os.path.join(experiment_dir, f"{domain}_inference_probe")
         inference_df = _load_probe_metric_csvs(inference_dir, "_inference_probe_metrics.csv")
@@ -402,9 +422,14 @@ def generate_averaged_plots(experiment_dir: str, logger=None):
             all_inference_dfs.append(inference_df)
 
     knowledge_probe_df = pd.concat(all_knowledge_dfs) if all_knowledge_dfs else pd.DataFrame()
+    paraphrased_knowledge_probe_df = (
+        pd.concat(all_paraphrased_knowledge_dfs)
+        if all_paraphrased_knowledge_dfs
+        else pd.DataFrame()
+    )
     inference_probe_df = pd.concat(all_inference_dfs) if all_inference_dfs else pd.DataFrame()
 
-    if knowledge_probe_df.empty and inference_probe_df.empty:
+    if knowledge_probe_df.empty and paraphrased_knowledge_probe_df.empty and inference_probe_df.empty:
         log_info("No probe metrics found across any domain. Skipping plotting.")
         return
 
@@ -417,8 +442,10 @@ def generate_averaged_plots(experiment_dir: str, logger=None):
     
     # Prepare data
     mean_knowledge_log_probs = _mean_by_step(knowledge_probe_df, 'log_prob')
+    mean_paraphrased_knowledge_log_probs = _mean_by_step(paraphrased_knowledge_probe_df, 'log_prob')
     mean_inference_log_probs = _mean_by_step(inference_probe_df, 'log_prob')
     mean_knowledge_rank = _mean_by_step(knowledge_probe_df, 'target_rank')
+    mean_paraphrased_knowledge_rank = _mean_by_step(paraphrased_knowledge_probe_df, 'target_rank')
     mean_inference_rank = _mean_by_step(inference_probe_df, 'target_rank')
 
     # --- Plot 1a (Averaged) ---
@@ -430,6 +457,8 @@ def generate_averaged_plots(experiment_dir: str, logger=None):
     
     if not mean_knowledge_log_probs.empty:
         sns.lineplot(data=mean_knowledge_log_probs, x='step', y='log_prob', ax=ax1, label='Knowledge Probes Mean Log Probs', color='blue')
+    if not mean_paraphrased_knowledge_log_probs.empty:
+        sns.lineplot(data=mean_paraphrased_knowledge_log_probs, x='step', y='log_prob', ax=ax1, label='Paraphrased Knowledge Probes Mean Log Probs', color='orange')
     if not mean_inference_log_probs.empty:
         sns.lineplot(data=mean_inference_log_probs, x='step', y='log_prob', ax=ax1, label='Inference Probes Mean Log Probs', color='green')
     ax1.legend(loc='upper left')
@@ -457,6 +486,8 @@ def generate_averaged_plots(experiment_dir: str, logger=None):
 
     if not mean_knowledge_rank.empty:
         sns.lineplot(data=mean_knowledge_rank, x='step', y='target_rank', ax=ax1, label='Knowledge Probes Mean Target Rank', color='blue')
+    if not mean_paraphrased_knowledge_rank.empty:
+        sns.lineplot(data=mean_paraphrased_knowledge_rank, x='step', y='target_rank', ax=ax1, label='Paraphrased Knowledge Probes Mean Target Rank', color='orange')
     if not mean_inference_rank.empty:
         sns.lineplot(data=mean_inference_rank, x='step', y='target_rank', ax=ax1, label='Inference Probes Mean Target Rank', color='green')
     ax1.legend(loc='upper left')

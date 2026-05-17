@@ -398,6 +398,50 @@ def write_audit(path: Path, source_path: Path, results: list[RewriteResult]) -> 
     write_csv_rows(path, fieldnames, audit_rows)
 
 
+def load_reuse_results(path: Path, rows: list[dict[str, str]]) -> dict[int, RewriteResult]:
+    """Return accepted rewrites from a prior audit that match rows in this file."""
+    if not path.exists():
+        return {}
+
+    def key(probe: str, fact: str) -> tuple[str, str]:
+        return (normalize_text(probe), normalize_text(fact))
+
+    row_index_by_key = {
+        key(row.get("probe", ""), row.get("fact", row.get("probe", "") + row.get("target", ""))): idx
+        for idx, row in enumerate(rows)
+    }
+    reused: dict[int, RewriteResult] = {}
+    _, audit_rows = read_csv_rows(path)
+    for audit_row in audit_rows:
+        if str(audit_row.get("accepted", "")).lower() != "true":
+            continue
+        original_probe = audit_row.get("original_probe", "")
+        original_fact = audit_row.get("original_fact", "")
+        row_index = row_index_by_key.get(key(original_probe, original_fact))
+        if row_index is None or row_index in reused:
+            continue
+
+        row = rows[row_index]
+        rewritten_probe = audit_row.get("rewritten_probe", "")
+        rewritten_fact = audit_row.get("rewritten_fact", rewritten_probe + row.get("target", ""))
+        if not structurally_valid_rewrite(row.get("probe", ""), rewritten_probe, row.get("target", "")):
+            continue
+        raw = row.get("raw_knowledge_statement", "")
+        reused[row_index] = RewriteResult(
+            row_index=row_index,
+            original_probe=row.get("probe", ""),
+            rewritten_probe=rewritten_probe,
+            original_fact=row.get("fact", row.get("probe", "") + row.get("target", "")),
+            rewritten_fact=rewritten_fact,
+            original_metrics=lexical_metrics(row.get("probe", ""), raw),
+            rewritten_metrics=lexical_metrics(rewritten_probe, raw),
+            attempts=0,
+            accepted=True,
+            note=f"reused accepted rewrite from {path}",
+        )
+    return reused
+
+
 def discover_probe_files(root: Path, version: str) -> list[Path]:
     return sorted(root.glob(f"*/*/facts/probes_{version}.csv"))
 
@@ -423,6 +467,9 @@ def process_file(
     attempts: int,
     max_token_jaccard: float,
     max_lcs_run: int,
+    reuse_audit_version: str | None,
+    reuse_audit_suffix: str,
+    reuse_only: bool,
     dry_run: bool,
     progress_every: int,
 ) -> None:
@@ -432,18 +479,33 @@ def process_file(
     if missing:
         raise ValueError(f"{path} missing required columns: {sorted(missing)}")
 
-    selected_indices = list(range(start_row, len(rows)))
+    reuse_results: dict[int, RewriteResult] = {}
+    if reuse_audit_version:
+        reuse_audit_path = path.with_name(
+            f"probes_{reuse_audit_version}{reuse_audit_suffix}.audit.csv"
+        )
+        reuse_results = load_reuse_results(reuse_audit_path, rows)
+
+    selected_indices = [
+        index for index in range(start_row, len(rows))
+        if index not in reuse_results
+    ]
     if limit is not None:
         selected_indices = selected_indices[:limit]
 
     out_path = output_path_for(path, output_suffix, output_dir)
     audit_path = out_path.with_suffix(".audit.csv")
-    print(f"{path}: {len(selected_indices)} rows selected -> {out_path}")
+    print(
+        f"{path}: {len(reuse_results)} reused, "
+        f"{len(selected_indices)} rows selected -> {out_path}"
+    )
     if dry_run:
         return
+    if reuse_only:
+        selected_indices = []
 
     domain_hint = "/".join(path.parts[-4:-2])
-    results: list[RewriteResult] = []
+    results: list[RewriteResult] = list(reuse_results.values())
 
     def submit(index: int) -> RewriteResult:
         return rewrite_row(
@@ -524,6 +586,17 @@ def parse_args() -> argparse.Namespace:
         help="Deprecated; retained for CLI compatibility. Acceptance is now based on absolute final overlap.",
     )
     parser.add_argument("--max-lcs-run", type=int, default=6)
+    parser.add_argument(
+        "--reuse-audit-version",
+        default=None,
+        help="Reuse accepted rewrites from probes_<version><reuse-audit-suffix>.audit.csv in each facts directory.",
+    )
+    parser.add_argument("--reuse-audit-suffix", default="_low_overlap_strict")
+    parser.add_argument(
+        "--reuse-only",
+        action="store_true",
+        help="Write files using reused audit rows only; leave non-reused rows unchanged.",
+    )
     parser.add_argument("--request-timeout", type=float, default=60.0)
     parser.add_argument("--progress-every", type=int, default=25)
     parser.add_argument("--dry-run", action="store_true")
@@ -536,7 +609,7 @@ def main() -> None:
     if not files:
         raise SystemExit("No probe files found.")
 
-    client = None if args.dry_run else get_openai_client(args.request_timeout)
+    client = None if args.dry_run or args.reuse_only else get_openai_client(args.request_timeout)
     for path in files:
         process_file(
             path,
@@ -550,6 +623,9 @@ def main() -> None:
             attempts=max(args.attempts, 1),
             max_token_jaccard=args.max_token_jaccard,
             max_lcs_run=args.max_lcs_run,
+            reuse_audit_version=args.reuse_audit_version,
+            reuse_audit_suffix=args.reuse_audit_suffix,
+            reuse_only=args.reuse_only,
             dry_run=args.dry_run,
             progress_every=args.progress_every,
         )

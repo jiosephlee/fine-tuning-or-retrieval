@@ -24,14 +24,24 @@ LOG_ROOT = SCRIPT_DIR / "logs" / "e123_autonomous"
 
 MODEL_ID = "allenai/OLMo-2-1124-7B"
 KNOWLEDGE_PROBES_VERSION = "v13"
+PARAPHRASED_KNOWLEDGE_PROBES_VERSION = "v13"
+PARAPHRASED_KNOWLEDGE_PROBE_SUFFIX = "_paraphrased"
 MCQA_PROBES_VERSION = "v14"
-DEFAULT_NPROC = 8
-DEFAULT_DEVICE_BATCH_SIZE = 16
+INFERENCE_MCQA_PROBES_VERSION = "v12"
+DEFAULT_NPROC = 4
+DEFAULT_DEVICE_BATCH_SIZE = 32
 DEFAULT_EFFECTIVE_BATCH_SIZE = 256
 DEFAULT_CONTEXT_LENGTH = 4096
-DEFAULT_LEARNING_RATE = "1e-5"
-DEFAULT_ATTN_IMPLEMENTATION = "sdpa"
-DEFAULT_NUM_EPOCHS = 10
+DEFAULT_LEARNING_RATE = "4e-5"
+DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2"
+DEFAULT_NUM_EPOCHS = 100
+DEFAULT_OVERLAP_RATIO = "1_16"
+DEFAULT_MCQA_PROMPT_COLUMN = "formatted_question_5shot"
+DEFAULT_MCQA_PROBE_BATCH_SIZE = 32
+DEFAULT_PROBE_EVERY_N_STEPS = 2
+DEFAULT_MCQA_PROBE_EVERY_N_STEPS = 4
+DEFAULT_PARAMETER_DELTA_EVERY_N_STEPS = 5
+DEFAULT_LR_SCHEDULER_MIN_LR_RATIO = "0.1"
 
 SOURCES = ("arxiv", "legal", "medical")
 REQUIRED_PROBE_COLUMNS = ("fact", "probe", "target")
@@ -228,13 +238,17 @@ def preflight(args: argparse.Namespace) -> int:
 
     domain_report: dict[str, Any] = {}
     total_probe_rows = 0
+    total_paraphrased_probe_rows = 0
     total_mcqa_probe_rows = 0
+    total_inference_mcqa_probe_rows = 0
     for source in SOURCES:
         domains = discover_domains(source)
         source_report = {
             "domains": domains,
             "probe_rows": 0,
+            "paraphrased_probe_rows": 0,
             "mcqa_probe_rows": 0,
+            "inference_mcqa_probe_rows": 0,
             "missing": [],
             "malformed": [],
         }
@@ -251,6 +265,28 @@ def preflight(args: argparse.Namespace) -> int:
                     source_report["malformed"].append(
                         {
                             "path": str(probe_path.relative_to(PROJECT_ROOT)),
+                            "missing_columns": missing_columns,
+                        }
+                    )
+
+            paraphrased_probe_path = (
+                facts_dir
+                / f"probes_{PARAPHRASED_KNOWLEDGE_PROBES_VERSION}"
+                f"{PARAPHRASED_KNOWLEDGE_PROBE_SUFFIX}.csv"
+            )
+            if not paraphrased_probe_path.exists():
+                source_report["missing"].append(str(paraphrased_probe_path.relative_to(PROJECT_ROOT)))
+            else:
+                rows, missing_columns = count_probe_rows(
+                    paraphrased_probe_path,
+                    REQUIRED_PROBE_COLUMNS,
+                )
+                source_report["paraphrased_probe_rows"] += rows
+                total_paraphrased_probe_rows += rows
+                if missing_columns:
+                    source_report["malformed"].append(
+                        {
+                            "path": str(paraphrased_probe_path.relative_to(PROJECT_ROOT)),
                             "missing_columns": missing_columns,
                         }
                     )
@@ -272,6 +308,25 @@ def preflight(args: argparse.Namespace) -> int:
                             "missing_columns": missing_columns,
                         }
                     )
+            inference_dir = PROJECT_ROOT / "probes" / source / domain / "inference"
+            inference_mcqa_probe_path = inference_dir / f"probes_{INFERENCE_MCQA_PROBES_VERSION}_mcqa.csv"
+            if not inference_mcqa_probe_path.exists():
+                source_report["missing"].append(str(inference_mcqa_probe_path.relative_to(PROJECT_ROOT)))
+            else:
+                rows, missing_columns = count_probe_rows(
+                    inference_mcqa_probe_path,
+                    REQUIRED_MCQA_PROBE_COLUMNS,
+                )
+                source_report.setdefault("inference_mcqa_probe_rows", 0)
+                source_report["inference_mcqa_probe_rows"] += rows
+                total_inference_mcqa_probe_rows += rows
+                if missing_columns:
+                    source_report["malformed"].append(
+                        {
+                            "path": str(inference_mcqa_probe_path.relative_to(PROJECT_ROOT)),
+                            "missing_columns": missing_columns,
+                        }
+                    )
         if source_report["missing"] or source_report["malformed"]:
             errors.append(
                 f"{source} has missing or malformed "
@@ -280,7 +335,9 @@ def preflight(args: argparse.Namespace) -> int:
         domain_report[source] = source_report
     manifest["checks"]["domains"] = domain_report
     manifest["checks"]["total_probe_rows"] = total_probe_rows
+    manifest["checks"]["total_paraphrased_probe_rows"] = total_paraphrased_probe_rows
     manifest["checks"]["total_mcqa_probe_rows"] = total_mcqa_probe_rows
+    manifest["checks"]["total_inference_mcqa_probe_rows"] = total_inference_mcqa_probe_rows
 
     for source in SOURCES:
         for folder in ("paraphrased", "explanations"):
@@ -310,17 +367,38 @@ def base_training_args(custom_suffix: str, num_epochs: int, args: argparse.Names
         "finetuning_knowledge_v9.py",
         "--custom_suffix",
         custom_suffix,
+        "--wandb_group",
+        "finetuning_official",
         "--model_id",
         MODEL_ID,
         "--knowledge_probes_version",
         KNOWLEDGE_PROBES_VERSION,
+        "--paraphrased_knowledge_probes",
+        "--paraphrased_knowledge_probes_version",
+        PARAPHRASED_KNOWLEDGE_PROBES_VERSION,
+        "--paraphrased_knowledge_probe_filename_suffix",
+        PARAPHRASED_KNOWLEDGE_PROBE_SUFFIX,
         "--mcqa_probes",
         "--mcqa_probes_version",
         MCQA_PROBES_VERSION,
+        "--mcqa_prompt_column",
+        DEFAULT_MCQA_PROMPT_COLUMN,
+        "--mcqa_probe_batch_size",
+        str(DEFAULT_MCQA_PROBE_BATCH_SIZE),
+        "--inference_mcqa_probes",
+        "--inference_mcqa_probes_version",
+        INFERENCE_MCQA_PROBES_VERSION,
+        "--inference_mcqa_prompt_column",
+        "formatted_question",
         "--num_train_epochs",
         str(num_epochs),
         "--learning_rate",
         DEFAULT_LEARNING_RATE,
+        "--lr_scheduler_min_lr_ratio",
+        DEFAULT_LR_SCHEDULER_MIN_LR_RATIO,
+        "--overlap_sections",
+        "--overlap_ratio",
+        DEFAULT_OVERLAP_RATIO,
         "--device_batch_size",
         str(args.device_batch_size),
         "--effective_batch_size_for_cpt",
@@ -332,9 +410,14 @@ def base_training_args(custom_suffix: str, num_epochs: int, args: argparse.Names
         DEFAULT_ATTN_IMPLEMENTATION,
         "--gradient_checkpointing",
         "--full_finetuning",
+        "--probe_every_n_steps",
+        str(DEFAULT_PROBE_EVERY_N_STEPS),
+        "--mcqa_probe_every_n_steps",
+        str(DEFAULT_MCQA_PROBE_EVERY_N_STEPS),
         "--enable_parameter_delta_tracking",
+        "--parameter_delta_every_n_steps",
+        str(DEFAULT_PARAMETER_DELTA_EVERY_N_STEPS),
         "--no-save_local_model",
-        "--no_callback_every_step",
     ]
 
 
@@ -597,6 +680,11 @@ def validate(args: argparse.Namespace) -> int:
                 str(experiment_dir),
                 "--knowledge_probes_version",
                 KNOWLEDGE_PROBES_VERSION,
+                "--paraphrased_knowledge_probes",
+                "--paraphrased_knowledge_probes_version",
+                PARAPHRASED_KNOWLEDGE_PROBES_VERSION,
+                "--paraphrased_knowledge_probe_filename_suffix",
+                PARAPHRASED_KNOWLEDGE_PROBE_SUFFIX,
             ]
             plot_proc = run_cmd(plot_cmd, SCRIPT_DIR)
             if plot_proc.returncode != 0:

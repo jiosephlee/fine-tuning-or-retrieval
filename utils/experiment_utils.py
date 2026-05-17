@@ -152,25 +152,39 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
     callbacks = []
     report_to_wandb = not args.test_script
     probe_batch_size = args.device_batch_size * 4
+    mcqa_probe_batch_size = max(1, int(getattr(args, "mcqa_probe_batch_size", 32) or 32))
     sparse_eval = getattr(args, "no_callback_every_step", False)
     disable_inference_probes = getattr(args, "disable_inference_probes", False)
     enable_wandb_source_panels = getattr(args, "enable_wandb_source_panels", False)
     panel_sources = getattr(args, "wandb_panel_sources", ["legal", "arxiv", "medical"])
+    probe_report_to_wandb = report_to_wandb and not enable_wandb_source_panels
     wandb_probe_metric_allowlist = getattr(args, "wandb_probe_metric_allowlist", None)
     disable_corpus_perplexity_wandb = getattr(args, "disable_corpus_perplexity_wandb", False)
     disable_training_loss_perplexity_wandb = getattr(args, "disable_training_loss_perplexity_wandb", False)
     domain_sources = getattr(args, "domain_data_sources", {}) or {}
     enable_mcqa_probes = getattr(args, "mcqa_probes", False)
+    enable_inference_mcqa_probes = getattr(args, "inference_mcqa_probes", False)
     default_knowledge_probes_version = getattr(args, "knowledge_probes_version", "v13")
     knowledge_probe_filename_suffix = getattr(args, "knowledge_probe_filename_suffix", "")
+    enable_paraphrased_knowledge_probes = getattr(args, "paraphrased_knowledge_probes", False)
+    paraphrased_knowledge_probes_version = getattr(
+        args, "paraphrased_knowledge_probes_version", default_knowledge_probes_version
+    )
+    paraphrased_knowledge_probe_filename_suffix = getattr(
+        args, "paraphrased_knowledge_probe_filename_suffix", "_paraphrased"
+    )
     mcqa_probes_version = getattr(args, "mcqa_probes_version", default_knowledge_probes_version)
     mcqa_prompt_column = getattr(args, "mcqa_prompt_column", "formatted_question")
+    inference_mcqa_probes_version = getattr(args, "inference_mcqa_probes_version", "v12")
+    inference_mcqa_prompt_column = getattr(args, "inference_mcqa_prompt_column", "formatted_question")
     probe_every_n_steps = max(1, int(getattr(args, "probe_every_n_steps", 1) or 1))
     mcqa_probe_every_n_steps = max(1, int(getattr(args, "mcqa_probe_every_n_steps", 1) or 1))
     enable_parameter_delta_tracking = getattr(args, "enable_parameter_delta_tracking", False)
     knowledge_probe_callbacks = []
+    paraphrased_knowledge_probe_callbacks = []
     inference_probe_callbacks = []
     mcqa_probe_callbacks = []
+    inference_mcqa_probe_callbacks = []
 
     if not domains:
         domains = get_all_domains()
@@ -201,7 +215,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
             knowledge_probe_callback = _create_probe_callback(
                 tokenizer, knowledge_probe_df, probe_batch_size, log,
                 output_dir_knowledge_probe, f"{domain}_knowledge_probe",
-                report_to_wandb, sparse_eval,
+                probe_report_to_wandb, sparse_eval,
                 wandb_probe_metric_allowlist,
                 probe_every_n_steps,
             )
@@ -210,6 +224,36 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
             log.info(f"Loaded {len(knowledge_probe_df)} knowledge probes from {knowledge_probe_path}")
         else:
             log.warning(f"Knowledge probe file not found for domain {domain} at {knowledge_probe_path}")
+
+        if enable_paraphrased_knowledge_probes:
+            paraphrased_knowledge_probe_path = str(
+                probe_paths.resolve_knowledge_probe_path(
+                    domain,
+                    paraphrased_knowledge_probes_version,
+                    domain_source=domain_source,
+                    filename_suffix=paraphrased_knowledge_probe_filename_suffix,
+                )
+            )
+            if os.path.exists(paraphrased_knowledge_probe_path):
+                paraphrased_knowledge_probe_df = pd.read_csv(paraphrased_knowledge_probe_path)
+                paraphrased_knowledge_probe_callback = _create_probe_callback(
+                    tokenizer, paraphrased_knowledge_probe_df, probe_batch_size, log,
+                    output_dir_knowledge_probe, f"{domain}_knowledge_probe_paraphrased",
+                    probe_report_to_wandb, sparse_eval,
+                    wandb_probe_metric_allowlist,
+                    probe_every_n_steps,
+                )
+                callbacks.append(paraphrased_knowledge_probe_callback)
+                paraphrased_knowledge_probe_callbacks.append(paraphrased_knowledge_probe_callback)
+                log.info(
+                    f"Loaded {len(paraphrased_knowledge_probe_df)} paraphrased knowledge probes "
+                    f"from {paraphrased_knowledge_probe_path}"
+                )
+            else:
+                log.warning(
+                    f"Paraphrased knowledge probe file not found for domain {domain} "
+                    f"at {paraphrased_knowledge_probe_path}"
+                )
 
         # MCQA probes (constrained-decoding evaluation)
         if enable_mcqa_probes:
@@ -227,9 +271,9 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                 )
                 os.makedirs(output_dir_mcqa, exist_ok=True)
                 mcqa_callback = _create_mcqa_callback(
-                    tokenizer, mcqa_df, probe_batch_size, log,
+                    tokenizer, mcqa_df, mcqa_probe_batch_size, log,
                     output_dir_mcqa, f"{domain}_mcqa_probe",
-                    report_to_wandb, sparse_eval,
+                    probe_report_to_wandb, sparse_eval,
                     wandb_probe_metric_allowlist,
                     mcqa_probe_every_n_steps,
                     prompt_column=mcqa_prompt_column,
@@ -238,12 +282,49 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                 mcqa_probe_callbacks.append(mcqa_callback)
                 log.info(
                     f"Loaded {len(mcqa_df)} MCQA probes "
-                    f"({mcqa_probes_version}) from {mcqa_probe_path}"
+                    f"({mcqa_probes_version}) from {mcqa_probe_path} "
+                    f"with batch_size={mcqa_probe_batch_size}"
                 )
             else:
                 log.warning(
                     f"MCQA probe file not found for domain {domain} "
                     f"with version {mcqa_probes_version} at {mcqa_probe_path}"
+                )
+
+        # Inference MCQA probes (constrained-decoding evaluation)
+        if enable_inference_mcqa_probes:
+            inference_mcqa_probe_path = str(
+                probe_paths.resolve_mcqa_probe_path(
+                    "inference", domain, inference_mcqa_probes_version,
+                    domain_source=domain_source,
+                )
+            )
+            if os.path.exists(inference_mcqa_probe_path):
+                inference_mcqa_df = pd.read_csv(inference_mcqa_probe_path)
+                output_dir_inference_mcqa = os.path.join(
+                    args.base_results_dir, args.experiment_name,
+                    f"{domain}{suffix}_inference_mcqa_probe",
+                )
+                os.makedirs(output_dir_inference_mcqa, exist_ok=True)
+                inference_mcqa_callback = _create_mcqa_callback(
+                    tokenizer, inference_mcqa_df, mcqa_probe_batch_size, log,
+                    output_dir_inference_mcqa, f"{domain}_inference_mcqa_probe",
+                    probe_report_to_wandb, sparse_eval,
+                    wandb_probe_metric_allowlist,
+                    mcqa_probe_every_n_steps,
+                    prompt_column=inference_mcqa_prompt_column,
+                )
+                callbacks.append(inference_mcqa_callback)
+                inference_mcqa_probe_callbacks.append(inference_mcqa_callback)
+                log.info(
+                    f"Loaded {len(inference_mcqa_df)} inference MCQA probes "
+                    f"({inference_mcqa_probes_version}) from {inference_mcqa_probe_path} "
+                    f"with batch_size={mcqa_probe_batch_size}"
+                )
+            else:
+                log.warning(
+                    f"Inference MCQA probe file not found for domain {domain} "
+                    f"with version {inference_mcqa_probes_version} at {inference_mcqa_probe_path}"
                 )
 
         if disable_inference_probes:
@@ -255,18 +336,23 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
             # Inference probes path
             inference_probes_version = args.inference_probes_version
             inference_probe_subset = getattr(args, "inference_probe_subset", "all")
-            log.info(f"Using inference_probe_subset='{inference_probe_subset}' for domain {domain}")
+            inference_probe_filename_suffix = getattr(args, "inference_probe_filename_suffix", "")
+            log.info(
+                f"Using inference_probe_subset='{inference_probe_subset}' "
+                f"and probes_{inference_probes_version}{inference_probe_filename_suffix}.csv "
+                f"for domain {domain}"
+            )
 
             # Optional subset-specific test files: test_probes_vX.csv or type_split_test_probes_vX.csv
             if inference_probe_subset in {"test", "type_split_test"}:
                 base_dir = str(probe_paths.resolve_probe_dir("inference", domain, domain_source))
                 candidate_path = []
                 if inference_probe_subset == "test":
-                    candidate_path.append(os.path.join(base_dir, f'train_probes_{inference_probes_version}.csv'))
-                    candidate_path.append(os.path.join(base_dir, f'test_probes_{inference_probes_version}.csv'))
+                    candidate_path.append(os.path.join(base_dir, f'train_probes_{inference_probes_version}{inference_probe_filename_suffix}.csv'))
+                    candidate_path.append(os.path.join(base_dir, f'test_probes_{inference_probes_version}{inference_probe_filename_suffix}.csv'))
                 else:  # type_split_test
-                    candidate_path.append(os.path.join(base_dir, f'type_split_train_probes_{inference_probes_version}.csv'))
-                    candidate_path.append(os.path.join(base_dir, f'type_split_test_probes_{inference_probes_version}.csv'))
+                    candidate_path.append(os.path.join(base_dir, f'type_split_train_probes_{inference_probes_version}{inference_probe_filename_suffix}.csv'))
+                    candidate_path.append(os.path.join(base_dir, f'type_split_test_probes_{inference_probes_version}{inference_probe_filename_suffix}.csv'))
 
                 if os.path.exists(candidate_path[0]):
                     inference_probe_path = candidate_path[0]
@@ -292,7 +378,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                     inference_probe_callback = _create_probe_callback(
                         tokenizer, inference_probe_df, probe_batch_size, log,
                         output_dir_inference_probe, prefix,
-                        report_to_wandb, sparse_eval,
+                        probe_report_to_wandb, sparse_eval,
                         wandb_probe_metric_allowlist,
                         probe_every_n_steps,
                     )
@@ -306,6 +392,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                         domain,
                         inference_probes_version,
                         domain_source=domain_source,
+                        filename_suffix=inference_probe_filename_suffix,
                     )
                 ]
 
@@ -322,7 +409,7 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
                 inference_probe_callback = _create_probe_callback(
                     tokenizer, inference_probe_df, probe_batch_size, log,
                     output_dir_inference_probe, f"{domain}_inference_probe",
-                    report_to_wandb, sparse_eval,
+                    probe_report_to_wandb, sparse_eval,
                     wandb_probe_metric_allowlist,
                     probe_every_n_steps,
                 )
@@ -447,8 +534,10 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
         callbacks.append(
             llm_callbacks.WandbSourcePanelsCallback(
                 knowledge_callbacks=knowledge_probe_callbacks,
+                paraphrased_knowledge_callbacks=paraphrased_knowledge_probe_callbacks,
                 inference_callbacks=inference_probe_callbacks,
                 mcqa_callbacks=mcqa_probe_callbacks,
+                inference_mcqa_callbacks=inference_mcqa_probe_callbacks,
                 domain_sources=domain_sources,
                 panel_sources=panel_sources,
                 report_to_wandb=report_to_wandb,

@@ -80,11 +80,12 @@ def resolve_inference_probe_candidates(
     domain: str,
     version: str,
     domain_source: Optional[str] = None,
+    filename_suffix: str = "",
 ) -> List[Path]:
     base_dir = resolve_probe_dir("inference", domain, domain_source)
     return [
-        base_dir / f"probes_{version}.csv",
-        base_dir / f"{domain.lower()}_high_level_probes_{version}.csv",
+        base_dir / f"probes_{version}{filename_suffix}.csv",
+        base_dir / f"{domain.lower()}_high_level_probes_{version}{filename_suffix}.csv",
     ]
 
 

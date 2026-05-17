@@ -32,9 +32,11 @@ DOMAIN_OVERRIDE_ARG_BY_SOURCE = {
     "medical": "override_medical_domain",
 }
 DEFAULT_WANDB_PROJECT = "v9_refined"
+DEFAULT_WANDB_GROUP = "finetuning_official"
 DEFAULT_WANDB_PANEL_SOURCES = ("legal", "arxiv", "medical")
 DEFAULT_KNOWLEDGE_PROBES_VERSION = "v13"
 DEFAULT_KNOWLEDGE_PROBE_FILENAME_SUFFIX = ""
+DEFAULT_PARAPHRASED_KNOWLEDGE_PROBE_FILENAME_SUFFIX = "_paraphrased"
 DEFAULT_KNOWLEDGE_PROBE_VARIANT = "standard"
 KNOWLEDGE_PROBE_VARIANT_SUFFIXES = {
     "standard": "",
@@ -44,9 +46,50 @@ KNOWLEDGE_PROBE_VARIANT_DEFAULT_VERSION = {
     "low_overlap_strict": "v14",
 }
 DEFAULT_MCQA_PROBES_VERSION = "v14"
+DEFAULT_INFERENCE_MCQA_PROBES_VERSION = "v12"
+DEFAULT_INFERENCE_PROBES_VERSION = "v11"
+DEFAULT_INFERENCE_PROBE_FILENAME_SUFFIX = ""
+DEFAULT_INFERENCE_PROBE_VARIANT = "reviewed"
+INFERENCE_PROBE_VARIANT_SUFFIXES = {
+    "standard": "",
+    "reviewed": "_reviewed",
+}
+INFERENCE_PROBE_VARIANT_DEFAULT_VERSION = {
+    "reviewed": "v11",
+}
 REQUIRED_KNOWLEDGE_PROBE_COLUMNS = ("fact", "probe", "target")
 REQUIRED_INFERENCE_PROBE_COLUMNS = ("fact", "probe", "target")
 REQUIRED_MCQA_PROBE_COLUMNS = ("formatted_question", "correct_label")
+
+
+def _validate_probe_rows(probe_df: pd.DataFrame, required_columns: Tuple[str, ...]) -> List[str]:
+    missing_columns = [
+        column for column in required_columns
+        if column not in probe_df.columns
+    ]
+    if missing_columns:
+        return [f"missing columns {missing_columns}"]
+
+    null_mask = probe_df[list(required_columns)].isna().any(axis=1)
+    messages = []
+    if null_mask.any():
+        messages.append(
+            "null values in required columns at row indices "
+            f"{probe_df.index[null_mask].tolist()[:10]}"
+        )
+
+    reconstructed = (
+        probe_df["probe"].astype(str)
+        + probe_df["target"].astype(str)
+    )
+    mismatch_mask = reconstructed != probe_df["fact"].astype(str)
+    if mismatch_mask.any():
+        messages.append(
+            "probe + target != fact at row indices "
+            f"{probe_df.index[mismatch_mask].tolist()[:10]}"
+        )
+
+    return messages
 
 
 def distributed_world_size() -> int:
@@ -115,7 +158,8 @@ def resolve_domains_and_sources(args, log) -> Tuple[Optional[List[str]], Dict[st
             resolved_domains.append(domain)
             seen.add(domain)
 
-    for source in SUPPORTED_HIGH_LEVEL_DOMAINS:
+    included_sources = tuple(getattr(args, "include_sources", SUPPORTED_HIGH_LEVEL_DOMAINS))
+    for source in included_sources:
         catalog = _discover_domains_for_source(source, args)
         override_arg = DOMAIN_OVERRIDE_ARG_BY_SOURCE[source]
         requested = getattr(args, override_arg)
@@ -169,12 +213,12 @@ def validate_selected_knowledge_probes(args, log) -> None:
             continue
 
         probe_df = pd.read_csv(probe_path)
-        missing_columns = [
-            column for column in REQUIRED_KNOWLEDGE_PROBE_COLUMNS
-            if column not in probe_df.columns
-        ]
-        if missing_columns:
-            malformed.append((str(probe_path), missing_columns))
+        malformed_messages = _validate_probe_rows(
+            probe_df,
+            REQUIRED_KNOWLEDGE_PROBE_COLUMNS,
+        )
+        if malformed_messages:
+            malformed.append((str(probe_path), malformed_messages))
             continue
 
         total_rows += len(probe_df)
@@ -190,8 +234,8 @@ def validate_selected_knowledge_probes(args, log) -> None:
             details.append(
                 "Malformed knowledge probe files:\n"
                 + "\n".join(
-                    f"  - {path}: missing columns {columns}"
-                    for path, columns in malformed
+                    f"  - {path}: {'; '.join(messages)}"
+                    for path, messages in malformed
                 )
             )
         raise ValueError("\n".join(details))
@@ -201,6 +245,62 @@ def validate_selected_knowledge_probes(args, log) -> None:
         f"probes_{args.knowledge_probes_version}"
         f"{args.knowledge_probe_filename_suffix}.csv across "
         f"{len(args.resolved_domains)} domains."
+    )
+
+
+def validate_selected_paraphrased_knowledge_probes(args, log) -> None:
+    """Fail early if optional paraphrased factual probe files are absent or malformed."""
+    if not getattr(args, "paraphrased_knowledge_probes", False):
+        return
+
+    missing_paths = []
+    malformed = []
+    total_rows = 0
+    version = args.paraphrased_knowledge_probes_version
+    suffix = args.paraphrased_knowledge_probe_filename_suffix
+
+    for domain in args.resolved_domains:
+        domain_source = args.domain_data_sources.get(domain)
+        probe_path = probe_paths.resolve_knowledge_probe_path(
+            domain,
+            version,
+            domain_source=domain_source,
+            filename_suffix=suffix,
+        )
+        if not os.path.exists(probe_path):
+            missing_paths.append(str(probe_path))
+            continue
+
+        probe_df = pd.read_csv(probe_path)
+        malformed_messages = _validate_probe_rows(
+            probe_df,
+            REQUIRED_KNOWLEDGE_PROBE_COLUMNS,
+        )
+        if malformed_messages:
+            malformed.append((str(probe_path), malformed_messages))
+            continue
+        total_rows += len(probe_df)
+
+    if missing_paths or malformed:
+        details = []
+        if missing_paths:
+            details.append(
+                "Missing paraphrased knowledge probe files:\n"
+                + "\n".join(f"  - {path}" for path in missing_paths)
+            )
+        if malformed:
+            details.append(
+                "Malformed paraphrased knowledge probe files:\n"
+                + "\n".join(
+                    f"  - {path}: {'; '.join(messages)}"
+                    for path, messages in malformed
+                )
+            )
+        raise ValueError("\n".join(details))
+
+    log.info(
+        f"Validated {total_rows} paraphrased factual probes from "
+        f"probes_{version}{suffix}.csv across {len(args.resolved_domains)} domains."
     )
 
 
@@ -231,23 +331,60 @@ def apply_knowledge_probe_variant(args) -> None:
         args.knowledge_probe_variant = "custom_suffix"
 
 
-def validate_selected_mcqa_probes(args, log) -> None:
+def apply_inference_probe_variant(args) -> None:
+    """Normalize first-class inference probe variant flags into version/suffix fields."""
+    if getattr(args, "use_reviewed_inference_probes", False):
+        args.inference_probe_variant = "reviewed"
+
+    variant = getattr(args, "inference_probe_variant", DEFAULT_INFERENCE_PROBE_VARIANT)
+    if variant not in INFERENCE_PROBE_VARIANT_SUFFIXES:
+        raise ValueError(
+            f"Unknown inference_probe_variant={variant!r}. "
+            f"Expected one of {sorted(INFERENCE_PROBE_VARIANT_SUFFIXES)}."
+        )
+
+    if variant != "standard":
+        default_version = INFERENCE_PROBE_VARIANT_DEFAULT_VERSION.get(variant)
+        if default_version and args.inference_probes_version == DEFAULT_INFERENCE_PROBES_VERSION:
+            args.inference_probes_version = default_version
+        variant_suffix = INFERENCE_PROBE_VARIANT_SUFFIXES[variant]
+        if args.inference_probe_filename_suffix and args.inference_probe_filename_suffix != variant_suffix:
+            raise ValueError(
+                f"--inference_probe_variant {variant} implies suffix {variant_suffix!r}, "
+                f"but --inference_probe_filename_suffix was {args.inference_probe_filename_suffix!r}."
+            )
+        args.inference_probe_filename_suffix = variant_suffix
+    elif args.inference_probe_filename_suffix:
+        args.inference_probe_variant = "custom_suffix"
+
+
+def validate_selected_mcqa_probe_family(
+    args,
+    log,
+    *,
+    enabled_attr: str,
+    version_attr: str,
+    prompt_column_attr: str,
+    probe_kind: str,
+    label: str,
+) -> None:
     """Fail early if enabled MCQA probe files are absent or malformed."""
-    if not args.mcqa_probes:
+    if not getattr(args, enabled_attr, False):
         return
 
     missing_paths = []
     malformed = []
     total_rows = 0
-    mcqa_prompt_column = getattr(args, "mcqa_prompt_column", "formatted_question")
+    mcqa_prompt_column = getattr(args, prompt_column_attr, "formatted_question")
+    mcqa_probes_version = getattr(args, version_attr)
     required_columns = tuple(dict.fromkeys(REQUIRED_MCQA_PROBE_COLUMNS + (mcqa_prompt_column,)))
 
     for domain in args.resolved_domains:
         domain_source = args.domain_data_sources.get(domain)
         probe_path = probe_paths.resolve_mcqa_probe_path(
-            "facts",
+            probe_kind,
             domain,
-            args.mcqa_probes_version,
+            mcqa_probes_version,
             domain_source=domain_source,
         )
 
@@ -284,9 +421,30 @@ def validate_selected_mcqa_probes(args, log) -> None:
         raise ValueError("\n".join(details))
 
     log.info(
-        f"Validated {total_rows} MCQA probes from "
-        f"probes_{args.mcqa_probes_version}_mcqa.csv using prompt column "
+        f"Validated {total_rows} {label} MCQA probes from "
+        f"{probe_kind}/probes_{mcqa_probes_version}_mcqa.csv using prompt column "
         f"'{mcqa_prompt_column}' across {len(args.resolved_domains)} domains."
+    )
+
+
+def validate_selected_mcqa_probes(args, log) -> None:
+    validate_selected_mcqa_probe_family(
+        args,
+        log,
+        enabled_attr="mcqa_probes",
+        version_attr="mcqa_probes_version",
+        prompt_column_attr="mcqa_prompt_column",
+        probe_kind="facts",
+        label="factual",
+    )
+    validate_selected_mcqa_probe_family(
+        args,
+        log,
+        enabled_attr="inference_mcqa_probes",
+        version_attr="inference_mcqa_probes_version",
+        prompt_column_attr="inference_mcqa_prompt_column",
+        probe_kind="inference",
+        label="inference",
     )
 
 
@@ -294,23 +452,25 @@ def _selected_inference_probe_paths(domain: str, domain_source: str, args) -> Li
     """Return the inference probe CSVs required by the selected v9 settings."""
     inference_probe_subset = getattr(args, "inference_probe_subset", "all")
     inference_probes_version = args.inference_probes_version
+    inference_probe_filename_suffix = getattr(args, "inference_probe_filename_suffix", "")
 
     if inference_probe_subset in {"test", "type_split_test"}:
         base_dir = str(probe_paths.resolve_probe_dir("inference", domain, domain_source))
         if inference_probe_subset == "test":
             return [
-                os.path.join(base_dir, f"train_probes_{inference_probes_version}.csv"),
-                os.path.join(base_dir, f"test_probes_{inference_probes_version}.csv"),
+                os.path.join(base_dir, f"train_probes_{inference_probes_version}{inference_probe_filename_suffix}.csv"),
+                os.path.join(base_dir, f"test_probes_{inference_probes_version}{inference_probe_filename_suffix}.csv"),
             ]
         return [
-            os.path.join(base_dir, f"type_split_train_probes_{inference_probes_version}.csv"),
-            os.path.join(base_dir, f"type_split_test_probes_{inference_probes_version}.csv"),
+            os.path.join(base_dir, f"type_split_train_probes_{inference_probes_version}{inference_probe_filename_suffix}.csv"),
+            os.path.join(base_dir, f"type_split_test_probes_{inference_probes_version}{inference_probe_filename_suffix}.csv"),
         ]
 
     candidates = probe_paths.resolve_inference_probe_candidates(
         domain,
         inference_probes_version,
         domain_source=domain_source,
+        filename_suffix=inference_probe_filename_suffix,
     )
     for candidate in candidates:
         if candidate.exists():
@@ -364,7 +524,9 @@ def validate_selected_inference_probes(args, log) -> None:
 
     log.info(
         f"Validated {total_rows} inference probes from "
-        f"{args.inference_probes_version} ({args.inference_probe_subset}) across "
+        f"probes_{args.inference_probes_version}"
+        f"{args.inference_probe_filename_suffix}.csv "
+        f"({args.inference_probe_subset}) across "
         f"{len(args.resolved_domains)} domains."
     )
 
@@ -391,6 +553,13 @@ def construct_experiment_name(args):
     probes_version = f"probes_{args.knowledge_probes_version}"
     if args.knowledge_probe_filename_suffix:
         probes_version += args.knowledge_probe_filename_suffix
+    if getattr(args, "paraphrased_knowledge_probes", False):
+        probes_version += (
+            f"_para_{args.paraphrased_knowledge_probes_version}"
+            f"{args.paraphrased_knowledge_probe_filename_suffix}"
+        )
+    if not getattr(args, "disable_inference_probes", False):
+        probes_version += f"_inf_{args.inference_probes_version}{args.inference_probe_filename_suffix}"
     if getattr(args, "mcqa_probes", False):
         mcqa_probes_version = getattr(
             args,
@@ -405,6 +574,20 @@ def construct_experiment_name(args):
                 for char in mcqa_prompt_column
             )
             probes_version += f"_prompt_{prompt_tag}"
+    if getattr(args, "inference_mcqa_probes", False):
+        inference_mcqa_probes_version = getattr(
+            args,
+            "inference_mcqa_probes_version",
+            DEFAULT_INFERENCE_MCQA_PROBES_VERSION,
+        )
+        probes_version += f"_inf_mcqa_{inference_mcqa_probes_version}"
+        inference_mcqa_prompt_column = getattr(args, "inference_mcqa_prompt_column", "formatted_question")
+        if inference_mcqa_prompt_column != "formatted_question":
+            prompt_tag = "".join(
+                char if char.isalnum() or char in {"_", "-"} else "_"
+                for char in inference_mcqa_prompt_column
+            )
+            probes_version += f"_inf_prompt_{prompt_tag}"
 
     # 4. Chunking Style: e.g., 'sec_no-ovp', 'sec_ovp_1_4', 'tok'
     if args.chunk_by_section:
@@ -443,24 +626,37 @@ def construct_experiment_name(args):
 
                 if args.granular_explanations_num_tracks > 1:
                     data_mix += f"_tracks{args.granular_explanations_num_tracks}"
+                if args.explanation_granularity == "chunk":
+                    data_mix += f"_granchunk{args.explanation_track_size_by_chunk}"
+            elif args.explanations_insertion_strategy == "granular_queue":
+                data_mix += f"_insgranular_queue_tracks{args.granular_explanations_num_tracks}"
+                if args.explanation_granularity == "chunk":
+                    data_mix += f"_chunk{args.explanation_track_size_by_chunk}"
 
-            if args.explanations_insertion_strategy != "granular":
+            if args.explanations_insertion_strategy not in ("granular", "granular_queue"):
                 data_mix += f"_ins{args.explanations_insertion_strategy}"
 
             if args.explanations_insertion_strategy == "whole":
                 data_mix += f"_every{args.whole_explanations_insert_every_n}"
+            if args.match_explanation_source_replay:
+                data_mix += "_srcmatch"
 
         if args.document_track_baseline:
             data_mix += "_docmatch_expl"
+            if args.explanation_granularity == "chunk":
+                data_mix += f"_granchunk{args.explanation_track_size_by_chunk}"
 
     else:
         data_mix = "source_only"
         if args.document_track_baseline:
             data_mix += "_docmatch_expl"
+            if args.explanation_granularity == "chunk":
+                data_mix += f"_granchunk{args.explanation_track_size_by_chunk}"
 
     # 6. Domains (per source): compact, avoids giant path names when "all" is used.
     selection_tags = []
-    for source in SUPPORTED_HIGH_LEVEL_DOMAINS:
+    included_sources = tuple(getattr(args, "include_sources", SUPPORTED_HIGH_LEVEL_DOMAINS))
+    for source in included_sources:
         override_arg = DOMAIN_OVERRIDE_ARG_BY_SOURCE[source]
         chosen = getattr(args, override_arg)
         if not chosen:
@@ -567,9 +763,15 @@ def continue_pretraining(model, tokenizer, log, args, train: bool = True):
         "report_to": "wandb" if not args.test_script else "none",
         "activation_offloading": args.offload_to_cpu,
         "compile": args.compile_model,
+        "loss_type": args.sft_loss_type,
     }
     if args.constant_lr:
         training_config_kwargs["lr_scheduler_type"] = "constant_with_warmup"
+    else:
+        training_config_kwargs["lr_scheduler_type"] = "cosine_with_min_lr"
+        training_config_kwargs["lr_scheduler_kwargs"] = {
+            "min_lr_rate": args.lr_scheduler_min_lr_ratio
+        }
     
     if args.overrule_warmup_via_steps:
         training_config_kwargs["warmup_steps"] = args.overrule_warmup_via_steps
@@ -621,10 +823,17 @@ def continue_pretraining(model, tokenizer, log, args, train: bool = True):
             "shuffle_seed": args.shuffle_seed,
             "granular_explanations_cycle": args.granular_explanations_cycle,
             "granular_explanations_num_tracks": args.granular_explanations_num_tracks,
+            "explanation_granularity": args.explanation_granularity,
+            "explanation_track_size_by_chunk": args.explanation_track_size_by_chunk,
             "explanations_insertion_strategy": args.explanations_insertion_strategy,
             "whole_explanations_insert_every_n": args.whole_explanations_insert_every_n,
             "document_track_baseline": args.document_track_baseline,
+            "match_explanation_source_replay": args.match_explanation_source_replay,
             "document_match_specific_explanation": args.document_match_specific_explanation,
+            "with_prior_knowledge": args.with_prior_knowledge,
+            "prior_knowledge_insertion": args.prior_knowledge_insertion,
+            "prior_knowledge_cycle": args.prior_knowledge_cycle,
+            "prior_knowledge_match_document_track": args.prior_knowledge_match_document_track,
         }
 
         use_special_injection = bool(args.with_specific_explanation)
@@ -709,9 +918,15 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
         "report_to": "wandb" if not args.test_script else "none",
         "activation_offloading": args.offload_to_cpu,
         "compile": args.compile_model,
+        "loss_type": args.sft_loss_type,
     }
     if args.constant_lr:
         lima_training_config_kwargs["lr_scheduler_type"] = "constant_with_warmup"
+    else:
+        lima_training_config_kwargs["lr_scheduler_type"] = "cosine_with_min_lr"
+        lima_training_config_kwargs["lr_scheduler_kwargs"] = {
+            "min_lr_rate": args.lr_scheduler_min_lr_ratio
+        }
     
     if args.overrule_warmup_via_steps:
         lima_training_config_kwargs["warmup_steps"] = args.overrule_warmup_via_steps
@@ -810,6 +1025,15 @@ if __name__ == "__main__":
     parser.add_argument("--full_finetuning", default=False, action="store_true")
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--constant_lr", action="store_true", help="Use constant learning rate instead of a scheduler (with minimal warmup)")
+    parser.add_argument(
+        "--lr_scheduler_min_lr_ratio",
+        type=float,
+        default=0.1,
+        help=(
+            "For scheduled LR runs, decay to this fraction of the peak learning "
+            "rate instead of zero. Default 0.1 means 10%% of peak LR."
+        ),
+    )
     parser.add_argument("--overrule_warmup_via_steps", type=int, default=None, help="Override warmup_ratio and specify warmup in steps instead")
     parser.add_argument(
         "--knowledge_probes_version",
@@ -843,6 +1067,35 @@ if __name__ == "__main__":
             "Alias for --knowledge_probe_variant low_overlap_strict."
         ),
     )
+    parser.set_defaults(paraphrased_knowledge_probes=False)
+    parser.add_argument(
+        "--paraphrased_knowledge_probes",
+        "--paraphrased-knowledge-probes",
+        dest="paraphrased_knowledge_probes",
+        action="store_true",
+        help="Also evaluate a paraphrased factual cloze-probe file alongside the main factual probes.",
+    )
+    parser.add_argument(
+        "--disable_paraphrased_knowledge_probes",
+        "--disable-paraphrased-knowledge-probes",
+        "--no_paraphrased_knowledge_probes",
+        "--no-paraphrased-knowledge-probes",
+        dest="paraphrased_knowledge_probes",
+        action="store_false",
+        help="Disable paraphrased factual cloze-probe evaluation.",
+    )
+    parser.add_argument(
+        "--paraphrased_knowledge_probes_version",
+        type=str,
+        default=DEFAULT_KNOWLEDGE_PROBES_VERSION,
+        help="Version for the optional paraphrased factual probes.",
+    )
+    parser.add_argument(
+        "--paraphrased_knowledge_probe_filename_suffix",
+        type=str,
+        default=DEFAULT_PARAPHRASED_KNOWLEDGE_PROBE_FILENAME_SUFFIX,
+        help="Suffix inserted before .csv for optional paraphrased factual probes.",
+    )
     parser.add_argument(
         "--mcqa_probes_version",
         "--mcqa-probes-version",
@@ -860,7 +1113,53 @@ if __name__ == "__main__":
             "answer suffix. Use formatted_question_5shot for the fixed 5-shot prompt."
         ),
     )
-    parser.add_argument("--inference_probes_version", type=str, default="v7", help="Version of the inference probes to use.")
+    parser.add_argument(
+        "--inference_mcqa_probes_version",
+        "--inference-mcqa-probes-version",
+        type=str,
+        default=DEFAULT_INFERENCE_MCQA_PROBES_VERSION,
+        help="Version of the inference MCQA probes to use when --inference_mcqa_probes is enabled.",
+    )
+    parser.add_argument(
+        "--inference_mcqa_prompt_column",
+        "--inference-mcqa-prompt-column",
+        type=str,
+        default="formatted_question",
+        help=(
+            "CSV column to use as the inference MCQA prompt before appending the "
+            "constrained answer suffix."
+        ),
+    )
+    parser.add_argument(
+        "--inference_probes_version",
+        type=str,
+        default=DEFAULT_INFERENCE_PROBES_VERSION,
+        help="Version of the inference probes to use.",
+    )
+    parser.add_argument(
+        "--inference_probe_filename_suffix",
+        type=str,
+        default=DEFAULT_INFERENCE_PROBE_FILENAME_SUFFIX,
+        help=(
+            "Advanced: optional suffix inserted before .csv for inference probes. "
+            "Prefer --inference_probe_variant for named probe families."
+        ),
+    )
+    parser.add_argument(
+        "--inference_probe_variant",
+        type=str,
+        default=DEFAULT_INFERENCE_PROBE_VARIANT,
+        choices=sorted(INFERENCE_PROBE_VARIANT_SUFFIXES),
+        help=(
+            "Inference probe family to evaluate and track. "
+            "reviewed uses probes_v11_reviewed.csv by default."
+        ),
+    )
+    parser.add_argument(
+        "--use_reviewed_inference_probes",
+        action="store_true",
+        help="Alias for --inference_probe_variant reviewed.",
+    )
     parser.add_argument(
         "--disable_inference_probes",
         action="store_true",
@@ -885,6 +1184,26 @@ if __name__ == "__main__":
         dest="mcqa_probes",
         action="store_false",
         help="Disable constrained-decoding MCQA evaluation.",
+    )
+    parser.set_defaults(inference_mcqa_probes=False)
+    parser.add_argument(
+        "--inference_mcqa_probes",
+        "--inference-mcqa-probes",
+        dest="inference_mcqa_probes",
+        action="store_true",
+        help=(
+            "Enable constrained-decoding MCQA evaluation for inference probes. "
+            "Loads inference/probes_<inference_mcqa_probes_version>_mcqa.csv."
+        ),
+    )
+    parser.add_argument(
+        "--disable_inference_mcqa_probes",
+        "--disable-inference-mcqa-probes",
+        "--no_inference_mcqa_probes",
+        "--no-inference-mcqa-probes",
+        dest="inference_mcqa_probes",
+        action="store_false",
+        help="Disable constrained-decoding inference MCQA evaluation.",
     )
     parser.add_argument(
         "--inference_probe_subset",
@@ -913,11 +1232,21 @@ if __name__ == "__main__":
         default=DEFAULT_WANDB_PROJECT,
         help="W&B project name to use for this script.",
     )
+    parser.add_argument(
+        "--wandb_group",
+        type=str,
+        default=DEFAULT_WANDB_GROUP,
+        help="W&B group name to use for this script. Set to an empty string to leave it unset.",
+    )
     parser.add_argument("--num_paraphrased_texts", type=int, default=9, help="Number of paraphrased texts to use for training (0-9)")
     parser.add_argument("--lima_afterwards", default=False, action="store_true", help="LIMA-based instruction tuning after continued pretraining")
     parser.add_argument("--prior_knowledge", action="store_true", help="Use prior_knowledge textbooks (per source, if available) instead of cleaned/raw documents for continued pretraining.")
     parser.add_argument("--prior_knowledge_num_train_epochs", type=int, default=None, help="If set, override num_train_epochs during prior-knowledge CPT.")
     parser.add_argument("--prior_knowledge_effective_batch_size_for_cpt", type=int, default=None, help="If set, override effective_batch_size_for_cpt during prior-knowledge CPT.")
+    parser.add_argument("--with_prior_knowledge", action="store_true", help="Inject prior-knowledge chapters (one chapter per batch, one full pass) into the regular training schedule at the timing given by --prior_knowledge_insertion. Separate from --prior_knowledge.")
+    parser.add_argument("--prior_knowledge_insertion", choices=["front", "middle", "end"], default="front", help="When --with_prior_knowledge is set, where to splice the prior-knowledge block: front (before all doc batches), middle (~50%% mark), or end (after all doc batches).")
+    parser.add_argument("--prior_knowledge_cycle", default="full", help="'full' loads all chapters per domain; otherwise an integer N to load only the first N chapters.")
+    parser.add_argument("--prior_knowledge_match_document_track", action="store_true", help="Baseline for --with_prior_knowledge: replace PK chapter chunks with same-shape source+paraphrase replay chunks (matches compute/exposure without PK content).")
 
     # Defaults, do not change unless for ablations
     parser.add_argument("--chunk_by_section", action="store_true", help="Use section-based chunking instead of token-based chunking")
@@ -925,7 +1254,7 @@ if __name__ == "__main__":
     parser.add_argument("--overlap_sections", default=False, action="store_true", help="Overlap sections when chunking")
     parser.add_argument("--overlap_ratio", type=str, default="1_4", help="Ratio of overlap when chunking")
     parser.add_argument("--with_specific_explanation", type=str, nargs='+', default=None, help="Use specific explanation type(s). For granular these are subfolders; for whole/legacy these map to flat files (e.g., textbooks -> textbook.txt).")
-    parser.add_argument("--document_track_baseline", action="store_true", help="Add an auxiliary document replay track matched to a granular explanation schedule without training on explanations.")
+    parser.add_argument("--document_track_baseline", action="store_true", help="Add an auxiliary document replay track matched to a granular explanation schedule.")
     parser.add_argument("--document_match_specific_explanation", type=str, nargs='+', default=None, help="Explanation subfolder type(s) used only to size --document_track_baseline, e.g. textbooks blogs stackexchange.")
     parser.add_argument("--raw", action="store_true", help="Use raw texts instead of cleaned/semi-cleaned corpora.")
     parser.add_argument("--times_explanations", type=int, default=1, help="Number of times to repeat the explanation texts.")
@@ -933,14 +1262,15 @@ if __name__ == "__main__":
     parser.add_argument("--test_script", action="store_true", help="Run in test mode with a small model and minimal epochs.")
     parser.add_argument("--shuffle_chunks", action="store_true", help="Shuffle constructed training chunks with seed 42 before training.")
     parser.add_argument("--shuffle_seed", type=int, default=42, help="Seed to use when shuffling training chunks.")
-    parser.add_argument("--granular_explanations_cycle", type=str, default="0", help="Granular strategy only: number of explanation files to cycle through across document batches. Use 'full' to load all available files, or specify an integer.")
+    parser.add_argument("--granular_explanations_cycle", type=str, default="0", help="Granular strategy only: number of explanation files to cycle through across document batches. Use 'full' to load all available files, or specify an integer. Not used by granular_queue.")
     parser.add_argument(
         "--explanations_insertion_strategy",
         type=str,
         default="granular",
-        choices=["granular", "whole", "legacy", "random_splice"],
+        choices=["granular", "granular_queue", "whole", "legacy", "random_splice"],
         help=(
             "How explanations are inserted: 'granular' (per-batch cycling), "
+            "'granular_queue' (shuffle selected explanation files into K tracks), "
             "'whole' (insert explanation-only batch every N steps), 'legacy' "
             "(older coupled splice behavior), or 'random_splice' (legacy-style "
             "chunk replacement starting at a deterministic random paraphrase batch)."
@@ -956,8 +1286,33 @@ if __name__ == "__main__":
         "--granular_explanations_num_tracks",
         type=int,
         default=1,
-        help="Granular strategy only: number of explanation tracks to build. Track i uses an offset of floor(i * num_files / N). "
-             "Default is 1.",
+        help="Granular/granular_queue only: number of explanation tracks to build. For granular, track i uses an offset of floor(i * num_files / N). For granular_queue, files are length-balanced across same-step track slots. Default is 1.",
+    )
+    parser.add_argument(
+        "--explanation_granularity",
+        type=str,
+        default="file",
+        choices=["file", "chunk"],
+        help=(
+            "Granular explanation track unit. 'file' keeps each selected explanation "
+            "file together as one step; 'chunk' groups selected explanation chunks "
+            "into fixed-size track steps."
+        ),
+    )
+    parser.add_argument(
+        "--explanation_track_size_by_chunk",
+        type=int,
+        default=4,
+        help="When --explanation_granularity chunk is used, number of explanation chunks per track step.",
+    )
+    parser.add_argument(
+        "--match_explanation_source_replay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "For granular explanation runs, append a matched source/paraphrase replay "
+            "track with the same per-domain, per-step chunk counts as the explanation track."
+        ),
     )
     parser.add_argument("--shuffled_papers", action="store_true", help="Legacy: use shuffled versions of papers (files ending with _shuffle.tex) when available.")
     parser.add_argument("--word_shuffled_papers", action="store_true", help="Use word-shuffled versions of papers (files ending with _shuffle_words.tex) when available.")
@@ -971,6 +1326,14 @@ if __name__ == "__main__":
     parser.add_argument("--lora_target_modules", type=str, nargs='+', default=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'], help="LoRA target modules.")
 
     # New arguments for multi-domain training
+    parser.add_argument(
+        "--include_sources",
+        type=str,
+        nargs='+',
+        default=list(SUPPORTED_HIGH_LEVEL_DOMAINS),
+        choices=list(SUPPORTED_HIGH_LEVEL_DOMAINS),
+        help="High-level sources to include when resolving domains. Use 'arxiv legal' to exclude medical.",
+    )
     parser.add_argument(
         "--override_arxiv_domain",
         type=str,
@@ -998,6 +1361,13 @@ if __name__ == "__main__":
     parser.add_argument("--effective_batch_size_for_cpt", type=int, default=8, help="The effective batch size for continued pretraining.")
     parser.add_argument("--effective_batch_size_for_lima", type=int, default=32, help="The effective batch size for LIMA training.")
     parser.add_argument("--device_batch_size", type=int, default=2, help="The batch size per device.")
+    parser.add_argument(
+        "--sft_loss_type",
+        type=str,
+        default="nll",
+        choices=["nll", "dft", "chunked_nll"],
+        help="Loss implementation passed to TRL SFTConfig.",
+    )
     parser.add_argument("--context_length_for_cpt", type=int, default=3072, help="Context length for continued pretraining.")
     parser.add_argument("--context_length_for_lima", type=int, default=2560, help="Context length for LIMA training.")
     parser.add_argument("--push_to_hub_cpt_id", type=str, default="", help="Optional Hub model ID to push CPT model to.")
@@ -1042,6 +1412,16 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Run MCQA probe callbacks every N training steps.",
+    )
+    parser.add_argument(
+        "--mcqa_probe_batch_size",
+        type=int,
+        default=32,
+        help=(
+            "Microbatch size for MCQA probe forward passes. MCQA prompts can be "
+            "much longer than cloze probes, especially with few-shot prompts, so "
+            "this is intentionally separate from --device_batch_size."
+        ),
     )
     parser.add_argument(
         "--enable_parameter_delta_tracking",
@@ -1098,6 +1478,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     apply_knowledge_probe_variant(args)
+    apply_inference_probe_variant(args)
     args.wandb_panel_sources = list(dict.fromkeys(args.wandb_panel_sources))
 
     # v9 built-ins:
@@ -1117,6 +1498,9 @@ if __name__ == "__main__":
     else:
         args.cache_dir = None
 
+    if not 0.0 <= args.lr_scheduler_min_lr_ratio < 1.0:
+        raise ValueError("--lr_scheduler_min_lr_ratio must be in [0.0, 1.0).")
+
     # When using prior knowledge textbooks, adjust defaults:
     # - disable paraphrases and explanations
     # - optionally override CPT epochs and effective batch size
@@ -1130,6 +1514,16 @@ if __name__ == "__main__":
             args.num_train_epochs = args.prior_knowledge_num_train_epochs
         if args.prior_knowledge_effective_batch_size_for_cpt is not None:
             args.effective_batch_size_for_cpt = args.prior_knowledge_effective_batch_size_for_cpt
+
+    if args.with_prior_knowledge and args.prior_knowledge:
+        raise ValueError("--with_prior_knowledge (injection into regular training) and --prior_knowledge (PK-only training) are mutually exclusive.")
+    if args.prior_knowledge_match_document_track and not args.with_prior_knowledge:
+        raise ValueError("--prior_knowledge_match_document_track requires --with_prior_knowledge.")
+    if args.prior_knowledge_cycle != "full":
+        try:
+            int(args.prior_knowledge_cycle)
+        except ValueError:
+            raise ValueError(f"--prior_knowledge_cycle must be 'full' or an integer, got: {args.prior_knowledge_cycle}")
 
     # --- Argument Validation ---
     # Parse granular_explanations_cycle
@@ -1150,36 +1544,63 @@ if __name__ == "__main__":
     ):
         raise ValueError(
             "--whole_explanations_insert_every_n is only supported with --explanations_insertion_strategy whole "
-            "(set it to 1 for granular/legacy/random_splice)."
+            "(set it to 1 for granular/granular_queue/legacy/random_splice)."
         )
 
     if args.granular_explanations_num_tracks <= 0:
         raise ValueError("--granular_explanations_num_tracks must be a positive integer.")
 
+    if args.explanation_track_size_by_chunk <= 0:
+        raise ValueError("--explanation_track_size_by_chunk must be a positive integer.")
+
+    if args.mcqa_probe_batch_size <= 0:
+        raise ValueError("--mcqa_probe_batch_size must be a positive integer.")
+
     if (
-        args.explanations_insertion_strategy != "granular"
+        args.explanations_insertion_strategy not in ("granular", "granular_queue")
         and args.granular_explanations_num_tracks != 1
     ):
         raise ValueError(
-            "--granular_explanations_num_tracks is only supported with --explanations_insertion_strategy granular "
+            "--granular_explanations_num_tracks is only supported with --explanations_insertion_strategy granular or granular_queue "
             "(set it to 1 for whole/legacy/random_splice)."
+        )
+
+    if (
+        args.explanations_insertion_strategy not in ("granular", "granular_queue")
+        and args.explanation_granularity != "file"
+    ):
+        raise ValueError(
+            "--explanation_granularity chunk is only supported with "
+            "--explanations_insertion_strategy granular or granular_queue."
+        )
+
+    if args.explanation_granularity == "file" and args.explanation_track_size_by_chunk != 4:
+        raise ValueError(
+            "--explanation_track_size_by_chunk is only used with --explanation_granularity chunk "
+            "(leave it at the default 4 for file granularity)."
         )
 
     if args.explanations_insertion_strategy != "granular" and args.granular_explanations_cycle != 0:
         raise ValueError(
             "--granular_explanations_cycle is only supported with --explanations_insertion_strategy granular. "
-            "For whole/legacy/random_splice, leave --granular_explanations_cycle at the default 0."
+            "For granular_queue/whole/legacy/random_splice, leave --granular_explanations_cycle at the default 0."
         )
+
+    if args.match_explanation_source_replay:
+        if args.document_track_baseline:
+            raise ValueError(
+                "--match_explanation_source_replay cannot be combined with --document_track_baseline; "
+                "the former is for real explanation runs, the latter is for no-explanation controls."
+            )
+        if not args.with_specific_explanation:
+            raise ValueError("--match_explanation_source_replay requires --with_specific_explanation.")
+        if args.explanations_insertion_strategy != "granular":
+            raise ValueError("--match_explanation_source_replay currently supports only granular insertion.")
 
     if args.parameter_delta_every_n_steps is not None and args.parameter_delta_every_n_steps <= 0:
         raise ValueError("--parameter_delta_every_n_steps must be a positive integer when set.")
 
     if args.document_track_baseline:
-        if args.with_specific_explanation:
-            raise ValueError(
-                "--document_track_baseline cannot be combined with --with_specific_explanation; "
-                "use it for no-explanation document replay baselines."
-            )
         if not args.document_match_specific_explanation:
             raise ValueError(
                 "--document_track_baseline requires --document_match_specific_explanation "
@@ -1203,6 +1624,11 @@ if __name__ == "__main__":
             "to be a positive integer or 'full'."
         )
 
+    if args.explanations_insertion_strategy == "granular_queue" and not args.with_specific_explanation:
+        raise ValueError(
+            "Granular queue insertion requires --with_specific_explanation to select explanation subfolders."
+        )
+
     # Normalize single explanation type from argparse nargs='+' list into a scalar.
     if isinstance(args.with_specific_explanation, list) and len(args.with_specific_explanation) == 1:
         args.with_specific_explanation = args.with_specific_explanation[0]
@@ -1223,6 +1649,10 @@ if __name__ == "__main__":
         args.base_results_dir = os.path.join("../../results", "tests")
     else: 
         os.environ["WANDB_PROJECT"] = args.wandb_project
+        if args.wandb_group:
+            os.environ["WANDB_RUN_GROUP"] = args.wandb_group
+        else:
+            os.environ.pop("WANDB_RUN_GROUP", None)
         args.base_results_dir = os.path.join("../../results", "FT")
 
     if args.disable_inference_probes:
@@ -1230,7 +1660,10 @@ if __name__ == "__main__":
     else:
         log.info(
             f"Inference probes are enabled "
-            f"({args.inference_probes_version}, subset={args.inference_probe_subset})."
+            f"(variant={args.inference_probe_variant}, "
+            f"probes_{args.inference_probes_version}"
+            f"{args.inference_probe_filename_suffix}.csv, "
+            f"subset={args.inference_probe_subset})."
         )
     log.info(
         "Factual knowledge probes: "
@@ -1238,8 +1671,33 @@ if __name__ == "__main__":
         f"probes_{args.knowledge_probes_version}"
         f"{args.knowledge_probe_filename_suffix}.csv"
     )
+    if args.constant_lr:
+        log.info("Learning-rate scheduler: constant_with_warmup.")
+    else:
+        log.info(
+            "Learning-rate scheduler: cosine_with_min_lr "
+            f"(min_lr_rate={args.lr_scheduler_min_lr_ratio:g}; "
+            f"floor={args.learning_rate * args.lr_scheduler_min_lr_ratio:g})."
+        )
+    if args.mcqa_probes:
+        log.info(
+            "Factual MCQA probes are enabled "
+            f"(facts/probes_{args.mcqa_probes_version}_mcqa.csv, "
+            f"prompt_column={args.mcqa_prompt_column})."
+        )
+    if args.inference_mcqa_probes:
+        log.info(
+            "Inference MCQA probes are enabled "
+            f"(inference/probes_{args.inference_mcqa_probes_version}_mcqa.csv, "
+            f"prompt_column={args.inference_mcqa_prompt_column})."
+        )
     if args.enable_wandb_source_panels:
         mcqa_note = f" MCQA constrained-decoding ({args.mcqa_probes_version})." if args.mcqa_probes else ""
+        inference_mcqa_note = (
+            f" Inference MCQA constrained-decoding ({args.inference_mcqa_probes_version})."
+            if args.inference_mcqa_probes
+            else ""
+        )
         inference_note = (
             " Inference probe metrics: <source>/<document>_inference_log_prob, "
             "<source>/<document>_inference_target_rank."
@@ -1250,11 +1708,14 @@ if __name__ == "__main__":
             f"W&B source panels enabled for: {args.wandb_panel_sources}. "
             "Flat metrics: <source>/<document>_log_prob, "
             "<source>/<document>_target_rank, "
-            f"<source>/<document>_mcqa_accuracy.{mcqa_note}{inference_note}"
+            "<source>/<document>_mcqa_accuracy, "
+            f"<source>/<document>_inference_mcqa_accuracy.{mcqa_note}"
+            f"{inference_mcqa_note}{inference_note}"
         )
 
     args.resolved_domains, args.domain_data_sources = resolve_domains_and_sources(args, log)
     validate_selected_knowledge_probes(args, log)
+    validate_selected_paraphrased_knowledge_probes(args, log)
     validate_selected_inference_probes(args, log)
     validate_selected_mcqa_probes(args, log)
 

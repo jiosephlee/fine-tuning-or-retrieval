@@ -88,7 +88,7 @@ The chapter should be comprehensive and suitable for someone learning this mater
 
 Separate each subtopic with a section header "#".
 
-Also, please write all mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi$". Do not use unicode mathematical characters e.g. "π".""",
+Also, please write all mathematical notation in LaTeX only e.g. "$x^2$" or "$\\pi$". Do not use unicode mathematical characters e.g. "π".""",
                 'user': f"""### Chapter Title
 {chapter_title}
 
@@ -158,13 +158,19 @@ Also, please write all mathematical notation in LaTeX only e.g. "$x^2$" or "$\pi
 
 def process_papers():
     input_dir = "../../data/arxiv/cleaned/"
-    
-    # Get list of files in cleaned directory
-    files = [f for f in os.listdir(input_dir) if f.endswith('.tex') and f != 'DPO.tex']
-    
-    for filename in files:
-        # Extract paper name without extension
-        paper_name = os.path.splitext(filename)[0]
+
+    paper_names = sorted(
+        os.path.splitext(filename)[0]
+        for filename in os.listdir(input_dir)
+        if filename.endswith('.tex')
+    )
+    print(f"Found {len(paper_names)} local arxiv cleaned papers.\n")
+
+    for paper_name in paper_names:
+        output_dir = f"../../data/arxiv/prior_knowledge/{paper_name}/"
+        if os.path.exists(os.path.join(output_dir, "textbook.txt")):
+            print(f"Skipping {paper_name} (already generated).")
+            continue
         generate_prior_knowledge(paper_name)
         
 if __name__ == "__main__":

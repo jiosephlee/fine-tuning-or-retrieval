@@ -1,7 +1,7 @@
 import torch
 from trl import SFTConfig
 from pydantic import BaseModel, Field
-from typing import Optional, List, TypeVar, Literal
+from typing import Any, Dict, Optional, List, TypeVar, Literal
 from transformers import (
     TrainingArguments,
 )
@@ -48,11 +48,13 @@ class TrainingConfig(BaseModel):
     use_liger_kernel: bool = True # This saves VRAM
     activation_offloading: bool = False
     compile: bool = False
+    loss_type: str = "nll"
         
     # These Hyperparameters are overwritten for LIMA
     num_train_epochs: int = 1
     learning_rate: float = 2e-5
     lr_scheduler_type: str = "cosine"
+    lr_scheduler_kwargs: Optional[Dict[str, Any]] = None
     warmup_steps: int = 0
     warmup_ratio: float = 0.03
     train_sampling_strategy: Literal["random", "sequential"] = "random"
@@ -76,6 +78,10 @@ class TrainingConfig(BaseModel):
     def to_training_args(self) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
         use_cuda = torch.cuda.is_available()
+        kwargs = {}
+        if self.lr_scheduler_kwargs:
+            kwargs["lr_scheduler_kwargs"] = self.lr_scheduler_kwargs
+
         return TrainingArguments(
             max_length = self.context_length,
             per_device_train_batch_size=self.per_device_train_batch_size,
@@ -104,16 +110,22 @@ class TrainingConfig(BaseModel):
             logging_steps=self.logging_steps,
             save_strategy=self.save_strategy,
             report_to=self.report_to,
+            **kwargs,
         )
     def to_sft_training_args(self) -> TrainingArguments:
         """Creates a transformers.TrainingArguments object from the config."""
         use_cuda = torch.cuda.is_available()
+        kwargs = {}
+        if self.lr_scheduler_kwargs:
+            kwargs["lr_scheduler_kwargs"] = self.lr_scheduler_kwargs
+
         return SFTConfig(
             dataset_text_field=self.dataset_text_field,
             packing = self.packing,
             padding_free = self.padding_free, # This saves VRAM (Requires Flash Attention 2)
             max_length = self.context_length,
             completion_only_loss = self.completion_only_loss,
+            loss_type = self.loss_type,
             # Activation offloading in TRL uses CUDA stream helpers; disable on CPU-only setups.
             activation_offloading = self.activation_offloading and use_cuda,
 
@@ -135,7 +147,7 @@ class TrainingConfig(BaseModel):
             bf16=use_cuda and torch.cuda.is_bf16_supported(),
             fp16=use_cuda and (not torch.cuda.is_bf16_supported()),
             gradient_checkpointing=self.gradient_checkpointing,
-            use_liger_kernel=self.use_liger_kernel and use_cuda,
+            use_liger_kernel=self.use_liger_kernel and use_cuda and self.loss_type != "chunked_nll",
             torch_compile=self.compile,
             seed=self.seed,
             remove_unused_columns=self.remove_unused_columns,
@@ -148,6 +160,7 @@ class TrainingConfig(BaseModel):
             logging_steps=self.logging_steps,
             save_strategy=self.save_strategy,
             report_to=self.report_to,
+            **kwargs,
         )
 
 class InferenceConfig(BaseModel):
