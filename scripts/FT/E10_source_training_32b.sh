@@ -59,7 +59,7 @@ if [[ "$INFERENCE_MCQA_PROBES" == "1" ]]; then
 fi
 OFFLOAD_ARGS=()
 if [[ "$OFFLOAD_TO_CPU" == "1" ]]; then
-    OFFLOAD_ARGS+=(--offload_to_cpu)
+    OFFLOAD_ARGS+=(--activation_offloading)
 fi
 
 FT_TMPDIR="${FT_TMPDIR:-/tmp/${USER:-ft}/ft_${SLURM_JOB_ID:-$$}}"

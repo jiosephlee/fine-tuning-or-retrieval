@@ -761,7 +761,7 @@ def continue_pretraining(model, tokenizer, log, args, train: bool = True):
         "packing": True,
         "padding_free": True,
         "report_to": "wandb" if not args.test_script else "none",
-        "activation_offloading": args.offload_to_cpu,
+        "activation_offloading": args.activation_offloading or args.offload_to_cpu,
         "compile": args.compile_model,
         "loss_type": args.sft_loss_type,
     }
@@ -916,7 +916,7 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
         "padding_free": True,
         "dataset_text_field": "text",
         "report_to": "wandb" if not args.test_script else "none",
-        "activation_offloading": args.offload_to_cpu,
+        "activation_offloading": args.activation_offloading or args.offload_to_cpu,
         "compile": args.compile_model,
         "loss_type": args.sft_loss_type,
     }
@@ -1395,7 +1395,8 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
     parser.add_argument("--compile_model", action="store_true", help="Enable torch.compile for the model.")
     parser.add_argument("--compile", dest="compile_model", action="store_true", help="Enable torch.compile via TrainingArguments.")
-    parser.add_argument("--offload_to_cpu", action="store_true", help="Enable activation offloading to CPU.")
+    parser.add_argument("--activation_offloading", action="store_true", help="Enable TRL activation offloading without changing model device placement.")
+    parser.add_argument("--offload_to_cpu", action="store_true", help="Enable activation offloading and CPU/GPU model loading.")
     parser.add_argument(
         "--no_callback_every_step",
         action="store_true",
