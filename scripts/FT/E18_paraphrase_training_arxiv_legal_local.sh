@@ -21,6 +21,10 @@ ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
 CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E18_paraphrase_arxiv_legal_local}"
 MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v14}"
 MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
+MCQA_PROBE_BATCH_SIZE="${MCQA_PROBE_BATCH_SIZE:-32}"
+INFERENCE_MCQA_PROBES="${INFERENCE_MCQA_PROBES:-1}"
+INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v12_reviewed v12}"
+INFERENCE_MCQA_PROMPT_COLUMN="${INFERENCE_MCQA_PROMPT_COLUMN:-formatted_question}"
 USE_PARCC="${USE_PARCC:-0}"
 SAVE_LOCAL_MODEL="${SAVE_LOCAL_MODEL:-0}"
 SPARSE_CALLBACKS="${SPARSE_CALLBACKS:-0}"
@@ -40,6 +44,14 @@ fi
 if [[ "$SPARSE_CALLBACKS" == "1" ]]; then
     EXTRA_ARGS+=(--no_callback_every_step)
 fi
+if [[ "$INFERENCE_MCQA_PROBES" == "1" ]]; then
+    read -r -a INFERENCE_MCQA_PROBE_VERSION_ARGS <<< "$INFERENCE_MCQA_PROBES_VERSION"
+    EXTRA_ARGS+=(
+        --inference_mcqa_probes
+        --inference_mcqa_probes_version "${INFERENCE_MCQA_PROBE_VERSION_ARGS[@]}"
+        --inference_mcqa_prompt_column "$INFERENCE_MCQA_PROMPT_COLUMN"
+    )
+fi
 
 if [[ "${CONDA_DEFAULT_ENV:-}" == "$CONDA_ENV" ]]; then
     LAUNCH=(torchrun --standalone --nproc_per_node "$NPROC_PER_NODE")
@@ -56,6 +68,7 @@ fi
     --mcqa_probes \
     --mcqa_probes_version "$MCQA_PROBES_VERSION" \
     --mcqa_prompt_column "$MCQA_PROMPT_COLUMN" \
+    --mcqa_probe_batch_size "$MCQA_PROBE_BATCH_SIZE" \
     --num_train_epochs "$NUM_EPOCHS" \
     --learning_rate "$LEARNING_RATE" \
     --overlap_sections \

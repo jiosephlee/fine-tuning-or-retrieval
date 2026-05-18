@@ -13,6 +13,20 @@ set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p logs
 
+INFERENCE_MCQA_PROBES="${INFERENCE_MCQA_PROBES:-1}"
+INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v12_reviewed v12}"
+INFERENCE_MCQA_PROMPT_COLUMN="${INFERENCE_MCQA_PROMPT_COLUMN:-formatted_question}"
+
+EXTRA_ARGS=()
+if [[ "$INFERENCE_MCQA_PROBES" == "1" ]]; then
+    read -r -a INFERENCE_MCQA_PROBE_VERSION_ARGS <<< "$INFERENCE_MCQA_PROBES_VERSION"
+    EXTRA_ARGS+=(
+        --inference_mcqa_probes
+        --inference_mcqa_probes_version "${INFERENCE_MCQA_PROBE_VERSION_ARGS[@]}"
+        --inference_mcqa_prompt_column "$INFERENCE_MCQA_PROMPT_COLUMN"
+    )
+fi
+
 conda run --no-capture-output -n openrlhf torchrun --standalone --nproc_per_node 8 finetuning_knowledge_v9.py \
     --custom_suffix E17_source_arxiv_legal \
     --model_id allenai/OLMo-2-1124-7B \
@@ -37,4 +51,5 @@ conda run --no-capture-output -n openrlhf torchrun --standalone --nproc_per_node
     --compile \
     --full_finetuning \
     --enable_parameter_delta_tracking \
-    --no-save_local_model
+    --no-save_local_model \
+    "${EXTRA_ARGS[@]}"

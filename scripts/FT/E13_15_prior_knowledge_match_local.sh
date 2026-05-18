@@ -1,11 +1,13 @@
 #!/bin/bash
 
-# Document-match baseline for E13/E14/E15: trains with the same schedule shape
+# Document-match baseline for E13/E14/E15 only: trains with the same schedule shape
 # as the prior-knowledge runs, but replaces PK chapter chunks with same-shape
 # source+paraphrase replay chunks. Isolates the PK *content* effect from the
 # extra compute/exposure introduced at the splice position.
 #
 # Sweep position via PRIOR_KNOWLEDGE_INSERTION env var (front|middle|end).
+# E16 uses a different document-match insert-content setup and is not covered
+# by this helper.
 
 set -euo pipefail
 
@@ -29,7 +31,7 @@ MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v14}"
 MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 MCQA_PROBE_BATCH_SIZE="${MCQA_PROBE_BATCH_SIZE:-32}"
 INFERENCE_MCQA_PROBES="${INFERENCE_MCQA_PROBES:-1}"
-INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v12}"
+INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v12_reviewed v12}"
 INFERENCE_MCQA_PROMPT_COLUMN="${INFERENCE_MCQA_PROMPT_COLUMN:-formatted_question}"
 USE_PARCC="${USE_PARCC:-0}"
 SAVE_LOCAL_MODEL="${SAVE_LOCAL_MODEL:-0}"
@@ -51,9 +53,10 @@ if [[ "$SPARSE_CALLBACKS" == "1" ]]; then
     EXTRA_ARGS+=(--no_callback_every_step)
 fi
 if [[ "$INFERENCE_MCQA_PROBES" == "1" ]]; then
+    read -r -a INFERENCE_MCQA_PROBE_VERSION_ARGS <<< "$INFERENCE_MCQA_PROBES_VERSION"
     EXTRA_ARGS+=(
         --inference_mcqa_probes
-        --inference_mcqa_probes_version "$INFERENCE_MCQA_PROBES_VERSION"
+        --inference_mcqa_probes_version "${INFERENCE_MCQA_PROBE_VERSION_ARGS[@]}"
         --inference_mcqa_prompt_column "$INFERENCE_MCQA_PROMPT_COLUMN"
     )
 fi
