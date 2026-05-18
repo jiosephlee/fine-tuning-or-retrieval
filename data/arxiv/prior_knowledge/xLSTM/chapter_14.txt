@@ -1,0 +1,119 @@
+Introduction
+
+Large sequence models such as Transformers are computationally and memory intensive. When you take a model from a research paper and try to run it at scale (long contexts, large batch sizes, many GPUs, or low-latency generation), understanding the interaction between algorithmic complexity, memory usage, and hardware primitives becomes essential. This chapter explains how time and memory scale with sequence length and model size, the common parallelization strategies used in practice, the implications of batching and streaming for latency and throughput, essential GPU programming concepts, the role of KV-caches in autoregressive generation, and practical approaches to profile and remove bottlenecks. The goal is to give you enough intuition and formulae to reason quantitatively about trade-offs and to read/interpret implementation details in papers and code.
+
+# Time and memory complexity with respect to sequence length and model dimension
+
+Complexity of modern sequence models is most naturally expressed in terms of sequence length $n$ and model dimension $d$ (the size of token embeddings / hidden states). A Transformer layer consists primarily of multi-head self-attention and a feed-forward network (FFN). The dominant costs per layer can be summarized as:
+
+- Self-attention (dense, full attention): compute cost $O(n^2 d)$ and memory cost $O(n^2)$ for the attention score matrix (if stored explicitly) and $O(n d)$ for key/value storage. More concretely, forming the $QK^\top$ matrix requires $n \times d$ times $d \times n$ style arithmetic which scales as $n^2 d$. The softmax and weighted sum that follow are also $O(n^2 d)$ if implemented naively. In practice implementations avoid storing all $n^2$ elements at once (blockwise compute), but asymptotically the compute grows quadratically in $n$.
+
+- Feed-forward network (FFN): most implementations use a two-layer MLP with intermediate dimension $d_{ff} = k d$ (typical $k=4$). The compute per token is $O(d \cdot d_{ff}) = O(k d^2)$, so for the whole sequence it's $O(n d^2)$. If $d_{ff}$ is proportional to $d$, the FFN cost is roughly $O(n d^2)$.
+
+Putting both together, per-layer compute is approximately $O(n^2 d + n d^2)$. Which term dominates depends on the regime:
+- For long sequences ($n \gg d$), $n^2 d$ dominates and attention is the bottleneck.
+- For very wide models ($d \gg n$), $n d^2$ dominates and FFN/GEMMs dominate.
+
+Memory usage also has multiple components:
+- Activation memory for the hidden states: $O(n d)$, because you must store the representation per token.
+- KV-cache (during generation) stores keys and values for all past tokens for all layers: $O(n d)$ (more precise formula below).
+- Temporary buffers for attention calculation and intermediate activations inside FFNs and layernorms: these add extra constants times $n d$ and potentially $n^2$ if you materialize the attention matrix.
+- Model parameter memory: $O(d^2)$ for large matrices (e.g., projection matrices and FFN weight matrices) but this is independent of $n$.
+
+To make this concrete with an example: suppose $d = 4096$ and $n = 2048$. The FFN term $n d^2$ scales like $2048 \times 4096^2$, while the attention term $n^2 d$ scales like $2048^2 \times 4096$. Numerically these are comparable because one has an extra factor of $d$ and the other an extra factor of $n$. Changing either $n$ or $d$ by a modest factor can flip which is dominant.
+
+There are also variants of attention that reduce the $O(n^2 d)$ scaling. Sparse or low-rank approximations, locality-restricted attention, block sparse or linear-attention methods aim to reduce compute to something like $O(n d \log n)$ or $O(n d)$, but they change the model's representational properties and may introduce additional constants or complications for implementation. When reading papers keep track whether their complexity claims are asymptotic or also include constant factors — in practice those constants and memory overheads often decide whether a method is practical.
+
+# Data and model parallelism strategies
+
+Scaling models beyond a single GPU requires dividing work across devices. There are multiple parallelism axes; the three common ones are data parallelism, model (tensor) parallelism, and pipeline (sequence) parallelism. Each has different communication, memory, and synchronization characteristics.
+
+Data parallelism replicates the model parameters on each device and partitions the batch of examples (or sequences) across devices. Each device computes forward and backward passes on its subset of data, then communication (typically an all-reduce) is used to aggregate gradients and update parameters synchronously. Data parallelism is conceptually simple and scales well when the per-device batch size is large enough to keep GPUs busy. Its downsides: model parameters must fit on each device (so not helpful for giant models), and communication cost is proportional to parameter size per update (but can be mitigated with gradient compression, gradient accumulation, or large batch sizes).
+
+Model (tensor) parallelism splits individual large tensors or operations across devices. Examples:
+- Column/row splitting of weight matrices in a linear layer: multiply an input by partitioned weights and then reduce sums. This reduces per-device memory but requires fine-grained communication for each layer’s activations.
+- "Tensor parallelism" as used by Megatron and others splits large GEMMs across devices so that block-GEMMs run locally but require communication (e.g., all-reduces or all-gathers) to assemble outputs. This can scale to more GPUs than data-parallel alone and is suitable for very wide layers.
+
+Pipeline parallelism splits layers sequentially across devices: device 0 holds layers 1–k, device 1 holds layers k+1–m, etc. Each micro-batch flows forward through the pipeline and then backwards. Pipeline parallelism reduces per-device memory for parameters because each device stores only a subset of layers. It introduces pipeline bubbles (latency waste) which can be mitigated with micro-batching and scheduling. Pipeline parallelism is complementary to tensor and data parallelism in large-scale systems.
+
+Hybrid strategies combine these: for example, a single training job might use tensor parallelism inside a node (split a big linear layer across GPUs in a node), pipeline parallelism across nodes (each node holds a group of layers), and data parallelism across multiple replicas. Modern large-scale frameworks and libraries provide primitives to orchestrate these combinations, but understanding the communication patterns is important: tensor and pipeline parallelism require frequent fine-grained communication, while data parallelism requires larger but less frequent all-reduces (one per update or per gradient accumulation step).
+
+Trade-offs in choosing a strategy include:
+- Memory: tensor/pipeline parallelism reduce parameter memory on a per-device basis; data parallelism does not.
+- Communication overhead: tensor and pipeline parallelism require low-latency, high-bandwidth interconnect for per-layer exchanges; data parallelism needs high bandwidth for gradient aggregation but can amortize this with large batches.
+- Implementation complexity and latency: pipeline parallelism introduces scheduling overhead and latency; tensor parallelism complicates operator implementations.
+
+# Batching, streaming and incremental decoding
+
+Batching is the main levers for increasing GPU utilization and throughput. GPUs are optimized for large, dense linear algebra. Grouping multiple sequences into a batch allows larger GEMMs, which produce higher arithmetic intensity and better utilization of GPU FLOPS. For training, increasing batch size is often beneficial (up to optimization and generalization constraints). In inference, batching multiple requests together increases throughput but increases per-request latency because you wait to fill the batch.
+
+Streaming and incremental decoding address the opposite problem: you want to generate tokens one-by-one in an online or low-latency setting. The naive approach to autoregressive decoding recomputes all attention up to the new token, costing $O(t^2 d)$ for generating $t$ tokens. In contrast, incremental decoding stores the projected keys and values (the KV-cache) for every past token and only computes attention of the new query against stored keys and values; this makes the cost per new token $O(t d)$ for attention (and $O(d^2)$ for FFN), and overall generation cost becomes $O(t^2 d)$ in total but with much smaller constant factors and without recomputing many intermediate projections.
+
+Batching interacts with streaming in complex ways. For example, if you have many concurrent single-token generation requests, you can batch the attention computation across different requests at the same current generation step. This requires synchronizing when each request is at a particular token index. There is a fundamental tradeoff between throughput and latency: larger batches give higher throughput but larger per-request latency. Systems often implement adaptive batching: wait up to a small time window or number of requests before launching a batched kernel, or use dynamic batching where requests are padded and batched together for a single kernel invocation.
+
+Incremental decoding also changes memory requirements (you must store KV pairs), and complicates techniques like beam search (beams may require copying or branching KV-caches). Beam search multiplies memory by the beam width if you keep separate caches per hypothesis, or requires writing clever shared-cache schemes that allow backtracking and selective copying.
+
+When you plan for throughput or latency targets, quantify metrics: throughput in tokens/sec, latency per request (the time from input to output token), and tail latency (e.g., 95th or 99th percentile). Different applications prioritize different metrics (e.g., real-time chat vs batch summarization), and design choices (batching windows, use of mixed precision, KV-cache sizes) should follow those priorities.
+
+# GPU programming primitives (kernels, warps, registers, shared memory)
+
+To make effective use of GPUs, you must understand basic GPU abstractions and how they map to performance.
+
+A GPU kernel is a function launched on the device that runs many threads in parallel. Threads are organized hierarchically: threads belong to warps (NVIDIA) or wavefronts (AMD). On NVIDIA hardware a warp is typically 32 threads that execute instructions in lock-step (SIMT). Warps are grouped into thread blocks (CUDA blocks), and blocks are scheduled onto streaming multiprocessors (SMs). The GPU manages thousands of warps concurrently to hide latency.
+
+Each thread has its own registers (the fastest storage), but register file is limited per SM. If kernels use too many registers, fewer threads can be resident, reducing occupancy (the number of active warps able to hide memory latency). Thread blocks also have shared memory (also called on-chip scratchpad) which is fast and explicitly managed; shared memory is useful for cooperative operations like tiled matrix multiply or for reducing global memory traffic. Global device memory (DRAM) is large but has high latency and is the slowest accessible memory.
+
+Memory hierarchy and access patterns matter: global memory accesses should be coalesced (neighboring threads read neighboring addresses) to achieve maximum bandwidth. Random access patterns lead to many small transactions and poor bandwidth utilization. Shared memory and registers are orders of magnitude faster than global memory, so blocking computation to reuse data in shared memory is often key to high performance. However, shared memory is limited in size per block so careful tiling strategies are required.
+
+When designing GPU code, you must balance arithmetic intensity (FLOPs per byte moved) and memory bandwidth. Many neural net operations are memory-bandwidth-bound unless you can rearrange computation to do more arithmetic per loaded datum. Libraries like cuBLAS and cuDNN implement highly optimized kernels (large GEMMs, convolutions) that achieve near-peak utilization by using tiling, packing, and carefully tuned register/shared memory use. For custom operations, consider whether you can express the computation as a large GEMM or sequence of fused kernels to avoid extra global memory traffic.
+
+Warp divergence is another hazard: threads in the same warp must follow the same instruction path for best performance. Branches that cause threads in a warp to diverge will serialize execution and reduce throughput. Minimizing divergence and balancing work across warps is important for GPU efficiency.
+
+Finally, kernel launch overheads and the cost of many small kernels can be significant. Fusing elementwise operations or using libraries that produce large kernels can reduce overhead. Also consider asynchronous kernel launches and streams to overlap computation and communication.
+
+# KV-caches and memory trade-offs in autoregressive generation
+
+In autoregressive generation, the model attends to all previously generated tokens. Naively re-evaluating the whole prefix is expensive. KV-caches remove this duplicate work by storing the projected keys $K$ and values $V$ for each layer for each past token. When generating token $t+1$, you project the new token to query $Q_{t+1}$ and compute attention against the cached $K_{1..t}$ and $V_{1..t}$.
+
+Memory cost of KV-cache: suppose you have $L$ layers, model dimension $d$, number of heads $h$, and per-head dimension $d_{head} = d/h$. For each past token you store a key and a value per head, each of size $d_{head}$. So per token per layer memory is $2 d$ (since $h \times d_{head} = d$, and two of them for K and V). Over $L$ layers and $n$ stored tokens, cache memory is:
+
+$M_{KV} = n \times L \times 2d \times \text{bytes\_per\_element}$.
+
+In practice with mixed precision (e.g., float16), bytes_per_element is 2; with float32 it's 4. Using float16 halves KV memory. As an example: $L=32$, $d=2048$, $n=4096$, float16: $M_{KV} = 4096 \times 32 \times 2 \times 2048 \times 2\ \text{bytes} \approx 1$ TB? Let's compute more carefully: 4096*32 = 131072; times 2*2048 = 4096; 131072*4096 = 536,870,912 elements; times 2 bytes = 1,073,741,824 bytes ≈ 1 GiB. So KV-caches can be large but are manageable with modern GPUs for moderate contexts; with much larger $n$ and $L$ they become the limiting memory factor.
+
+KV-cache trade-offs and design points:
+- Precision: using float16 or bfloat16 halves the KV memory compared to float32. Some systems use quantization (e.g., 8-bit) for keys/values to save memory, at the cost of some numeric fidelity.
+- Sharding: caching can be sharded across devices in tensor-parallel or model-parallel setups; this complicates lookup because the attention computation must either gather remote caches or compute partial products and communicate. For low-latency single-token generation, frequent cross-device communication can kill latency, so KV-sharding strategies must be designed to minimize per-step communication.
+- Copying vs referencing beams: beam search implies multiple active hypotheses. You can either keep separate KV-caches per hypothesis (multiplying memory by beam width) or implement branching that copies only layer activations as needed. Copying caches is expensive; alternative strategies include reusing shared prefixes or compressing caches for identical prefixes.
+- Eviction and windowing: for very long generation sessions you may only keep a sliding window of keys/values (e.g., the last $w$ tokens) and drop older ones, approximating limited context. This reduces memory but discards long-range history.
+
+Compute trade-offs: storing KV avoids recomputing projections of past tokens (saves $O(n d^2)$ if you would reproject them). But you still must perform $QK^\top$ of size $1 \times n$ per head for each new token, costing $O(n d)$ per new token. If you instead recomputed everything, you'd pay $O(n^2 d)$. KV-caches are therefore essential to get feasible latency for long contexts in autoregressive decoders.
+
+# Practical profiling and bottleneck analysis
+
+Profiling is the scientific method of performance engineering: measure before you optimize, identify bottlenecks, and iterate. Several principles and tools help here.
+
+Metrics and high-level models. The roofline model is a simple conceptual tool: it plots achievable performance as limited by either memory bandwidth or compute peak, depending on arithmetic intensity (FLOPs per byte). For each kernel or stage, estimate arithmetic intensity and see whether it is memory-bound or compute-bound. If memory-bound, focus on reducing memory traffic (better tiling, reuse via shared memory, quantization); if compute-bound, consider faster algorithms, lower precision, or larger batch sizes to improve utilization.
+
+Tools. On NVIDIA hardware you have tools like nvprof (deprecated), NVIDIA Nsight Systems and Nsight Compute. These tools show timeline traces, kernel-level timing, memory throughput, occupancy, register and shared-memory usage, and per-kernel FLOPs and achieved bandwidth. Higher level profilers within frameworks (e.g., PyTorch profiler) can show operator-level timelines and allocations.
+
+Procedure to find bottlenecks:
+- First measure end-to-end time for representative workloads. Capture wall-clock time, tokens/sec, and latency percentiles for inference.
+- Break down the timeline into major stages: data preprocessing and copying, kernel execution, host-device synchronization, and communication (all-reduce, all-gather).
+- Use tracing to find which kernels consume the most time. Often large GEMMs (matrix multiplies) or attention kernels dominate.
+- For top kernels, inspect occupancy, achieved FLOPs, and memory throughput. If an operator achieves close to device peak FLOPs, it is compute-bound and hard to speed up further except by larger batch sizes, lower precision, or algorithmic changes. If it has low FLOPs and low bandwidth, it indicates poor utilization due to small problem sizes or poor tiling; consider increasing batch sizes or fusing kernels.
+- Check for frequent small kernel launches: many small elementwise kernels can dominate overhead. Kernel fusion (combining multiple elementwise ops) or using fused implementations in libraries reduces host overhead and increases per-kernel efficiency.
+- Check synchronization points and CPU-GPU interactions. Blocking host calls or serialized GPU streams can introduce stalls that kill utilization. Use asynchronous data movement and streams to overlap compute and I/O.
+- For multi-GPU setups, check network communication time versus compute. All-reduces can be a bottleneck if batch sizes are small; gradient accumulation or overlapping communication and computation can help.
+
+Common bottlenecks and fixes:
+- Small batch sizes leading to poor GEMM efficiency: increase batch, pad and pack inputs, or use grouped GEMMs.
+- Memory bandwidth limited attention kernels: implement blocking/tiling, use mixed precision, or use more efficient attention algorithms.
+- KV-cache bandwidth and memory pressure: reduce precision, shard cache carefully, or limit context windows.
+- Interconnect latency for model-parallel communication: reduce the frequency of communication (fuse operations), use faster interconnect (NVLink), or reorganize parallelism to localize compute.
+
+Finally, keep a performance regression checklist and automated benchmarks. When you change code, run microbenchmarks and full-system benchmarks to ensure that performance did not regress. Collect representative real-world inputs (length distributions, batch sizes) because synthetic benchmarks with uniform sizes can mislead about tail behavior.
+
+Concluding remarks
+
+Efficiency engineering for large sequence models is a multi-dimensional problem: algorithmic complexity in $n$ and $d$, memory constraints, parallelism choices, and low-level GPU characteristics all interact. Understanding the asymptotic formulas ($O(n^2 d)$ vs $O(n d^2)$), the memory growth of KV-caches ($O(L n d)$), and how batching and streaming influence latency and throughput will let you reason about trade-offs quantitatively. Knowledge of GPU primitives, kernel organization, and profiling tools lets you translate that reasoning into concrete optimizations. When reading or reproducing research, ask: which complexity term dominates in my target regime, what parallelism strategy fits my hardware and latency constraints, and where does the implementation spend time according to profilers? Applying the principles in this chapter will help you move from a correct implementation to a practical, efficient one.

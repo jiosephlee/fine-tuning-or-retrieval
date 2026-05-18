@@ -62,6 +62,22 @@ REQUIRED_INFERENCE_PROBE_COLUMNS = ("fact", "probe", "target")
 REQUIRED_MCQA_PROBE_COLUMNS = ("formatted_question", "correct_label")
 
 
+def _coerce_version_list(value) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_values = value.replace(",", " ").split()
+    else:
+        raw_values = []
+        for item in value:
+            raw_values.extend(str(item).replace(",", " ").split())
+    return list(dict.fromkeys(v for v in raw_values if v))
+
+
+def _safe_tag(value: str) -> str:
+    return "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in value)
+
+
 def _validate_probe_rows(probe_df: pd.DataFrame, required_columns: Tuple[str, ...]) -> List[str]:
     missing_columns = [
         column for column in required_columns
@@ -376,32 +392,33 @@ def validate_selected_mcqa_probe_family(
     malformed = []
     total_rows = 0
     mcqa_prompt_column = getattr(args, prompt_column_attr, "formatted_question")
-    mcqa_probes_version = getattr(args, version_attr)
+    mcqa_probes_versions = _coerce_version_list(getattr(args, version_attr))
     required_columns = tuple(dict.fromkeys(REQUIRED_MCQA_PROBE_COLUMNS + (mcqa_prompt_column,)))
 
     for domain in args.resolved_domains:
         domain_source = args.domain_data_sources.get(domain)
-        probe_path = probe_paths.resolve_mcqa_probe_path(
-            probe_kind,
-            domain,
-            mcqa_probes_version,
-            domain_source=domain_source,
-        )
+        for mcqa_probes_version in mcqa_probes_versions:
+            probe_path = probe_paths.resolve_mcqa_probe_path(
+                probe_kind,
+                domain,
+                mcqa_probes_version,
+                domain_source=domain_source,
+            )
 
-        if not os.path.exists(probe_path):
-            missing_paths.append(str(probe_path))
-            continue
+            if not os.path.exists(probe_path):
+                missing_paths.append(str(probe_path))
+                continue
 
-        probe_df = pd.read_csv(probe_path)
-        missing_columns = [
-            column for column in required_columns
-            if column not in probe_df.columns
-        ]
-        if missing_columns:
-            malformed.append((str(probe_path), missing_columns))
-            continue
+            probe_df = pd.read_csv(probe_path)
+            missing_columns = [
+                column for column in required_columns
+                if column not in probe_df.columns
+            ]
+            if missing_columns:
+                malformed.append((str(probe_path), missing_columns))
+                continue
 
-        total_rows += len(probe_df)
+            total_rows += len(probe_df)
 
     if missing_paths or malformed:
         details = []
@@ -422,7 +439,7 @@ def validate_selected_mcqa_probe_family(
 
     log.info(
         f"Validated {total_rows} {label} MCQA probes from "
-        f"{probe_kind}/probes_{mcqa_probes_version}_mcqa.csv using prompt column "
+        f"{probe_kind}/probes_{'+'.join(mcqa_probes_versions)}_mcqa.csv using prompt column "
         f"'{mcqa_prompt_column}' across {len(args.resolved_domains)} domains."
     )
 
@@ -575,18 +592,17 @@ def construct_experiment_name(args):
             )
             probes_version += f"_prompt_{prompt_tag}"
     if getattr(args, "inference_mcqa_probes", False):
-        inference_mcqa_probes_version = getattr(
-            args,
-            "inference_mcqa_probes_version",
-            DEFAULT_INFERENCE_MCQA_PROBES_VERSION,
+        inference_mcqa_probes_versions = _coerce_version_list(
+            getattr(
+                args,
+                "inference_mcqa_probes_version",
+                DEFAULT_INFERENCE_MCQA_PROBES_VERSION,
+            )
         )
-        probes_version += f"_inf_mcqa_{inference_mcqa_probes_version}"
+        probes_version += f"_inf_mcqa_{'+'.join(_safe_tag(v) for v in inference_mcqa_probes_versions)}"
         inference_mcqa_prompt_column = getattr(args, "inference_mcqa_prompt_column", "formatted_question")
         if inference_mcqa_prompt_column != "formatted_question":
-            prompt_tag = "".join(
-                char if char.isalnum() or char in {"_", "-"} else "_"
-                for char in inference_mcqa_prompt_column
-            )
+            prompt_tag = _safe_tag(inference_mcqa_prompt_column)
             probes_version += f"_inf_prompt_{prompt_tag}"
 
     # 4. Chunking Style: e.g., 'sec_no-ovp', 'sec_ovp_1_4', 'tok'
@@ -643,6 +659,8 @@ def construct_experiment_name(args):
 
         if args.document_track_baseline:
             data_mix += "_docmatch_expl"
+            if args.document_match_insert_content != "document":
+                data_mix += f"_insert{args.document_match_insert_content}"
             if args.explanation_granularity == "chunk":
                 data_mix += f"_granchunk{args.explanation_track_size_by_chunk}"
 
@@ -650,6 +668,8 @@ def construct_experiment_name(args):
         data_mix = "source_only"
         if args.document_track_baseline:
             data_mix += "_docmatch_expl"
+            if args.document_match_insert_content != "document":
+                data_mix += f"_insert{args.document_match_insert_content}"
             if args.explanation_granularity == "chunk":
                 data_mix += f"_granchunk{args.explanation_track_size_by_chunk}"
 
@@ -830,6 +850,7 @@ def continue_pretraining(model, tokenizer, log, args, train: bool = True):
             "document_track_baseline": args.document_track_baseline,
             "match_explanation_source_replay": args.match_explanation_source_replay,
             "document_match_specific_explanation": args.document_match_specific_explanation,
+            "document_match_insert_content": args.document_match_insert_content,
             "with_prior_knowledge": args.with_prior_knowledge,
             "prior_knowledge_insertion": args.prior_knowledge_insertion,
             "prior_knowledge_cycle": args.prior_knowledge_cycle,
@@ -1117,8 +1138,9 @@ if __name__ == "__main__":
         "--inference_mcqa_probes_version",
         "--inference-mcqa-probes-version",
         type=str,
+        nargs='+',
         default=DEFAULT_INFERENCE_MCQA_PROBES_VERSION,
-        help="Version of the inference MCQA probes to use when --inference_mcqa_probes is enabled.",
+        help="Version(s) of the inference MCQA probes to use when --inference_mcqa_probes is enabled.",
     )
     parser.add_argument(
         "--inference_mcqa_prompt_column",
@@ -1254,8 +1276,19 @@ if __name__ == "__main__":
     parser.add_argument("--overlap_sections", default=False, action="store_true", help="Overlap sections when chunking")
     parser.add_argument("--overlap_ratio", type=str, default="1_4", help="Ratio of overlap when chunking")
     parser.add_argument("--with_specific_explanation", type=str, nargs='+', default=None, help="Use specific explanation type(s). For granular these are subfolders; for whole/legacy these map to flat files (e.g., textbooks -> textbook.txt).")
-    parser.add_argument("--document_track_baseline", action="store_true", help="Add an auxiliary document replay track matched to a granular explanation schedule.")
+    parser.add_argument("--document_track_baseline", action="store_true", help="Add an auxiliary track matched to a granular explanation schedule.")
     parser.add_argument("--document_match_specific_explanation", type=str, nargs='+', default=None, help="Explanation subfolder type(s) used only to size --document_track_baseline, e.g. textbooks blogs stackexchange.")
+    parser.add_argument(
+        "--document_match_insert_content",
+        type=str,
+        default="document",
+        choices=["document", "cited_works", "prior_knowledge"],
+        help=(
+            "Content inserted into the matched auxiliary track: 'document' cycles the current "
+            "source/paraphrase chunks, 'cited_works' cycles cited_textbooks, and "
+            "'prior_knowledge' cycles prior_knowledge chapters."
+        ),
+    )
     parser.add_argument("--raw", action="store_true", help="Use raw texts instead of cleaned/semi-cleaned corpora.")
     parser.add_argument("--times_explanations", type=int, default=1, help="Number of times to repeat the explanation texts.")
     parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")
@@ -1687,15 +1720,17 @@ if __name__ == "__main__":
             f"prompt_column={args.mcqa_prompt_column})."
         )
     if args.inference_mcqa_probes:
+        inference_mcqa_probes_versions = _coerce_version_list(args.inference_mcqa_probes_version)
         log.info(
             "Inference MCQA probes are enabled "
-            f"(inference/probes_{args.inference_mcqa_probes_version}_mcqa.csv, "
+            f"(versions={inference_mcqa_probes_versions}, "
             f"prompt_column={args.inference_mcqa_prompt_column})."
         )
     if args.enable_wandb_source_panels:
         mcqa_note = f" MCQA constrained-decoding ({args.mcqa_probes_version})." if args.mcqa_probes else ""
         inference_mcqa_note = (
-            f" Inference MCQA constrained-decoding ({args.inference_mcqa_probes_version})."
+            f" Inference MCQA constrained-decoding "
+            f"({_coerce_version_list(args.inference_mcqa_probes_version)})."
             if args.inference_mcqa_probes
             else ""
         )

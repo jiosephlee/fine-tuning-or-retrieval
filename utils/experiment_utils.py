@@ -41,6 +41,22 @@ MCQA_LABEL_TO_INDEX = {"(A)": 0, "(B)": 1, "(C)": 2, "(D)": 3, "(E)": 4,
                         "A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
 
 
+def _coerce_version_list(value) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_values = value.replace(",", " ").split()
+    else:
+        raw_values = []
+        for item in value:
+            raw_values.extend(str(item).replace(",", " ").split())
+    return list(dict.fromkeys(v for v in raw_values if v))
+
+
+def _safe_metric_tag(value: str) -> str:
+    return "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in value)
+
+
 def _create_mcqa_callback(
     tokenizer,
     mcqa_df: pd.DataFrame,
@@ -55,6 +71,8 @@ def _create_mcqa_callback(
     prompt_suffix: str = DEFAULT_MCQA_PROMPT_SUFFIX,
     prompt_column: str = "formatted_question",
     choice_tokens: list = None,
+    panel_domain: str = None,
+    panel_metric_name: str = None,
 ):
     """Create an MCQAProbeCallback from a MCQA probe DataFrame.
 
@@ -98,6 +116,8 @@ def _create_mcqa_callback(
         sparse_eval=sparse_eval,
         eval_every_n_steps=eval_every_n_steps,
         wandb_metric_allowlist=wandb_metric_allowlist,
+        panel_domain=panel_domain,
+        panel_metric_name=panel_metric_name,
     )
 
 
@@ -175,7 +195,9 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
     )
     mcqa_probes_version = getattr(args, "mcqa_probes_version", default_knowledge_probes_version)
     mcqa_prompt_column = getattr(args, "mcqa_prompt_column", "formatted_question")
-    inference_mcqa_probes_version = getattr(args, "inference_mcqa_probes_version", "v12")
+    inference_mcqa_probes_versions = _coerce_version_list(
+        getattr(args, "inference_mcqa_probes_version", "v12")
+    )
     inference_mcqa_prompt_column = getattr(args, "inference_mcqa_prompt_column", "formatted_question")
     probe_every_n_steps = max(1, int(getattr(args, "probe_every_n_steps", 1) or 1))
     mcqa_probe_every_n_steps = max(1, int(getattr(args, "mcqa_probe_every_n_steps", 1) or 1))
@@ -293,39 +315,51 @@ def setup_callbacks(domains, tokenizer, log, args, is_lima: bool = False):
 
         # Inference MCQA probes (constrained-decoding evaluation)
         if enable_inference_mcqa_probes:
-            inference_mcqa_probe_path = str(
-                probe_paths.resolve_mcqa_probe_path(
-                    "inference", domain, inference_mcqa_probes_version,
-                    domain_source=domain_source,
+            use_version_tags = len(inference_mcqa_probes_versions) > 1
+            for inference_mcqa_probes_version in inference_mcqa_probes_versions:
+                version_tag = _safe_metric_tag(inference_mcqa_probes_version)
+                inference_mcqa_probe_path = str(
+                    probe_paths.resolve_mcqa_probe_path(
+                        "inference", domain, inference_mcqa_probes_version,
+                        domain_source=domain_source,
+                    )
                 )
-            )
-            if os.path.exists(inference_mcqa_probe_path):
-                inference_mcqa_df = pd.read_csv(inference_mcqa_probe_path)
-                output_dir_inference_mcqa = os.path.join(
-                    args.base_results_dir, args.experiment_name,
-                    f"{domain}{suffix}_inference_mcqa_probe",
-                )
-                os.makedirs(output_dir_inference_mcqa, exist_ok=True)
-                inference_mcqa_callback = _create_mcqa_callback(
-                    tokenizer, inference_mcqa_df, mcqa_probe_batch_size, log,
-                    output_dir_inference_mcqa, f"{domain}_inference_mcqa_probe",
-                    probe_report_to_wandb, sparse_eval,
-                    wandb_probe_metric_allowlist,
-                    mcqa_probe_every_n_steps,
-                    prompt_column=inference_mcqa_prompt_column,
-                )
-                callbacks.append(inference_mcqa_callback)
-                inference_mcqa_probe_callbacks.append(inference_mcqa_callback)
-                log.info(
-                    f"Loaded {len(inference_mcqa_df)} inference MCQA probes "
-                    f"({inference_mcqa_probes_version}) from {inference_mcqa_probe_path} "
-                    f"with batch_size={mcqa_probe_batch_size}"
-                )
-            else:
-                log.warning(
-                    f"Inference MCQA probe file not found for domain {domain} "
-                    f"with version {inference_mcqa_probes_version} at {inference_mcqa_probe_path}"
-                )
+                if os.path.exists(inference_mcqa_probe_path):
+                    inference_mcqa_df = pd.read_csv(inference_mcqa_probe_path)
+                    output_dir_name = f"{domain}{suffix}_inference_mcqa_probe"
+                    log_prefix = f"{domain}_inference_mcqa_probe"
+                    panel_metric_name = "inference_mcqa_accuracy"
+                    if use_version_tags:
+                        output_dir_name += f"_{version_tag}"
+                        log_prefix += f"_{version_tag}"
+                        panel_metric_name += f"_{version_tag}"
+                    output_dir_inference_mcqa = os.path.join(
+                        args.base_results_dir, args.experiment_name,
+                        output_dir_name,
+                    )
+                    os.makedirs(output_dir_inference_mcqa, exist_ok=True)
+                    inference_mcqa_callback = _create_mcqa_callback(
+                        tokenizer, inference_mcqa_df, mcqa_probe_batch_size, log,
+                        output_dir_inference_mcqa, log_prefix,
+                        probe_report_to_wandb, sparse_eval,
+                        wandb_probe_metric_allowlist,
+                        mcqa_probe_every_n_steps,
+                        prompt_column=inference_mcqa_prompt_column,
+                        panel_domain=domain,
+                        panel_metric_name=panel_metric_name,
+                    )
+                    callbacks.append(inference_mcqa_callback)
+                    inference_mcqa_probe_callbacks.append(inference_mcqa_callback)
+                    log.info(
+                        f"Loaded {len(inference_mcqa_df)} inference MCQA probes "
+                        f"({inference_mcqa_probes_version}) from {inference_mcqa_probe_path} "
+                        f"with batch_size={mcqa_probe_batch_size}"
+                    )
+                else:
+                    log.warning(
+                        f"Inference MCQA probe file not found for domain {domain} "
+                        f"with version {inference_mcqa_probes_version} at {inference_mcqa_probe_path}"
+                    )
 
         if disable_inference_probes:
             log.info(f"Skipping inference probes for domain {domain} (--disable_inference_probes).")

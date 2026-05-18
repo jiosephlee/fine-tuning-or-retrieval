@@ -1000,16 +1000,19 @@ class WandbSourcePanelsCallback(TrainerCallback):
 
         # Inference MCQA constrained-decoding accuracy
         for callback in self.inference_mcqa_callbacks:
-            domain = self._domain_from_prefix(getattr(callback, "log_prefix", ""))
+            domain = getattr(callback, "panel_domain", None) or self._domain_from_prefix(
+                getattr(callback, "log_prefix", "")
+            )
             if not domain:
                 continue
+            metric_name = getattr(callback, "panel_metric_name", None) or "inference_mcqa_accuracy"
             acc_entries = callback.history.get("mcqa_accuracy", [])
             entry = self._entry_for_step(acc_entries, step)
             if not entry:
                 continue
             avg = self._safe_average(entry.get("values", []))
             if self._valid_number(avg):
-                per_domain.setdefault(domain, {})["inference_mcqa_accuracy"] = float(avg)
+                per_domain.setdefault(domain, {})[metric_name] = float(avg)
 
         return per_domain
 
@@ -1277,6 +1280,8 @@ class MCQAProbeCallback(TrainerCallback):
         sparse_eval: bool = False,
         eval_every_n_steps: int = 1,
         wandb_metric_allowlist: Optional[List[str]] = None,
+        panel_domain: Optional[str] = None,
+        panel_metric_name: Optional[str] = None,
     ):
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
@@ -1293,6 +1298,8 @@ class MCQAProbeCallback(TrainerCallback):
         self.sparse_eval = sparse_eval
         self.eval_every_n_steps = max(1, int(eval_every_n_steps or 1))
         self.wandb_metric_allowlist = set(wandb_metric_allowlist) if wandb_metric_allowlist else None
+        self.panel_domain = panel_domain
+        self.panel_metric_name = panel_metric_name
         self.history = {"mcqa_accuracy": []}
         self.predictions_history: List[Dict] = []
 

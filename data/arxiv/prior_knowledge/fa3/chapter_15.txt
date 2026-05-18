@@ -1,0 +1,179 @@
+# Introduction
+
+Softmax is a core building block in machine learning models, from classification heads to attention mechanisms in transformers. The softmax of a vector $x\in\mathbb{R}^n$ produces a probability distribution
+\[
+\operatorname{softmax}(x)_i = \frac{e^{x_i}}{\sum_{j=1}^n e^{x_j}}.
+\]
+When batches and high-dimensional vectors are involved, computing softmax efficiently becomes critical for overall system throughput. On GPUs, throughput is limited not only by arithmetic throughput but also by memory bandwidth, instruction throughput for special functions, and the ability to map reductions and data movement to the hardware’s parallel structure (warps, thread blocks, and shared memory). This chapter explains how to implement softmax efficiently on GPUs. We cover parallel row-wise reduction patterns used to compute row maxima and sums, numerical stabilization using the subtract-max/trick and log-sum-exp, how exponential evaluation interacts with special-function units (SFUs) on GPUs, approximation strategies for $e^x$ and their trade-offs, and techniques that minimize memory traffic by performing local reductions.
+
+Throughout, emphasize intuition, correctness, and the practical trade-offs of performance versus numerical accuracy. The goal is that after reading this chapter, you will be able to read GPU softmax code in libraries like cuDNN, Triton, or custom kernels, and understand why they are written that way and what alternatives exist.
+
+# Row-wise reduction patterns (max, sum) implemented in parallel
+
+Softmax applied to a matrix is typically computed row-wise: for a matrix $X\in\mathbb{R}^{B\times N}$ with $B$ rows (batch size) and $N$ columns (vector length), we want to compute softmax for each row independently. GPUs provide massive single-instruction multiple-thread parallelism, but reductions (max, sum) need coordination across threads that collectively own the elements of a row. The key idea is to map each row to a group of threads that cooperate to compute reductions hierarchically and in parallel across rows.
+
+There are several common mapping strategies:
+
+- One thread per element: launch $B\times N$ threads; each element is processed by one thread. Threads cooperate within a warp or block to perform reductions using warp intrinsics or shared memory. This mapping is simple but can be limited by the cost of collective communication when $N$ is small.
+
+- One warp per row: assign one warp (commonly 32 threads on NVIDIA) to each row. Each thread in the warp processes several columns (strided or contiguous) and the warp uses fast warp-level primitives (like shuffle or ballot) to implement reductions. This works well when $N$ is comparable to or larger than a warp size; throughput is high because warp intrinsics avoid shared memory and synchronization barriers.
+
+- Multiple warps per row: for very long rows, multiple warps are assigned to the same row. Each warp computes a local reduction over its assigned columns, then a second-level reduction combines the warp-level results. This requires shared memory and cross-warp synchronization (block-level barriers), but it scales to large $N$.
+
+- Multiple rows per block: assign a thread block to process several rows. Threads are partitioned into subgroups (possibly warps) that operate on different rows. This maximizes the reuse of shared memory and reduces kernel launch overhead.
+
+Whatever mapping is chosen, a hierarchical reduction pattern minimizes latency and leverages fast intra-warp communication. A typical two-level approach is:
+
+1. Local reduction per thread: each thread accumulates a local max or partial sum over the elements it loads into registers. This reduces register-to-register work and amortizes memory loads.
+
+2. Warp-level reduction: threads within a warp combine their local results using warp shuffles (e.g., XOR-shuffle tree) to compute a warp-local max or sum. Warp shuffles are preferable because they avoid shared memory and are very low-latency.
+
+3. Block-level reduction (if necessary): when multiple warps participate in the same row, the warp results are written to shared memory and a single warp performs a reduction on those warp results, or a tree reduction using atomic or synchronization with __syncthreads() is used.
+
+Max and sum have slightly different properties. Maximum is an idempotent associative operation that is stable under parallel reductions; sums require careful ordering if numerical reproducibility is desired, but associative summation is acceptable for many ML workloads. For softmax numerical stability, computing the exact order is less important than having consistent accuracy.
+
+To illustrate concretely, imagine one warp per row. Each thread t in the warp computes
+\[
+\text{local\_max}_t = \max_{k=0}^{K-1} x_{i, t+kw}
+\]
+where $w$ is warp size and $K=\lceil N/w\rceil$ is the number of elements per thread. Then the warp-level max is computed by repeated shuffle-xor:
+\[
+\text{warp\_max} = \max\left(\text{local\_max}_t, \text{local\_max}_{t\oplus 16}, \ldots\right).
+\]
+The same pattern applies to computing sums, though numeric accumulation in 32-bit floats leads to some rounding errors when $N$ is large; in those cases one might use pairwise summation or FP16-compute/FP32-accumulation to balance performance and accuracy.
+
+Key performance considerations include reducing synchronization points, minimizing shared-memory bank conflicts when shared memory is used, and ensuring coalesced global memory loads so threads in a warp read contiguous addresses when possible. For row-major storage and one warp per row, contiguous columns are loaded by consecutive threads, giving coalesced accesses. When rows are very short (smaller than warp size), it is often better to pack multiple rows per warp to maintain occupancy.
+
+# Numerically stable softmax: subtracting row max and log-sum-exp
+
+Directly computing $e^{x_i}$ can overflow or underflow for large positive or negative $x_i$. A standard stabilization is to subtract the maximum value in the row before exponentiating:
+\[
+\operatorname{softmax}(x)_i = \frac{e^{x_i}}{\sum_j e^{x_j}} = \frac{e^{x_i - m}}{\sum_j e^{x_j - m}},
+\]
+where $m=\max_j x_j$. This subtraction does not change the result but keeps exponents in a numerically safer range, typically preventing overflow when entries are large. When computing log-likelihoods or log-softmax, the log-sum-exp trick provides a stable computation of $\log\sum_j e^{x_j}$ as
+\[
+\log\sum_j e^{x_j} = m + \log\sum_j e^{x_j - m},
+\]
+where $m$ is the same row max. This formula avoids exponentiating large positive numbers and keeps the sum under control.
+
+On GPUs, implementing this numerically stable pattern requires two reductions per row: one to find $m$ and another to compute the sum of $e^{x_j - m}$. A typical kernel structure is:
+
+1. Compute the row maximum $m$ using the row-wise reduction pattern described above.
+
+2. Subtract $m$ from each element, exponentiate, and compute the row sum $s = \sum_j e^{x_j - m}$, again via parallel reduction.
+
+3. Compute the final normalized outputs by dividing each exponentiated element by $s$ (or computing $x_i - m - \log s$ for log-softmax).
+
+Because the same value $m$ is needed by all threads processing a row, it is often written to shared memory or a per-row output array between steps. When multiple warps process a row, the availability of $m$ typically requires an explicit synchronization (for example, writing $m$ into shared memory and calling __syncthreads()), or using a two-kernel approach where the first kernel writes the row maxima into global memory and the second kernel reads maxima and finishes the exponentiation and normalization. A two-kernel approach increases global memory traffic but can simplify synchronization and increase modularity.
+
+The log-sum-exp variant is especially important for loss computation in classification and for numerical stability during training with mixed precision. When using FP16 inputs with FP32 accumulation, subtracting the row max and using FP32 accumulation for the exponentials and sum gives much better stability than pure FP16 arithmetic.
+
+It is also useful to consider the range after subtraction: if $x_j - m$ is less than some negative threshold (e.g., less than -20 in FP32), then $e^{x_j - m}$ is tiny and contributes negligible mass to the sum. Implementations can exploit this by clamping or skipping very small exponentials for speed, at small accuracy cost—this is more relevant in approximate or sparse-softmax contexts.
+
+# Efficient evaluation of exponentials and special function unit constraints
+
+The exponential function $e^x$ is not a single-cycle operation on GPUs. GPU architectures typically include specialized functional units (SFUs) capable of evaluating transcendental functions like exponentials, logarithms, reciprocal square roots, and trigonometric functions. However, SFU capacity per multiprocessor is finite; issuing many exponential instructions can saturate SFUs and limit throughput.
+
+Hardware SFUs often support a small number of operations per cycle; solicitations beyond that must wait, effectively serializing some fraction of the work. Moreover, in older or lower-power GPUs, SFU throughput can be a major bottleneck if every thread issues exponentials. Therefore, software strategies aim to reduce the number of exponentials computed, amortize SFU usage, or replace expensive exponentials with approximations that use cheaper arithmetic and produce acceptable error.
+
+Another constraint is that SFU implementations typically have specific latency and throughput characteristics. Latency could be in the range of tens of cycles; warp scheduling hides latency by switching to other warps, but if the kernel has insufficient parallelism (insufficient active warps) or memory-bound behavior, SFU latency becomes a limiting factor. Architectures with Tensor Cores or matrix instructions might rely less on SFUs for some workloads, but softmax is inherently elementwise plus reductions and does not map directly to matrix multiply units.
+
+Given SFU constraints, practical implementations take a few approaches:
+
+- Reduce the number of exponentials: compute exponentials only when needed, e.g., avoid exponentiating very small values that will underflow to zero, or use a threshold below which you treat $e^{x} \approx 0$.
+
+- Use vectorized or fused kernels: fusing the subtraction, exponentiation, and multiply-adds reduces global memory traffic and allows better instruction overlap. Since each thread performs multiple operations per loaded element, the relative cost of exponents is amortized.
+
+- Use approximate exponentials implemented as sequences of arithmetic operations (polynomials, rational approximations, or table lookup + interpolation), which can be executed on integer and FP units rather than SFUs. These approximations must be chosen carefully to trade off accuracy and the number of FP operations.
+
+- Leverage hardware intrinsics where available: some GPU programming models expose fast approximate exponent or exp2 intrinsics (e.g., __expf in CUDA returns a faster, sometimes lower-precision exponential). Know your environment and test numerical errors for your application.
+
+It is also important to consider mixed precision: computing $e^{x}$ in FP32 while inputs are FP16 reduces exponent inaccuracy relative to FP16 exponent evaluation. Often, exponentiation is the dominating cost; replacing $e^x$ with an approximation reduces the pressure on SFUs and reduces instruction scheduling constraints. But approximations incur error and may require compensated accumulation in the sum to avoid bias.
+
+# Approximation methods for exponentials and trade-offs
+
+Approximating the exponential function trades accuracy for performance. Several classes of approximations are commonly used in GPU softmax kernels: polynomial approximations (like Taylor or minimax polynomials), rational approximations (Padé approximants), table lookup with interpolation, and bit-manipulation tricks exploiting floating-point representations.
+
+Polynomial approximations approximate $e^x$ over a limited interval with a polynomial
+\[
+e^x \approx \sum_{k=0}^p a_k x^k.
+\]
+Chebyshev or minimax polynomials minimize maximum error on the interval and often need fewer terms for a given error bound than simple Taylor series. The advantage is using only multiply-add operations, which GPUs can perform quickly. The downside is that the approximation interval is finite; you must first reduce the argument to a small interval (range reduction) and then apply the polynomial. Range reduction typically uses the identity $e^x = 2^{x/\ln 2} = 2^n \cdot e^r$ where $x/\ln 2 = n + r$ and $r\in[-1/2,1/2]$, so $n$ is an integer and $r$ is small. Computing $2^n$ is cheap if you can manipulate floating-point exponents or use fast integer shifts, but careful handling is needed to avoid rounding errors.
+
+Rational approximations use a ratio of polynomials:
+\[
+e^x \approx \frac{p(x)}{q(x)}.
+\]
+Rational approximations can achieve high accuracy with lower degree polynomials than pure polynomials, but they require division which is relatively expensive on GPUs. However, one can compute reciprocal via fast reciprocal approximations plus Newton iterations to improve accuracy; this often remains faster than SFU exponentials for well-chosen degrees.
+
+Table lookup plus interpolation partitions the domain into small intervals, stores precomputed values (and perhaps derivatives) in a table, and interpolates. This is attractive when the table can fit in shared memory or registers and when the same table entries are reused by many threads. The cost is memory for the table and potential shared memory conflicts. For softmax, where the distribution of inputs may concentrate around certain ranges, adaptive tables can be effective.
+
+Bit-manipulation tricks use the floating-point representation directly. For single-precision floats, a fast approximation to $2^x$ or $e^x$ can be achieved by constructing a float from an integer exponent and fractional part using the IEEE 754 layout; this yields a crude approximation and is often combined with one or two Newton or polynomial refinements. These tricks are very fast but can be lower precision and must be validated for a given tolerance.
+
+Each approximation has trade-offs:
+
+- Accuracy vs. Cost: Higher accuracy requires higher polynomial degree, more table entries, or extra refinement iterations, increasing instruction count or memory usage.
+
+- Branching and divergence: Some approximations use conditional code (e.g., special handling for large negative arguments). Branch divergence across threads in a warp reduces efficiency; it is preferable to use branchless approximations or to structure code to minimize divergence.
+
+- Range reduction cost: The overhead of reducing the argument to a suitable interval and reconstructing the scale factor must be accounted for. For example, computing $n = \operatorname{round}(x / \ln 2)$ involves a multiply and convert-to-int operation.
+
+- Accumulated error in softmax: Because softmax is normalized, multiplicative scaling errors in exponent approximations can partially cancel if applied uniformly, but additive errors in the exponent domain can bias probabilities. When approximations are used in both numerator and denominator, relative error patterns matter. It's common to verify that any approximation yields small relative errors in the computed softmax probabilities; sometimes an approximation is acceptable for forward pass but not for backward pass gradients, so separate strategies may be used (higher precision for backward).
+
+- Determinism and reproducibility: Approximate exponentials may be non-deterministic across devices or compiler versions if they rely on hardware-specific intrinsics, which can be a concern for debugging or testing.
+
+In practice, a common pattern is to use a low-degree minimax polynomial for $e^x$ on a small interval combined with an efficient range reduction that uses fast integer operations for scaling. An alternative is to use the hardware intrinsic for exponent when high accuracy is needed or when SFU is not the bottleneck; modern GPUs often have improved transcendental throughput.
+
+When choosing an approximation, profile the kernel: if SFU throughput is the bottleneck and acceptable accuracy permits an approximation, replace $e^x$ with an approximation. Otherwise, use hardware exponentials. Benchmark across representative inputs to ensure correctness in the intended application.
+
+# Minimizing memory traffic when computing softmax (local reductions)
+
+Memory bandwidth is often the primary limiter of GPU kernels. Softmax involves reading the input matrix, writing a few per-row scalars (like the max and sum), and writing the normalized outputs. If done naively, this can result in multiple passes over global memory: one pass to compute maxima, a second to compute exponentials and sums, and a third to write the outputs. Minimizing memory traffic by performing as much as possible in registers and shared memory reduces global loads/stores and increases arithmetic intensity.
+
+Key strategies to reduce memory traffic include:
+
+- Fused kernels: Combine the compute stages (max reduction, exponentiation, sum reduction, final normalization) into a single kernel. This avoids writing intermediate scalars to global memory between steps if all cooperating threads reside in the same block and can exchange data via shared memory or registers. Fusing reduces kernel launch overhead and global memory traffic, at the cost of potentially larger kernel complexity.
+
+- Local reductions and streaming: Each thread reads multiple elements into registers and computes local maxima and partial sums before performing inter-thread reductions. By keeping as much state in registers as possible, you avoid reloading elements from global memory. For example, a thread may load a contiguous chunk of 8 or 16 elements, compute their local max in registers, then participate in warp-level reduction to compute the row max. Later, it reuses the same register values to compute exponentials (after loading $m$ into a register) or may have to reload values if registers were spilled. Therefore, balance the number of elements per thread against register pressure.
+
+- Using shared memory to stage blocks of rows: When multiple warps in a block process the same row or neighboring rows, loading a tile of the input into shared memory enables multiple threads to reuse the data without extra global loads. This tiling is particularly effective when computing softmax over the columns and subsequent layers will reuse the same data.
+
+- Two-phase reductions with partial sums stored in shared memory: In multiple-warp-per-row scenarios, each warp computes a warp-local sum and writes it to shared memory. A single warp then reduces the shared-memory array to produce the total sum. Because writes to shared memory are much cheaper than global memory, this pattern saves bandwidth.
+
+- Avoiding unnecessary writes: If softmax outputs are immediately consumed by another fused layer (e.g., a matrix multiply for attention), fuse that layer to consume exponentiated elements directly from registers without writing them back to global memory. This producer-consumer fusion eliminates writes of intermediate arrays.
+
+- Memory access patterns and coalescing: Structure threads so that global memory accesses are coalesced. For row-major layout and one warp per row, consecutive threads load consecutive columns for a single row, leading to coalesced accesses. If the matrix is stored transposed or the mapping is different, adjust the kernel mapping to keep coalesced loads.
+
+An example of a feasible fused single-pass softmax kernel for moderate row sizes follows this flow. Each thread loads a contiguous chunk of elements into registers, reduces to compute a local max, and then participates in a warp-level reduction to obtain the row max $m$. Without returning to global memory, each thread computes exponentials of its locally held elements shifted by $m$, accumulates a local sum, and participates in a warp-level reduction to compute the row sum $s$. Finally, each thread normalizes its locally held exponentials by dividing by $s$ and writes the normalized outputs back to the output array. This entire sequence reads each input value exactly once and writes each output value exactly once, minimizing global memory traffic.
+
+However, some constraints can prevent a fully fused single-kernel approach: if a row spans multiple blocks, or if the grid configuration maps one block per row but the number of rows exceeds the number of SMs leading to diverse scheduling, you might need a multi-kernel approach, in which case write-back of intermediate scalars (like maxima) to global memory is unavoidable. Even then, minimize the amount written: write only one scalar per row for the max and one scalar for the log-sum-exp if necessary.
+
+Finally, consider precision and storage format: using FP16 halves memory traffic compared to FP32, but exponentiation in FP16 has smaller dynamic range; often compute in FP32 accumulation while loading/storing in FP16 to get the best trade-off between memory bandwidth and numerical stability—this is the mixed-precision approach commonly used in modern frameworks.
+
+# Putting it together: an example design and practical guidelines
+
+Combining the preceding ideas yields practical designs for different row lengths and GPU characteristics.
+
+For short rows (N <= warp size): pack multiple rows per warp so that each warp still has enough work. Use warp-level reductions exclusively (shuffle instructions) to avoid shared memory. Keep everything in registers: load element(s), compute local max, compute warp max, subtract, exponentiate with an approximate or hardware exponential depending on SFU load, compute warp sum, normalize, and write outputs.
+
+For medium rows (warp size < N <= several thousand): one warp or multiple warps per row works. Use warp-level reductions for local chunks and a block-level reduction for warps across the row. Fuse the entire softmax into one kernel to avoid multiple passes. Use FP32 accumulation for exponentials even when inputs are FP16. Use an efficient polynomial approximation for $e^x$ if SFU is a bottleneck and accuracy allows it. Use shared memory to store warp partial sums, but avoid frequent global memory writes.
+
+For very long rows (N very large): split rows into tiles processed by blocks or multiple kernel launches. Each tile produces partial sums and partial maxima; combine tile results in a second stage. You may have to write intermediate tile maxima to global memory, then launch a small kernel to reduce them and broadcast the results. To minimize memory traffic, combine this with tiling so each tile reads its portion once and writes only its normalized outputs.
+
+Practical code-level guidelines:
+
+- Favor warp shuffles for intra-warp reductions; they are faster and avoid shared memory bank conflicts.
+
+- Keep register pressure reasonable: holding too many elements per thread may cause register spilling, which hits local memory (global memory) and defeats the optimization.
+
+- Measure the SFU throughput: profile with representative inputs to determine whether exponentials are the bottleneck; if so, evaluate approximate exponentials.
+
+- Use fused kernels where possible: when softmax is immediately followed by another operation (attention dot-product), fuse them to reduce memory traffic.
+
+- Use mixed precision wisely: compute critical reductions (max, sum) in FP32 even if inputs are FP16, and convert outputs back if needed.
+
+- Test numerically: verify that approximation and precision choices do not degrade training or inference behavior unacceptably. Check both forward outputs and backward gradients if training.
+
+- Consider caching per-row constants and broadcasting them efficiently: store row maxima and log-sum-exp values in shared memory or registers for fast access by threads in the row.
+
+By understanding the structure of softmax, the hardware limits (SFU and memory bandwidth), and the available primitives (warp shuffles, shared memory, fast arithmetic), you can design kernels that compute softmax both quickly and stably. The appropriate choices depend on row length, desired accuracy, and the particular GPU generation. Implementations in major libraries represent years of engineering to balance these trade-offs; use them as references, but knowing these principles allows customizing softmax for new architectures or application-specific constraints.

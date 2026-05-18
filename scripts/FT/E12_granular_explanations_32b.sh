@@ -23,7 +23,6 @@ mkdir -p logs
 MODEL_ID="${MODEL_ID:-allenai/OLMo-2-0325-32B}"
 CONDA_ENV="${CONDA_ENV:-openrlhf}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
-DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-deepspeed_zero2_4gpus.yaml}"
 # In this CPT pipeline, NUM_EPOCHS is used as the target number of
 # knowledge-injection batches when >1. The default 100 matches E1/E2 local.
 NUM_EPOCHS="${NUM_EPOCHS:-100}"
@@ -33,6 +32,9 @@ EFFECTIVE_BATCH_SIZE="${EFFECTIVE_BATCH_SIZE:-256}"
 LEARNING_RATE="${LEARNING_RATE:-4e-5}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
+OFFLOAD_TO_CPU="${OFFLOAD_TO_CPU:-0}"
+DEVICE_MAP_AUTO="${DEVICE_MAP_AUTO:-$OFFLOAD_TO_CPU}"
+ACTIVATION_OFFLOADING="${ACTIVATION_OFFLOADING:-1}"
 CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E12_granular_explanations_32b_all_domains}"
 PUSH_TO_HUB_CPT_ID="${PUSH_TO_HUB_CPT_ID:-e12-olmo2-32b-para9-expl-20260517}"
 EXPLANATION_TYPES="${EXPLANATION_TYPES:-textbooks stackexchange blogs}"
@@ -46,11 +48,12 @@ MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v14}"
 MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 MCQA_PROBE_BATCH_SIZE="${MCQA_PROBE_BATCH_SIZE:-32}"
 INFERENCE_MCQA_PROBES="${INFERENCE_MCQA_PROBES:-1}"
-INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v12_reviewed}"
+INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v12_reviewed v12}"
 INFERENCE_MCQA_PROMPT_COLUMN="${INFERENCE_MCQA_PROMPT_COLUMN:-formatted_question}"
 USE_PARCC="${USE_PARCC:-0}"
 SAVE_LOCAL_MODEL="${SAVE_LOCAL_MODEL:-0}"
 SPARSE_CALLBACKS="${SPARSE_CALLBACKS:-0}"
+PARAMETER_DELTA_TRACKING="${PARAMETER_DELTA_TRACKING:-1}"
 PARAMETER_DELTA_EVERY_N_STEPS="${PARAMETER_DELTA_EVERY_N_STEPS:-5}"
 PROBE_EVERY_N_STEPS="${PROBE_EVERY_N_STEPS:-2}"
 MCQA_PROBE_EVERY_N_STEPS="${MCQA_PROBE_EVERY_N_STEPS:-4}"
@@ -66,10 +69,22 @@ fi
 if [[ "$SPARSE_CALLBACKS" == "1" ]]; then
     EXTRA_ARGS+=(--no_callback_every_step)
 fi
+if [[ "$PARAMETER_DELTA_TRACKING" == "1" ]]; then
+    EXTRA_ARGS+=(
+        --enable_parameter_delta_tracking
+        --parameter_delta_every_n_steps "$PARAMETER_DELTA_EVERY_N_STEPS"
+    )
+fi
+if [[ "$DEVICE_MAP_AUTO" == "1" ]]; then
+    EXTRA_ARGS+=(--offload_to_cpu)
+elif [[ "$ACTIVATION_OFFLOADING" == "1" ]]; then
+    EXTRA_ARGS+=(--activation_offloading)
+fi
 if [[ "$INFERENCE_MCQA_PROBES" == "1" ]]; then
+    read -r -a INFERENCE_MCQA_PROBE_VERSION_ARGS <<< "$INFERENCE_MCQA_PROBES_VERSION"
     EXTRA_ARGS+=(
         --inference_mcqa_probes
-        --inference_mcqa_probes_version "$INFERENCE_MCQA_PROBES_VERSION"
+        --inference_mcqa_probes_version "${INFERENCE_MCQA_PROBE_VERSION_ARGS[@]}"
         --inference_mcqa_prompt_column "$INFERENCE_MCQA_PROMPT_COLUMN"
     )
 fi
@@ -103,11 +118,13 @@ fi
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
-accelerate launch \
-    --config_file "$DEEPSPEED_CONFIG" \
-    --num_processes "$NPROC_PER_NODE" \
-    --main_process_port "$MASTER_PORT" \
-    finetuning_knowledge_v9.py \
+if [[ "$DEVICE_MAP_AUTO" == "1" ]]; then
+    LAUNCH=(python -s finetuning_knowledge_v9.py)
+else
+    LAUNCH=(torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" finetuning_knowledge_v9.py)
+fi
+
+"${LAUNCH[@]}" \
     --custom_suffix "$CUSTOM_SUFFIX" \
     --wandb_group finetuning_official \
     --model_id "$MODEL_ID" \
@@ -136,7 +153,5 @@ accelerate launch \
     --full_finetuning \
     --probe_every_n_steps "$PROBE_EVERY_N_STEPS" \
     --mcqa_probe_every_n_steps "$MCQA_PROBE_EVERY_N_STEPS" \
-    --enable_parameter_delta_tracking \
-    --parameter_delta_every_n_steps "$PARAMETER_DELTA_EVERY_N_STEPS" \
     --push_to_hub_cpt_id "$PUSH_TO_HUB_CPT_ID" \
     "${EXTRA_ARGS[@]}"

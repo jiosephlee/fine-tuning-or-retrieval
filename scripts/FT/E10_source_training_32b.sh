@@ -33,10 +33,15 @@ MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 MCQA_PROBE_BATCH_SIZE="${MCQA_PROBE_BATCH_SIZE:-32}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-1}"
 EFFECTIVE_BATCH_SIZE="${EFFECTIVE_BATCH_SIZE:-256}"
+CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 LOSS_TYPE="${LOSS_TYPE:-chunked_nll}"
 OFFLOAD_TO_CPU="${OFFLOAD_TO_CPU:-0}"
+DEVICE_MAP_AUTO="${DEVICE_MAP_AUTO:-$OFFLOAD_TO_CPU}"
+ACTIVATION_OFFLOADING="${ACTIVATION_OFFLOADING:-1}"
+PARAMETER_DELTA_TRACKING="${PARAMETER_DELTA_TRACKING:-1}"
+PARAMETER_DELTA_EVERY_N_STEPS="${PARAMETER_DELTA_EVERY_N_STEPS:-5}"
 INFERENCE_MCQA_PROBES="${INFERENCE_MCQA_PROBES:-1}"
-INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v12_reviewed}"
+INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v12_reviewed v12}"
 INFERENCE_MCQA_PROMPT_COLUMN="${INFERENCE_MCQA_PROMPT_COLUMN:-formatted_question}"
 
 DOC_MATCH_ARGS=()
@@ -51,15 +56,25 @@ if [[ "$DOCUMENT_TRACK_BASELINE" == "1" ]]; then
 fi
 INFERENCE_MCQA_ARGS=()
 if [[ "$INFERENCE_MCQA_PROBES" == "1" ]]; then
+    read -r -a INFERENCE_MCQA_PROBE_VERSION_ARGS <<< "$INFERENCE_MCQA_PROBES_VERSION"
     INFERENCE_MCQA_ARGS+=(
         --inference_mcqa_probes
-        --inference_mcqa_probes_version "$INFERENCE_MCQA_PROBES_VERSION"
+        --inference_mcqa_probes_version "${INFERENCE_MCQA_PROBE_VERSION_ARGS[@]}"
         --inference_mcqa_prompt_column "$INFERENCE_MCQA_PROMPT_COLUMN"
     )
 fi
 OFFLOAD_ARGS=()
-if [[ "$OFFLOAD_TO_CPU" == "1" ]]; then
+if [[ "$DEVICE_MAP_AUTO" == "1" ]]; then
+    OFFLOAD_ARGS+=(--offload_to_cpu)
+elif [[ "$ACTIVATION_OFFLOADING" == "1" ]]; then
     OFFLOAD_ARGS+=(--activation_offloading)
+fi
+PARAMETER_DELTA_ARGS=()
+if [[ "$PARAMETER_DELTA_TRACKING" == "1" ]]; then
+    PARAMETER_DELTA_ARGS+=(
+        --enable_parameter_delta_tracking
+        --parameter_delta_every_n_steps "$PARAMETER_DELTA_EVERY_N_STEPS"
+    )
 fi
 
 FT_TMPDIR="${FT_TMPDIR:-/tmp/${USER:-ft}/ft_${SLURM_JOB_ID:-$$}}"
@@ -78,7 +93,13 @@ fi
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
-torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" finetuning_knowledge_v9.py \
+if [[ "$DEVICE_MAP_AUTO" == "1" ]]; then
+    LAUNCH=(python -s finetuning_knowledge_v9.py)
+else
+    LAUNCH=(torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" finetuning_knowledge_v9.py)
+fi
+
+"${LAUNCH[@]}" \
     --custom_suffix "$CUSTOM_SUFFIX" \
     --wandb_group finetuning_official \
     --model_id allenai/OLMo-2-0325-32B \
@@ -101,7 +122,7 @@ torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" finetuning_knowledge_v9
     --device_batch_size "$DEVICE_BATCH_SIZE" \
     --sft_loss_type "$LOSS_TYPE" \
     --effective_batch_size_for_cpt "$EFFECTIVE_BATCH_SIZE" \
-    --context_length_for_cpt 4096 \
+    --context_length_for_cpt "$CONTEXT_LENGTH" \
     --fill_batches_with_pretraining \
     --attn_implementation flash_attention_2 \
     "${OFFLOAD_ARGS[@]}" \
@@ -109,7 +130,6 @@ torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" finetuning_knowledge_v9
     --full_finetuning \
     --probe_every_n_steps "$PROBE_EVERY_N_STEPS" \
     --mcqa_probe_every_n_steps "$MCQA_PROBE_EVERY_N_STEPS" \
-    --enable_parameter_delta_tracking \
-    --parameter_delta_every_n_steps 5 \
+    "${PARAMETER_DELTA_ARGS[@]}" \
     --push_to_hub_cpt_id "$PUSH_TO_HUB_CPT_ID" \
     --no-save_local_model

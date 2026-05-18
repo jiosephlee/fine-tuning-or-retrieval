@@ -1,0 +1,198 @@
+\title{KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache}
+
+\begin{abstract}
+Efficiently serving large language models (LLMs) requires batching of many requests to reduce the cost per request. Yet, with larger batch sizes and longer context lengths, the key-value (KV) cache, which stores attention keys and values to avoid re-computations, significantly increases memory demands and becomes the new bottleneck in speed and memory usage. Additionally, the loading of the KV cache causes the computational core to be idle, which limits the inference speed. A straightforward and effective solution to reduce KV cache size is quantization, which decreases the total bytes taken by KV cache. However, there is a lack of in-depth studies that explore the element distribution of KV cache to understand the hardness and limitation of KV cache quantization. 
+\quad
+To fill the gap, we conducted a comprehensive study on the element distribution in KV cache of popular LLMs. Our findings indicate that the key cache should be quantized per-channel, i.e., group elements along the channel dimension and quantize them together. In contrast, the value cache should be quantized per-token. From this analysis, we developed a tuning-free 2bit KV cache quantization algorithm named \texttt{KIVI}. With hardware-friendly implementation, \texttt{KIVI} can enable Llama, Falcon, and Mistral models to maintain almost the same quality while using $\mathbf{2.6\times}$ less peak memory (including model weight). This reduction in memory usage enables up to $\mathbf{4\times}$ larger batch size, bringing $\mathbf{2.35\times \sim 3.47\times}$ throughput on real LLM inference workload. The source code is available at \url{https://github.com/jy-yuan/KIVI}.
+\end{abstract}
+
+\section{Introduction}
+
+Large Language Models (LLMs) have demonstrated strong performance across a wide range of tasks \citep{gpt3,taylor2022galactica,yuan2023large,chuang2024understanding}. However, their deployment is very costly, requiring a large number of hardware accelerators such as GPUs. Given these substantial costs, one natural way to reduce the cost per request is to combine a sufficient number of requests together for batch processing. However, in this batch inference scenario, the key-value cache (KV cache), which holds the attention keys and values during generation to prevent re-computations, is becoming the new memory and speed bottleneck. This bottleneck becomes more pronounced with larger batch sizes and longer context lengths. For instance, in 540B PaLM, with a batch size of 512 and a context length of 2048, KV cache alone can take 3TB. This is 3 times the size of the model's parameters \citep{pope2023efficiently}. Also, the GPU SRAM has to load the whole KV cache from the GPU device memory for every token generated, during which the computational cores are idle. Thus, reducing KV cache size in LLMs while maintaining accuracy is important.
+
+Existing works towards this problem can be roughly divided into three categories. First, some work suggests reducing the number of heads in KV cache, such as multi-query attention \citep{mqa} and multi-group attention \citep{gqa}. However, these methods require either training the model from scratch or fine-tuning the existing model. Second, another research line reduces KV cache size by evicting unimportant tokens \citep{h2o}. Third, some other works try to solve this problem from the system perspective, e.g., offloading KV cache \citep{flexgen} or extending virtual memory and paging techniques into the attention mechanism \citep{vllm}.
+
+To reduce the size of KV cache, the most simple and effective way is to reduce the total bytes taken by KV cache, namely, quantization. Unlike the well-studied weight quantization \citep{lin2023awq, xiao2023smoothquant, zhao2024atom}, to the best of our knowledge, only a few studies applied the vanilla 4bit round-to-nearest quantization to KV cache \citep{flexgen, h2o, zhao2024atom} due to the streaming nature of KV cache or other complications. There is a lack of in-depth studies that explore the element distribution of KV cache to understand the hardness and limitation of KV cache quantization. To fill the gap, we study the element distribution of KV cache. Our analysis suggests:
+
+\begin{itemize}
+    \item For key cache, there are a few fixed channels whose magnitudes are very large, which is consistent with previous finding \citep{lin2023awq, xiao2023smoothquant}. Thus, as shown in Figure \ref{fig: quant scheme} right, key cache should be quantized per-channel, i.e., group elements along the channel dimension and quantize them together. In this way, it can confine the error to each individual channel, without impacting the other normal channels.
+     \item For value cache, there is no obvious outlier pattern. Although value cache has no obvious outlier pattern, we experimentally show that it can only be quantized per-token because it is used to calculate the attention output, which is essentially a value cache mixer. As shown in Figure \ref{fig: quant scheme} left, the per-token quantization can confine the error inside each individual token and ensure that the quantization of one token does not adversely impact the others.
+
+\end{itemize}
+
+Based on the above insights, we propose \texttt{KIVI}, a plug-and-play extreme low-bit KV cache quantization method.
+\texttt{KIVI} quantizes key cache per-channel and quantizes value cache per-token. The per-token value cache quantization aligns well with the streaming nature of auto-regressive inference, allowing newly quantized tensors to be directly appended to the existing quantized value cache by token dimension. However, for per-channel key cache quantization, the quantization process spans different tokens, which cannot be directly implemented in this streaming setting. Since the number of tokens in key cache can be arbitrary, our key idea is to split key cache into two parts. The \textbf{first} part is the grouped key cache, which contains several groups of tokens and each group has a certain number of tokens. The \textbf{second} part is the residual key cache, which does not have a sufficient number of tokens to form a complete group. Similarly, we split value cache into the grouped and residual parts to maintain the accuracy. We only apply group-wise quantization to the grouped key cache and value cache, while the residual key cache and value cache are kept in full precision. The grouped and residual parts can be combined using tiled matrix multiplication when computing attention scores. Our contributions are summarized as follows:
+
+\begin{itemize}
+    \item \textbf{Extensive analysis regarding the outlier patterns and quantization error of KV cache in commonly-used LLMs}. Our observations suggest that key cache should be quantized per-channel and value cache should be quantized per-token. We also explain in depth why these caches require different quantization approaches.
+
+     \item \textbf{A new plug-and-play 2bit KV cache quantization algorithm without any fine-tuning, \texttt{KIVI}, with hardware-friendly implementation.} We conduct an extensive evaluation for \texttt{KIVI} with Llama, Mistral, and Falcon on popular generation tasks.
+    \texttt{KIVI} can efficiently compress KV cache to 2bit and bring $\mathbf{2.6\times}$ peak memory usage reduction for Llama-2-7B, with little to no accuracy drop. With our efficient system implementation, this memory reduction, in return, enables up to $\mathbf{4\times}$ larger batch size and brings $\mathbf{2.35\times \sim 3.47\times}$ throughput. 
+
+\end{itemize}
+
+\section{Background: Attention Inference-Time Workflow}
+\label{sec: background}
+
+The LLM attention inference-time workflow involves two phases: i) the \textit{prefill} phase, where the input prompt is used to generate KV cache for each transformer layer of LLMs; and ii) the \textit{decoding} phase, where the model uses and updates KV cache to generate the next token, one at a time. 
+
+\paragraph{Prefill Phase.} Let ${\bm{X}} \in \mathbb{R}^{b\times l_{\text{prompt}} \times d}$ be the input tensor, where $b$ is the batch size, $l_{\text{prompt}}$ is the length of the input prompt, and $d$ is the model hidden size. For convenience, we ignore the layer index here. The key, value tensors can be computed by
+
+\begin{equation}
+    {\bm{X}}_K= {\bm{X}} {\bm{W}}_K, {\bm{X}}_V = {\bm{X}} {\bm{W}}_V, \nonumber
+\end{equation}
+
+where ${\bm{W}}_K, {\bm{W}}_V\in\mathbb{R}^{d\times d}$ are the key and value layer weight, respectively.  After obtaining ${\bm{X}}_K$ and ${\bm{X}}_V$, they are cached in the memory for the ease of decoding.
+
+\paragraph{Decoding Phase.} Let ${\bm{t}} \in \mathbb{R}^{b\times 1 \times d}$ be the current input token embedding. Let ${\bm{t}}_K={\bm{t}} {\bm{W}}_K$ and ${\bm{t}}_V={\bm{t}} {\bm{W}}_V$ be the key and value layer output, respectively. We first update KV cache:
+
+\begin{align}
+    {\bm{X}}_K &\leftarrow \text{Concat} ({\bm{X}}_K, {\bm{t}}_K), \nonumber \\
+    {\bm{X}}_V &\leftarrow \text{Concat} ({\bm{X}}_V,  {\bm{t}}_V ) \nonumber,     
+\end{align}
+
+then calculate the attention output as:
+
+\begin{align}
+ {\bm{t}}_Q &= {\bm{t}} {\bm{W}}_Q,   \nonumber \\
+  {\bm{A}} &= \text{Softmax} ({\bm{t}}_Q {\bm{X}}^{\top}_K),  \nonumber \\
+ {\bm{t}}_O &= {\bm{A}}{\bm{X}}_V,
+ \label{eq: av}
+\end{align}
+
+where ${\bm{W}}_Q$ is the weight matrix of the query layer. For ease of illustration, we ignore the attention output layer and the other parts of the inference workflow.
+
+\paragraph{Memory and Speed Analysis.} The above process is repeated until a special token indicating the sentence's conclusion is reached. Let $l_{\textbf{gen}}$ be the number of generated tokens. From the above analysis, the shape of KV cache is $b\times (l_{\textbf{prompt}}+l_{\textbf{gen}})\times d$. To get a sense of the scale, consider the OPT-175B model with a batch size $b$ 512, a prompt length $l_{\textbf{prompt}}$ 512, and an output length $l_{\textbf{gen}}$ 32. The KV cache requires 1.2TB, which is 3.8 times the model weights \citep{flexgen}. Besides the memory, the inference speed is also decided by the KV cache size. The GPU needs to load KV cache from GPU main memory to GPU SRAM once for every token generated during which the computational core of the chip is essentially idle \citep{pope2023efficiently, vllm}.
+
+\section{Methodology}
+
+In scenarios with long contexts or batched inferences, the memory and speed bottlenecks are storing and loading KV cache. The most simple and effective way to alleviate this problem is to reduce the total bytes occupied by KV cache, specifically, quantization. Following this motivation, we first evaluate the performance of the existing quantization method in Section \ref{sec: quant prelim}. Our observations suggest that key and value cache should be quantized along different dimensions. We analyze the rationale behind this observation in Section \ref{sec: analysis}. Then based on the analysis, we propose \texttt{KIVI}, a new KV cache quantization method along with its streaming data structure, detailed in Section \ref{sec: algo}.
+
+\subsection{Preliminary Study of KV Cache Quantization}
+\label{sec: quant prelim}
+
+As we analyzed in Section \ref{sec: background}, KV cache functions as a streaming data structure, where the new tensor arrives sequentially. Thus, optimization-based methods like GPTQ \citep{gptq} are unsuitable for quantizing KV cache due to the overhead. To the best of our knowledge, the most flexible way for quantizing KV cache is the round-to-nearest quantization. The $B-$bit integer quantization-dequantization process can be expressed as:
+
+\begin{equation}
+    Q({\bm{X}}) = \bm\lfloor \frac{{\bm{X}} - z_X}{s_X} \bm\rceil, ~~~
+    {\bm{X}}' = Q({\bm{X}}) \cdot s_X + z_X,  \nonumber
+\end{equation}
+
+where $z_X=\min {\bm{X}}$ is the zero-point, $s_X=(\max {\bm{X}} - \min {\bm{X}})/(2^B - 1)$ is the scaling factor, and $\bm\lfloor\cdot\bm\rceil$ is the rounding operation. Here we ignore the batch size for ease of understanding. As shown in Figure \ref{fig: quant scheme}, ${\bm{X}}$ is quantized along either the token or channel dimension group-wisely. 
+
+Considering the streaming nature of KV cache, previous studies often apply per-token quantization to both key and value cache since the newly quantized KV cache can be naively added to the existing quantized one along the token dimension \citep{flexgen}. While per-channel quantization is non-trivial, we have designed a padding method to implement per-channel quantization to explore its effect on both key and value cache.
+
+\paragraph{Setting.}
+In Table \ref{tab:sub_simulation}, we show the results of fake KV cache group-wise quantization with different configurations on the Llama-2-13B model for the CoQA and TruthfulQA tasks. We use a group size of 32 for all configurations. Here fake quantization means we simulate the quantization process by first quantizing KV cache into lower precision and then dequantizing it in the attention layer. For per-channel quantization, if the number of tokens is not divided evenly into groups, we add zero-padding to ensure it can be grouped perfectly. In this way, we ensure that all tokens in KV cache are quantized for a fair comparison. The detailed experimental setting can be found in Section \ref{sec: setting}. Specifically, we observe that: 
+
+\textbf{OB 1.} When using the commonly used per-token quantization to both key and value caches, INT4 precision can maintain accuracy. However, reducing it to INT2 results in a notable accuracy drop.
+
+\textbf{OB 2.} When value cache is quantized per-channel, the accuracy significantly worsens regardless of how key cache is quantized.
+
+\textbf{OB 3.}  When using a lower numerical precision such as INT2, the most accurate approach is to quantize key cache per-channel and value cache per-token.
+
+\subsection{Why Key and Value Cache Should Quantize Along Different Dimensions?}
+\label{sec: analysis} In Table \ref{tab:sub_simulation}, we observe that quantizing key cache per-channel and value cache per-token to 2bit results in a very small accuracy drop. Here we analyze why this configuration delivers better accuracy. In Figure \ref{fig: vis} we visualize the original KV cache distribution at different layers. We observe that \textbf{in key cache, some fixed channels exhibit very large magnitudes, whereas in value cache, there is no significant pattern for outliers.}
+
+\paragraph{Analysis of Key Cache.} The above observation for key cache aligns with previous findings that certain fixed columns in activations exhibit larger outliers \citep{llmint8, lin2023awq}. The persistence of outliers within each channel means that per-channel quantization can confine the quantization error to each individual channel without impacting the other normal channels. Thus, Figure \ref{fig: vis} explains why key cache should be quantized per-channel. In Table \ref{tab: v cache analysis} we show key cache relative reconstruction error $\|\frac{{\bm{X}}_K-{\bm{X}}_K'}{{\bm{X}}_K}\|_F$, along with the relative attention score error $\|\frac{{\bm{A}}-{\bm{A}}'}{{\bm{A}}}\|_F$ where ${\bm{A}}'=\text{Softmax}({\bm{t}}_Q{\bm{X}}^{'\top}_K)$. 
+We observe that the per-token quantization can lead to almost $5\times$ larger attention score error than per-channel quantization, which is consistent with Figure \ref{fig: vis}.
+
+\paragraph{Analysis of Value Cache.} Unlike key cache, value cache does not show the channel-wise outlier pattern. Furthermore, Figure \ref{fig: vis} alone cannot explain \textbf{OB2}, which indicates value cache should only be quantized per-token. This is because Figure \ref{fig: vis} implies that errors should be comparable for both per-token and per-channel quantization, given the absence of a clear pattern. As shown in Equation~(\ref{eq: av}), value cache is used to calculate the attention output ${\bm{t}}_O$.
+Instead of analyzing the quantization error of value cache ${\bm{X}}_V$, in Table \ref{tab: v cache analysis} we analyze the relative error $\Delta=\|\frac{{\bm{A}}{\bm{X}}_V-{\bm{A}} {\bm{X}}'_V}{{\bm{A}}{\bm{X}}_V}\|_F$ with different quantization configurations. Surprisingly, we observe that the per-token quantization error is almost $15\times$ smaller than per-channel quantization, which explains why \textbf{OB2} happens. The intuition behind this observation stems from the attention sparsity.
+Equation~(\ref{eq: av}) can be written as:
+
+\begin{align}
+    [{\bm{A}} {\bm{X}}_V]_{i*} = \sum_{j=1}^{l_{\text{prompt}}} {\bm{A}}_{ij} [{\bm{X}}_{V}]_{j*},
+    \label{eq: att}
+\end{align}
+
+where $[{\bm{X}}_{V}]_{j*}$ is the $j$-th row of ${\bm{X}}_{V}$.
+From Equation~(\ref{eq: att}), the attention output is the weighted summation of value cache across various tokens, with the weights being the attention scores. Since the attention score is highly sparse \citep{tian2023scan}, the output is just the combination of value caches of a few important tokens. The per-token quantization can confine the error to each individual token. Thus, quantizing other tokens does not affect the accuracy of important tokens. Consequently, per-token quantization leads to a much smaller relative error $\Delta$. 
+
+\subsection{\texttt{KIVI}: Algorithm and System Support}
+\label{sec: algo}
+
+\paragraph{Algorithm.}
+As we previously analyzed, key cache should be quantized per-channel and value cache should be quantized per-token. Recall that key and value cache of newly generated tokens arrive sequentially. From the implementation perspective, per-token quantization aligns well with streaming settings, allowing newly quantized tensors to be directly appended to the existing quantized value cache by token dimension. However, for per-channel quantization, the quantization process spans across different tokens, which cannot be directly implemented in the streaming setting. As shown in Figure \ref{fig: kivi}, our key idea to solve this problem is to group key cache every $G$ tokens and quantize them separately. Because the number of tokens in ${\bm{X}}_K$ can be arbitrary, we split ${\bm{X}}_K$ into two parts, namely, the grouped part ${\bm{X}}_{K_g}={\bm{X}}_{K}[:l-r]$ and residual part ${\bm{X}}_{K_r}={\bm{X}}_{K}[l-r:]$, where $l$ is the number of tokens inside the current key cache ${\bm{X}}_K$, $r$ is the number of residual tokens, where $l-r$ can be divisible by $G$.
+
+Since ${\bm{X}}_{K_g}$ can be evenly divided into $(l-r)/G$ groups, we only store $Q({\bm{X}}_{K_g})$ with group-wise quantization, while ${\bm{X}}_{K_r}$ is kept in full precision. During the decoding process, each newly arrived key cache ${\bm{t}}_K$ is added to ${\bm{X}}_{K_r}$ and once ${\bm{X}}_{K_r}$ reaches $R$ tokens, which is a hyperparameter - residual length, we quantize and concatenate it with the previously quantized $Q({\bm{X}}_{K_G})$. 
+Then we reset ${\bm{X}}_{K_r}$ to an empty tensor. We note that $R$ should be divisible by $G$. With tiled matrix multiplication, the raw attention logits is then calculated as:
+
+\begin{align}
+{\bm{A}}_g &= {\bm{t}}_Q Q({\bm{X}}^{\top}_{K_g}), \nonumber \\
+{\bm{X}}_{K_r} &= \text{Concat}([{\bm{X}}_{K_r}, {\bm{t}}_K]), \nonumber \\
+{\bm{A}}_r &= {\bm{t}}_Q {\bm{X}}^{\top}_{K_r}, \nonumber \\
+{\bm{A}} &= \text{Concat}([{\bm{A}}_g, {\bm{A}}_r]).
+\label{eq: attquant}
+\end{align}
+
+For value cache, similar to key cache, we also split it into two parts and keep the most recent value cache in full precision, namely, ${\bm{X}}_{V_g}$ and ${\bm{X}}_{V_r}$. Specifically, we maintain a queue and each newly arrived value cache is pushed into the queue. Once the queue reaches the predefined residual length $R$, the most outdated value cache is poped. Then the poped value cache is quantized per-token and concatenated with the previously quantized value cache along the token dimension. 
+
+As shown in Figure \ref{fig: kivi}, we also emphasize that during the prefill phase, the exact key and value tensors are passed to the next layers, although only the quantized KV cache is retained in memory. The whole algorithm can be found in Appendix \ref{app: implement} Algorithm \ref{algo: kivi}.
+
+\paragraph{Analysis.}
+In \texttt{KIVI}, the grouped key cache ${\bm{X}}_{K_g}$ and value cache ${\bm{X}}_{V_g}$ is quantized, while the residual key cache ${\bm{X}}_{K_r}$ and value cache ${\bm{X}}_{V_r}$ is kept in full precision. By design, there are at most $R$ tokens inside ${\bm{X}}_{K_r}$ or ${\bm{X}}_{V_r}$. In practice, we set $R \leq 128$ and the sequence length $l_{\text{prompt}}+l_{\text{gen}}$ is often much longer than $R$. Thus the memory overhead from ${\bm{X}}_{K_r}$ and ${\bm{X}}_{V_r}$ is negligible when considering the benefit from extreme low-bit quantization, especially for the long context scenarios. Also, since the newly arrived key and value tensors are added to ${\bm{X}}_{K_r}$ and ${\bm{X}}_{V_r}$ in full precision, \texttt{KIVI} maintains a full precision KV cache sliding window for the local relevant tokens. This window size is expected to be $\frac{R}{2}$ for key cache, and $R$ for value cache.
+\textbf{Later in the experiment section, we show that this full precision sliding window is crucial for obtaining desirable performance on hard tasks, such as GSM8K.}
+
+\paragraph{System Support.} We provide a hardware-friendly implementation for running \texttt{KIVI} on GPUs. To minimize the overhead, we have fused the dequantization process with matrix multiplication, e.g., Q\_MatMul in Figure \ref{fig: kivi}, using CUDA. We also implement the group-wise quantization kernel in Triton. Our method is fully compatible with weight-only quantization.
+
+\section{Experiments}
+
+\subsection{Settings}
+\label{sec: setting}
+\paragraph{Models.} We evaluate \texttt{KIVI} using three popular model families: Llama/Llama-2~\citep{touvron2023llama, touvron2023llama2}, Falcon~\citep{penedo2023refinedweb} and Mistral~\citep{jiang2023mistral}. Llama and Mistral model is based on multi-head attention, while Falcon is based on multi-query attention \citep{mqa}. We use the Hugging Face Transformers codebase and implement the \texttt{KIVI} algorithm upon it. Following previous work \citep{flexgen}, the group size $G$ in Algorithm \ref{algo: kivi} for quantization is set as 32 across all experiments, the residual length $R$ for key and value cache is set to 128.
+
+\paragraph{Tasks.}
+As we analyzed in Section \ref{sec: background}, the KV cache size grows larger with a longer context. Thus, we evaluate \texttt{KIVI} under the normal context length and long context setting, respectively. Specifically, we adopt generation tasks from LM-Eval~\citep{eval-harness} for normal context length evaluation and LongBench~\citep{bai2023longbench} for long context evaluation, respectively\footnote{The closed-end tasks such as MMLU are not ideal to evaluate \texttt{KIVI} since they only involve one decoding step and directly fetch the output logits, which is not suitable for studying the impact of compressed KV cache.}. For LM-eval, we adopt CoQA (Exact match accuracy), TruthfulQA (BLEU score), and GSM8K (Exact match accuracy). For LongBench, we chose tasks from four subgroups. Specifically, Qasper (F1 score) is a Single-Document QA task; QMSum (ROUGE score) and MultiNews (ROUGE score) are Summarization tasks; TREC (classification score), TriviaQA (F1 score), and SAMSum (ROUGE score) are Few-shot Learning tasks; and LCC (similarity score) and RepoBench-P (similarity score) is Code Completion task. The maximum sequence length in LongBench was set to 8192 for the Mistral model and 4096 for other models. We also consider the needle-in-a-haystack task (NIAH) to evaluate the model's long context retrieval ability after quantizing KV cache. Detailed NIAH setting can be found in Appendix \ref{app: niah}.
+
+\subsection{Accuracy and Efficiency Analysis}
+
+\subsubsection{Comparison Between Different Quantization Configurations}
+
+We first utilize the fake quantization to demonstrate the effectiveness of our asymmetric quantization, namely, quantizing key cache per-channel and value cache per-token. Here fake quantization is exactly the same as in Table \ref{tab:sub_simulation}.
+The results are shown in Table \ref{tab:merged-lm-eval}.
+We observe that ``2bit (K per-channel, V per-token)'' consistently achieves the best results compared to all other configurations. This is consistent with our previous analysis. We also note that for hard generation tasks such as GSM8K, the fake ``2bit (K per-channel, V per-token)'' quantization results are significantly worse than the full precision counterparts. However, for \texttt{KIVI} in Table \ref{tab:merged-lm-eval}, we observe that the accuracy drop is only around $2\%$ for GSM8K across different models. As we analyzed in Section \ref{sec: algo}, the difference between fake ``2bit (K per-channel, V per-token)'' quantization and \texttt{KIVI} is that \texttt{KIVI} maintains a full precision key and value cache sliding window for the local relevant tokens. This sliding window is crucial to maintaining accuracy for hard generation tasks such as mathematical reasoning. 
+
+\subsubsection{Accuracy Comparison on Generation Tasks}
+
+\paragraph{LM-Eval Results.} We benchmark \texttt{KIVI} in CoQA, TruthfulQA and GSM8K tasks using the LM-Eval framework. All dataset parameters were set to default. We compare the standard 16bit configuration with our \texttt{KIVI} compression techniques in Llama-2-7B, Llama-2-13B, Falcon-7B and Mistral-7B. As shown in Table ~\ref{tab:merged-lm-eval}, we observe that for the Llama and Mistral model, \texttt{KIVI} only has up to 2\% accuracy drop despite the KV cache being stored in 2bit. For instance, in the Llama-2-7B model, the transition from 16bit to 2bit only slightly decreases accuracy. Similar trends are observed in other Llama-family models. Since Falcon-7B adopts multi-query attention and only has one head for KV cache, it is already highly compressed compared to Llama-based models. Thus, in Table \ref{tab:merged-lm-eval}, 4bit \texttt{KIVI} is needed to maintain the accuracy, while 2bit \texttt{KIVI} may have a large accuracy drop in this case.
+
+\paragraph{LongBench Results.} The performance of \texttt{KIVI} over various models in the LongBench dataset is summarised in Table ~\ref{tab:longbench}. We apply \texttt{KIVI} to Llama2-7B, Llama2-13B, Llama2-7B-Chat, Llama2-13B-Chat, Falcon-7B and Mistral-7B. Table \ref{tab:longbench} suggests that \texttt{KIVI} is an effective method for KV cache compression with minimal impact on accuracy across various hard long context generation tasks.
+\textbf{We present additional results using Llama3-8b, Mistral-7B-v0.2, and LongChat-7B-v1.5, which can be found in Appendix~\ref{app: exp}.}
+
+\paragraph{NIAH Results.} From Figure \ref{fig: needle}, we observe that \texttt{KIVI} can still maintain the retrieval ability of LLMs even with 2bit KV Cache. Detailed NIAH setting can be found in Appendix \ref{app: niah}.
+
+\subsubsection{Ablation}
+
+In this section, we benchmark \texttt{KIVI} on GSM8K, one of the hardest generation tasks, to show the effect of hyperparameters group size $G$ and residual length $R$ on the model performance. For full results of \texttt{KIVI} with a residual length of 32, please refer to Appendix~\ref{app: abl}.
+
+\textbf{The effect of group size.} We fix the residual length at 128 and vary the group sizes to 32, 64, and 128. From Table~\ref{tab:abl}, we observe that group sizes 32 and 64 yield similar results, whereas the performance significantly decreases when the group size reaches 128. Note the zero-point and the scaling factor mentioned in Section~\ref{sec: quant prelim} are calculated according to this group size; where the choice of group size will greatly impact the KV cache compression effect under a long input.
+
+\textbf{The effect of residual length.} We fix the group size at 32 and vary the residual length across 32, 64, 96, and 128. As shown in Table~\ref{tab:abl}, 
+there is no consistent pattern between residual lengths and model accuracy. Namely, while a residual length of 128 achieves good results, 32 and 96 yield similar outcomes, but a residual length of 64 results in the worst performance. We emphasize that while we observe no significance among residual lengths of $\{32, 96, 128\}$, \textbf{having a reasonably large residual length is important; as it brings much performance boosts on hard tasks like GSM8K, again as shown in Table~\ref{tab:abl}.}
+
+\subsubsection{Efficiency Comparison}
+\label{sec: efficiency}
+
+To evaluate the wall-clock time efficiency of \texttt{KIVI},
+following vLLM \citep{vllm}, we synthesize workloads based on ShareGPT \citep{shargpt}, which contain input and output texts of real LLM services. On average, the data set has an input prompt length $l_{\text{prompt}}$ of 161 and an output length $l_{\text{gen}}$ of 338 \citep{vllm}. We increase the batch size until out of memory and report the peak memory usage and throughput between \texttt{KIVI} (with residual length 32 and 128) and FP16 baseline for the Llama-2-7B model. The hardware here is a single NVIDIA A100 GPU (80GB).
+
+As shown in Figure \ref{fig: throughput}, with similar maximum memory usage, \texttt{KIVI} enables up to $\mathbf{4\times}$ larger batch size and gives $\mathbf{2.35\times \sim 3.47\times}$ larger throughput. This throughput number can grow larger with longer context length and output length. We also note that \textbf{ this speed-up can be greatly increased if we further fuse the KV cache quantization process with previous operations.} We leave it as one of future work.
+
+\section{Related Work}
+
+Many machine learning systems and benchmark works consider scaling up LLM inference process \citep{pope2023efficiently, yuan2024kv}. Among them, quantization techniques have been widely applied \citep{gptq, lin2023awq, kim2023squeezellm, xu2023compress}. A main branch of LLM quantization is weight-only quantization, which involves the quantization of model weights to lower precision. For instance, AWQ~\citep{lin2023awq} cleverly quantizes model weights to INT4 and INT3 using an activation-aware manner. GPTQ~\citep{gptq} utilizes approximate second-order information to quantize model weights both accurately and efficiently. SqueezeLLM~\citep{kim2023squeezellm} adopts the concept of non-uniform quantization based on sensitivity along with dense-and-sparse decomposition. This line of work is orthogonal to ours, as they can be combined.
+
+SmoothQuant~\citep{xiao2023smoothquant} is a post-training quantization method that is more closely related to our work. This method uses equivalent transformations to balance the quantization complexity for both activation and weight, making the activation easier to quantize. SmoothQuant can compress KV cache to 8bit with minor performance loss. However, it faces a significant accuracy drop when scaled down to 4bit or less~\citep{zhao2024atom}. FlexGen~\citep{flexgen} adopts 4-bit group-wise quantization for both key and value cache.
+
+One essential recipe of \texttt{KIVI} is the per-channel quantization scheme designed based on the observation made in Section~\ref{sec: analysis} and Figure~\ref{fig: vis}. ATOM \citep{zhao2024atom} also indicates that key cache exhibits more outliers compared to the value cache. \texttt{KIVI} provides further extensive analysis and leverages this observation to implement per-channel quantization. A similar observation and approach has been independently discovered and developed in the concurrent work KVQuant \citep{hooper2024kvquant}.
+
+vLLM \citep{vllm} and S3 \citep{jin2023s} are system-level works, which include memory management through the use of PagedAttention or memory usage prediction. They can lower the memory requirements of KV cache and simultaneously increase model throughput. This research direction is orthogonal to our work, since system-level optimizations can also be applied upon our algorithm.
+
+Several other works also consider compressing KV cache by evicting tokens. H2O~\citep{h2o} retains only a small portion of tokens that contribute significantly to the attention scores. Similarly, Scissorhands~\citep{liu2024scissorhands} exploit the persistence of the importance hypothesis in KV cache sparsification. StreamingLLM~\citep{xiao2023efficient} is based on the observation of ``attention sink'' and maintains only a few initial tokens to preserve performance. Unlike these works, our \texttt{KIVI} retains all input tokens and compresses them into lower precision. This line of work is orthogonal to ours, as they can also be combined together.
+
+\section{Conclusion and Future Work}
+
+In this paper, we systematically analyze KV cache element distribution in popular LLMs. We conclude that key cache should be quantized per-channel and value cache should be quantized per token. Based on these observations, we propose \texttt{KIVI}, a plug-and-play 2bit KV cache quantization algorithm without the need for any tuning. In real LLM workload, \texttt{KIVI} allows up to $\mathbf{4\times}$ larger batch sizes and $\mathbf{3.47\times}$ throughput. In the future, we will further optimize the implementation to reduce the overhead of quantization process during the prefill and decoding phase.
+
+\end{document}

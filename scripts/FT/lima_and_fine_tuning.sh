@@ -3,7 +3,7 @@ num_paraphrased=0
 nohup python finetuning_knowledge_v8.py \
     --test_script \
     --override_domains DPO 1_58 GRPO BOFT OFT QLoRA \
-    --effective_batch_size_for_cpt 32 \
+    --effective_batch_size_for_cpt 256 \
     --separate_batches_with_pretraining 1 \
     --pretraining_data_type dclm \
     --fill_batches_with_pretraining \
@@ -16,4 +16,3 @@ nohup python finetuning_knowledge_v8.py \
     --full_finetuning > output_1.log 2>&1 &
 
         # --separate_batches_with_pretraining 1 \
-

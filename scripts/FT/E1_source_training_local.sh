@@ -22,7 +22,7 @@ conda run --no-capture-output -n openrlhf torchrun --standalone --nproc_per_node
     --overlap_sections \
     --overlap_ratio 1_8 \
     --device_batch_size 8 \
-    --effective_batch_size_for_cpt 128 \
+    --effective_batch_size_for_cpt 256 \
     --context_length_for_cpt 4096 \
     --fill_batches_with_pretraining \
     --attn_implementation flash_attention_2 \

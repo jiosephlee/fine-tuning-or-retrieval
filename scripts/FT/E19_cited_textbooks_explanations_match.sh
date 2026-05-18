@@ -9,8 +9,8 @@
 #SBATCH --mem=512G
 #SBATCH --time=0-8:00:00
 
-# Train with cited_textbooks as the granular explanation track, with a document-match
-# replay track shaped against the ordinary textbooks/stackexchange/blogs schedule.
+# Train with cited_textbooks inserted into a matched auxiliary track shaped against
+# the ordinary textbooks/stackexchange/blogs schedule.
 
 set -euo pipefail
 
@@ -31,7 +31,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 NUM_EPOCHS="${NUM_EPOCHS:-100}"
 NUM_PARAPHRASED="${NUM_PARAPHRASED:-9}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-32}"
-EFFECTIVE_BATCH_SIZE="${EFFECTIVE_BATCH_SIZE:-128}"
+EFFECTIVE_BATCH_SIZE="${EFFECTIVE_BATCH_SIZE:-256}"
 LEARNING_RATE="${LEARNING_RATE:-4e-5}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
@@ -50,10 +50,9 @@ PARAMETER_DELTA_EVERY_N_STEPS="${PARAMETER_DELTA_EVERY_N_STEPS:-5}"
 PROBE_EVERY_N_STEPS="${PROBE_EVERY_N_STEPS:-2}"
 MCQA_PROBE_EVERY_N_STEPS="${MCQA_PROBE_EVERY_N_STEPS:-4}"
 DOCUMENT_TRACK_BASELINE="${DOCUMENT_TRACK_BASELINE:-1}"
-EXPLANATION_TYPES="${EXPLANATION_TYPES:-cited_textbooks}"
 DOCUMENT_MATCH_EXPLANATION_TYPES="${DOCUMENT_MATCH_EXPLANATION_TYPES:-textbooks stackexchange blogs}"
 DOCUMENT_MATCH_EXPLANATIONS_CYCLE="${DOCUMENT_MATCH_EXPLANATIONS_CYCLE:-full}"
-read -r -a EXPLANATION_TYPE_ARGS <<< "$EXPLANATION_TYPES"
+DOCUMENT_MATCH_INSERT_CONTENT="${DOCUMENT_MATCH_INSERT_CONTENT:-cited_works}"
 EXTRA_ARGS=()
 if [[ "$USE_PARCC" == "1" ]]; then
     EXTRA_ARGS+=(--parcc)
@@ -78,6 +77,7 @@ if [[ "$DOCUMENT_TRACK_BASELINE" == "1" ]]; then
     EXTRA_ARGS+=(
         --document_track_baseline
         --document_match_specific_explanation "${DOCUMENT_MATCH_EXPLANATION_TYPE_ARGS[@]}"
+        --document_match_insert_content "$DOCUMENT_MATCH_INSERT_CONTENT"
         --explanations_insertion_strategy granular
         --granular_explanations_cycle "$DOCUMENT_MATCH_EXPLANATIONS_CYCLE"
     )
@@ -109,7 +109,6 @@ torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" finetuning_knowledge_v9
     --overlap_sections \
     --overlap_ratio 1_16 \
     --num_paraphrased_texts "$NUM_PARAPHRASED" \
-    --with_specific_explanation "${EXPLANATION_TYPE_ARGS[@]}" \
     --device_batch_size "$DEVICE_BATCH_SIZE" \
     --effective_batch_size_for_cpt "$EFFECTIVE_BATCH_SIZE" \
     --context_length_for_cpt "$CONTEXT_LENGTH" \

@@ -1,0 +1,155 @@
+Introduction
+
+Training modern deep neural networks, especially very large models, requires careful management of numerical precision, memory, and stability. Using reduced-precision numeric formats and a collection of engineering “tricks” can dramatically reduce memory and compute cost, enabling larger models and faster runs. However, lower precision introduces new numerical failure modes (underflow, overflow, loss of significance) that must be understood and mitigated. This chapter explains the commonly used floating formats (FP32, FP16, BF16), how automatic mixed precision (AMP) works and why loss scaling is necessary, how to manage optimizer state when parts of the model are stored in reduced precision, practical checkpointing and memory-saving techniques, safe hyperparameter choices such as warmup schedules for large-scale runs, and reproducibility/determinism considerations when training with mixed precision and parallelism. Throughout, emphasis is on intuition, the math behind updates, and practical trade-offs so you can read and evaluate research or build robust training pipelines.
+
+# FP32, FP16 and BF16 numeric formats and trade-offs
+
+Floating-point formats encode real numbers with a sign bit, exponent bits, and mantissa (significand) bits. Two important characteristics are dynamic range (how large and small values can be represented) and precision (how many significant digits are retained). These properties determine how well computations avoid overflow, underflow, and catastrophic cancellation.
+
+IEEE 754 single precision (FP32) uses 1 sign bit, 8 exponent bits, and 23 mantissa bits. The exponent field allows representing numbers roughly in the range $[1.18\cdot 10^{-38},\ 3.4\cdot 10^{38}]$ for normalized values (ignoring subnormals), and the 23 mantissa bits give about 7 decimal digits or about $2^{-23}\approx 1.2\cdot 10^{-7}$ relative precision. FP32 is the historical default for deep learning: it provides enough dynamic range to represent very large activations and gradients without overflow, and enough precision to avoid major rounding errors in most networks.
+
+FP16 (binary16, IEEE half precision) uses 1 sign bit, 5 exponent bits, and 10 mantissa bits. This much smaller representation has a dynamic range approximately $[6.1\cdot 10^{-5},\ 6.5\cdot 10^{4}]$ for normalized numbers, and about 3 decimal digits of precision (roughly $2^{-10}\approx 9.8\cdot 10^{-4}$ relative precision). FP16’s narrow exponent range makes it prone to overflow/underflow: large gradients or accumulation can exceed the largest representable FP16 number, producing Inf, while small gradients may underflow to zero. The low mantissa width causes greater rounding error and loss of small updates. On hardware with specialized FP16 units (Tensor Cores), FP16 arithmetic can be much faster and more memory efficient, but naively training with FP16 for all tensors often destabilizes optimization.
+
+BF16 (bfloat16) is a 16-bit format designed to preserve FP32’s dynamic range while reducing precision. It uses 1 sign bit, 8 exponent bits (same as FP32), and 7 mantissa bits. Thus BF16’s exponent range matches FP32 (so overflow/underflow behavior is similar), but it retains only 7 bits of precision (about 2 decimal digits of precision). BF16 avoids many of FP16’s dynamic-range issues while still halving memory compared with FP32. The trade-off is increased rounding noise relative to FP32, which can slow convergence or require small tweaks (e.g., larger batches or different optimizers) in some cases. Many modern accelerators (TPUs, some GPUs) provide BF16 support, and BF16 has become popular because it often requires fewer stability tricks than FP16.
+
+Which format to choose depends on hardware and model sensitivity. FP16 gives the largest compute/memory gains but the highest risk of numerical issues, requiring mitigation (discussed below). BF16 offers a compromise—similar dynamic range to FP32 but less precision—often making it easier to adopt on hardware that supports it. FP32 remains the safest option for storing parameters and optimizer state, or as a “master copy” when doing mixed-precision training.
+
+Key numerical failure modes and their causes:
+- Overflow: When a value exceeds the largest representable number, resulting in Inf. More likely in FP16 because of its small exponent range.
+- Underflow: Very small values become zero (or subnormal numbers). This causes small gradients to vanish if they fall below the representation threshold.
+- Loss of significance (catastrophic cancellation): Subtracting nearly equal numbers can eliminate significant digits, and low mantissa widths (FP16/BF16) exacerbate this.
+- Accumulation error: Repeated addition of small increments (e.g., streaming gradient accumulation) can lose the small increments if the accumulator has insufficient precision.
+
+Understanding these trade-offs helps explain why mixed-precision approaches typically store or compute some quantities in FP32 (to preserve precision for accumulators or optimizer states) while using reduced precision for activations and weights to save memory and accelerate matrix multiplies.
+
+# Automatic mixed precision (AMP) and loss scaling
+
+Automatic mixed precision (AMP) is a practical system that automates the use of mixed numeric precision during training. The basic idea is to perform the heavy matrix-multiply operations (GEMMs/convolutions) in a lower precision (usually FP16 or BF16) to exploit fast hardware units and lower memory usage, while keeping other numerically critical operations in FP32 or with special handling. AMP frameworks (e.g., NVIDIA Apex/torch.cuda.amp, TensorFlow mixed precision) provide automatic casting and a set of policies to decide which operations run in reduced precision and which remain in higher precision.
+
+A central numerical issue in AMP—especially for FP16—is gradient underflow: during backward propagation, gradients can be very small and may underflow to zero in FP16. If gradients are systematically lost, the optimizer cannot collect weight updates and training stalls. Loss scaling is the standard countermeasure.
+
+Loss scaling multiplies the loss value by a positive factor $S$ before backpropagation. If the original loss is $L$, then compute gradients of $S\cdot L$; the resulting gradients are scaled by $S$ as well (by linearity), so very small gradients that would have underflowed in FP16 may remain representable after scaling. After performing backward and accumulating gradients, the optimizer divides the gradients by $S$ to rescale them back to the original magnitude before applying parameter updates. This preserves the correct update while avoiding underflow during gradient computation and accumulation.
+
+There are two common strategies for selecting $S$:
+
+1. Static loss scaling: Choose a fixed $S$ (e.g., $2^{8}, 2^{16}$) large enough to prevent underflow during most of training. Static scaling is simple but risks overflow: if $S$ is too large, gradients or intermediate quantities may overflow to Inf/NaN. Detecting overflow and restarting or adjusting becomes necessary.
+
+2. Dynamic loss scaling: Monitor for Inf/NaN in gradients during training. If an overflow is detected (Inf/NaN), the typical policy is to skip the optimizer step, reduce $S$ (e.g., divide by 2), and retry. If training proceeds without overflows for several steps, $S$ can be increased (e.g., multiply by 2) to allow more headroom against underflow. Dynamic scaling automatically adapts to changing gradient magnitudes during training and is widely used in practice.
+
+Why loss scaling works mathematically is simple: gradients computed from $S\cdot L$ are $S\cdot \nabla L$. After backward, dividing by $S$ yields the true $\nabla L$. The challenge is purely numerical: scaling moves small numbers into the representable range. However, scaling also scales any numerical error or potential overflow risk. Dynamic schemes aim to balance these risks adaptively.
+
+Practical AMP policies also include:
+- Keep layer normalization, softmax (if implemented as log-softmax), and reductions in FP32 where precision matters.
+- Cast weights to reduced precision for matmuls, but keep a FP32 master copy for updates (discussed next).
+- Use fused kernels where possible to reduce cast overhead and maintain accuracy.
+- For BF16, loss scaling is often unnecessary because the exponent range matches FP32; nonetheless some models may still need it if precision losses are causing issues.
+
+AMP integrates with the autodiff engine to insert casts and manage loss scaling automatically, dramatically simplifying adoption. However, understanding the underlying rationale allows diagnosing failures (e.g., why loss suddenly becomes NaN, or why gradients are zero).
+
+# Optimizer state handling with reduced precision
+
+Optimizers like SGD with momentum, Adam, RMSProp, and LAMB maintain per-parameter state beyond the parameter values themselves: moment estimates, squared gradient averages, and sometimes higher-order statistics. These states typically require higher precision because they act as accumulators and must represent small incremental changes accurately over many steps.
+
+Two common strategies when using reduced precision for model weights/activations:
+
+1. Master parameters in FP32 (recommended): Keep a full-precision FP32 copy of model parameters (the “master weights”) that the optimizer updates, while storing and using a reduced-precision copy (FP16 or BF16) for forward/backward computations. The training loop becomes:
+   - Cast master FP32 weights to FP16/BF16 and use these for the forward pass (and to compute gradients).
+   - Scale loss and compute gradients in reduced precision (with loss scaling if needed).
+   - Convert gradients back to FP32 and unscale.
+   - Perform optimizer update on FP32 master weights (Adam update in FP32).
+   - Update the reduced-precision copy by casting the FP32 master to reduced precision.
+
+   This approach preserves numerical stability of updates and optimizer state (momentum, Adam $m$ and $v$) while gaining memory/compute improvements for the heavy linear algebra. The extra cost is maintaining an extra full-precision parameter copy, typically doubling parameter memory compared with pure reduced-precision storage, but this still often reduces memory overall because activations (which can dominate peak memory) are in reduced precision.
+
+2. Reduced-precision optimizer state with compensation: To further save memory, some systems keep optimizer states in reduced precision as well. For example, one can store momentum or Adam $v$ in FP16/BF16 with techniques to compensate for precision loss:
+   - Store "difference" or low-rank corrections in FP32 and compress the bulk state.
+   - Use block-wise or quantized storage for states with periodic full-precision reconstruction.
+   - Use algorithms designed to be stable in lower precision (e.g., LAMB’s layer-wise scaling can tolerate lower precision in certain settings).
+
+   These approaches are more complex and risk convergence issues if not carefully implemented. For cutting-edge large-scale training, practitioners often accept the FP32 optimizer state memory cost because optimizer states (e.g., Adam’s 2x multiplier for $m$ and $v$) can still be smaller than the original FP32-only baseline once activations and forward tensors are in reduced precision.
+
+Example: Adam optimizer update. Let $\theta_t$ be parameters, $g_t$ gradient at step $t$. Adam keeps first and second moment estimates $m_t$ and $v_t$ and updates
+   m_t = \beta_1 m_{t-1} + (1-\beta_1) g_t
+   v_t = \beta_2 v_{t-1} + (1-\beta_2) g_t^2
+   \hat{m}_t = m_t / (1-\beta_1^t)
+   \hat{v}_t = v_t / (1-\beta_2^t)
+   \theta_{t+1} = \theta_t - \alpha \hat{m}_t / (\sqrt{\hat{v}_t} + \epsilon)
+
+Because $v_t$ accumulates squared gradients, it can vary over orders of magnitude; storing $v_t$ in low precision loses information. Keeping $m_t$ and $v_t$ in FP32 is therefore a common design choice.
+
+Practical considerations:
+- Keep optimizer arithmetic in FP32 even if the states are stored in lower precision; that is, cast states to FP32 for computation and cast back for storage. This reduces numerical drift.
+- For very large models, consider partitioning optimizer state across devices (sharding) or using parameter-server-like designs to spread memory.
+- Ensure consistent casting and careful handling of in-place operations to avoid accidental precision loss.
+
+In summary, the canonical mixed-precision pattern keeps compute-heavy ops in FP16/BF16 and keeps optimizer state and master parameters in FP32. This combination preserves optimizer accuracy and avoids many numerical pitfalls while still benefiting from reduced-precision computation for throughput and memory.
+
+# Checkpointing, gradient accumulation and memory saving
+
+Large models often exceed device memory capacity. Multiple complementary techniques help reduce peak memory without changing the model:
+
+1. Activation checkpointing (also called gradient checkpointing or recomputation): Autodiff typically stores activations from the forward pass to compute gradients during the backward pass. Checkpointing trades compute for memory by saving only a subset of activations (checkpoints) and recomputing the missing parts during backward. The algorithm: partition the computation graph into segments, store the inputs to each segment (the checkpoints), and when computing backward through a segment, recompute forward within that segment to reconstruct intermediate activations. This reduces memory at the cost of extra forward computations during backward.
+
+   The memory–time trade-off is tunable: more checkpoints save more memory but cost more recomputation. Theoretical analysis shows checkpointing can reduce activation memory from $O(L)$ to $O(\sqrt{L})$ for a sequence of $L$ layers with an optimal checkpointing schedule. In practice, frameworks provide simple variants (e.g., store every $k$th activation) that are straightforward to apply.
+
+2. Gradient accumulation (micro-batching): GPUs/TPUs have limits on batch size due to memory. If the target global batch size exceeds per-device memory, perform gradient accumulation across multiple micro-batches: run forward/backward on a micro-batch, accumulate gradients in the optimizer, but do not step the optimizer until several micro-batches are processed. This yields effectively larger batch sizes while preserving per-device memory constraints. Important details:
+   - When using gradient accumulation with mixed precision, ensure gradient scaling/unscaling is applied consistently and that gradients are accumulated in FP32 (or the higher precision) to avoid loss of small increments.
+   - Accumulation can be implemented by increasing the effective batch size and adjusting learning rate accordingly (linear scaling rule, possibly with warmup).
+
+3. Offloading and sharding optimizer state: To reduce per-device memory, store optimizer state on CPU or another device and transfer parameters or updates as needed (offloading). Alternatively, use optimizer sharding (e.g., ZeRO optimizer) to partition optimizer states across devices so each device only stores a fraction. ZeRO-1/2/3 progressively shard optimizer states, gradients, and parameters to minimize redundancy. These systems can reduce memory by factors proportional to number of data-parallel replicas.
+
+4. Mixed-precision activations and reduced temporary storage: Use BF16/FP16 activations, fused kernels that avoid creating duplicate temporaries, and careful in-place ops to minimize transient memory spikes. Also prefer inference-style memory layout and memory pinning where applicable.
+
+5. Checkpointing for long-running jobs and failure resilience: Regularly save model state (parameters and optimizer state) to durable storage. For very large models, use sharded checkpoints to avoid a single-file bottleneck. Checkpoint frequency balances recovery time vs. I/O overhead.
+
+Putting techniques together often yields multiplicative benefits: for example, using BF16 activations, activation checkpointing, gradient accumulation, and optimizer sharding can make previously impossible batch sizes or model sizes feasible on a given hardware cluster.
+
+# Warmup schedules and conservative hyperparameter choices for large-scale runs
+
+Large models and large-batch training are more fragile to aggressive hyperparameter choices. Conservative schedules and gradual changes help avoid early instability and catastrophic divergence.
+
+Learning rate warmup is widely used: start with a small learning rate and gradually increase it to the target learning rate over a number of steps or epochs. Warmup prevents large gradient steps when model parameters are poorly scaled at initialization, especially in architectures relying on LayerNorm or in transformer-style models. Common warmup variants include linear warmup (increase linearly from 0 to $\alpha$ over $T_{warm}$ steps), exponential warmup, and cosine warmup. A simple linear warmup is:
+   \alpha_t = \alpha \cdot \frac{t}{T_{warm}}, for t \le T_{warm},
+then switch to the base schedule after $T_{warm}$ steps.
+
+When scaling the batch size by a factor $k$, a common heuristic is the linear scaling rule: multiply the base learning rate by $k$. That is, if $\alpha_{base}$ works for batch size $B$, use $\alpha = k\cdot \alpha_{base}$ for batch size $kB$. This rule often requires longer warmup or modifications (e.g., square-root scaling or LARS/LAMB adaptive optimizers) for very large $k$. Extremely large learning rates amplify gradient noise and can cause divergence; warmup helps the optimizer adapt to the larger effective batch.
+
+Other conservative choices for stability:
+- Smaller initial learning rates or longer warmup when using reduced precision.
+- Larger epsilon values in Adam/RMSProp to avoid division by very small numbers. For example, increasing $\epsilon$ from $10^{-8}$ to $10^{-6}$ can reduce sensitivity to tiny $v_t$ and avoid numeric blow-ups in mixed precision.
+- Gradient clipping (norm clipping) to avoid rare large gradient spikes destabilizing training. Clip gradients by global norm: if $\|g\| > C$, rescale $g \leftarrow g\cdot C / \|g\|$. Clipping is particularly helpful when large-batch gradients have heavy tails.
+- Weight decay through decoupled algorithms (e.g., AdamW) rather than relying on L2 regularization inside the squared-gradient accumulation. Decoupled weight decay tends to interact more predictably with optimizer state in mixed precision.
+- Conservative momentum parameters initially (e.g., smaller $\beta_1$ in Adam) to avoid excessive inertia when model signals are noisy.
+
+Learning-rate schedules after warmup also matter. Cosine decay or step decay are commonly used. For long runs, use schedules that reduce step sizes gradually to avoid sudden jumps that could unbalance the numerics.
+
+Finally, logging and monitoring are essential: track training loss, gradient norms, parameter norms, learning rate, and the frequency of Inf/NaN events. Early indicators (sharp increases in loss or gradient norms) can be detected and mitigated by reducing learning rate or restarting with more conservative settings.
+
+# Reproducibility and deterministic training considerations
+
+Reproducibility in deep learning is more complicated when using mixed precision and distributed training. Deterministic behavior is desirable for debugging, ablation studies, and scientific claims, but achieving it can conflict with performance or hardware features.
+
+Sources of nondeterminism:
+- Parallel reduction operations that use non-associative floating-point addition. Different reduction orders (e.g., across devices or within multi-threaded kernels) lead to small rounding differences that propagate and can eventually cause different training trajectories.
+- Atomic operations in GPU kernels that perform reductions with unspecified ordering.
+- Nondeterministic algorithms in libraries (e.g., cuDNN) that choose different convolution algorithms for speed and may have nondeterministic execution order.
+- Asynchronous communication in distributed training (e.g., overlapping communication and computation) that changes effective update ordering.
+- Random number generators without fixed seeds or with per-device seeds not carefully set. Also, operations like dropout, data augmentation, and shuffling introduce randomness.
+- Mixed precision itself: casting, loss scaling, and different rounding behaviors can amplify small numerical differences.
+
+Practical steps to increase reproducibility:
+- Fix random seeds for all RNGs used (Python, NumPy, PyTorch/TensorFlow, and any library-specific RNGs). Also set per-device seeds deterministically if using multiple GPUs.
+- Disable nondeterministic algorithms where frameworks allow a deterministic flag (e.g., set appropriate environment variables or API flags to force deterministic cuDNN algorithms). Be aware this may reduce performance.
+- Use deterministic reduction algorithms when available (e.g., deterministic allreduce) or control the reduction order deterministically (e.g., via fixed ring allreduce ordering). Libraries like NCCL and MPI provide options to affect reproducibility.
+- Avoid operations that are known to be nondeterministic unless necessary. Replace atomic-based kernels with deterministic variants if possible.
+- When using AMP and loss scaling, log the scale and Inf/NaN events. If retry-on-overflow behavior exists, it produces different execution traces than the non-overflow path; documenting loss-scaling changes can help reproduce events.
+- For model checkpoints and restarts, ensure the optimizer state and any RNG states are saved and restored. Many bugs arise from forgetting to save RNG states or optimizer moments.
+- Use 64-bit timestamps or counters if you depend on ordering across epochs in data loaders. Ensure distributed shuffling uses fixed seeds conditioned on epoch and shard ID.
+
+Accept that full bitwise reproducibility across different hardware/software/backends may be infeasible or too expensive. In research, aim for statistical reproducibility: repeated runs with the same hyperparameters produce behavior within an acceptable variance. Report variance across several seeds, and when exact reproducibility is required (e.g., to debug a crash), be prepared to turn on slower deterministic modes temporarily.
+
+Trade-offs: Enforcing determinism can slow training (deterministic kernels might be slower) and reduce parallel scaling options. In many production settings, performance is prioritized and deterministic bitwise matches are not required. Nevertheless, for tight comparisons in papers, log seeds and detail nondeterministic settings so readers can reproduce approximate results.
+
+Conclusion
+
+Mixed-precision training combined with a toolbox of memory and numerical tricks unlocks training of models that would otherwise be prohibitive in time or memory. FP16 and BF16 provide important performance wins, but their different dynamic-range and precision characteristics require understanding and mitigation: use master FP32 parameters and optimizer state, apply loss scaling when needed, and choose conservative hyperparameters (warmup, clipping, epsilon tuning) for large runs. Memory-saving strategies—activation checkpointing, gradient accumulation, optimizer sharding, and offloading—extend what can fit on hardware, at the cost of extra compute or communication. Finally, reproducibility is more challenging under mixed precision and distributed training; document seeds and settings, and be aware of nondeterministic kernels. With these principles and techniques, you will be equipped to implement, evaluate, and understand modern large-scale training methods in the literature.

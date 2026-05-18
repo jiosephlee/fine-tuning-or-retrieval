@@ -383,8 +383,14 @@ def prepare_training_mix(
     document_track_baseline = bool(strategy_args.get("document_track_baseline", False))
     match_explanation_source_replay = bool(strategy_args.get("match_explanation_source_replay", False))
     document_match_specific_explanation = strategy_args.get("document_match_specific_explanation", None)
+    document_match_insert_content = strategy_args.get("document_match_insert_content", "document")
     if isinstance(document_match_specific_explanation, list) and len(document_match_specific_explanation) == 1:
         document_match_specific_explanation = document_match_specific_explanation[0]
+    if document_match_insert_content not in {"document", "cited_works", "prior_knowledge"}:
+        raise ValueError(
+            "--document_match_insert_content must be one of: document, cited_works, prior_knowledge; "
+            f"got {document_match_insert_content!r}"
+        )
 
     with_prior_knowledge = bool(strategy_args.get("with_prior_knowledge", False))
     prior_knowledge_insertion = strategy_args.get("prior_knowledge_insertion", "front")
@@ -684,6 +690,36 @@ def prepare_training_mix(
                 if step_size > 0
             ]
 
+        def _load_document_match_insert_chunks(explanation_dir: str) -> List[str]:
+            if document_match_insert_content == "document":
+                chunks = list(source_chunks)
+                if num_paraphrased_texts > 0:
+                    for para_chunks in paraphrased_chunks_by_doc:
+                        chunks.extend(para_chunks)
+                return chunks
+
+            insert_type = {
+                "cited_works": "cited_textbooks",
+                "prior_knowledge": "prior_knowledge",
+            }[document_match_insert_content]
+            subfolder_path, files = _resolve_explanation_subfolder(insert_type)
+            if subfolder_path is None or not files:
+                log.warning(
+                    f"Domain {domain}: --document_match_insert_content={document_match_insert_content} "
+                    f"requested, but no {insert_type} files found; skipping matched insert track."
+                )
+                return []
+
+            chunks: List[str] = []
+            for filename in files:
+                with open(os.path.join(subfolder_path, filename), 'r', encoding='utf-8') as f:
+                    chunks.extend(_chunk_explanation(f.read()))
+            log.info(
+                f"Domain {domain}: using {document_match_insert_content} as matched insert content "
+                f"({len(files)} files, {len(chunks)} chunks)."
+            )
+            return chunks
+
         if document_track_baseline:
             explanation_dir = f'../../data/{domain_source}/explanations/{domain}/'
             files_to_load = _select_granular_explanation_files(
@@ -691,10 +727,7 @@ def prepare_training_mix(
                 document_match_specific_explanation,
             )
             type_objects = _load_granular_type_objects(explanation_dir, files_to_load)
-            document_replay_chunks = list(source_chunks)
-            if num_paraphrased_texts > 0:
-                for chunks in paraphrased_chunks_by_doc:
-                    document_replay_chunks.extend(chunks)
+            matched_insert_chunks = _load_document_match_insert_chunks(explanation_dir)
 
             for track_idx in range(granular_explanations_num_tracks):
                 track_objects = {}
@@ -716,10 +749,10 @@ def prepare_training_mix(
                     )
                     track_pool = _create_document_match_pool_from_step_sizes(
                         [len(step) for step in explanation_track_pool],
-                        document_replay_chunks,
+                        matched_insert_chunks,
                     )
                 else:
-                    track_pool = _create_document_match_pool_from_objects(track_objects, document_replay_chunks)
+                    track_pool = _create_document_match_pool_from_objects(track_objects, matched_insert_chunks)
                 if track_pool:
                     current_domain_document_match_tracks.append(track_pool)
             if current_domain_document_match_tracks:
@@ -729,8 +762,9 @@ def prepare_training_mix(
                     for step in track_pool
                 )
                 log.info(
-                    f"Domain {domain}: built document-match baseline tracks "
-                    f"({len(current_domain_document_match_tracks)} tracks, {matched_chunks} scheduled replay chunks)."
+                    f"Domain {domain}: built matched insert tracks "
+                    f"(content={document_match_insert_content}, {len(current_domain_document_match_tracks)} tracks, "
+                    f"{matched_chunks} scheduled chunks)."
                 )
         
         if include_explanations:
