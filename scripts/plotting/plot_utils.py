@@ -143,6 +143,49 @@ def _latest_timestamp_dir(path: str) -> Optional[str]:
         return None
 
 
+def _looks_like_run_leaf(path: str) -> bool:
+    """Return True if *path* directly contains per-domain result folders."""
+    try:
+        children = [
+            name
+            for name in os.listdir(path)
+            if os.path.isdir(os.path.join(path, name))
+        ]
+    except FileNotFoundError:
+        return False
+
+    probe_suffixes = (
+        "_knowledge_probe",
+        "_inference_probe",
+        "_mcqa_probe",
+        "_inference_mcqa_probe",
+        "_corpus_perplexity",
+    )
+    return any(
+        any(suffix in child for suffix in probe_suffixes)
+        for child in children
+    )
+
+
+def _latest_named_dir(path: str, pattern: str) -> Optional[str]:
+    """Find the newest child directory whose name matches *pattern*."""
+    try:
+        candidates = [
+            os.path.join(path, name)
+            for name in os.listdir(path)
+            if os.path.isdir(os.path.join(path, name)) and re.match(pattern, name)
+        ]
+    except FileNotFoundError:
+        return None
+    if not candidates:
+        return None
+    return sorted(
+        candidates,
+        key=lambda p: (os.path.getmtime(p), os.path.basename(p)),
+        reverse=True,
+    )[0]
+
+
 def find_latest_run(base_path: str) -> Optional[str]:
     """
     Resolve a run directory from a manually-given base path.
@@ -150,16 +193,21 @@ def find_latest_run(base_path: str) -> Optional[str]:
     Rules:
       1. If base_path itself looks like a run leaf (ends with timestamp or ``run``),
          return it.
-      2. If a direct ``run`` subdirectory exists, return it.
-      3. If timestamped subdirectories exist, return the latest.
-      4. If ``overlap_1_4`` or ``no_overlap`` exist, descend one level and retry.
-      5. Otherwise return ``None``.
+      2. If base_path directly contains per-domain result folders, return it.
+      3. If a direct ``run`` subdirectory exists, return it.
+      4. If timestamped subdirectories exist, return the latest.
+      5. If an ``E*`` experiment directory exists, descend into the newest one.
+      6. If ``overlap_*`` or ``no_overlap`` directories exist, descend and retry.
+      7. Otherwise return ``None``.
     """
     if not base_path or not os.path.isdir(base_path):
         return None
 
     tail = os.path.basename(base_path.rstrip(os.sep))
     if tail == "run" or re.match(r"\d{2}_\d{2}_\d{2}_\d{2}", tail):
+        return base_path
+
+    if _looks_like_run_leaf(base_path):
         return base_path
 
     run_dir = os.path.join(base_path, "run")
@@ -170,15 +218,30 @@ def find_latest_run(base_path: str) -> Optional[str]:
     if ts_dir:
         return ts_dir
 
-    for sub in ("overlap_1_4", "no_overlap"):
-        candidate = os.path.join(base_path, sub)
-        if os.path.isdir(candidate):
-            run_dir = os.path.join(candidate, "run")
-            if os.path.isdir(run_dir):
-                return run_dir
-            ts_dir = _latest_timestamp_dir(candidate)
-            if ts_dir:
-                return ts_dir
+    e_dir = _latest_named_dir(base_path, r"E.*")
+    if e_dir:
+        resolved = find_latest_run(e_dir)
+        if resolved:
+            return resolved
+
+    try:
+        overlap_candidates = [
+            os.path.join(base_path, name)
+            for name in os.listdir(base_path)
+            if os.path.isdir(os.path.join(base_path, name))
+            and (name == "no_overlap" or re.match(r"overlap_.*", name))
+        ]
+    except FileNotFoundError:
+        overlap_candidates = []
+
+    for candidate in sorted(
+        overlap_candidates,
+        key=lambda p: (os.path.getmtime(p), os.path.basename(p)),
+        reverse=True,
+    ):
+        resolved = find_latest_run(candidate)
+        if resolved:
+            return resolved
 
     return None
 
@@ -187,6 +250,106 @@ def find_latest_run(base_path: str) -> Optional[str]:
 # DATA LOADING
 # ================================================================
 
+def _candidate_probe_dirs(
+    run_path: str,
+    domain: str,
+    probe_type: str,
+    probe_family: str,
+    lima: bool = False,
+    mcqa_variant: str = "preferred",
+) -> List[str]:
+    """Return candidate probe directories in preference order."""
+    if probe_family not in {"classic", "mcqa", "auto"}:
+        raise ValueError("probe_family must be one of: classic, mcqa, auto")
+    if probe_type not in {"knowledge", "inference"}:
+        raise ValueError("probe_type must be 'knowledge' or 'inference'")
+    if mcqa_variant not in {"preferred", "regular", "reviewed"}:
+        raise ValueError("mcqa_variant must be one of: preferred, regular, reviewed")
+
+    families = ("classic", "mcqa") if probe_family == "auto" else (probe_family,)
+    candidates: List[str] = []
+    reviewed_inference_root = _is_reviewed_inference_mcqa_root(run_path)
+    for family in families:
+        if family == "classic":
+            if probe_type == "knowledge":
+                name = f"{domain}_lima_knowledge_probe" if lima else f"{domain}_knowledge_probe"
+            else:
+                name = f"{domain}_lima_inference_probe" if lima else f"{domain}_inference_probe"
+            candidates.append(os.path.join(run_path, name))
+            continue
+
+        if lima:
+            continue
+        try:
+            child_names = [
+                name
+                for name in os.listdir(run_path)
+                if os.path.isdir(os.path.join(run_path, name))
+            ]
+        except FileNotFoundError:
+            child_names = []
+
+        if probe_type == "knowledge":
+            matches = [f"{domain}_mcqa_probe"]
+            matches.extend(
+                name
+                for name in child_names
+                if name.startswith(f"{domain}_knowledge_mcqa_probe")
+            )
+        else:
+            matches = [
+                name
+                for name in child_names
+                if name.startswith(f"{domain}_inference_mcqa_probe")
+            ]
+        reviewed = sorted([name for name in matches if "reviewed" in name])
+        regular = sorted([name for name in matches if "reviewed" not in name])
+        if probe_type == "inference" and reviewed_inference_root and not reviewed:
+            reviewed = regular
+            regular = []
+        if mcqa_variant == "regular":
+            ordered = regular
+        elif mcqa_variant == "reviewed":
+            ordered = reviewed
+        else:
+            ordered = reviewed + regular
+        candidates.extend(os.path.join(run_path, name) for name in ordered)
+
+    return list(dict.fromkeys(candidates))
+
+
+def _is_reviewed_inference_mcqa_root(run_path: str) -> bool:
+    """Return whether a run root encodes reviewed inference MCQA in its path.
+
+    Some reviewed v12 runs, notably 13B, store legacy unversioned per-domain
+    folders such as ``DPO_inference_mcqa_probe`` under an
+    ``*_inf_mcqa_v12_reviewed`` experiment root.
+    """
+    return any(
+        re.search(r"inf_mcqa[^/]*reviewed", part)
+        for part in os.path.normpath(run_path).split(os.sep)
+    )
+
+
+def _candidate_metric_paths(probe_dir: str, domain: str, probe_type: str) -> List[str]:
+    """Return metric CSV paths in a probe directory, excluding training-loss files."""
+    if not os.path.isdir(probe_dir):
+        return []
+    expected = os.path.join(probe_dir, f"{os.path.basename(probe_dir)}_metrics.csv")
+    if os.path.exists(expected):
+        return [expected]
+    legacy = os.path.join(probe_dir, f"{domain}_{probe_type}_probe_metrics.csv")
+    if os.path.exists(legacy):
+        return [legacy]
+    return [
+        os.path.join(probe_dir, name)
+        for name in sorted(os.listdir(probe_dir))
+        if name.endswith("_metrics.csv")
+        and name != "training_loss_perplexity_metrics.csv"
+        and "training_loss" not in name
+    ]
+
+
 def aggregate_across_domains(
     run_path: str,
     probe_type: str,
@@ -194,6 +357,8 @@ def aggregate_across_domains(
     split_probes: bool = False,
     project_root: str = ".",
     lima: bool = False,
+    probe_family: str = "classic",
+    mcqa_variant: str = "preferred",
 ) -> pd.DataFrame:
     """
     Load and concatenate probe CSVs across all *domains* from a single run.
@@ -212,6 +377,12 @@ def aggregate_across_domains(
         Repository root.
     lima : bool
         If True, read from the ``*_lima_*`` probe directories.
+    probe_family : str
+        ``"classic"`` for log-prob probe folders, ``"mcqa"`` for MCQA probe
+        folders, or ``"auto"`` to try classic first and then MCQA.
+    mcqa_variant : str
+        ``"regular"`` for non-reviewed MCQA folders, ``"reviewed"`` for reviewed
+        MCQA folders, or ``"preferred"`` for reviewed-first fallback.
 
     Returns
     -------
@@ -221,34 +392,50 @@ def aggregate_across_domains(
     """
     all_domain_dfs: list[pd.DataFrame] = []
     for domain in domains:
-        if probe_type == "knowledge":
-            probe_dir = f"{domain}_lima_knowledge_probe" if lima else f"{domain}_knowledge_probe"
-            file_name = f"{domain}_knowledge_probe_metrics.csv"
-        else:
-            probe_dir = f"{domain}_lima_inference_probe" if lima else f"{domain}_inference_probe"
-            file_name = f"{domain}_inference_probe_metrics.csv"
+        probe_dirs = _candidate_probe_dirs(
+            run_path,
+            domain,
+            probe_type,
+            probe_family,
+            lima=lima,
+            mcqa_variant=mcqa_variant,
+        )
+        metric_paths: List[str] = []
+        for probe_dir in probe_dirs:
+            metric_paths = _candidate_metric_paths(probe_dir, domain, probe_type)
+            if metric_paths:
+                break
 
-        metrics_path = os.path.join(run_path, probe_dir, file_name)
+        if not metric_paths:
+            print(
+                f"Warning: No {probe_family} {probe_type} metric files found for "
+                f"domain {domain} under {run_path}"
+            )
+            continue
 
-        if not os.path.exists(metrics_path) or os.path.getsize(metrics_path) == 0:
-            if not os.path.exists(metrics_path):
-                print(f"Warning: File not found at {metrics_path}")
-            else:
+        domain_dfs: List[pd.DataFrame] = []
+        for metrics_path in metric_paths:
+            if os.path.getsize(metrics_path) == 0:
                 print(f"Warning: File is empty at {metrics_path}")
-            continue
+                continue
+            df = pd.read_csv(metrics_path)
+            if "step" not in df.columns:
+                print(f"Warning: 'step' column not found in {metrics_path}. Skipping.")
+                continue
 
-        df = pd.read_csv(metrics_path)
-        if "step" not in df.columns or "log_prob" not in df.columns:
-            print(f"Warning: 'step' or 'log_prob' column not found in {metrics_path}. Skipping.")
-            continue
+            df["step"] = pd.to_numeric(df["step"], errors="coerce")
+            df.dropna(subset=["step"], inplace=True)
+            if df.empty:
+                continue
+            df["step"] = df["step"].astype(int)
+            df["domain"] = domain
+            if len(metric_paths) > 1:
+                df["metric_file"] = os.path.basename(metrics_path)
+            domain_dfs.append(df)
 
-        df["step"] = pd.to_numeric(df["step"], errors="coerce")
-        df["log_prob"] = pd.to_numeric(df["log_prob"], errors="coerce")
-        df.dropna(subset=["step", "log_prob"], inplace=True)
-        if df.empty:
+        if not domain_dfs:
             continue
-        df["step"] = df["step"].astype(int)
-        df["domain"] = domain
+        df = pd.concat(domain_dfs, ignore_index=True)
 
         if split_probes:
             probe_folder = "inference" if probe_type == "inference" else "facts"
@@ -289,6 +476,8 @@ def load_metrics(
     filter_file: Optional[str] = None,
     exclude_origins: Optional[Sequence[str]] = None,
     aggregate: bool = True,
+    probe_family: str = "classic",
+    mcqa_variant: str = "preferred",
 ) -> Optional[pd.DataFrame]:
     """
     High-level loader: resolve path -> load CSVs -> optionally filter probes
@@ -319,6 +508,12 @@ def load_metrics(
     aggregate : bool
         If True (default), return one row per step with mean metric values
         across domains/probes.  If False, return the raw per-probe DataFrame.
+    probe_family : str
+        ``"classic"`` for log-prob probe folders, ``"mcqa"`` for MCQA probe
+        folders, or ``"auto"`` to try classic first and then MCQA.
+    mcqa_variant : str
+        ``"regular"`` for non-reviewed MCQA folders, ``"reviewed"`` for reviewed
+        MCQA folders, or ``"preferred"`` for reviewed-first fallback.
 
     Returns
     -------
@@ -332,7 +527,10 @@ def load_metrics(
     split = filter_file is not None
     base_df = aggregate_across_domains(
         resolved, probe_type, domains,
-        split_probes=split, project_root=project_root,
+        split_probes=split,
+        project_root=project_root,
+        probe_family=probe_family,
+        mcqa_variant=mcqa_variant,
     )
     if base_df.empty:
         return None
@@ -343,14 +541,27 @@ def load_metrics(
         if base_df.empty:
             return None
 
-    keep_cols = ["step"] + [m for m in metrics if m in base_df.columns]
+    if tuple(metrics) == ("log_prob",) and "log_prob" not in base_df.columns and "mcqa_accuracy" in base_df.columns:
+        metrics = ("mcqa_accuracy",)
+
+    available_metrics = [m for m in metrics if m in base_df.columns]
+    if not available_metrics:
+        return None
+    base_df = base_df.copy()
+    for metric in available_metrics:
+        base_df[metric] = pd.to_numeric(base_df[metric], errors="coerce")
+    base_df.dropna(subset=available_metrics, how="all", inplace=True)
+    if base_df.empty:
+        return None
+
+    keep_cols = ["step"] + available_metrics
     if not aggregate:
-        extra = [c for c in ("domain", "probe_index", "origin", "probe", "target")
+        extra = [c for c in ("domain", "probe_index", "origin", "probe", "target", "metric_file")
                  if c in base_df.columns]
         return base_df[list(dict.fromkeys(keep_cols + extra))]
 
     # Aggregate: mean per step
-    base_agg = base_df.groupby("step")[list(metrics)].mean().reset_index()
+    base_agg = base_df.groupby("step")[available_metrics].mean().reset_index()
     base_agg["step"] = base_agg["step"].astype(int)
     base_agg.sort_values("step", inplace=True)
 
@@ -361,7 +572,11 @@ def load_metrics(
     max_step_ft = int(base_agg["step"].max())
     lima_df = aggregate_across_domains(
         resolved, probe_type, domains,
-        split_probes=split, project_root=project_root, lima=True,
+        split_probes=split,
+        project_root=project_root,
+        lima=True,
+        probe_family=probe_family,
+        mcqa_variant=mcqa_variant,
     )
     if lima_df.empty:
         return base_agg
@@ -370,8 +585,15 @@ def load_metrics(
         lima_df = lima_df[~lima_df["origin"].isin(exclude_origins)]
         if lima_df.empty:
             return base_agg
+    lima_df = lima_df.copy()
+    for metric in available_metrics:
+        if metric in lima_df.columns:
+            lima_df[metric] = pd.to_numeric(lima_df[metric], errors="coerce")
+    lima_df.dropna(subset=available_metrics, how="all", inplace=True)
+    if lima_df.empty:
+        return base_agg
 
-    lima_agg = lima_df.groupby("step")[list(metrics)].mean().reset_index()
+    lima_agg = lima_df.groupby("step")[available_metrics].mean().reset_index()
     lima_agg["step"] = lima_agg["step"].astype(int)
     if max_step_ft > 0:
         lima_agg["step"] += max_step_ft
@@ -388,6 +610,8 @@ def load_probe_series(
     domains,
     project_root: str,
     with_lima: bool = False,
+    probe_family: str = "classic",
+    mcqa_variant: str = "preferred",
 ) -> Optional[pd.DataFrame]:
     """
     Load mean log_prob vs. step for a single run, optionally appending LIMA
@@ -395,7 +619,10 @@ def load_probe_series(
     """
     return load_metrics(
         run_path, probe_type, domains, project_root,
-        metrics=("log_prob",), with_lima=with_lima,
+        metrics=("log_prob",),
+        with_lima=with_lima,
+        probe_family=probe_family,
+        mcqa_variant=mcqa_variant,
     )
 
 
@@ -428,13 +655,24 @@ def get_final_val(
     domains: Sequence[str],
     project_root: str,
     metric: str = "log_prob",
+    probe_family: str = "classic",
+    mcqa_variant: str = "preferred",
 ) -> Optional[float]:
     """
     Shorthand: load a run and return the final-step value for *metric*.
     Returns None if data is missing.
     """
-    df = load_metrics(run_path, probe_type, domains, project_root, metrics=(metric,))
+    df = load_metrics(
+        run_path, probe_type, domains, project_root,
+        metrics=(metric,),
+        probe_family=probe_family,
+        mcqa_variant=mcqa_variant,
+    )
     if df is None or df.empty:
+        return None
+    if metric not in df.columns and metric == "log_prob" and "mcqa_accuracy" in df.columns:
+        metric = "mcqa_accuracy"
+    if metric not in df.columns:
         return None
     max_step = df["step"].max()
     return float(df.loc[df["step"] == max_step, metric].mean())
