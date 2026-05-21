@@ -66,9 +66,9 @@ fi
 
 "${LAUNCH[@]}" finetuning_knowledge_v9.py \
     --custom_suffix "$CUSTOM_SUFFIX" \
+    --wandb_panel_sources arxiv legal \
     --model_id "$MODEL_ID" \
     --include_sources arxiv legal \
-    --wandb_panel_sources arxiv legal \
     --knowledge_probes_version v13 \
     --mcqa_probes \
     --mcqa_probes_version "$MCQA_PROBES_VERSION" \

@@ -64,6 +64,7 @@ conda activate "$CONDA_ENV"
 torchrun --standalone --nproc_per_node 4 finetuning_knowledge_v9.py \
     --custom_suffix "$CUSTOM_SUFFIX" \
     --wandb_group finetuning_official \
+    --push_to_hub_cpt_id "$PUSH_TO_HUB_CPT_ID" \
     --model_id allenai/OLMo-2-1124-13B \
     --knowledge_probes_version v13 \
     --paraphrased_knowledge_probes \
@@ -73,14 +74,12 @@ torchrun --standalone --nproc_per_node 4 finetuning_knowledge_v9.py \
     --mcqa_probes_version v14 \
     --mcqa_prompt_column "$MCQA_PROMPT_COLUMN" \
     --mcqa_probe_batch_size "$MCQA_PROBE_BATCH_SIZE" \
-    "${INFERENCE_MCQA_ARGS[@]}" \
     --num_train_epochs 100 \
     --learning_rate 4e-5 \
     --lr_scheduler_min_lr_ratio 0.1 \
     --num_paraphrased_texts 0 \
     --overlap_sections \
     --overlap_ratio 1_16 \
-    "${DOC_MATCH_ARGS[@]}" \
     --device_batch_size "$DEVICE_BATCH_SIZE" \
     --effective_batch_size_for_cpt "$EFFECTIVE_BATCH_SIZE" \
     --context_length_for_cpt 4096 \
@@ -92,5 +91,6 @@ torchrun --standalone --nproc_per_node 4 finetuning_knowledge_v9.py \
     --mcqa_probe_every_n_steps "$MCQA_PROBE_EVERY_N_STEPS" \
     --enable_parameter_delta_tracking \
     --parameter_delta_every_n_steps 5 \
-    --push_to_hub_cpt_id "$PUSH_TO_HUB_CPT_ID" \
-    --no-save_local_model
+    --no-save_local_model \
+    "${INFERENCE_MCQA_ARGS[@]}" \
+    "${DOC_MATCH_ARGS[@]}"

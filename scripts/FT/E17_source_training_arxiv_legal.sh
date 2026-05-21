@@ -29,9 +29,9 @@ fi
 
 conda run --no-capture-output -n openrlhf torchrun --standalone --nproc_per_node 8 finetuning_knowledge_v9.py \
     --custom_suffix E17_source_arxiv_legal \
+    --wandb_panel_sources arxiv legal \
     --model_id allenai/OLMo-2-1124-7B \
     --include_sources arxiv legal \
-    --wandb_panel_sources arxiv legal \
     --knowledge_probes_version v13 \
     --mcqa_probes \
     --mcqa_probes_version v14 \

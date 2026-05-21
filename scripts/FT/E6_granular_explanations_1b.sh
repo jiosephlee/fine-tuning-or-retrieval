@@ -95,6 +95,7 @@ conda activate "$CONDA_ENV"
 torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" finetuning_knowledge_v9.py \
     --custom_suffix "$CUSTOM_SUFFIX" \
     --wandb_group finetuning_official \
+    --push_to_hub_cpt_id "$PUSH_TO_HUB_CPT_ID" \
     --model_id "$MODEL_ID" \
     --knowledge_probes_version v13 \
     --paraphrased_knowledge_probes \
@@ -110,11 +111,11 @@ torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" finetuning_knowledge_v9
     --num_paraphrased_texts "$NUM_PARAPHRASED" \
     --with_specific_explanation "${EXPLANATION_TYPE_ARGS[@]}" \
     "${EXPLANATION_SCHEDULE_ARGS[@]}" \
+    --overlap_sections \
+    --overlap_ratio 1_16 \
     --device_batch_size "$DEVICE_BATCH_SIZE" \
     --effective_batch_size_for_cpt "$EFFECTIVE_BATCH_SIZE" \
     --context_length_for_cpt "$CONTEXT_LENGTH" \
-    --overlap_sections \
-    --overlap_ratio 1_16 \
     --fill_batches_with_pretraining \
     --attn_implementation "$ATTN_IMPLEMENTATION" \
     --gradient_checkpointing \
@@ -123,5 +124,4 @@ torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" finetuning_knowledge_v9
     --mcqa_probe_every_n_steps "$MCQA_PROBE_EVERY_N_STEPS" \
     --enable_parameter_delta_tracking \
     --parameter_delta_every_n_steps "$PARAMETER_DELTA_EVERY_N_STEPS" \
-    --push_to_hub_cpt_id "$PUSH_TO_HUB_CPT_ID" \
     "${EXTRA_ARGS[@]}"

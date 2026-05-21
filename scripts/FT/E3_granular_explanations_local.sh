@@ -84,14 +84,13 @@ fi
     --learning_rate "$LEARNING_RATE" \
     --lr_scheduler_min_lr_ratio 0.1 \
     --num_paraphrased_texts "$NUM_PARAPHRASED" \
-    "${EXPLANATION_ARGS[@]}" \
     --explanations_insertion_strategy granular \
     --granular_explanations_cycle "$EXPLANATIONS_CYCLE" \
+    --overlap_sections \
+    --overlap_ratio 1_16 \
     --device_batch_size "$DEVICE_BATCH_SIZE" \
     --effective_batch_size_for_cpt "$EFFECTIVE_BATCH_SIZE" \
     --context_length_for_cpt "$CONTEXT_LENGTH" \
-    --overlap_sections \
-    --overlap_ratio 1_16 \
     --fill_batches_with_pretraining \
     --attn_implementation "$ATTN_IMPLEMENTATION" \
     --gradient_checkpointing \
@@ -100,4 +99,5 @@ fi
     --mcqa_probe_every_n_steps "$MCQA_PROBE_EVERY_N_STEPS" \
     --enable_parameter_delta_tracking \
     --parameter_delta_every_n_steps "$PARAMETER_DELTA_EVERY_N_STEPS" \
-    "${EXTRA_ARGS[@]}"
+    "${EXTRA_ARGS[@]}" \
+    "${EXPLANATION_ARGS[@]}"

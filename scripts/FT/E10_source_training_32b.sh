@@ -102,6 +102,7 @@ fi
 "${LAUNCH[@]}" \
     --custom_suffix "$CUSTOM_SUFFIX" \
     --wandb_group finetuning_official \
+    --push_to_hub_cpt_id "$PUSH_TO_HUB_CPT_ID" \
     --model_id allenai/OLMo-2-0325-32B \
     --knowledge_probes_version v13 \
     --paraphrased_knowledge_probes \
@@ -111,25 +112,24 @@ fi
     --mcqa_probes_version v14 \
     --mcqa_prompt_column "$MCQA_PROMPT_COLUMN" \
     --mcqa_probe_batch_size "$MCQA_PROBE_BATCH_SIZE" \
-    "${INFERENCE_MCQA_ARGS[@]}" \
     --num_train_epochs 100 \
     --learning_rate 4e-5 \
     --lr_scheduler_min_lr_ratio 0.1 \
+    --sft_loss_type "$LOSS_TYPE" \
     --num_paraphrased_texts 0 \
     --overlap_sections \
     --overlap_ratio 1_16 \
-    "${DOC_MATCH_ARGS[@]}" \
     --device_batch_size "$DEVICE_BATCH_SIZE" \
-    --sft_loss_type "$LOSS_TYPE" \
     --effective_batch_size_for_cpt "$EFFECTIVE_BATCH_SIZE" \
     --context_length_for_cpt "$CONTEXT_LENGTH" \
     --fill_batches_with_pretraining \
     --attn_implementation flash_attention_2 \
-    "${OFFLOAD_ARGS[@]}" \
     --gradient_checkpointing \
     --full_finetuning \
     --probe_every_n_steps "$PROBE_EVERY_N_STEPS" \
     --mcqa_probe_every_n_steps "$MCQA_PROBE_EVERY_N_STEPS" \
-    "${PARAMETER_DELTA_ARGS[@]}" \
-    --push_to_hub_cpt_id "$PUSH_TO_HUB_CPT_ID" \
-    --no-save_local_model
+    --no-save_local_model \
+    "${INFERENCE_MCQA_ARGS[@]}" \
+    "${DOC_MATCH_ARGS[@]}" \
+    "${OFFLOAD_ARGS[@]}" \
+    "${PARAMETER_DELTA_ARGS[@]}"

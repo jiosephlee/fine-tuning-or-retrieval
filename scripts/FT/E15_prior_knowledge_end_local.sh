@@ -73,16 +73,16 @@ fi
     --num_train_epochs "$NUM_EPOCHS" \
     --learning_rate "$LEARNING_RATE" \
     --lr_scheduler_min_lr_ratio 0.1 \
+    --num_paraphrased_texts "$NUM_PARAPHRASED" \
+    --with_prior_knowledge \
+    --prior_knowledge_insertion "$PRIOR_KNOWLEDGE_INSERTION" \
+    --prior_knowledge_cycle "$PRIOR_KNOWLEDGE_CYCLE" \
     --overlap_sections \
     --overlap_ratio 1_16 \
-    --num_paraphrased_texts "$NUM_PARAPHRASED" \
     --device_batch_size "$DEVICE_BATCH_SIZE" \
     --effective_batch_size_for_cpt "$EFFECTIVE_BATCH_SIZE" \
     --context_length_for_cpt "$CONTEXT_LENGTH" \
     --fill_batches_with_pretraining \
-    --with_prior_knowledge \
-    --prior_knowledge_insertion "$PRIOR_KNOWLEDGE_INSERTION" \
-    --prior_knowledge_cycle "$PRIOR_KNOWLEDGE_CYCLE" \
     --attn_implementation "$ATTN_IMPLEMENTATION" \
     --gradient_checkpointing \
     --full_finetuning \

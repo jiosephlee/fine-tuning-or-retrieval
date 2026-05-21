@@ -78,9 +78,9 @@ fi
 "${LAUNCH[@]}" finetuning_knowledge_v9.py \
     --custom_suffix "$CUSTOM_SUFFIX" \
     --wandb_group finetuning_official \
+    --wandb_panel_sources arxiv legal \
     --model_id "$MODEL_ID" \
     --include_sources arxiv legal \
-    --wandb_panel_sources arxiv legal \
     --knowledge_probes_version v13 \
     --paraphrased_knowledge_probes \
     --paraphrased_knowledge_probes_version v13 \
@@ -92,9 +92,9 @@ fi
     --num_train_epochs "$NUM_EPOCHS" \
     --learning_rate "$LEARNING_RATE" \
     --lr_scheduler_min_lr_ratio 0.1 \
+    --num_paraphrased_texts "$NUM_PARAPHRASED" \
     --overlap_sections \
     --overlap_ratio 1_16 \
-    --num_paraphrased_texts "$NUM_PARAPHRASED" \
     --device_batch_size "$DEVICE_BATCH_SIZE" \
     --effective_batch_size_for_cpt "$EFFECTIVE_BATCH_SIZE" \
     --context_length_for_cpt "$CONTEXT_LENGTH" \

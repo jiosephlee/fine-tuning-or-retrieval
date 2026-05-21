@@ -50,15 +50,20 @@ fi
 "${LAUNCH[@]}" finetuning_knowledge_v9.py \
     --custom_suffix "$CUSTOM_SUFFIX" \
     --model_id "$MODEL_ID" \
+    --wandb_group finetuning_official \
     --knowledge_probes_version v13 \
+    --paraphrased_knowledge_probes \
+    --paraphrased_knowledge_probes_version v13 \
+    --paraphrased_knowledge_probe_filename_suffix _paraphrased \
     --mcqa_probes \
     --mcqa_probes_version "$MCQA_PROBES_VERSION" \
     --mcqa_prompt_column "$MCQA_PROMPT_COLUMN" \
     --num_train_epochs "$NUM_EPOCHS" \
     --learning_rate "$LEARNING_RATE" \
-    --overlap_sections \
-    --overlap_ratio 1_8 \
+    --lr_scheduler_min_lr_ratio 0.1 \
     --num_paraphrased_texts "$NUM_PARAPHRASED" \
+    --overlap_sections \
+    --overlap_ratio 1_16 \
     --device_batch_size "$DEVICE_BATCH_SIZE" \
     --effective_batch_size_for_cpt "$EFFECTIVE_BATCH_SIZE" \
     --context_length_for_cpt "$CONTEXT_LENGTH" \
