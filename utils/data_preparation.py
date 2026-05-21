@@ -406,12 +406,13 @@ def prepare_training_mix(
         )
         return chunks
 
-    def _chunk_explanation(text: str) -> List[str]:
+    def _chunk_explanation(text: str, title_prefix: bool = True) -> List[str]:
         text_with_eos = text + tokenizer.eos_token
         explanation_overlap_ratio = "1_10"
+        use_title = add_title_prefix if title_prefix else False
         chunks, _ = chunking.chunk(
             text_with_eos, tokenizer, train_cfg.context_length,
-            chunk_by_section, overlap_sections, explanation_overlap_ratio, add_title_prefix, log=log
+            chunk_by_section, overlap_sections, explanation_overlap_ratio, use_title, log=log
         )
         return chunks
 
@@ -711,9 +712,10 @@ def prepare_training_mix(
                 return []
 
             chunks: List[str] = []
+            title_prefix = document_match_insert_content != "prior_knowledge"
             for filename in files:
                 with open(os.path.join(subfolder_path, filename), 'r', encoding='utf-8') as f:
-                    chunks.extend(_chunk_explanation(f.read()))
+                    chunks.extend(_chunk_explanation(f.read(), title_prefix=title_prefix))
             log.info(
                 f"Domain {domain}: using {document_match_insert_content} as matched insert content "
                 f"({len(files)} files, {len(chunks)} chunks)."
@@ -976,7 +978,7 @@ def prepare_training_mix(
                         pass
                 for cf in chapter_files:
                     with open(os.path.join(pk_dir, cf), 'r', encoding='utf-8') as f:
-                        per_chapter_chunks.append(_chunk_explanation(f.read()))
+                        per_chapter_chunks.append(_chunk_explanation(f.read(), title_prefix=False))
                 if prior_knowledge_match_document_track:
                     document_replay_chunks = list(source_chunks)
                     for chunks in paraphrased_chunks_by_doc:
@@ -1098,7 +1100,6 @@ def prepare_training_mix(
             fill_with_pretraining=fill_with_pretraining
         )
     else:
-        log.info("Using LEGACY Method (Coupled Batches).")
         final_chunks = replicate_and_interleave_legacy(
             unique_document_batches=unique_document_batches,
             explanation_spliced_document_batches=explanation_spliced_document_batches,

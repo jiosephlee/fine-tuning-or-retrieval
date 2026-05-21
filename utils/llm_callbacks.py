@@ -1912,3 +1912,1032 @@ class ParameterDeltaCallback(TrainerCallback):
             self._log_warning(f"ParameterDeltaCallback: plotting failed: {exc}")
 
         self._log_info(f"ParameterDeltaCallback: saved outputs to {self.output_dir}.")
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses for unified callbacks
+# ---------------------------------------------------------------------------
+from dataclasses import dataclass, field
+
+
+@dataclass
+class DomainProbeSegment:
+    """One domain's worth of knowledge probe data."""
+    log_prefix: str
+    output_dir: str
+    facts: List[str]
+    probes: List[str]
+    targets: List[str]
+    probes_df: pd.DataFrame
+    # Populated during unified tokenization:
+    tokenized_facts: dict = field(default=None, repr=False)
+    context_lengths: torch.Tensor = field(default=None, repr=False)
+    target_lengths: torch.Tensor = field(default=None, repr=False)
+    fact_lengths: torch.Tensor = field(default=None, repr=False)
+    # Per-domain tracking:
+    history: Dict[str, list] = field(default_factory=lambda: {
+        'log_prob': [], 'perplexity': [], 'target_rank': [],
+    })
+    initial_metrics: Dict[str, torch.Tensor] = field(default_factory=dict)
+
+
+@dataclass
+class DomainMCQASegment:
+    """One domain's worth of MCQA probe data."""
+    log_prefix: str
+    output_dir: str
+    formatted_questions: List[str]
+    correct_choice_indices: List[int]
+    probes_df: pd.DataFrame
+    tokenized_mcqa_prompts: dict = field(default=None, repr=False)
+    history: Dict[str, list] = field(default_factory=lambda: {"mcqa_accuracy": []})
+    predictions_history: List[Dict] = field(default_factory=list)
+    panel_domain: Optional[str] = None
+    panel_metric_name: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Proxy object used by WandbSourcePanelsCallback
+# ---------------------------------------------------------------------------
+
+class _DomainProxy:
+    """Lightweight proxy exposing .log_prefix, .history, .panel_domain, .panel_metric_name."""
+    def __init__(self, segment):
+        self._segment = segment
+
+    @property
+    def log_prefix(self):
+        return self._segment.log_prefix
+
+    @property
+    def history(self):
+        return self._segment.history
+
+    @property
+    def panel_domain(self):
+        return getattr(self._segment, "panel_domain", None)
+
+    @property
+    def panel_metric_name(self):
+        return getattr(self._segment, "panel_metric_name", None)
+
+
+# ---------------------------------------------------------------------------
+# Distributed helpers
+# ---------------------------------------------------------------------------
+
+def _get_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+def _get_world_size() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    return 1
+
+
+def _gather_objects(local_obj):
+    """Gather *local_obj* from every rank into a list on rank 0.
+
+    Returns the gathered list on rank 0, or ``None`` on other ranks.
+    Uses ``torch.distributed.gather_object`` when available (PyTorch ≥ 1.8).
+    Falls back gracefully when distributed is not initialised.
+    """
+    if _get_world_size() == 1:
+        return [local_obj]
+    gathered = [None] * _get_world_size() if _get_rank() == 0 else None
+    torch.distributed.gather_object(local_obj, gathered, dst=0)
+    return gathered
+
+
+# ---------------------------------------------------------------------------
+# UnifiedKnowledgeProbeCallback
+# ---------------------------------------------------------------------------
+
+class UnifiedKnowledgeProbeCallback(TrainerCallback):
+    """One callback that evaluates *all* domains for a single probe type.
+
+    Segments are distributed across ranks in round-robin fashion so that each
+    rank only runs a subset of the forward passes.  Results are gathered back
+    to rank 0 for logging / reporting.
+    """
+
+    COMBINED_INFERENCE_TYPES = BaseKnowledgeProbeCallBack.COMBINED_INFERENCE_TYPES
+
+    def __init__(
+        self,
+        segments: List[DomainProbeSegment],
+        tokenizer: AutoTokenizer,
+        batch_size: int = 8,
+        logger=None,
+        report_to_wandb: bool = True,
+        sparse_eval: bool = False,
+        eval_every_n_steps: int = 1,
+        wandb_metric_allowlist: Optional[List[str]] = None,
+    ):
+        self.segments = segments
+        self.tokenizer = tokenizer
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.batch_size = batch_size
+        self.logger = logger
+        self.report_to_wandb = report_to_wandb
+        self.sparse_eval = sparse_eval
+        self.eval_every_n_steps = max(1, int(eval_every_n_steps or 1))
+        self.wandb_metric_allowlist = set(wandb_metric_allowlist) if wandb_metric_allowlist else None
+        self.excluded_report_columns = [
+            'section', 'subsection', 'section_text', 'subsection_text',
+            'subsection_text_paraphrased', 'section_text_paraphrased',
+        ]
+
+        # Pre-tokenize each segment
+        for seg in self.segments:
+            self._precompute_segment(seg)
+
+    # -- proxy helpers for WandbSourcePanelsCallback -----------------------
+
+    def get_domain_proxies(self) -> List[_DomainProxy]:
+        return [_DomainProxy(seg) for seg in self.segments]
+
+    # -- distribution helpers -----------------------------------------------
+
+    def _my_segment_indices(self) -> List[int]:
+        rank = _get_rank()
+        world = _get_world_size()
+        if world == 1:
+            return list(range(len(self.segments)))
+        return list(range(rank, len(self.segments), world))
+
+    # -- tokenization -------------------------------------------------------
+
+    def _precompute_segment(self, seg: DomainProbeSegment):
+        print(f"UnifiedKnowledgeProbeCallback: pre-computing tokens for {seg.log_prefix} …")
+        tok = self.tokenizer
+
+        tokenized_probes = tok(seg.probes, padding=False, add_special_tokens=False)
+        context_lengths = torch.tensor([len(ids) for ids in tokenized_probes['input_ids']])
+
+        tokenized_targets = tok(seg.targets, padding=False, add_special_tokens=False)
+        target_lengths = torch.tensor([len(ids) for ids in tokenized_targets['input_ids']])
+
+        tokenized_facts = tok(seg.facts, padding=False, add_special_tokens=False)
+        fact_lengths = torch.tensor([len(ids) for ids in tokenized_facts['input_ids']])
+
+        tokenized_facts_tensor = tok(seg.facts, padding=True, add_special_tokens=False, return_tensors="pt")
+
+        seg.tokenized_facts = tokenized_facts_tensor
+        seg.context_lengths = context_lengths
+        seg.target_lengths = target_lengths
+        seg.fact_lengths = fact_lengths
+
+    # -- core evaluation (single segment) -----------------------------------
+
+    def _evaluate_segment(self, seg: DomainProbeSegment, model, step=None):
+        """Run the knowledge-probe forward passes for one segment. Returns metrics dict."""
+        all_metrics = {'log_prob': [], 'perplexity': [], 'target_rank': []}
+        device = model.device
+        num_facts = len(seg.facts)
+
+        for i in range(0, num_facts, self.batch_size):
+            end_index = i + self.batch_size
+            inputs = {
+                'input_ids': seg.tokenized_facts['input_ids'][i:end_index].to(device),
+                'attention_mask': seg.tokenized_facts['attention_mask'][i:end_index].to(device),
+            }
+            attention_mask = inputs['attention_mask']
+            with torch.no_grad():
+                logits = model(**inputs).logits
+
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = inputs['input_ids'][..., 1:].contiguous()
+            context_lengths = seg.context_lengths[i:end_index].to(device)
+            target_lengths = seg.target_lengths[i:end_index].to(device)
+
+            context_lengths = context_lengths - 1  # account for shift
+
+            log_prob, perplexity = self._calculate_log_probs(
+                shift_logits, shift_labels, context_lengths, target_lengths,
+                seg, batch_start_idx=i, step=step,
+            )
+            all_metrics['log_prob'].append(log_prob)
+            all_metrics['perplexity'].append(perplexity)
+
+            target_rank = self._calculate_target_rank(
+                shift_logits, shift_labels, context_lengths, target_lengths,
+            )
+            all_metrics['target_rank'].append(target_rank)
+
+        return {
+            k: torch.cat(v) if v else None
+            for k, v in all_metrics.items()
+        }
+
+    # -- metric helpers (adapted from BaseKnowledgeProbeCallBack) -----------
+
+    @staticmethod
+    def _get_target_mask(tokenized_full, context_lengths, target_lengths):
+        mask = torch.zeros_like(tokenized_full, dtype=torch.bool)
+        for i in range(tokenized_full.shape[0]):
+            start = int(context_lengths[i].item())
+            end = start + int(target_lengths[i].item())
+            if start < end:
+                mask[i, start:end] = True
+        return mask
+
+    def _calculate_log_probs(self, logits, labels, context_lengths, target_lengths,
+                             seg, batch_start_idx=0, step=None):
+        full_lengths = context_lengths + target_lengths
+        target_mask = self._get_target_mask(labels, context_lengths, target_lengths)
+
+        labels_masked = labels.clone()
+        labels_masked[labels_masked == self.tokenizer.pad_token_id] = -100
+        labels_masked[~target_mask] = -100
+
+        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+        loss_target = loss_fct(logits.permute(0, 2, 1), labels_masked)
+        sum_loss_target = loss_target.sum(dim=1)
+        log_prob = -sum_loss_target
+
+        num_tokens_target = (labels_masked != -100).sum(dim=1).float()
+        mean_nll_target = sum_loss_target / num_tokens_target
+        perplexity = torch.exp(mean_nll_target)
+        return log_prob, perplexity
+
+    @staticmethod
+    def _calculate_target_rank(logits, input_ids, context_lengths, target_lengths):
+        batch_size = logits.shape[0]
+        ranks = []
+        for i in range(batch_size):
+            start = int(context_lengths[i].item())
+            target_length = int(target_lengths[i].item())
+            end = start + target_length
+            if start < 0 or target_length <= 0 or end > logits.shape[1]:
+                ranks.append(torch.tensor(float('nan'), device=logits.device))
+                continue
+            pred_logits = logits[i, start:end, :]
+            actual_tokens = input_ids[i, start:end]
+            valid_mask = (actual_tokens != -100)
+            if pred_logits.shape[0] == 0 or not valid_mask.any():
+                ranks.append(torch.tensor(float('nan'), device=logits.device))
+                continue
+            pred_logits = pred_logits[valid_mask]
+            actual_tokens = actual_tokens[valid_mask]
+            actual_logits = pred_logits.gather(1, actual_tokens.unsqueeze(1))
+            token_ranks = (pred_logits > actual_logits).sum(dim=1).float() + 1.0
+            ranks.append(token_ranks.max())
+        return torch.stack(ranks)
+
+    # -- inference-type metrics ---------------------------------------------
+
+    def _log_inference_type_metrics(self, seg, values, metric_name, log_data):
+        if seg.probes_df is None or 'inference_type' not in seg.probes_df.columns:
+            return
+        if metric_name not in ['log_prob', 'target_rank']:
+            return
+        inference_types = seg.probes_df['inference_type'].unique()
+        combined_inference_indices = []
+        for inference_type in inference_types:
+            type_mask = seg.probes_df['inference_type'] == inference_type
+            type_indices = type_mask[type_mask].index.tolist()
+            if type_indices:
+                type_values = values[type_indices]
+                type_valid = ~torch.isinf(type_values) & ~torch.isnan(type_values)
+                if type_valid.any():
+                    log_data[f"{seg.log_prefix}/{metric_name}_by_type/{inference_type}"] = type_values[type_valid].mean().item()
+                if inference_type in self.COMBINED_INFERENCE_TYPES:
+                    combined_inference_indices.extend(type_indices)
+        if combined_inference_indices:
+            combined_values = values[combined_inference_indices]
+            combined_valid = ~torch.isinf(combined_values) & ~torch.isnan(combined_values)
+            if combined_valid.any():
+                log_data[f"{seg.log_prefix}/{metric_name}_by_type/Inference"] = combined_values[combined_valid].mean().item()
+
+    # -- evaluate, gather, merge, log ---------------------------------------
+
+    def _evaluate_my_segments(self, model, step=None):
+        """Evaluate assigned segments and return {log_prefix: metrics_dict}."""
+        results = {}
+        for idx in self._my_segment_indices():
+            seg = self.segments[idx]
+            metrics = self._evaluate_segment(seg, model, step=step)
+            # Move to CPU for gathering
+            results[seg.log_prefix] = {k: v.cpu() if v is not None else None for k, v in metrics.items()}
+        return results
+
+    def _merge_and_record(self, gathered_list, step, state):
+        """Rank 0: merge gathered dicts into segment histories and log to wandb."""
+        # Build merged dict: log_prefix -> metrics
+        merged = {}
+        for rank_results in gathered_list:
+            if rank_results is None:
+                continue
+            merged.update(rank_results)
+
+        log_data = {}
+        for seg in self.segments:
+            metrics = merged.get(seg.log_prefix)
+            if metrics is None:
+                continue
+            for metric_name, values in metrics.items():
+                if values is None:
+                    continue
+                seg.history[metric_name].append({'step': step, 'values': values.tolist()})
+                should_log = self.wandb_metric_allowlist is None or metric_name in self.wandb_metric_allowlist
+                if should_log:
+                    valid_mask = ~torch.isinf(values) & ~torch.isnan(values)
+                    if valid_mask.any():
+                        log_data[f"{seg.log_prefix}/{metric_name}_avg"] = values[valid_mask].mean().item()
+                    self._log_inference_type_metrics(seg, values, metric_name, log_data)
+            if step == 0:
+                seg.initial_metrics = metrics
+
+        if log_data and self.report_to_wandb and wandb.run:
+            wandb.log(log_data, step=step)
+
+    def _non_rank0_record(self, local_results, step):
+        """Non-rank-0: record into local segment histories for consistency."""
+        for seg in self.segments:
+            metrics = local_results.get(seg.log_prefix)
+            if metrics is None:
+                continue
+            for metric_name, values in metrics.items():
+                if values is None:
+                    continue
+                seg.history[metric_name].append({'step': step, 'values': values.tolist()})
+            if step == 0:
+                seg.initial_metrics = metrics
+
+    # -- TrainerCallback hooks ----------------------------------------------
+
+    def on_train_begin(self, args, state, control, model, **kwargs):
+        print(f"UnifiedKnowledgeProbeCallback: initial eval ({len(self.segments)} segments) …")
+        model.eval()
+        local_results = self._evaluate_my_segments(model, step=0)
+        gathered = _gather_objects(local_results)
+        if _get_rank() == 0:
+            self._merge_and_record(gathered, 0, state)
+            # Generate initial reports
+            for seg in self.segments:
+                self._generate_full_token_analysis_report(seg, model, "initial")
+                self._generate_best_probes_report(seg)
+        else:
+            self._non_rank0_record(local_results, 0)
+        model.train()
+        print(f"UnifiedKnowledgeProbeCallback: initial eval complete.")
+
+    def on_step_end(self, args, state, control, model, **kwargs):
+        if _should_skip_sparse_eval(self, state):
+            return
+        model.eval()
+        step = state.global_step
+        local_results = self._evaluate_my_segments(model, step=step)
+        gathered = _gather_objects(local_results)
+        if _get_rank() == 0:
+            self._merge_and_record(gathered, step, state)
+        else:
+            self._non_rank0_record(local_results, step)
+        model.train()
+
+    def on_train_end(self, args, state, control, model, **kwargs):
+        print(f"UnifiedKnowledgeProbeCallback: final reports …")
+        model.eval()
+        if _get_rank() == 0:
+            for seg in self.segments:
+                self._generate_full_token_analysis_report(seg, model, "final")
+                self._generate_worst_probes_report(seg)
+                self._generate_most_and_least_learned_probes_report(seg)
+        model.train()
+        print(f"UnifiedKnowledgeProbeCallback: done.")
+
+    # -- save_results -------------------------------------------------------
+
+    def save_results(self):
+        for seg in self.segments:
+            os.makedirs(seg.output_dir, exist_ok=True)
+            print(f"UnifiedKnowledgeProbeCallback: saving {seg.log_prefix} → {seg.output_dir}")
+            all_dfs = []
+            for metric_name, history_data in seg.history.items():
+                if not history_data:
+                    continue
+                records = [
+                    {'step': entry['step'], 'probe_index': i, metric_name: value}
+                    for entry in history_data
+                    for i, value in enumerate(entry['values'])
+                ]
+                df = pd.DataFrame(records)
+                if not df.empty:
+                    all_dfs.append(df.set_index(['step', 'probe_index']))
+            if not all_dfs:
+                continue
+            final_df = pd.concat(all_dfs, axis=1).reset_index()
+            output_path = os.path.join(seg.output_dir, f'{seg.log_prefix}_metrics.csv')
+            final_df.to_csv(output_path, index=False)
+            print(f" > Saved {output_path} ({len(final_df)} rows)")
+
+    # -- report generation (per-segment, runs on rank 0) --------------------
+
+    def _generate_full_token_analysis_report(self, seg, model, state_name):
+        print(f"Generating token analysis ({state_name}) for {seg.log_prefix} …")
+        full_analysis = {}
+        device = model.device
+        num_facts = len(seg.facts)
+        for i in range(0, num_facts, self.batch_size):
+            end_index = min(i + self.batch_size, num_facts)
+            inputs = {
+                'input_ids': seg.tokenized_facts['input_ids'][i:end_index].to(device),
+                'attention_mask': seg.tokenized_facts['attention_mask'][i:end_index].to(device),
+            }
+            with torch.no_grad():
+                logits = model(**inputs).logits
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = inputs['input_ids'][..., 1:].contiguous()
+            context_lengths = seg.context_lengths[i:end_index].to(device) - 1
+            target_lengths = seg.target_lengths[i:end_index].to(device)
+            for j in range(shift_logits.shape[0]):
+                probe_idx = i + j
+                probe_analysis = self._get_detailed_token_analysis(
+                    shift_logits[j], shift_labels[j],
+                    context_lengths[j], target_lengths[j],
+                )
+                full_analysis[probe_idx] = probe_analysis
+        output_path = os.path.join(seg.output_dir, f'{seg.log_prefix}_{state_name}_token_analysis.json')
+        with open(output_path, 'w') as f:
+            json.dump(full_analysis, f, indent=2)
+        print(f" > Saved {output_path}")
+
+    def _get_detailed_token_analysis(self, logits, labels, context_length, target_length, top_k=10):
+        analysis_list = []
+        start = context_length.item()
+        end = start + target_length.item()
+        target_token_ids = labels[start:end]
+        target_logits = logits[start:end]
+        for i in range(target_token_ids.shape[0]):
+            actual_token_id = target_token_ids[i].item()
+            if actual_token_id == self.tokenizer.pad_token_id or actual_token_id == -100:
+                continue
+            token_logits = target_logits[i]
+            top_k_probs, top_k_indices = torch.topk(torch.softmax(token_logits, dim=-1), top_k)
+            top_k_tokens = [self.tokenizer.decode(t) for t in top_k_indices]
+            actual_token = self.tokenizer.decode(actual_token_id)
+            sorted_indices = torch.argsort(token_logits, descending=True)
+            rank_tensor = (sorted_indices == actual_token_id).nonzero()
+            rank = rank_tensor.item() + 1 if rank_tensor.numel() > 0 else "Not in vocab"
+            analysis_list.append({
+                'target_token_#': i + 1,
+                'actual_token': actual_token,
+                'rank': rank,
+                'top_k_predictions': [
+                    {'token': top_k_tokens[j], 'prob': round(top_k_probs[j].item(), 4)}
+                    for j in range(top_k)
+                ],
+            })
+        return analysis_list
+
+    @staticmethod
+    def _format_token_analysis_from_json(analysis_data):
+        if not analysis_data:
+            return "  No token analysis available for this probe.\n"
+        report_lines = []
+        for token_data in analysis_data:
+            report_lines.append(f"  - Target Token #{token_data['target_token_#']}: '{token_data['actual_token']}'")
+            report_lines.append(f"    - Rank: {token_data['rank']}")
+            report_lines.append(f"    - Top {len(token_data['top_k_predictions'])} predictions:")
+            for i, pred in enumerate(token_data['top_k_predictions']):
+                report_lines.append(f"      {i+1}. '{pred['token']}' (Prob: {pred['prob']:.4f})")
+        return "\n".join(report_lines)
+
+    def _generate_best_probes_report(self, seg, top_k=10):
+        if not seg.initial_metrics or 'perplexity' not in seg.initial_metrics or seg.initial_metrics['perplexity'] is None:
+            return
+        initial_analysis_path = os.path.join(seg.output_dir, f'{seg.log_prefix}_initial_token_analysis.json')
+        if not os.path.exists(initial_analysis_path):
+            return
+        with open(initial_analysis_path, 'r') as f:
+            initial_analysis_data = json.load(f)
+        initial_perplexities = seg.initial_metrics['perplexity'].clone().cpu()
+        initial_perplexities[torch.isnan(initial_perplexities)] = float('inf')
+        best_indices = torch.argsort(initial_perplexities, descending=False)[:top_k]
+        report_path = os.path.join(seg.output_dir, f'{seg.log_prefix}_best_probes_report.txt')
+        with open(report_path, 'w') as f:
+            f.write(f"Best Probes Report (Top {top_k} by Perplexity) at Step 0\n")
+            f.write("=" * 50 + "\n\n")
+            for i, probe_idx in enumerate(best_indices):
+                idx = probe_idx.item()
+                f.write(f"--- Probe Index: {idx} (Initial Rank: {i+1}) ---\n")
+                if seg.probes_df is not None and idx < len(seg.probes_df):
+                    metadata = seg.probes_df.iloc[idx].to_dict()
+                    for key, val in metadata.items():
+                        if key not in self.excluded_report_columns:
+                            f.write(f"{key}: {val}\n")
+                else:
+                    f.write(f"Fact: {seg.facts[idx]}\n")
+                f.write("\nInitial Metrics:\n")
+                for metric_name, values in seg.initial_metrics.items():
+                    if values is not None:
+                        f.write(f"  {metric_name}: {values[idx]:.4f}\n")
+                f.write("\nDetailed Token-level Analysis:\n")
+                f.write(self._format_token_analysis_from_json(initial_analysis_data.get(str(idx))))
+                f.write("\n" + "=" * 50 + "\n\n")
+
+    def _generate_worst_probes_report(self, seg, top_k=10):
+        if not seg.history['perplexity']:
+            return
+        final_analysis_path = os.path.join(seg.output_dir, f'{seg.log_prefix}_final_token_analysis.json')
+        if not os.path.exists(final_analysis_path):
+            return
+        with open(final_analysis_path, 'r') as f:
+            final_analysis_data = json.load(f)
+        final_metrics = seg.history['perplexity'][-1]
+        final_perplexities = torch.tensor(final_metrics['values'])
+        final_perplexities[torch.isnan(final_perplexities)] = float('inf')
+        worst_indices = torch.argsort(final_perplexities, descending=True)[:top_k]
+        report_path = os.path.join(seg.output_dir, f'{seg.log_prefix}_worst_probes_report.txt')
+        with open(report_path, 'w') as f:
+            f.write(f"Worst Probes Report (Top {top_k} by Perplexity) at Step {final_metrics['step']}\n")
+            f.write("=" * 50 + "\n\n")
+            for i, probe_idx in enumerate(worst_indices):
+                idx = probe_idx.item()
+                f.write(f"--- Probe Index: {idx} (Final Rank: {i+1}) ---\n")
+                if seg.probes_df is not None and idx < len(seg.probes_df):
+                    metadata = seg.probes_df.iloc[idx].to_dict()
+                    for key, val in metadata.items():
+                        if key not in self.excluded_report_columns:
+                            f.write(f"{key}: {val}\n")
+                else:
+                    f.write(f"Fact: {seg.facts[idx]}\n")
+                f.write("\nFinal Metrics:\n")
+                for metric_name, history_data in seg.history.items():
+                    if history_data:
+                        f.write(f"  {metric_name}: {history_data[-1]['values'][idx]:.4f}\n")
+                f.write("\nDetailed Token-level Analysis:\n")
+                f.write(self._format_token_analysis_from_json(final_analysis_data.get(str(idx))))
+                f.write("\n" + "=" * 50 + "\n\n")
+
+    def _generate_most_and_least_learned_probes_report(self, seg, top_k=5):
+        if not seg.initial_metrics or 'perplexity' not in seg.initial_metrics or seg.initial_metrics['perplexity'] is None:
+            return
+        if not seg.history['perplexity'] or len(seg.history['perplexity']) < 1:
+            return
+        initial_analysis_path = os.path.join(seg.output_dir, f'{seg.log_prefix}_initial_token_analysis.json')
+        final_analysis_path = os.path.join(seg.output_dir, f'{seg.log_prefix}_final_token_analysis.json')
+        if not os.path.exists(initial_analysis_path) or not os.path.exists(final_analysis_path):
+            return
+        with open(initial_analysis_path, 'r') as f:
+            initial_analysis_data = json.load(f)
+        with open(final_analysis_path, 'r') as f:
+            final_analysis_data = json.load(f)
+        initial_perplexities = seg.initial_metrics['perplexity'].clone().cpu()
+        final_perplexities = torch.tensor(seg.history['perplexity'][-1]['values'])
+        final_step = seg.history['perplexity'][-1]['step']
+        initial_perplexities[torch.isnan(initial_perplexities)] = float('inf')
+        final_perplexities[torch.isnan(final_perplexities)] = float('inf')
+        initial_ranks = torch.empty_like(initial_perplexities, dtype=torch.long)
+        initial_ranks[torch.argsort(initial_perplexities)] = torch.arange(len(initial_perplexities)) + 1
+        final_ranks = torch.empty_like(final_perplexities, dtype=torch.long)
+        final_ranks[torch.argsort(final_perplexities)] = torch.arange(len(final_perplexities)) + 1
+        perplexity_delta = initial_perplexities - final_perplexities
+        perplexity_delta[torch.isnan(perplexity_delta)] = 0.0
+        most_learned = torch.argsort(perplexity_delta, descending=True)[:top_k]
+        least_learned = torch.argsort(perplexity_delta, descending=False)[:top_k]
+        for indices, report_type in [(most_learned, 'most_learned'), (least_learned, 'least_learned')]:
+            title = "Most Learned" if report_type == 'most_learned' else "Least Learned"
+            report_path = os.path.join(seg.output_dir, f'{seg.log_prefix}_{report_type}_probes_report.txt')
+            with open(report_path, 'w') as f:
+                f.write(f"{title} Probes Report (Top {top_k} by Perplexity Change) at Step {final_step}\n")
+                f.write("=" * 50 + "\n\n")
+                for i, probe_idx in enumerate(indices):
+                    idx = probe_idx.item()
+                    f.write(f"--- Probe Index: {idx} ---\n")
+                    if seg.probes_df is not None and idx < len(seg.probes_df):
+                        metadata = seg.probes_df.iloc[idx].to_dict()
+                        for key, val in metadata.items():
+                            if key not in self.excluded_report_columns:
+                                f.write(f"{key}: {val}\n")
+                    else:
+                        f.write(f"Fact: {seg.facts[idx]}\n")
+                    f.write("\nInitial Metrics:\n")
+                    for mn, vals in seg.initial_metrics.items():
+                        if vals is not None:
+                            v = vals[idx]
+                            if mn == 'perplexity':
+                                f.write(f"  {mn}: {v:.4f} (Rank: {initial_ranks[idx].item()})\n")
+                            else:
+                                f.write(f"  {mn}: {v:.4f}\n")
+                    f.write("\nFinal Metrics:\n")
+                    for mn, hd in seg.history.items():
+                        if hd:
+                            fv = hd[-1]['values'][idx]
+                            if mn == 'perplexity':
+                                f.write(f"  {mn}: {fv:.4f} (Rank: {final_ranks[idx].item()})\n")
+                            else:
+                                f.write(f"  {mn}: {fv:.4f}\n")
+                    f.write("\nDetailed Token-level Analysis (Initial State):\n")
+                    f.write(self._format_token_analysis_from_json(initial_analysis_data.get(str(idx))))
+                    f.write("\nDetailed Token-level Analysis (Final State):\n")
+                    f.write(self._format_token_analysis_from_json(final_analysis_data.get(str(idx))))
+                    f.write("\n" + "=" * 50 + "\n\n")
+
+
+# ---------------------------------------------------------------------------
+# UnifiedMCQAProbeCallback
+# ---------------------------------------------------------------------------
+
+class UnifiedMCQAProbeCallback(TrainerCallback):
+    """One callback that evaluates all domains for a single MCQA probe type."""
+
+    def __init__(
+        self,
+        segments: List[DomainMCQASegment],
+        tokenizer: AutoTokenizer,
+        choice_tokens: List[str],
+        batch_size: int = 32,
+        logger=None,
+        report_to_wandb: bool = True,
+        sparse_eval: bool = False,
+        eval_every_n_steps: int = 1,
+        wandb_metric_allowlist: Optional[List[str]] = None,
+    ):
+        self.segments = segments
+        self.tokenizer = tokenizer
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.choice_tokens = choice_tokens
+        self.batch_size = batch_size
+        self.logger = logger
+        self.report_to_wandb = report_to_wandb
+        self.sparse_eval = sparse_eval
+        self.eval_every_n_steps = max(1, int(eval_every_n_steps or 1))
+        self.wandb_metric_allowlist = set(wandb_metric_allowlist) if wandb_metric_allowlist else None
+
+        # Resolve choice token ids once
+        self.choice_token_ids: List[int] = []
+        for token_str in choice_tokens:
+            ids = tokenizer.encode(token_str, add_special_tokens=False)
+            if len(ids) != 1:
+                raise ValueError(
+                    f"Choice token '{token_str}' encodes to {len(ids)} tokens; each must be a single token."
+                )
+            self.choice_token_ids.append(ids[0])
+
+        self._supports_logits_to_keep = None
+
+        # Pre-tokenize each segment
+        original_padding_side = getattr(tokenizer, "padding_side", "right")
+        tokenizer.padding_side = "left"
+        try:
+            for seg in self.segments:
+                seg.tokenized_mcqa_prompts = tokenizer(
+                    seg.formatted_questions, padding=True, return_tensors="pt",
+                    add_special_tokens=False,
+                )
+        finally:
+            tokenizer.padding_side = original_padding_side
+
+        print(
+            f"UnifiedMCQAProbeCallback: {len(self.segments)} segments, "
+            f"choice tokens {list(zip(choice_tokens, self.choice_token_ids))}"
+        )
+
+    def get_domain_proxies(self) -> List[_DomainProxy]:
+        return [_DomainProxy(seg) for seg in self.segments]
+
+    def _my_segment_indices(self) -> List[int]:
+        rank = _get_rank()
+        world = _get_world_size()
+        if world == 1:
+            return list(range(len(self.segments)))
+        return list(range(rank, len(self.segments), world))
+
+    def _should_log_metric(self, metric_name: str) -> bool:
+        return self.wandb_metric_allowlist is None or metric_name in self.wandb_metric_allowlist
+
+    def _evaluate_segment(self, seg: DomainMCQASegment, model):
+        device = model.device
+        num_prompts = len(seg.formatted_questions)
+        choice_ids = torch.tensor(self.choice_token_ids, device=device)
+
+        all_correct: List[torch.Tensor] = []
+        all_predicted: List[torch.Tensor] = []
+        for i in range(0, num_prompts, self.batch_size):
+            end_idx = min(i + self.batch_size, num_prompts)
+            inputs = {
+                "input_ids": seg.tokenized_mcqa_prompts["input_ids"][i:end_idx].to(device),
+                "attention_mask": seg.tokenized_mcqa_prompts["attention_mask"][i:end_idx].to(device),
+            }
+            forward_kwargs = {}
+            if self._supports_logits_to_keep is not False:
+                forward_kwargs["logits_to_keep"] = 1
+            with torch.inference_mode():
+                try:
+                    logits = model(**inputs, **forward_kwargs).logits
+                    if forward_kwargs:
+                        self._supports_logits_to_keep = True
+                except TypeError as exc:
+                    if "logits_to_keep" not in str(exc):
+                        raise
+                    self._supports_logits_to_keep = False
+                    logits = model(**inputs).logits
+
+            last_logits = logits[:, -1]
+            choice_logits = last_logits[:, choice_ids]
+            predicted_idx = choice_logits.argmax(dim=-1)
+            correct_indices = torch.tensor(
+                seg.correct_choice_indices[i:end_idx], device=device, dtype=torch.long,
+            )
+            all_correct.append((predicted_idx == correct_indices).float())
+            all_predicted.append(predicted_idx)
+
+        if not all_correct:
+            return {"mcqa_accuracy": torch.empty(0), "predicted_idx": torch.empty(0, dtype=torch.long)}
+        return {"mcqa_accuracy": torch.cat(all_correct), "predicted_idx": torch.cat(all_predicted)}
+
+    def _evaluate_my_segments(self, model):
+        results = {}
+        for idx in self._my_segment_indices():
+            seg = self.segments[idx]
+            metrics = self._evaluate_segment(seg, model)
+            results[seg.log_prefix] = {k: v.cpu() for k, v in metrics.items()}
+        return results
+
+    def _merge_and_record(self, gathered_list, step, state):
+        merged = {}
+        for rank_results in gathered_list:
+            if rank_results is None:
+                continue
+            merged.update(rank_results)
+
+        log_data = {}
+        for seg in self.segments:
+            seg_results = merged.get(seg.log_prefix)
+            if seg_results is None:
+                continue
+            predicted = seg_results.pop("predicted_idx", None)
+            if predicted is not None:
+                seg.predictions_history.append({"step": step, "values": predicted.tolist()})
+            for metric_name, values in seg_results.items():
+                seg.history[metric_name].append({'step': step, 'values': values.tolist()})
+                if self._should_log_metric(metric_name):
+                    valid_mask = ~torch.isinf(values) & ~torch.isnan(values)
+                    if valid_mask.any():
+                        log_data[f"{seg.log_prefix}/{metric_name}_avg"] = values[valid_mask].mean().item()
+
+        if log_data and self.report_to_wandb and wandb.run:
+            wandb.log(log_data, step=step)
+
+    def _non_rank0_record(self, local_results, step):
+        for seg in self.segments:
+            seg_results = local_results.get(seg.log_prefix)
+            if seg_results is None:
+                continue
+            predicted = seg_results.pop("predicted_idx", None)
+            if predicted is not None:
+                seg.predictions_history.append({"step": step, "values": predicted.tolist()})
+            for metric_name, values in seg_results.items():
+                seg.history[metric_name].append({'step': step, 'values': values.tolist()})
+
+    def on_train_begin(self, args, state, control, model, **kwargs):
+        print(f"UnifiedMCQAProbeCallback: initial eval ({len(self.segments)} segments) …")
+        model.eval()
+        local_results = self._evaluate_my_segments(model)
+        gathered = _gather_objects(local_results)
+        if _get_rank() == 0:
+            self._merge_and_record(gathered, 0, state)
+        else:
+            self._non_rank0_record(local_results, 0)
+        model.train()
+
+    def on_step_end(self, args, state, control, model, **kwargs):
+        if _should_skip_sparse_eval(self, state):
+            return
+        model.eval()
+        local_results = self._evaluate_my_segments(model)
+        gathered = _gather_objects(local_results)
+        if _get_rank() == 0:
+            self._merge_and_record(gathered, state.global_step, state)
+        else:
+            self._non_rank0_record(local_results, state.global_step)
+        model.train()
+
+    def on_train_end(self, args, state, control, model, **kwargs):
+        if _get_rank() == 0:
+            for seg in self.segments:
+                self._generate_mcqa_report(seg)
+
+    def save_results(self):
+        for seg in self.segments:
+            os.makedirs(seg.output_dir, exist_ok=True)
+            print(f"UnifiedMCQAProbeCallback: saving {seg.log_prefix} → {seg.output_dir}")
+            predictions_by_step = {entry['step']: entry['values'] for entry in seg.predictions_history}
+            records = []
+            for entry in seg.history.get("mcqa_accuracy", []):
+                step = entry['step']
+                preds = predictions_by_step.get(step, [None] * len(entry['values']))
+                for i, value in enumerate(entry['values']):
+                    pred_idx = preds[i] if i < len(preds) else None
+                    pred_label = self.choice_tokens[pred_idx] if pred_idx is not None and 0 <= pred_idx < len(self.choice_tokens) else None
+                    correct_idx = seg.correct_choice_indices[i] if i < len(seg.correct_choice_indices) else None
+                    records.append({
+                        'step': step, 'probe_index': i, 'mcqa_accuracy': value,
+                        'predicted_idx': pred_idx, 'predicted_label': pred_label, 'correct_idx': correct_idx,
+                    })
+            if records:
+                output_path = os.path.join(seg.output_dir, f'{seg.log_prefix}_metrics.csv')
+                pd.DataFrame(records).to_csv(output_path, index=False)
+                print(f" > Saved {output_path} ({len(records)} rows)")
+
+    def _generate_mcqa_report(self, seg):
+        if not seg.history.get("mcqa_accuracy"):
+            return
+        report_path = os.path.join(seg.output_dir, f"{seg.log_prefix}_mcqa_report.txt")
+        final_acc = seg.history["mcqa_accuracy"][-1]
+        initial_acc = seg.history["mcqa_accuracy"][0]
+        num_choices = len(self.choice_token_ids)
+        with open(report_path, "w") as f:
+            f.write(f"MCQA Probe Report - {seg.log_prefix}\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(f"Number of probes : {len(seg.formatted_questions)}\n")
+            f.write(f"Number of choices: {num_choices}\n")
+            f.write(f"Choice tokens    : {self.choice_tokens}\n\n")
+            if initial_acc:
+                init_vals = torch.tensor(initial_acc["values"])
+                f.write(f"Initial accuracy : {init_vals.mean().item():.4f} (step {initial_acc['step']})\n")
+            final_vals = torch.tensor(final_acc["values"])
+            f.write(f"Final accuracy   : {final_vals.mean().item():.4f} (step {final_acc['step']})\n\n")
+            final_preds = None
+            if seg.predictions_history:
+                last_pred = seg.predictions_history[-1]
+                if last_pred["step"] == final_acc["step"]:
+                    final_preds = last_pred["values"]
+            if final_preds is not None:
+                pred_counts = [0] * num_choices
+                for p in final_preds:
+                    if 0 <= p < num_choices:
+                        pred_counts[p] += 1
+                total = max(1, sum(pred_counts))
+                f.write("Predicted-choice distribution (final):\n")
+                for i, tok in enumerate(self.choice_tokens):
+                    f.write(f"  {tok}: {pred_counts[i]:4d} ({100*pred_counts[i]/total:5.1f}%)\n")
+                per_label_total = [0] * num_choices
+                per_label_correct = [0] * num_choices
+                for i, p in enumerate(final_preds):
+                    if i >= len(seg.correct_choice_indices):
+                        break
+                    c = seg.correct_choice_indices[i]
+                    per_label_total[c] += 1
+                    if p == c:
+                        per_label_correct[c] += 1
+                f.write("\nAccuracy by correct label (final):\n")
+                for i, tok in enumerate(self.choice_tokens):
+                    denom = per_label_total[i]
+                    acc = per_label_correct[i] / denom if denom else 0.0
+                    f.write(f"  {tok}: {per_label_correct[i]:3d}/{denom:3d} = {acc:.3f}\n")
+                f.write("\n")
+            wrong_indices = (final_vals == 0).nonzero(as_tuple=True)[0]
+            if wrong_indices.numel() > 0:
+                f.write(f"Incorrectly answered probes ({wrong_indices.numel()}):\n")
+                f.write("-" * 40 + "\n")
+                for idx_t in wrong_indices[:20]:
+                    idx = idx_t.item()
+                    pred_label = ""
+                    if final_preds is not None and idx < len(final_preds):
+                        p = final_preds[idx]
+                        if 0 <= p < num_choices:
+                            pred_label = self.choice_tokens[p]
+                    if seg.probes_df is not None and idx < len(seg.probes_df):
+                        row = seg.probes_df.iloc[idx]
+                        f.write(f"  Probe {idx}: {str(row.get('probe', ''))[:120]}...\n")
+                        f.write(f"    Correct: {row.get('correct_label', '')} | Predicted: ({pred_label})\n\n")
+                    else:
+                        f.write(f"  Probe {idx}: {seg.formatted_questions[idx][:120]}...\n")
+                        f.write(f"    Predicted: ({pred_label})\n\n")
+        print(f" > Saved MCQA report to '{report_path}'")
+
+
+# ---------------------------------------------------------------------------
+# UnifiedCorpusPerplexityCallback
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _CorpusDomainData:
+    log_prefix: str
+    output_dir: str
+    encodings: Any
+    max_length: int
+    stride: int
+    history: list = field(default_factory=list)
+
+
+class UnifiedCorpusPerplexityCallback(TrainerCallback):
+    """One callback that evaluates corpus perplexity for all domains."""
+
+    def __init__(
+        self,
+        domains_data: List[_CorpusDomainData],
+        report_to_wandb: bool = True,
+        sparse_eval: bool = False,
+    ):
+        self.domains_data = domains_data
+        self.report_to_wandb = report_to_wandb
+        self.sparse_eval = sparse_eval
+        print(f"UnifiedCorpusPerplexityCallback: {len(domains_data)} domains")
+
+    def _my_domain_indices(self) -> List[int]:
+        rank = _get_rank()
+        world = _get_world_size()
+        if world == 1:
+            return list(range(len(self.domains_data)))
+        return list(range(rank, len(self.domains_data), world))
+
+    @staticmethod
+    def _evaluate_corpus(dd: '_CorpusDomainData', model) -> dict:
+        device = model.device
+        seq_len = dd.encodings.input_ids.size(1)
+        nll_sum = 0.0
+        n_tokens = 0
+        prev_end_loc = 0
+        for begin_loc in range(0, seq_len, dd.stride):
+            end_loc = min(begin_loc + dd.max_length, seq_len)
+            trg_len = end_loc - prev_end_loc
+            input_ids = dd.encodings.input_ids[:, begin_loc:end_loc].to(device)
+            target_ids = input_ids.clone()
+            target_ids[:, :-trg_len] = -100
+            if torch.all(target_ids == -100):
+                prev_end_loc = end_loc
+                if end_loc == seq_len:
+                    break
+                continue
+            with torch.no_grad():
+                outputs = model(input_ids, labels=target_ids)
+                neg_log_likelihood = outputs.loss
+            num_valid_tokens = (target_ids != -100).sum().item()
+            num_loss_tokens = num_valid_tokens - 1
+            if num_loss_tokens > 0:
+                nll_sum += neg_log_likelihood.item() * num_loss_tokens
+                n_tokens += num_loss_tokens
+            prev_end_loc = end_loc
+            if end_loc == seq_len:
+                break
+        if n_tokens > 0:
+            avg_nll = nll_sum / n_tokens
+            perplexity = math.exp(avg_nll)
+        else:
+            avg_nll = float('inf')
+            perplexity = float('inf')
+        return {"corpus_perplexity": perplexity, "corpus_loss": avg_nll}
+
+    def _evaluate_my_domains(self, model):
+        results = {}
+        for idx in self._my_domain_indices():
+            dd = self.domains_data[idx]
+            results[dd.log_prefix] = self._evaluate_corpus(dd, model)
+        return results
+
+    def _merge_and_record(self, gathered_list, step):
+        merged = {}
+        for rank_results in gathered_list:
+            if rank_results is None:
+                continue
+            merged.update(rank_results)
+        log_data = {}
+        for dd in self.domains_data:
+            metrics = merged.get(dd.log_prefix)
+            if metrics is None:
+                continue
+            dd.history.append({'step': step, **metrics})
+            if self.report_to_wandb and wandb.run:
+                log_data[f"{dd.log_prefix}/perplexity"] = metrics["corpus_perplexity"]
+                log_data[f"{dd.log_prefix}/loss"] = metrics["corpus_loss"]
+        if log_data and wandb.run:
+            wandb.log(log_data, step=step)
+
+    def _non_rank0_record(self, local_results, step):
+        for dd in self.domains_data:
+            metrics = local_results.get(dd.log_prefix)
+            if metrics is None:
+                continue
+            dd.history.append({'step': step, **metrics})
+
+    def on_step_end(self, args, state, control, model, **kwargs):
+        if _should_skip_sparse_eval(self, state):
+            return
+        model.eval()
+        local_results = self._evaluate_my_domains(model)
+        gathered = _gather_objects(local_results)
+        if _get_rank() == 0:
+            self._merge_and_record(gathered, state.global_step)
+        else:
+            self._non_rank0_record(local_results, state.global_step)
+        model.train()
+
+    def save_results(self):
+        for dd in self.domains_data:
+            os.makedirs(dd.output_dir, exist_ok=True)
+            output_path = os.path.join(dd.output_dir, f"{dd.log_prefix}_metrics.csv")
+            df = pd.DataFrame(dd.history)
+            if not df.empty:
+                df.to_csv(output_path, index=False)
+                print(f" > Saved {output_path} ({len(df)} rows)")
+            else:
+                pd.DataFrame(columns=['step', 'corpus_perplexity', 'corpus_loss']).to_csv(output_path, index=False)

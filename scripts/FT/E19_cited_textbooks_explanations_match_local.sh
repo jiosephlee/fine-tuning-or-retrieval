@@ -10,7 +10,7 @@ mkdir -p logs
 
 MODEL_ID="${MODEL_ID:-allenai/OLMo-2-1124-7B}"
 CONDA_ENV="${CONDA_ENV:-openrlhf}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 # In this CPT pipeline, NUM_EPOCHS is used as the target number of
 # knowledge-injection batches when >1. The default 10 is one full
 # source+9-paraphrase cycle, matching E1/E3 compute.
@@ -27,7 +27,7 @@ MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 MCQA_PROBE_BATCH_SIZE="${MCQA_PROBE_BATCH_SIZE:-32}"
 INFERENCE_MCQA_PROBES="${INFERENCE_MCQA_PROBES:-1}"
 INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v12_reviewed v12}"
-INFERENCE_MCQA_PROMPT_COLUMN="${INFERENCE_MCQA_PROMPT_COLUMN:-formatted_question}"
+INFERENCE_MCQA_PROMPT_COLUMN="${INFERENCE_MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 USE_PARCC="${USE_PARCC:-0}"
 SAVE_LOCAL_MODEL="${SAVE_LOCAL_MODEL:-0}"
 SPARSE_CALLBACKS="${SPARSE_CALLBACKS:-0}"

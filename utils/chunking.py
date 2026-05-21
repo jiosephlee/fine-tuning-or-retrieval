@@ -22,6 +22,7 @@ def _is_title_block(text: str) -> bool:
         re.match(r'^\\title\{[^}]+\}', stripped)
         or re.match(r'(?is)^Title\s*:', stripped)
         or re.match(r'(?is)^Case\s+(?:Title|Name)\s*:', stripped)
+        or re.match(r'(?im)^#\s+Cited\s+[^:\n]+:\s*.+$', stripped)
     )
 
 
@@ -39,6 +40,16 @@ def extract_title_prefix(text_content: str) -> str:
         return _format_title_prefix(
             line_match.group(2),
             label=_normalize_title(line_match.group(1)),
+        )
+
+    cited_match = re.search(
+        r'(?im)^\s*#\s+(Cited\s+[^:\n]+?)\s*:\s*(.+?)\s*$',
+        text_content,
+    )
+    if cited_match:
+        return _format_title_prefix(
+            cited_match.group(2),
+            label=_normalize_title(cited_match.group(1)),
         )
     return ""
 
@@ -82,8 +93,12 @@ def chunk_text(text_content: str, tokenizer, max_tokens: int, delimiter: str = "
     title = ""
     if add_title_prefix:
         title = extract_title_prefix(text_content)
-        if not title and log:
-            log.warning("add_title_prefix is True, but no title was found.")
+        if not title:
+            raise ValueError(
+                "add_title_prefix is True but no supported title header found in text. "
+                "Expected one of: \\title{...}, Title: ..., Case Title: ..., Case Name: ... "
+                "Pass add_title_prefix=False for texts without a title header."
+            )
 
     # 2. Split text into parts
     parts = text_content.split(delimiter)

@@ -410,17 +410,9 @@ def validate_selected_mcqa_probe_family(
                 continue
 
             probe_df = pd.read_csv(probe_path)
-            # formatted_question_5shot can be derived on-the-fly from
-            # formatted_question, so don't flag it as missing.
-            effective_columns = set(probe_df.columns)
-            if (
-                "formatted_question" in effective_columns
-                and "formatted_question_5shot" not in effective_columns
-            ):
-                effective_columns.add("formatted_question_5shot")
             missing_columns = [
                 column for column in required_columns
-                if column not in effective_columns
+                if column not in probe_df.columns
             ]
             if missing_columns:
                 malformed.append((str(probe_path), missing_columns))

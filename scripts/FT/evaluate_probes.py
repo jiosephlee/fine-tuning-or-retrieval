@@ -21,7 +21,6 @@ import argparse
 import logging
 import os
 import sys
-import pandas as pd
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -31,14 +30,8 @@ from utils import llm_callbacks
 from utils.experiment_utils import (
     build_probe_segments,
     DEFAULT_MCQA_CHOICE_TOKENS,
-    DEFAULT_MCQA_PROMPT_SUFFIX,
-    _make_mcqa_segment,
-    _safe_metric_tag,
-    _coerce_version_list,
     get_all_domains,
 )
-from utils.mcqa_prompts import build_mcqa_5shot_prompt, MCQA_5SHOT_PROMPT_COLUMN
-from utils import probe_paths
 
 
 def parse_args():
@@ -150,11 +143,6 @@ def main():
     if not args.inference_probes:
         args.disable_inference_probes = True
 
-    # Disable inference MCQA in build_probe_segments — we handle it ourselves
-    # to support on-the-fly 5shot prompt generation.
-    orig_inference_mcqa = args.inference_mcqa_probes
-    args.inference_mcqa_probes = False
-
     domains = args.override_domains or get_all_domains()
     log.info(f"Domains: {domains}")
 
@@ -167,57 +155,6 @@ def main():
         is_lima=False,
         tokenizer=None,  # skip corpus perplexity
     )
-
-    # ---- Build inference MCQA segments with 5shot support -----------------
-    args.inference_mcqa_probes = orig_inference_mcqa
-    if args.inference_mcqa_probes:
-        inference_mcqa_prompt_column = args.inference_mcqa_prompt_column
-        inference_mcqa_probes_versions = _coerce_version_list(args.inference_mcqa_probes_version)
-        domain_sources = getattr(args, "domain_data_sources", {}) or {}
-        use_version_tags = len(inference_mcqa_probes_versions) > 1
-        for domain in domains:
-            domain_source = domain_sources.get(domain)
-            for inf_mcqa_ver in inference_mcqa_probes_versions:
-                version_tag = _safe_metric_tag(inf_mcqa_ver)
-                inf_mcqa_path = str(
-                    probe_paths.resolve_mcqa_probe_path(
-                        "inference", domain, inf_mcqa_ver, domain_source=domain_source
-                    )
-                )
-                if not os.path.exists(inf_mcqa_path):
-                    log.warning(
-                        f"Inference MCQA probe not found for {domain} ({inf_mcqa_ver}): {inf_mcqa_path}"
-                    )
-                    continue
-                inf_mcqa_df = pd.read_csv(inf_mcqa_path)
-                # Build 5shot column on the fly if needed
-                if (
-                    inference_mcqa_prompt_column == MCQA_5SHOT_PROMPT_COLUMN
-                    and MCQA_5SHOT_PROMPT_COLUMN not in inf_mcqa_df.columns
-                ):
-                    log.info(
-                        f"Building {MCQA_5SHOT_PROMPT_COLUMN} on-the-fly for {domain} ({inf_mcqa_ver})"
-                    )
-                    inf_mcqa_df[MCQA_5SHOT_PROMPT_COLUMN] = inf_mcqa_df["formatted_question"].apply(
-                        build_mcqa_5shot_prompt
-                    )
-                output_dir_name = f"{domain}_inference_mcqa_probe"
-                lp = f"{domain}_inference_mcqa_probe"
-                pmn = "inference_mcqa_accuracy"
-                if use_version_tags:
-                    output_dir_name += f"_{version_tag}"
-                    lp += f"_{version_tag}"
-                    pmn += f"_{version_tag}"
-                odir = os.path.join(reeval_dir, output_dir_name)
-                os.makedirs(odir, exist_ok=True)
-                seg_data["inference_mcqa_segments"].append(
-                    _make_mcqa_segment(
-                        inf_mcqa_df, lp, odir,
-                        prompt_column=inference_mcqa_prompt_column,
-                        panel_domain=domain, panel_metric_name=pmn,
-                    )
-                )
-                log.info(f"Loaded {len(inf_mcqa_df)} inference MCQA probes ({inf_mcqa_ver}) for {domain}")
 
     # ---- Evaluate knowledge probes ----------------------------------------
     if args.knowledge_probes and seg_data["knowledge_segments"]:

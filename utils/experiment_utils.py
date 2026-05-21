@@ -5,7 +5,7 @@ from typing import Dict, List
 from utils import llm_callbacks
 from utils import llm_configs
 from utils import probe_paths
-from utils.mcqa_prompts import build_mcqa_5shot_prompt, MCQA_5SHOT_PROMPT_COLUMN
+
 
 
 def get_all_domains(facts_root: str | None = None) -> List[str]:
@@ -180,19 +180,10 @@ def _make_mcqa_segment(
 ):
     """Build a DomainMCQASegment from a DataFrame (no tokenizer needed yet)."""
     if prompt_column not in mcqa_df.columns:
-        if (
-            prompt_column == MCQA_5SHOT_PROMPT_COLUMN
-            and "formatted_question" in mcqa_df.columns
-        ):
-            mcqa_df = mcqa_df.copy()
-            mcqa_df[MCQA_5SHOT_PROMPT_COLUMN] = mcqa_df["formatted_question"].apply(
-                build_mcqa_5shot_prompt
-            )
-        else:
-            raise ValueError(
-                f"MCQA prompt column '{prompt_column}' not found. "
-                f"Available columns: {list(mcqa_df.columns)}"
-            )
+        raise ValueError(
+            f"MCQA prompt column '{prompt_column}' not found. "
+            f"Available columns: {list(mcqa_df.columns)}"
+        )
     formatted_questions = [
         str(row[prompt_column]).strip() + prompt_suffix
         for _, row in mcqa_df.iterrows()

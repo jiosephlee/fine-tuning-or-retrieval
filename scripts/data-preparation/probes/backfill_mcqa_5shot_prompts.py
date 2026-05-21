@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backfill fixed 5-shot MCQA prompt columns into v14 probe CSVs."""
+"""Backfill fixed 5-shot MCQA prompt columns into MCQA probe CSVs."""
 
 from __future__ import annotations
 
@@ -20,19 +20,27 @@ from utils.mcqa_prompts import (  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Add formatted_question_5shot to probes_v14_mcqa.csv files."
+        description="Add formatted_question_5shot to MCQA probe CSVs."
     )
     parser.add_argument(
         "--root",
         type=Path,
         default=PROJECT_ROOT / "probes",
-        help="Probe root containing <source>/<document>/facts/probes_v14_mcqa.csv files.",
+        help="Probe root containing <source>/<document>/<kind>/probes_*_mcqa.csv files.",
     )
     parser.add_argument(
         "--version",
         type=str,
-        default="v14",
-        help="Probe version to backfill.",
+        nargs="+",
+        default=["v14"],
+        help="Probe version(s) to backfill (e.g. v14 v12 v12_reviewed).",
+    )
+    parser.add_argument(
+        "--probe-kind",
+        type=str,
+        nargs="+",
+        default=["facts"],
+        help="Probe kind subdirectories to search (e.g. facts inference).",
     )
     parser.add_argument(
         "--dry-run",
@@ -42,8 +50,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def iter_mcqa_csvs(root: Path, version: str) -> list[Path]:
-    return sorted(root.glob(f"*/*/facts/probes_{version}_mcqa.csv"))
+def iter_mcqa_csvs(root: Path, versions: list[str], probe_kinds: list[str]) -> list[Path]:
+    paths = []
+    for kind in probe_kinds:
+        for version in versions:
+            paths.extend(root.glob(f"*/*/{kind}/probes_{version}_mcqa.csv"))
+    return sorted(set(paths))
 
 
 def backfill_csv(path: Path, dry_run: bool) -> tuple[int, bool]:
@@ -79,9 +91,12 @@ def main() -> None:
     args = parse_args()
     validate_mcqa_5shot_demonstrations()
 
-    paths = iter_mcqa_csvs(args.root, args.version)
+    paths = iter_mcqa_csvs(args.root, args.version, args.probe_kind)
     if not paths:
-        raise SystemExit(f"No probes_{args.version}_mcqa.csv files found under {args.root}")
+        raise SystemExit(
+            f"No MCQA probe files found under {args.root} "
+            f"for versions={args.version}, kinds={args.probe_kind}"
+        )
 
     total_rows = 0
     changed_files = 0
