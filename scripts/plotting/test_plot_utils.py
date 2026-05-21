@@ -1,5 +1,6 @@
 import os
 
+from scripts.plotting.plot_inference_mcqa_scaling import reeval_mcqa_run_path
 from scripts.plotting.plot_utils import find_latest_run, load_metrics
 
 
@@ -231,3 +232,14 @@ def test_load_metrics_inference_mcqa_mixed_reviewed_root_uses_explicit_variants(
 
     assert regular["mcqa_accuracy"].tolist() == [0.0, 0.25]
     assert reviewed["mcqa_accuracy"].tolist() == [0.75, 1.0]
+
+
+def test_reeval_mcqa_run_path_switches_inference_only(tmp_path):
+    leaf = tmp_path / "overlap_1_16" / "E8_paraphrase_all_domains"
+    reeval = leaf / "reeval"
+    _classic_probe(leaf, probe_type="inference", value=-2.0)
+    _mcqa_probe(reeval, probe_type="inference", value=0.75)
+
+    assert reeval_mcqa_run_path(str(leaf), "13b", "inference") == str(reeval)
+    assert reeval_mcqa_run_path(str(leaf), "7b", "inference") == str(reeval)
+    assert reeval_mcqa_run_path(str(leaf), "13b", "knowledge") == str(leaf)

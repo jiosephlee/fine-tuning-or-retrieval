@@ -19,7 +19,9 @@ from scripts.plotting.plot_inference_mcqa_scaling import (  # noqa: E402
     MODEL_LABELS,
     apply_plot_style,
     final_value,
+    mcqa_run_path_for_variant,
     regular_mcqa_run_path,
+    reeval_mcqa_run_path,
     run_path_for_variant,
     save_figure,
 )
@@ -37,10 +39,10 @@ PROBE_TYPES = (
     ("knowledge", "Factual Probes"),
 )
 PANELS = (
-    ("inference", "log_prob", "Inference Log Prob", "Final Log Prob"),
-    ("inference", "mcqa_accuracy", "Inference MCQA", "Final MCQA Accuracy"),
-    ("knowledge", "log_prob", "Factual Log Prob", "Final Log Prob"),
-    ("knowledge", "mcqa_accuracy", "Factual MCQA", "Final MCQA Accuracy"),
+    ("knowledge", "log_prob", "Factual Probes", "Final Log Prob"),
+    ("knowledge", "mcqa_accuracy", "Factual MCQA", "Final Accuracy"),
+    ("inference", "log_prob", "Inference Probes", "Final Log Prob"),
+    ("inference", "mcqa_accuracy", "Inference MCQA", "Final Accuracy"),
 )
 METHOD_COLORS = {
     "source_only": COLORS["method"]["source"],
@@ -101,10 +103,12 @@ def has_reviewed_mcqa_folder(run_path: str, probe_type: str) -> bool:
 
 def load_probe_pair(
     run_path: str,
+    model: str,
     probe_type: str,
     domains: Sequence[str],
     mcqa_variant: str,
     reviewed_fallback: str,
+    use_reeval: bool = True,
 ):
     classic = load_metrics(
         run_path,
@@ -115,17 +119,29 @@ def load_probe_pair(
         probe_family="classic",
     )
     actual_variant = mcqa_variant
-    if mcqa_variant == "reviewed" and not has_reviewed_mcqa_folder(run_path, probe_type):
+    mcqa_run_path = mcqa_run_path_for_variant(
+        run_path,
+        model,
+        probe_type,
+        mcqa_variant,
+        use_reeval=use_reeval,
+    )
+    if mcqa_variant == "reviewed" and not has_reviewed_mcqa_folder(mcqa_run_path, probe_type):
         if reviewed_fallback == "regular":
             actual_variant = "regular"
-            run_path = regular_mcqa_run_path(run_path)
+            regular_run_path = regular_mcqa_run_path(run_path)
+            mcqa_run_path = reeval_mcqa_run_path(
+                regular_run_path,
+                model,
+                probe_type,
+            ) if use_reeval else regular_run_path
         elif reviewed_fallback == "drop":
-            return classic, None, "dropped"
+            return classic, None, "dropped", mcqa_run_path
         else:
             raise FileNotFoundError(f"No reviewed {probe_type} MCQA folders found under {run_path}")
 
     mcqa = load_metrics(
-        run_path,
+        mcqa_run_path,
         probe_type,
         domains,
         str(REPO_ROOT),
@@ -135,9 +151,14 @@ def load_probe_pair(
     )
     if mcqa is None and actual_variant == "reviewed":
         if reviewed_fallback == "regular":
-            run_path = regular_mcqa_run_path(run_path)
+            regular_run_path = regular_mcqa_run_path(run_path)
+            mcqa_run_path = reeval_mcqa_run_path(
+                regular_run_path,
+                model,
+                probe_type,
+            ) if use_reeval else regular_run_path
             mcqa = load_metrics(
-                run_path,
+                mcqa_run_path,
                 probe_type,
                 domains,
                 str(REPO_ROOT),
@@ -150,29 +171,33 @@ def load_probe_pair(
             actual_variant = "dropped"
         else:
             raise FileNotFoundError(f"No reviewed {probe_type} MCQA metrics found under {run_path}")
-    return classic, mcqa, actual_variant
+    return classic, mcqa, actual_variant, mcqa_run_path
 
 
 def load_configured_values(
     domains: Sequence[str],
     mcqa_variant: str,
     reviewed_fallback: str,
+    use_reeval: bool = True,
 ):
     values: Dict[Tuple[str, str, str], dict] = {}
     for method, model, run_path in iter_run_items(mcqa_variant):
         for probe_type, _ in PROBE_TYPES:
-            classic, mcqa, actual_variant = load_probe_pair(
+            classic, mcqa, actual_variant, mcqa_run_path = load_probe_pair(
                 run_path,
+                model,
                 probe_type,
                 domains,
                 mcqa_variant=mcqa_variant,
                 reviewed_fallback=reviewed_fallback,
+                use_reeval=use_reeval,
             )
             values[(probe_type, method, model)] = {
                 "log_prob": final_value(classic, "log_prob"),
                 "mcqa_accuracy": final_value(mcqa, "mcqa_accuracy"),
                 "mcqa_variant": actual_variant,
                 "run_path": find_latest_run(run_path),
+                "mcqa_run_path": find_latest_run(mcqa_run_path),
             }
     return values
 
@@ -218,18 +243,15 @@ def plot_probe_scaling(values, output: str):
         Line2D([0], [0], color=METHOD_COLORS[method], linewidth=2, marker="o", label=METHOD_LABELS[method])
         for method in METHODS
     ]
-    metric_handles = [
-        Line2D([0], [0], color="black", linewidth=2, linestyle="-", label="Log Prob"),
-        Line2D([0], [0], color="black", linewidth=2, linestyle="--", label="MCQA Accuracy"),
-    ]
-    fig.legend(
-        handles=method_handles + metric_handles,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 1.03),
-        ncol=5,
-        frameon=False,
+    axes[1].legend(
+        handles=method_handles,
+        loc="lower right",
+        frameon=True,
+        framealpha=0.9,
+        borderpad=0.4,
+        handlelength=1.8,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.tight_layout()
     save_figure(fig, output)
 
 
@@ -247,6 +269,11 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     )
     parser.add_argument("--output", default="plots/probe_scaling_by_model")
     parser.add_argument("--domains", nargs="+")
+    parser.add_argument(
+        "--no_reeval",
+        action="store_true",
+        help="Use canonical run metrics instead of nearby final-model re-eval metrics.",
+    )
     return parser.parse_args(argv)
 
 
@@ -262,6 +289,7 @@ def main(argv: Optional[Sequence[str]] = None):
         domains,
         mcqa_variant=args.mcqa_variant,
         reviewed_fallback=args.reviewed_fallback,
+        use_reeval=not args.no_reeval,
     )
 
     missing = [

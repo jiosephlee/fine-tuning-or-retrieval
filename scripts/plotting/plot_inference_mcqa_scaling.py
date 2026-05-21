@@ -26,7 +26,7 @@ from scripts.plotting.plot_utils import (  # noqa: E402
 METHODS = ("source_only", "para9", "with_explanations")
 METHOD_LABELS = {
     "source_only": "Source Only",
-    "para9": "Para 9",
+    "para9": "Paraphrased",
     "with_explanations": "With Explanations",
 }
 MODEL_LABELS = {
@@ -75,6 +75,24 @@ def run_path_for_variant(path: str, mcqa_variant: str) -> str:
     return path
 
 
+def reeval_mcqa_run_path(
+    run_path: str,
+    model: Optional[str],
+    probe_type: str = "inference",
+) -> str:
+    """Use final-model re-evaluation outputs for inference MCQA when present."""
+    del model
+    if probe_type != "inference":
+        return run_path
+    resolved = find_latest_run(run_path)
+    if not resolved:
+        return run_path
+    reeval_path = os.path.join(resolved, "reeval")
+    if find_latest_run(reeval_path):
+        return reeval_path
+    return run_path
+
+
 def iter_run_items(mcqa_variant: str = "preferred") -> Iterable[Tuple[str, str, str]]:
     for method in METHODS:
         for model in MODEL_LABELS:
@@ -117,23 +135,55 @@ def _has_reviewed_mcqa(run_path: str) -> bool:
     )
 
 
+def mcqa_run_path_for_variant(
+    run_path: str,
+    model: Optional[str],
+    probe_type: str,
+    mcqa_variant: str,
+    use_reeval: bool = True,
+) -> str:
+    mcqa_run_path = reeval_mcqa_run_path(run_path, model, probe_type) if use_reeval else run_path
+    if (
+        mcqa_variant in {"reviewed", "preferred"}
+        and mcqa_run_path != run_path
+        and not _has_reviewed_mcqa(mcqa_run_path)
+        and _has_reviewed_mcqa(run_path)
+    ):
+        return run_path
+    return mcqa_run_path
+
+
 def _load_mcqa(
     run_path: str,
     domains: Sequence[str],
     mcqa_variant: str,
     reviewed_fallback: str,
+    model: Optional[str] = None,
+    use_reeval: bool = True,
 ):
-    if mcqa_variant == "reviewed" and not _has_reviewed_mcqa(run_path):
+    mcqa_run_path = mcqa_run_path_for_variant(
+        run_path,
+        model,
+        "inference",
+        mcqa_variant,
+        use_reeval=use_reeval,
+    )
+    if mcqa_variant == "reviewed" and not _has_reviewed_mcqa(mcqa_run_path):
         if reviewed_fallback == "regular":
             mcqa_variant = "regular"
-            run_path = regular_mcqa_run_path(run_path)
+            regular_run_path = regular_mcqa_run_path(run_path)
+            mcqa_run_path = reeval_mcqa_run_path(
+                regular_run_path,
+                model,
+                "inference",
+            ) if use_reeval else regular_run_path
         elif reviewed_fallback == "drop":
-            return None, "dropped"
+            return None, "dropped", mcqa_run_path
         else:
             raise FileNotFoundError(f"No reviewed MCQA folders found under {run_path}")
 
     df = load_metrics(
-        run_path,
+        mcqa_run_path,
         "inference",
         domains,
         str(REPO_ROOT),
@@ -142,20 +192,25 @@ def _load_mcqa(
         mcqa_variant=mcqa_variant,
     )
     if df is not None or mcqa_variant != "reviewed":
-        return df, mcqa_variant
+        return df, mcqa_variant, mcqa_run_path
     if reviewed_fallback == "regular":
-        run_path = regular_mcqa_run_path(run_path)
+        regular_run_path = regular_mcqa_run_path(run_path)
+        mcqa_run_path = reeval_mcqa_run_path(
+            regular_run_path,
+            model,
+            "inference",
+        ) if use_reeval else regular_run_path
         return load_metrics(
-            run_path,
+            mcqa_run_path,
             "inference",
             domains,
             str(REPO_ROOT),
             metrics=("mcqa_accuracy",),
             probe_family="mcqa",
             mcqa_variant="regular",
-        ), "regular"
+        ), "regular", mcqa_run_path
     if reviewed_fallback == "drop":
-        return None, "dropped"
+        return None, "dropped", mcqa_run_path
     raise FileNotFoundError(f"No reviewed MCQA metrics found under {run_path}")
 
 
@@ -163,6 +218,7 @@ def load_configured_series(
     domains: Sequence[str],
     mcqa_variant: str = "regular",
     reviewed_fallback: str = "regular",
+    use_reeval: bool = True,
 ):
     series = {}
     for method, model, run_path in iter_run_items(mcqa_variant):
@@ -174,17 +230,20 @@ def load_configured_series(
             metrics=("log_prob",),
             probe_family="classic",
         )
-        mcqa, actual_variant = _load_mcqa(
+        mcqa, actual_variant, mcqa_run_path = _load_mcqa(
             run_path,
             domains,
             mcqa_variant=mcqa_variant,
             reviewed_fallback=reviewed_fallback,
+            model=model,
+            use_reeval=use_reeval,
         )
         series[(method, model)] = {
             "classic": classic,
             "mcqa": mcqa,
             "mcqa_variant": actual_variant,
             "run_path": find_latest_run(run_path),
+            "mcqa_run_path": find_latest_run(mcqa_run_path),
         }
     return series
 
@@ -388,6 +447,11 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         choices=("trajectory", "final_value_only"),
         default="trajectory",
     )
+    parser.add_argument(
+        "--no_reeval",
+        action="store_true",
+        help="Use canonical run metrics instead of nearby final-model re-eval metrics.",
+    )
     return parser.parse_args(argv)
 
 
@@ -403,6 +467,7 @@ def main(argv: Optional[Sequence[str]] = None):
         domains,
         mcqa_variant=args.mcqa_variant,
         reviewed_fallback=args.reviewed_fallback,
+        use_reeval=not args.no_reeval,
     )
 
     missing = [
