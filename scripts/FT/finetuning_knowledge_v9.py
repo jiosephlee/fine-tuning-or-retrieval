@@ -1282,11 +1282,12 @@ if __name__ == "__main__":
         "--document_match_insert_content",
         type=str,
         default="document",
-        choices=["document", "cited_works", "prior_knowledge"],
+        choices=["document", "cited_works", "prior_knowledge", "textbooks", "blogs", "stackexchange"],
         help=(
             "Content inserted into the matched auxiliary track: 'document' cycles the current "
-            "source/paraphrase chunks, 'cited_works' cycles cited_textbooks, and "
-            "'prior_knowledge' cycles prior_knowledge chapters."
+            "source/paraphrase chunks, 'cited_works' cycles cited_textbooks, "
+            "'prior_knowledge' cycles prior_knowledge chapters, and "
+            "'textbooks'/'blogs'/'stackexchange' cycle the corresponding explanation subfolder."
         ),
     )
     parser.add_argument("--raw", action="store_true", help="Use raw texts instead of cleaned/semi-cleaned corpora.")

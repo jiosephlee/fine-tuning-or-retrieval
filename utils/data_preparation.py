@@ -386,9 +386,10 @@ def prepare_training_mix(
     document_match_insert_content = strategy_args.get("document_match_insert_content", "document")
     if isinstance(document_match_specific_explanation, list) and len(document_match_specific_explanation) == 1:
         document_match_specific_explanation = document_match_specific_explanation[0]
-    if document_match_insert_content not in {"document", "cited_works", "prior_knowledge"}:
+    if document_match_insert_content not in {"document", "cited_works", "prior_knowledge", "textbooks", "blogs", "stackexchange"}:
         raise ValueError(
-            "--document_match_insert_content must be one of: document, cited_works, prior_knowledge; "
+            "--document_match_insert_content must be one of: document, cited_works, prior_knowledge, "
+            "textbooks, blogs, stackexchange; "
             f"got {document_match_insert_content!r}"
         )
 
@@ -702,6 +703,9 @@ def prepare_training_mix(
             insert_type = {
                 "cited_works": "cited_textbooks",
                 "prior_knowledge": "prior_knowledge",
+                "textbooks": "textbooks",
+                "blogs": "blogs",
+                "stackexchange": "stackexchange",
             }[document_match_insert_content]
             subfolder_path, files = _resolve_explanation_subfolder(insert_type)
             if subfolder_path is None or not files:

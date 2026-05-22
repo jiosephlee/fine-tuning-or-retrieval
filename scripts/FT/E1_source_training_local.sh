@@ -20,7 +20,7 @@ conda run --no-capture-output -n openrlhf torchrun --standalone --nproc_per_node
     --learning_rate 4e-5 \
     --num_paraphrased_texts 0 \
     --overlap_sections \
-    --overlap_ratio 1_8 \
+    --overlap_ratio 1_16 \
     --device_batch_size 8 \
     --effective_batch_size_for_cpt 256 \
     --context_length_for_cpt 4096 \
