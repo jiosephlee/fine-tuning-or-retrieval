@@ -7,13 +7,13 @@ mkdir -p logs
 
 MODEL_ID="${MODEL_ID:-allenai/OLMo-2-1124-7B}"
 CONDA_ENV="${CONDA_ENV:-openrlhf}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 # In this CPT pipeline, NUM_EPOCHS is used as the target number of
 # knowledge-injection batches when >1. The default 10 is one full
 # source+9-paraphrase cycle, matching E1/E3 compute.
 NUM_EPOCHS="${NUM_EPOCHS:-100}"
 NUM_PARAPHRASED="${NUM_PARAPHRASED:-9}"
-DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-32}"
+DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-8}"
 EFFECTIVE_BATCH_SIZE="${EFFECTIVE_BATCH_SIZE:-256}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
