@@ -6,6 +6,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from matplotlib.lines import Line2D
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -49,6 +50,11 @@ METHOD_COLORS = {
     "para9": COLORS["paraphrase_level"]["para9"],
     "with_explanations": COLORS["method"]["aux_views"],
 }
+V13_LEGAL_INFERENCE_MCQA_TAG = (
+    "probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_"
+    "inf_mcqa_v13_legal"
+)
+INFERENCE_MCQA_REEVAL_CHOICES = ("v13_legal", "v13_mixed")
 
 
 def _abs_path(path: str) -> str:
@@ -62,6 +68,54 @@ def iter_run_items(mcqa_variant: str = "preferred") -> Iterable[Tuple[str, str, 
     for method in METHODS:
         for model in MODEL_LABELS:
             yield method, model, _abs_path(run_path_for_variant(DEFAULT_RUNS[method][model], mcqa_variant))
+
+
+def inference_mcqa_reeval_run_path(run_path: str, inference_mcqa_reeval: Optional[str]) -> str:
+    if inference_mcqa_reeval is None:
+        return run_path
+    if inference_mcqa_reeval == "v13_mixed":
+        return run_path
+    if inference_mcqa_reeval != "v13_legal":
+        raise ValueError(f"Unsupported inference MCQA reeval: {inference_mcqa_reeval}")
+
+    parts = Path(run_path).parts
+    mapped_parts = []
+    replaced = False
+    for part in parts:
+        if part.startswith("probes_v13_") and ("inf_mcqa_v12" in part or "inf_mcqa_v13" in part):
+            mapped_parts.append(V13_LEGAL_INFERENCE_MCQA_TAG)
+            replaced = True
+        else:
+            mapped_parts.append(part)
+    if not replaced:
+        raise ValueError(f"Could not map run path to v13 legal inference MCQA reeval: {run_path}")
+    return str(Path(*mapped_parts))
+
+
+def legal_domains_for(domains: Sequence[str]) -> List[str]:
+    legal_root = REPO_ROOT / "probes" / "legal"
+    legal_domains = {path.name for path in legal_root.iterdir() if path.is_dir()} if legal_root.is_dir() else set()
+    return [domain for domain in domains if domain in legal_domains]
+
+
+def aggregate_metric_frames(frames: Sequence[pd.DataFrame], metrics: Sequence[str]) -> Optional[pd.DataFrame]:
+    present = [df for df in frames if df is not None and not df.empty]
+    if not present:
+        return None
+    combined = pd.concat(present, ignore_index=True)
+    available_metrics = [metric for metric in metrics if metric in combined.columns]
+    if not available_metrics or "step" not in combined.columns:
+        return None
+    combined = combined.copy()
+    for metric in available_metrics:
+        combined[metric] = pd.to_numeric(combined[metric], errors="coerce")
+    combined.dropna(subset=available_metrics, how="all", inplace=True)
+    if combined.empty:
+        return None
+    aggregated = combined.groupby("step")[available_metrics].mean().reset_index()
+    aggregated["step"] = aggregated["step"].astype(int)
+    aggregated.sort_values("step", inplace=True)
+    return aggregated
 
 
 def discover_domains_from_runs(run_paths: Sequence[str]) -> List[str]:
@@ -109,6 +163,7 @@ def load_probe_pair(
     mcqa_variant: str,
     reviewed_fallback: str,
     use_reeval: bool = True,
+    inference_mcqa_reeval: Optional[str] = None,
 ):
     classic = load_metrics(
         run_path,
@@ -119,8 +174,13 @@ def load_probe_pair(
         probe_family="classic",
     )
     actual_variant = mcqa_variant
+    mcqa_base_run_path = (
+        inference_mcqa_reeval_run_path(run_path, inference_mcqa_reeval)
+        if probe_type == "inference"
+        else run_path
+    )
     mcqa_run_path = mcqa_run_path_for_variant(
-        run_path,
+        mcqa_base_run_path,
         model,
         probe_type,
         mcqa_variant,
@@ -129,7 +189,7 @@ def load_probe_pair(
     if mcqa_variant == "reviewed" and not has_reviewed_mcqa_folder(mcqa_run_path, probe_type):
         if reviewed_fallback == "regular":
             actual_variant = "regular"
-            regular_run_path = regular_mcqa_run_path(run_path)
+            regular_run_path = regular_mcqa_run_path(mcqa_base_run_path)
             mcqa_run_path = reeval_mcqa_run_path(
                 regular_run_path,
                 model,
@@ -149,9 +209,21 @@ def load_probe_pair(
         probe_family="mcqa",
         mcqa_variant=actual_variant,
     )
+    if mcqa is None and mcqa_run_path != mcqa_base_run_path:
+        fallback_mcqa = load_metrics(
+            mcqa_base_run_path,
+            probe_type,
+            domains,
+            str(REPO_ROOT),
+            metrics=("mcqa_accuracy",),
+            probe_family="mcqa",
+            mcqa_variant=actual_variant,
+        )
+        if fallback_mcqa is not None:
+            return classic, fallback_mcqa, actual_variant, mcqa_base_run_path
     if mcqa is None and actual_variant == "reviewed":
         if reviewed_fallback == "regular":
-            regular_run_path = regular_mcqa_run_path(run_path)
+            regular_run_path = regular_mcqa_run_path(mcqa_base_run_path)
             mcqa_run_path = reeval_mcqa_run_path(
                 regular_run_path,
                 model,
@@ -174,30 +246,115 @@ def load_probe_pair(
     return classic, mcqa, actual_variant, mcqa_run_path
 
 
+def load_mixed_v13_inference_mcqa(
+    run_path: str,
+    model: str,
+    domains: Sequence[str],
+    mcqa_variant: str,
+    use_reeval: bool,
+):
+    legal_domains = legal_domains_for(domains)
+    generic_domains = [domain for domain in domains if domain not in set(legal_domains)]
+    frames = []
+    paths = []
+
+    if generic_domains:
+        generic_path = mcqa_run_path_for_variant(
+            run_path,
+            model,
+            "inference",
+            mcqa_variant,
+            use_reeval=use_reeval,
+        )
+        generic = load_metrics(
+            generic_path,
+            "inference",
+            generic_domains,
+            str(REPO_ROOT),
+            metrics=("mcqa_accuracy",),
+            aggregate=False,
+            probe_family="mcqa",
+            mcqa_variant=mcqa_variant,
+        )
+        if generic is not None:
+            frames.append(generic)
+            paths.append(find_latest_run(generic_path))
+
+    if legal_domains:
+        legal_base_path = inference_mcqa_reeval_run_path(run_path, "v13_legal")
+        legal_path = mcqa_run_path_for_variant(
+            legal_base_path,
+            model,
+            "inference",
+            mcqa_variant,
+            use_reeval=use_reeval,
+        )
+        legal = load_metrics(
+            legal_path,
+            "inference",
+            legal_domains,
+            str(REPO_ROOT),
+            metrics=("mcqa_accuracy",),
+            aggregate=False,
+            probe_family="mcqa",
+            mcqa_variant=mcqa_variant,
+        )
+        if legal is not None:
+            frames.append(legal)
+            paths.append(find_latest_run(legal_path))
+
+    return aggregate_metric_frames(frames, ("mcqa_accuracy",)), paths
+
+
 def load_configured_values(
     domains: Sequence[str],
     mcqa_variant: str,
     reviewed_fallback: str,
     use_reeval: bool = True,
+    inference_mcqa_reeval: Optional[str] = None,
 ):
     values: Dict[Tuple[str, str, str], dict] = {}
     for method, model, run_path in iter_run_items(mcqa_variant):
         for probe_type, _ in PROBE_TYPES:
-            classic, mcqa, actual_variant, mcqa_run_path = load_probe_pair(
-                run_path,
-                model,
-                probe_type,
-                domains,
-                mcqa_variant=mcqa_variant,
-                reviewed_fallback=reviewed_fallback,
-                use_reeval=use_reeval,
-            )
+            if probe_type == "inference" and inference_mcqa_reeval == "v13_mixed":
+                classic, _, actual_variant, mcqa_run_path = load_probe_pair(
+                    run_path,
+                    model,
+                    probe_type,
+                    domains,
+                    mcqa_variant=mcqa_variant,
+                    reviewed_fallback=reviewed_fallback,
+                    use_reeval=use_reeval,
+                    inference_mcqa_reeval=None,
+                )
+                mcqa, mcqa_run_path = load_mixed_v13_inference_mcqa(
+                    run_path,
+                    model,
+                    domains,
+                    mcqa_variant=mcqa_variant,
+                    use_reeval=use_reeval,
+                )
+            else:
+                classic, mcqa, actual_variant, mcqa_run_path = load_probe_pair(
+                    run_path,
+                    model,
+                    probe_type,
+                    domains,
+                    mcqa_variant=mcqa_variant,
+                    reviewed_fallback=reviewed_fallback,
+                    use_reeval=use_reeval,
+                    inference_mcqa_reeval=inference_mcqa_reeval,
+                )
             values[(probe_type, method, model)] = {
                 "log_prob": final_value(classic, "log_prob"),
                 "mcqa_accuracy": final_value(mcqa, "mcqa_accuracy"),
                 "mcqa_variant": actual_variant,
                 "run_path": find_latest_run(run_path),
-                "mcqa_run_path": find_latest_run(mcqa_run_path),
+                "mcqa_run_path": (
+                    [path for path in mcqa_run_path if path]
+                    if isinstance(mcqa_run_path, list)
+                    else find_latest_run(mcqa_run_path)
+                ),
             }
     return values
 
@@ -274,6 +431,11 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         action="store_true",
         help="Use canonical run metrics instead of nearby final-model re-eval metrics.",
     )
+    parser.add_argument(
+        "--inference_mcqa_reeval",
+        choices=INFERENCE_MCQA_REEVAL_CHOICES,
+        help="Override inference MCQA loading with a specific re-eval result tree.",
+    )
     return parser.parse_args(argv)
 
 
@@ -290,6 +452,7 @@ def main(argv: Optional[Sequence[str]] = None):
         mcqa_variant=args.mcqa_variant,
         reviewed_fallback=args.reviewed_fallback,
         use_reeval=not args.no_reeval,
+        inference_mcqa_reeval=args.inference_mcqa_reeval,
     )
 
     missing = [

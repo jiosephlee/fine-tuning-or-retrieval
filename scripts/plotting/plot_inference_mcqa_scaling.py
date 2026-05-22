@@ -40,20 +40,20 @@ DEFAULT_RUNS: Dict[str, Dict[str, str]] = {
     "source_only": {
         "1b": "results/FT/full/1b/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12/newline2/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E4_source_1b_all_domains_fa2_packing",
         "7b": "results/FT/full/7b/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12/newline2/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E1_source_all_domains_fa2_packing",
-        "13b": "results/FT/full/allenai_OLMo-2-1124-13B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12_reviewed/newline2/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E7_source_13b_all_domains_fa2_packing",
-        "32b": "results/FT/full/allenai_OLMo-2-0325-32B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12_reviewed+v12/newline2/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E10_source_32b_all_domains_fa2_packing_chunked_nll_1gpu_device_map_auto_36h_nodelta",
+        "13b": "results/FT/full/allenai_OLMo-2-1124-13B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13/newline2/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E7_source_13b_all_domains_fa2_packing",
+        "32b": "results/FT/full/allenai_OLMo-2-0325-32B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13+v12/newline2/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E10_source_32b_all_domains_fa2_packing_chunked_nll_1gpu_device_map_auto_36h_nodelta",
     },
     "para9": {
         "1b": "results/FT/full/1b/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12/newline2/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E5_paraphrase_1b_all_domains",
         "7b": "results/FT/full/7b/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12/newline2/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E2_paraphrase_all_domains",
-        "13b": "results/FT/full/allenai_OLMo-2-1124-13B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12_reviewed/newline2/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E8_paraphrase_13b_all_domains",
-        "32b": "results/FT/full/allenai_OLMo-2-0325-32B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12_reviewed+v12/newline2/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E11_paraphrase_32b_all_domains_chunked_nll_1gpu_device_map_auto_36h_nodelta",
+        "13b": "results/FT/full/allenai_OLMo-2-1124-13B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13/newline2/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E8_paraphrase_13b_all_domains",
+        "32b": "results/FT/full/allenai_OLMo-2-0325-32B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13+v12/newline2/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E11_paraphrase_32b_all_domains_chunked_nll_1gpu_device_map_auto_36h_nodelta",
     },
     "with_explanations": {
         "1b": "results/FT/full/1b/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12/newline2/para9_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E6_granular_explanations_1b_all_domains",
         "7b": "results/FT/full/7b/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12/newline2/para9_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E3_granular_explanations_all_domains",
-        "13b": "results/FT/full/allenai_OLMo-2-1124-13B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12_reviewed/newline2/para9_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E9_granular_explanations_13b_all_domains",
-        "32b": "results/FT/full/allenai_OLMo-2-0325-32B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12_reviewed+v12/newline2/para9_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E12_granular_explanations_32b_all_domains_1gpu_device_map_auto_36h_nodelta",
+        "13b": "results/FT/full/allenai_OLMo-2-1124-13B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13/newline2/para9_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E9_granular_explanations_13b_all_domains",
+        "32b": "results/FT/full/allenai_OLMo-2-0325-32B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13+v12/newline2/para9_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E12_granular_explanations_32b_all_domains_1gpu_device_map_auto_36h_nodelta",
     },
 }
 
@@ -66,7 +66,22 @@ def _abs_path(path: str) -> str:
 
 
 def regular_mcqa_run_path(path: str) -> str:
-    return path.replace("_inf_mcqa_v12_reviewed/newline2", "_inf_mcqa_v12/newline2")
+    return (
+        path
+        .replace("_inf_mcqa_v13+v12/newline2", "_inf_mcqa_v12/newline2")
+        .replace("_inf_mcqa_v13/newline2", "_inf_mcqa_v12/newline2")
+        .replace("_inf_mcqa_v12_reviewed+v12/newline2", "_inf_mcqa_v12/newline2")
+        .replace("_inf_mcqa_v12_reviewed/newline2", "_inf_mcqa_v12/newline2")
+    )
+
+
+def reviewed_mcqa_run_path(path: str) -> str:
+    return (
+        path
+        .replace("_inf_mcqa_v12_reviewed+v12/newline2", "_inf_mcqa_v13+v12/newline2")
+        .replace("_inf_mcqa_v12_reviewed/newline2", "_inf_mcqa_v13/newline2")
+        .replace("_inf_mcqa_v12/newline2", "_inf_mcqa_v13/newline2")
+    )
 
 
 def run_path_for_variant(path: str, mcqa_variant: str) -> str:
@@ -84,7 +99,7 @@ def reeval_mcqa_run_path(
     del model
     if probe_type != "inference":
         return run_path
-    resolved = find_latest_run(run_path)
+    resolved = find_latest_run(run_path) or (run_path if os.path.isdir(run_path) else None)
     if not resolved:
         return run_path
     reeval_path = os.path.join(resolved, "reeval")
@@ -142,14 +157,26 @@ def mcqa_run_path_for_variant(
     mcqa_variant: str,
     use_reeval: bool = True,
 ) -> str:
-    mcqa_run_path = reeval_mcqa_run_path(run_path, model, probe_type) if use_reeval else run_path
+    base_run_path = run_path
+    if mcqa_variant in {"reviewed", "preferred"}:
+        reviewed_path = reviewed_mcqa_run_path(run_path)
+        if os.path.isdir(reviewed_path):
+            base_run_path = reviewed_path
+    mcqa_run_path = reeval_mcqa_run_path(base_run_path, model, probe_type) if use_reeval else base_run_path
+    if (
+        mcqa_variant == "regular"
+        and mcqa_run_path != base_run_path
+        and _is_reviewed_inference_mcqa_root(mcqa_run_path)
+        and _has_reviewed_mcqa(mcqa_run_path)
+    ):
+        return base_run_path
     if (
         mcqa_variant in {"reviewed", "preferred"}
-        and mcqa_run_path != run_path
+        and mcqa_run_path != base_run_path
         and not _has_reviewed_mcqa(mcqa_run_path)
-        and _has_reviewed_mcqa(run_path)
+        and _has_reviewed_mcqa(base_run_path)
     ):
-        return run_path
+        return base_run_path
     return mcqa_run_path
 
 
@@ -191,6 +218,18 @@ def _load_mcqa(
         probe_family="mcqa",
         mcqa_variant=mcqa_variant,
     )
+    if df is None and mcqa_run_path != run_path:
+        fallback_df = load_metrics(
+            run_path,
+            "inference",
+            domains,
+            str(REPO_ROOT),
+            metrics=("mcqa_accuracy",),
+            probe_family="mcqa",
+            mcqa_variant=mcqa_variant,
+        )
+        if fallback_df is not None:
+            return fallback_df, mcqa_variant, run_path
     if df is not None or mcqa_variant != "reviewed":
         return df, mcqa_variant, mcqa_run_path
     if reviewed_fallback == "regular":

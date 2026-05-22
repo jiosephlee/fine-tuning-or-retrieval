@@ -46,7 +46,7 @@ KNOWLEDGE_PROBE_VARIANT_DEFAULT_VERSION = {
     "low_overlap_strict": "v14",
 }
 DEFAULT_MCQA_PROBES_VERSION = "v14"
-DEFAULT_INFERENCE_MCQA_PROBES_VERSION = "v12"
+DEFAULT_INFERENCE_MCQA_PROBES_VERSION = "v13"
 DEFAULT_INFERENCE_PROBES_VERSION = "v11"
 DEFAULT_INFERENCE_PROBE_FILENAME_SUFFIX = ""
 DEFAULT_INFERENCE_PROBE_VARIANT = "reviewed"
@@ -1146,7 +1146,7 @@ if __name__ == "__main__":
         "--inference_mcqa_prompt_column",
         "--inference-mcqa-prompt-column",
         type=str,
-        default="formatted_question",
+        default="formatted_question_5shot",
         help=(
             "CSV column to use as the inference MCQA prompt before appending the "
             "constrained answer suffix."
@@ -1207,7 +1207,7 @@ if __name__ == "__main__":
         action="store_false",
         help="Disable constrained-decoding MCQA evaluation.",
     )
-    parser.set_defaults(inference_mcqa_probes=False)
+    parser.set_defaults(inference_mcqa_probes=True)
     parser.add_argument(
         "--inference_mcqa_probes",
         "--inference-mcqa-probes",

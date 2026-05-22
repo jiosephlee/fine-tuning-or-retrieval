@@ -321,12 +321,12 @@ def _candidate_probe_dirs(
 def _is_reviewed_inference_mcqa_root(run_path: str) -> bool:
     """Return whether a run root encodes reviewed inference MCQA in its path.
 
-    Some reviewed v12 runs, notably 13B, store legacy unversioned per-domain
+    Some reviewed v12/v13 runs, notably 13B, store legacy unversioned per-domain
     folders such as ``DPO_inference_mcqa_probe`` under an
-    ``*_inf_mcqa_v12_reviewed`` experiment root.
+    ``*_inf_mcqa_v13`` experiment root.
     """
     return any(
-        re.search(r"inf_mcqa[^/]*reviewed", part)
+        re.search(r"inf_mcqa[^/]*(reviewed|v13)", part)
         for part in os.path.normpath(run_path).split(os.sep)
     )
 
