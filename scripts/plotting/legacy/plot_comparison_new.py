@@ -20,12 +20,12 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 # Ensure the project root (containing 'scripts' and 'utils') is on sys.path
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
 from scripts.plotting.plot_utils import make_subplots, add_legend
-from scripts.plotting.plot_comparison import aggregate_across_domains
+from scripts.plotting.legacy.plot_comparison import aggregate_across_domains
 
 # Fixed 7B runs requested by the user (paths are relative to PROJECT_ROOT).
 RUNS_7B: Dict[str, str] = {

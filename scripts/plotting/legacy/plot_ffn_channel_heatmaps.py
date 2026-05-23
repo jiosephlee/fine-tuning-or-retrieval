@@ -11,7 +11,7 @@ import numpy.ma as ma
 import torch
 from transformers import AutoModelForCausalLM
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 from utils.llm_plotting import set_plot_style
 
 

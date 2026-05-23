@@ -7,7 +7,7 @@ from matplotlib.lines import Line2D
 import numpy as np
 
 # Ensure repo root is resolvable for imports
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 sys.path.append(REPO_ROOT)
 
 from scripts.plotting.plot_utils import (

@@ -4,8 +4,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import argparse
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from scripts.plotting.plot_comparison import aggregate_across_domains, find_latest_run_path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
+from scripts.plotting.legacy.plot_comparison import aggregate_across_domains, find_latest_run_path
 from utils.llm_plotting import set_plot_style
 
 
@@ -185,7 +185,7 @@ def main():
     args = parser.parse_args()
 
     # --- Configuration ---
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
     
     prior_knowledge_paths = {
         '1B': '/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/prior_knowledge/full/1b/probes_v9/domains_all/e50/run',

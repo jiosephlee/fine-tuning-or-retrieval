@@ -6,7 +6,7 @@ import json
 import numpy as np
 
 # Adjust path to include utils if needed, though we might not need it for this standalone script
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 from utils.llm_plotting import set_plot_style
 from utils import probe_paths
 
@@ -129,7 +129,7 @@ def load_and_filter_data(run_path, probe_type, domains, filter_logic, project_ro
 def main():
     set_plot_style()
     
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
     
     # Data Configuration
     # 32B Paths (from previous step)

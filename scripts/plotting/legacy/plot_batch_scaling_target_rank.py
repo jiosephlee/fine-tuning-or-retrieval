@@ -7,12 +7,12 @@ import matplotlib.gridspec as gridspec
 from matplotlib.lines import Line2D
 
 # Ensure repo root on path for imports (adjust if needed)
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 sys.path.append(REPO_ROOT)
 
 # Reuse styling and helpers
 from utils.llm_plotting import set_plot_style
-from scripts.plotting.plot_comparison import aggregate_across_domains
+from scripts.plotting.legacy.plot_comparison import aggregate_across_domains
 from scripts.plotting.plot_utils import (
     discover_domains,
     find_latest_run,

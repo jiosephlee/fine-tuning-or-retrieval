@@ -7,7 +7,7 @@ import argparse
 from cycler import cycler
 
 # Adjust the path to include the utils directory
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 try:
     from utils.llm_plotting import set_plot_style
 except ImportError:

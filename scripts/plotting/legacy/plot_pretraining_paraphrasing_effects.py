@@ -8,8 +8,8 @@ import argparse
 from matplotlib.lines import Line2D
 import numpy as np
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from scripts.plotting.plot_comparison import aggregate_across_domains
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
+from scripts.plotting.legacy.plot_comparison import aggregate_across_domains
 from utils.llm_plotting import set_plot_style
 
 def find_latest_run_path(base_path):
@@ -173,7 +173,7 @@ def main():
     parser.add_argument('--hspace', type=float, default=0.25, help='Height space between subplots.')
     args = parser.parse_args()
 
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
     domains_path = os.path.join(project_root, 'data/arxiv/cleaned')
     try:
         domains = sorted([os.path.splitext(f)[0] for f in os.listdir(domains_path) if f.endswith('.tex')])

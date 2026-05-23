@@ -10,7 +10,7 @@ import argparse
 from cycler import cycler
 
 # Adjust the path to include the utils directory
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 from utils.llm_plotting import set_plot_style
 
 
@@ -66,7 +66,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate comparison plots for knowledge and inference probes based on learning rates.")
     args = parser.parse_args()
 
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
     
     # Define paths for experiments
     experiments = {

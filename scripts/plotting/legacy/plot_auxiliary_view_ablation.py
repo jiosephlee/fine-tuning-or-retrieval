@@ -8,7 +8,7 @@ from matplotlib.lines import Line2D
 from transformers import AutoTokenizer
 
 # Adjust the path to include the utils directory
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 from utils.llm_plotting import set_plot_style
 
 def load_and_aggregate_data(run_path, probe_type, domains):
@@ -108,7 +108,7 @@ def main():
 
     domains = ['1_58', 'DPO', 'GRPO', 'BOFT', 'OFT', 'QLoRA']
     
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 
     print("Loading OLMo tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained("allenai/OLMo-2-1124-7B")

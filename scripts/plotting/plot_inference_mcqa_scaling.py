@@ -35,25 +35,26 @@ MODEL_LABELS = {
     "13b": "13B",
     "32b": "32B",
 }
+REEVAL_DIR_CHOICES = ("reeval", "reeval_v1", "reeval_v2")
 
 DEFAULT_RUNS: Dict[str, Dict[str, str]] = {
     "source_only": {
-        "1b": "results/FT/full/1b/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12/newline2/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E4_source_1b_all_domains_fa2_packing",
-        "7b": "results/FT/full/7b/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12/newline2/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E1_source_all_domains_fa2_packing",
-        "13b": "results/FT/full/allenai_OLMo-2-1124-13B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13/newline2/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E7_source_13b_all_domains_fa2_packing",
-        "32b": "results/FT/full/allenai_OLMo-2-0325-32B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13+v12/newline2/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E10_source_32b_all_domains_fa2_packing_chunked_nll_1gpu_device_map_auto_36h_nodelta",
+        "1b": "results/FT/full/1b/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E4_source_1b_all_domains_fa2_packing",
+        "7b": "results/FT/full/7b/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E1_source_all_domains_fa2_packing",
+        "13b": "results/FT/full/13b/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E7_source_13b_all_domains_fa2_packing",
+        "32b": "results/FT/full/32b/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E10_source_32b_all_domains_fa2_packing_chunked_nll_1gpu_device_map_auto_36h_nodelta",
     },
     "para9": {
-        "1b": "results/FT/full/1b/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12/newline2/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E5_paraphrase_1b_all_domains",
-        "7b": "results/FT/full/7b/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12/newline2/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E2_paraphrase_all_domains",
-        "13b": "results/FT/full/allenai_OLMo-2-1124-13B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13/newline2/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E8_paraphrase_13b_all_domains",
-        "32b": "results/FT/full/allenai_OLMo-2-0325-32B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13+v12/newline2/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E11_paraphrase_32b_all_domains_chunked_nll_1gpu_device_map_auto_36h_nodelta",
+        "1b": "results/FT/full/1b/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E5_paraphrase_1b_all_domains",
+        "7b": "results/FT/full/7b/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E2_paraphrase_all_domains",
+        "13b": "results/FT/full/13b/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E8_paraphrase_13b_all_domains",
+        "32b": "results/FT/full/32b/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E11_paraphrase_32b_all_domains_chunked_nll_1gpu_device_map_auto_36h_nodelta",
     },
     "with_explanations": {
-        "1b": "results/FT/full/1b/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12/newline2/para9_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E6_granular_explanations_1b_all_domains",
-        "7b": "results/FT/full/7b/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v12/newline2/para9_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E3_granular_explanations_all_domains",
-        "13b": "results/FT/full/allenai_OLMo-2-1124-13B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13/newline2/para9_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E9_granular_explanations_13b_all_domains",
-        "32b": "results/FT/full/allenai_OLMo-2-0325-32B/probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13+v12/newline2/para9_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E12_granular_explanations_32b_all_domains_1gpu_device_map_auto_36h_nodelta",
+        "1b": "results/FT/full/1b/para9_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E6_granular_explanations_1b_all_domains",
+        "7b": "results/FT/full/7b/para9_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E3_granular_explanations_all_domains",
+        "13b": "results/FT/full/13b/para9_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E9_granular_explanations_13b_all_domains",
+        "32b": "results/FT/full/32b/para9_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E12_granular_explanations_32b_all_domains_1gpu_device_map_auto_36h_nodelta",
     },
 }
 
@@ -65,7 +66,34 @@ def _abs_path(path: str) -> str:
     return str(candidate)
 
 
+def canonical_run_root(path: str) -> Optional[Path]:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = REPO_ROOT / candidate
+    parts = candidate.parts
+    if "eval_bundles" in parts:
+        index = parts.index("eval_bundles")
+        return Path(*parts[:index])
+    if (candidate / "eval_bundles").is_dir():
+        return candidate
+    return None
+
+
+def eval_bundle_path(path: str, bundle_names: Sequence[str], require_leaf: bool = True) -> str:
+    root = canonical_run_root(path)
+    if root is None:
+        return path
+    for bundle_name in bundle_names:
+        candidate = root / "eval_bundles" / bundle_name
+        if candidate.is_dir() and (not require_leaf or find_latest_run(str(candidate))):
+            return str(candidate)
+    return path
+
+
 def regular_mcqa_run_path(path: str) -> str:
+    canonical = eval_bundle_path(path, ("inf_mcqa_v12",))
+    if canonical != path:
+        return canonical
     return (
         path
         .replace("_inf_mcqa_v13+v12/newline2", "_inf_mcqa_v12/newline2")
@@ -75,7 +103,29 @@ def regular_mcqa_run_path(path: str) -> str:
     )
 
 
-def reviewed_mcqa_run_path(path: str) -> str:
+def reviewed_mcqa_run_path(path: str, reeval_dir: Optional[str] = None) -> str:
+    reviewed_bundles = (
+        "inf_mcqa_v13+v12",
+        "inf_mcqa_v13",
+        "inf_mcqa_v12_reviewed+v12",
+        "inf_mcqa_v12_reviewed",
+    )
+    root = canonical_run_root(path)
+    if root is not None:
+        if reeval_dir:
+            for bundle_name in reviewed_bundles:
+                candidate = root / "eval_bundles" / bundle_name
+                if candidate.is_dir() and find_latest_run(str(candidate / reeval_dir)):
+                    return str(candidate)
+        for bundle_name in reviewed_bundles:
+            candidate = root / "eval_bundles" / bundle_name
+            if candidate.is_dir() and find_latest_run(str(candidate)):
+                return str(candidate)
+        for bundle_name in reviewed_bundles:
+            candidate = root / "eval_bundles" / bundle_name
+            if candidate.is_dir():
+                return str(candidate)
+        return path
     return (
         path
         .replace("_inf_mcqa_v12_reviewed+v12/newline2", "_inf_mcqa_v13+v12/newline2")
@@ -84,27 +134,66 @@ def reviewed_mcqa_run_path(path: str) -> str:
     )
 
 
+def legacy_reviewed_mcqa_run_paths(path: str, model: Optional[str] = None) -> List[str]:
+    candidates = [
+        path
+        .replace("_inf_mcqa_v13_legal/newline2", "_inf_mcqa_v12_reviewed/newline2")
+        .replace("_inf_mcqa_v13+v12/newline2", "_inf_mcqa_v12_reviewed+v12/newline2")
+        .replace("_inf_mcqa_v13/newline2", "_inf_mcqa_v12_reviewed/newline2")
+        .replace("_inf_mcqa_v12/newline2", "_inf_mcqa_v12_reviewed/newline2"),
+        path
+        .replace("_inf_mcqa_v13_legal/newline2", "_inf_mcqa_v12_reviewed+v12/newline2")
+        .replace("_inf_mcqa_v13+v12/newline2", "_inf_mcqa_v12_reviewed+v12/newline2")
+        .replace("_inf_mcqa_v13/newline2", "_inf_mcqa_v12_reviewed+v12/newline2")
+        .replace("_inf_mcqa_v12/newline2", "_inf_mcqa_v12_reviewed+v12/newline2"),
+    ]
+    if model == "32b":
+        candidates = list(reversed(candidates))
+    unique = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return unique
+
+
 def run_path_for_variant(path: str, mcqa_variant: str) -> str:
     if mcqa_variant == "regular":
         return regular_mcqa_run_path(path)
-    return path
+    direct_reviewed = eval_bundle_path(
+        path,
+        (
+            "inf_mcqa_v13+v12",
+            "inf_mcqa_v13",
+            "inf_mcqa_v12_reviewed+v12",
+            "inf_mcqa_v12_reviewed",
+        ),
+    )
+    if direct_reviewed != path:
+        return direct_reviewed
+    return regular_mcqa_run_path(path)
 
 
 def reeval_mcqa_run_path(
     run_path: str,
     model: Optional[str],
     probe_type: str = "inference",
+    reeval_dir: str = "reeval",
 ) -> str:
     """Use final-model re-evaluation outputs for inference MCQA when present."""
-    del model
+    if reeval_dir not in REEVAL_DIR_CHOICES:
+        raise ValueError(f"Unsupported re-eval directory: {reeval_dir}")
     if probe_type != "inference":
         return run_path
-    resolved = find_latest_run(run_path) or (run_path if os.path.isdir(run_path) else None)
-    if not resolved:
-        return run_path
-    reeval_path = os.path.join(resolved, "reeval")
-    if find_latest_run(reeval_path):
-        return reeval_path
+    candidates = [run_path]
+    if canonical_run_root(run_path) is None:
+        candidates.extend(legacy_reviewed_mcqa_run_paths(run_path, model))
+    for candidate in candidates:
+        resolved = find_latest_run(candidate) or (candidate if os.path.isdir(candidate) else None)
+        if not resolved:
+            continue
+        reeval_path = os.path.join(resolved, reeval_dir)
+        if find_latest_run(reeval_path):
+            return reeval_path
     return run_path
 
 
@@ -156,13 +245,18 @@ def mcqa_run_path_for_variant(
     probe_type: str,
     mcqa_variant: str,
     use_reeval: bool = True,
+    reeval_dir: str = "reeval",
 ) -> str:
     base_run_path = run_path
     if mcqa_variant in {"reviewed", "preferred"}:
-        reviewed_path = reviewed_mcqa_run_path(run_path)
+        reviewed_path = reviewed_mcqa_run_path(run_path, reeval_dir=reeval_dir if use_reeval else None)
         if os.path.isdir(reviewed_path):
             base_run_path = reviewed_path
-    mcqa_run_path = reeval_mcqa_run_path(base_run_path, model, probe_type) if use_reeval else base_run_path
+    mcqa_run_path = (
+        reeval_mcqa_run_path(base_run_path, model, probe_type, reeval_dir=reeval_dir)
+        if use_reeval
+        else base_run_path
+    )
     if (
         mcqa_variant == "regular"
         and mcqa_run_path != base_run_path
@@ -187,6 +281,7 @@ def _load_mcqa(
     reviewed_fallback: str,
     model: Optional[str] = None,
     use_reeval: bool = True,
+    reeval_dir: str = "reeval",
 ):
     mcqa_run_path = mcqa_run_path_for_variant(
         run_path,
@@ -194,6 +289,7 @@ def _load_mcqa(
         "inference",
         mcqa_variant,
         use_reeval=use_reeval,
+        reeval_dir=reeval_dir,
     )
     if mcqa_variant == "reviewed" and not _has_reviewed_mcqa(mcqa_run_path):
         if reviewed_fallback == "regular":
@@ -203,6 +299,7 @@ def _load_mcqa(
                 regular_run_path,
                 model,
                 "inference",
+                reeval_dir=reeval_dir,
             ) if use_reeval else regular_run_path
         elif reviewed_fallback == "drop":
             return None, "dropped", mcqa_run_path
@@ -238,6 +335,7 @@ def _load_mcqa(
             regular_run_path,
             model,
             "inference",
+            reeval_dir=reeval_dir,
         ) if use_reeval else regular_run_path
         return load_metrics(
             mcqa_run_path,
@@ -258,6 +356,7 @@ def load_configured_series(
     mcqa_variant: str = "regular",
     reviewed_fallback: str = "regular",
     use_reeval: bool = True,
+    reeval_dir: str = "reeval",
 ):
     series = {}
     for method, model, run_path in iter_run_items(mcqa_variant):
@@ -276,6 +375,7 @@ def load_configured_series(
             reviewed_fallback=reviewed_fallback,
             model=model,
             use_reeval=use_reeval,
+            reeval_dir=reeval_dir,
         )
         series[(method, model)] = {
             "classic": classic,
@@ -491,6 +591,12 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         action="store_true",
         help="Use canonical run metrics instead of nearby final-model re-eval metrics.",
     )
+    parser.add_argument(
+        "--reeval_dir",
+        choices=REEVAL_DIR_CHOICES,
+        default="reeval",
+        help="Re-eval result directory to use when re-eval loading is enabled.",
+    )
     return parser.parse_args(argv)
 
 
@@ -507,6 +613,7 @@ def main(argv: Optional[Sequence[str]] = None):
         mcqa_variant=args.mcqa_variant,
         reviewed_fallback=args.reviewed_fallback,
         use_reeval=not args.no_reeval,
+        reeval_dir=args.reeval_dir,
     )
 
     missing = [

@@ -6,8 +6,8 @@ import re
 import argparse
 import numpy as np
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from scripts.plotting.plot_comparison import aggregate_across_domains
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
+from scripts.plotting.legacy.plot_comparison import aggregate_across_domains
 from utils.llm_plotting import set_plot_style
 
 def transform_to_exposure_steps(df, strategy_name=None):
@@ -58,7 +58,7 @@ def main():
     )
     args = parser.parse_args()
     
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
     
     runs_to_compare = {
         '1B': {

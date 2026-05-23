@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 # Ensure repo root on path
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 if REPO_ROOT not in sys.path:
     sys.path.append(REPO_ROOT)
 

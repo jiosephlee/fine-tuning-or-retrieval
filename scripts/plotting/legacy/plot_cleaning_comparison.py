@@ -6,7 +6,7 @@ import numpy as np
 from cycler import cycler
 
 # Adjust the path to include the utils directory
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 from utils.llm_plotting import set_plot_style
 
 
@@ -67,7 +67,7 @@ def main():
     ]
     run_labels_in_order = [r[0] for r in runs_to_plot]
 
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
     domains_path = os.path.join(project_root, 'data/arxiv/cleaned')
     try:
         domains = sorted([os.path.splitext(f)[0] for f in os.listdir(domains_path) if f.endswith('.tex') and os.path.isfile(os.path.join(domains_path, f))])

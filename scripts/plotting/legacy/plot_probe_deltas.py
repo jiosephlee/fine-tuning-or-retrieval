@@ -7,8 +7,8 @@ import argparse
 import textwrap
 
 # Adjust path to import from other scripts/utils
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from scripts.plotting.plot_comparison import aggregate_across_domains
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
+from scripts.plotting.legacy.plot_comparison import aggregate_across_domains
 from utils.llm_plotting import set_plot_style
 
 def get_final_step_performance(run_path, domains, project_root, source_only=False):
@@ -240,7 +240,7 @@ def main():
     )
     args = parser.parse_args()
     
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
     
     # Define the two runs to compare - using explicit paths
     runs_to_compare = {

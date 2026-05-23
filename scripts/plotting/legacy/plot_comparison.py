@@ -9,7 +9,7 @@ import argparse
 from cycler import cycler
 
 # Adjust the path to include the utils directory
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 from utils.llm_plotting import set_plot_style
 
 # Import canonical implementations from plot_utils (avoid duplication)
@@ -260,7 +260,7 @@ def main():
     # errorbar_setting = 'sd' if show_std_dev_shadows else None
     
     split_probes = args.split_probes
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
     methods = [
         ('para9_expl', 'Para. + Aux. Views', 'sep_1_dclm'),
         ('para9', 'Para.', 'sep_1_dclm'),

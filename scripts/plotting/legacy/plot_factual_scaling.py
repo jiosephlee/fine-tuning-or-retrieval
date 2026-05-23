@@ -7,7 +7,7 @@ import matplotlib.gridspec as gridspec
 from matplotlib.lines import Line2D
 
 # Ensure repo root on path for imports (adjust if needed)
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 sys.path.append(REPO_ROOT)
 
 # Reuse styling and helpers

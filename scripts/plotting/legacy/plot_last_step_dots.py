@@ -6,12 +6,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # Ensure repo root on path for imports
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 sys.path.append(REPO_ROOT)
 
 # Reuse styling and helpers from existing code
 from utils.llm_plotting import set_plot_style  # noqa: E402
-from scripts.plotting.plot_comparison import aggregate_across_domains  # noqa: E402
+from scripts.plotting.legacy.plot_comparison import aggregate_across_domains  # noqa: E402
 from scripts.plotting.plot_utils import (  # noqa: E402
     discover_domains,
     find_latest_run,
@@ -21,7 +21,7 @@ from scripts.plotting.plot_utils import (  # noqa: E402
     add_legend,
     get_final_step_value,
 )
-from scripts.plotting.plot_pretraining_paraphrasing_effects import (  # noqa: E402
+from scripts.plotting.legacy.plot_pretraining_paraphrasing_effects import (  # noqa: E402
     get_paraphrasing_data,
 )
 

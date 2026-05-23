@@ -4,8 +4,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from scripts.plotting.plot_comparison import aggregate_across_domains, check_step_consistency, find_latest_run_path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
+from scripts.plotting.legacy.plot_comparison import aggregate_across_domains, check_step_consistency, find_latest_run_path
 from utils.llm_plotting import set_plot_style
 
 def main():
@@ -14,7 +14,7 @@ def main():
     separating 'source_only' and 'para9' fine-tuning data.
     """
     # --- Configuration ---
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
     
     runs_to_compare = {
         '1B': {
