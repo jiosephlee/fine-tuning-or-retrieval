@@ -41,7 +41,9 @@ def parse_args():
     p.add_argument("--model_path", required=True,
                    help="HF hub model ID or local path")
     p.add_argument("--experiment_dir", required=True,
-                   help="Existing experiment directory; results go into {experiment_dir}/reeval/")
+                   help="Existing experiment directory; results go into {experiment_dir}/{reeval_subdir}/")
+    p.add_argument("--reeval_subdir", default="reeval",
+                   help="Subdirectory name under experiment_dir for outputs (default: reeval)")
     p.add_argument("--attn_implementation", default=None,
                    help="Attention implementation (e.g. flash_attention_2)")
     p.add_argument("--torch_dtype", default="bfloat16",
@@ -90,7 +92,7 @@ def main():
     log = logging.getLogger("evaluate_probes")
 
     # ---- Resolve output dir -----------------------------------------------
-    reeval_dir = os.path.join(args.experiment_dir, "reeval")
+    reeval_dir = os.path.join(args.experiment_dir, args.reeval_subdir)
     os.makedirs(reeval_dir, exist_ok=True)
     log.info(f"Results will be written to: {reeval_dir}")
 

@@ -10,13 +10,14 @@ Provides:
   - Legend builders:  add_legend, make_line_legend, make_bar_legend
   - Bar chart helper:  plot_grouped_bars
   - Color registry:  COLORS
-  - Style presets:  setup_style
+  - Style presets:  setup_style, apply_plot_style, get_style_preset
 """
 
 import json
 import os
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import matplotlib.patches as mpatches
@@ -76,13 +77,89 @@ COLORS: Dict[str, Dict[str, str]] = {
 # STYLE PRESETS
 # ================================================================
 
+STYLE_PRESETS = {
+    "new": {
+        "rc": {
+            "axes.labelsize": 12,
+            "axes.titlesize": 14,
+            "font.size": 11,
+            "legend.fontsize": 10,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+        },
+        "line_width": 1.8,
+        "batch_line_width": 1.8,
+        "marker_size": 4.5,
+        "marker_edge_width": 1.2,
+        "grid_alpha": 0.25,
+        "legend": {"frameon": False},
+        "strategy_styles": {
+            "Para 9": {"linestyle": "-", "marker": "o"},
+            "Source": {"linestyle": "--", "marker": "s"},
+        },
+    },
+    "legacy": {
+        "rc": {
+            "axes.labelsize": 18,
+            "xtick.labelsize": 16,
+            "ytick.labelsize": 16,
+            "legend.fontsize": 14,
+            "figure.titlesize": 22,
+            "axes.titlesize": 20,
+        },
+        "line_width": 2,
+        "batch_line_width": 1.5,
+        "marker_size": 4.5,
+        "marker_edge_width": 1.2,
+        "grid_alpha": 0.1,
+        "legend": {"frameon": True, "fontsize": 14},
+        "strategy_styles": {
+            "Para 9": {"linestyle": "-", "marker": "o"},
+            "Source": {"linestyle": "--", "marker": "s"},
+        },
+    },
+}
+
+
+def get_style_preset(preset: str = "new") -> dict:
+    if preset == "default":
+        preset = "new"
+    if preset == "publication":
+        preset = "legacy"
+    if preset not in STYLE_PRESETS:
+        raise ValueError(f"Unknown plot style preset: {preset}")
+    return STYLE_PRESETS[preset]
+
+
+def apply_plot_style(preset: str = "new") -> dict:
+    style = get_style_preset(preset)
+    try:
+        setup_style(preset)
+    except ModuleNotFoundError as exc:
+        if exc.name != "seaborn":
+            raise
+        plt.rcParams.update(style["rc"])
+    return style
+
+
+def save_figure(fig, output: str, suffixes: Sequence[str] = (".pdf", ".png")):
+    output_path = Path(output)
+    if output_path.suffix:
+        output_path = output_path.with_suffix("")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in suffixes:
+        fig.savefig(str(output_path) + suffix, bbox_inches="tight", dpi=300)
+        print(f"Saved {output_path}{suffix}")
+    plt.close(fig)
+
+
 def setup_style(preset: str = "default"):
     """
     Configure matplotlib rcParams.
 
     Presets:
-      - "default": Standard academic style (axes.labelsize=14, etc.)
-      - "publication": Larger fonts for camera-ready figures (axes.labelsize=18, etc.)
+      - "default" / "new": Standard academic style.
+      - "publication" / "legacy": Larger legacy figure style.
 
     Calls set_plot_style() from utils.llm_plotting internally,
     then applies preset-specific overrides.
@@ -95,15 +172,12 @@ def setup_style(preset: str = "default"):
     from utils.llm_plotting import set_plot_style
     set_plot_style()
 
+    if preset == "default":
+        preset = "new"
     if preset == "publication":
-        plt.rcParams.update({
-            "axes.labelsize": 18,
-            "xtick.labelsize": 16,
-            "ytick.labelsize": 16,
-            "legend.fontsize": 16,
-            "figure.titlesize": 22,
-            "axes.titlesize": 20,
-        })
+        preset = "legacy"
+    if preset in STYLE_PRESETS:
+        plt.rcParams.update(STYLE_PRESETS[preset]["rc"])
 
 
 # ================================================================

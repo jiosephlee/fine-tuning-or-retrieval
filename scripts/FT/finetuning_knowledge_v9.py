@@ -34,18 +34,20 @@ DOMAIN_OVERRIDE_ARG_BY_SOURCE = {
 DEFAULT_WANDB_PROJECT = "v9_refined"
 DEFAULT_WANDB_GROUP = "finetuning_official"
 DEFAULT_WANDB_PANEL_SOURCES = ("legal", "arxiv", "medical")
-DEFAULT_KNOWLEDGE_PROBES_VERSION = "v13"
+DEFAULT_KNOWLEDGE_PROBES_VERSION = "v14"
 DEFAULT_KNOWLEDGE_PROBE_FILENAME_SUFFIX = ""
 DEFAULT_PARAPHRASED_KNOWLEDGE_PROBE_FILENAME_SUFFIX = "_paraphrased"
-DEFAULT_KNOWLEDGE_PROBE_VARIANT = "standard"
+DEFAULT_KNOWLEDGE_PROBE_VARIANT = "short_targets"
 KNOWLEDGE_PROBE_VARIANT_SUFFIXES = {
     "standard": "",
     "low_overlap_strict": "_low_overlap_strict",
+    "short_targets": "_short_targets",
 }
 KNOWLEDGE_PROBE_VARIANT_DEFAULT_VERSION = {
     "low_overlap_strict": "v14",
+    "short_targets": "v14",
 }
-DEFAULT_MCQA_PROBES_VERSION = "v14"
+DEFAULT_MCQA_PROBES_VERSION = "v15"
 DEFAULT_INFERENCE_MCQA_PROBES_VERSION = "v14"
 DEFAULT_INFERENCE_PROBES_VERSION = "v11"
 DEFAULT_INFERENCE_PROBE_FILENAME_SUFFIX = ""
@@ -76,6 +78,56 @@ def _coerce_version_list(value) -> List[str]:
 
 def _safe_tag(value: str) -> str:
     return "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in value)
+
+
+def _construct_eval_bundle_name(args) -> str:
+    if getattr(args, "inference_mcqa_probes", False):
+        inference_mcqa_versions = _coerce_version_list(
+            getattr(
+                args,
+                "inference_mcqa_probes_version",
+                DEFAULT_INFERENCE_MCQA_PROBES_VERSION,
+            )
+        )
+        if inference_mcqa_versions:
+            return f"inf_mcqa_{'+'.join(_safe_tag(v) for v in inference_mcqa_versions)}"
+    return "default"
+
+
+def _construct_legacy_probe_bundle_name(args) -> str:
+    probes_version = f"probes_{args.knowledge_probes_version}"
+    if args.knowledge_probe_filename_suffix:
+        probes_version += args.knowledge_probe_filename_suffix
+    if getattr(args, "paraphrased_knowledge_probes", False):
+        probes_version += (
+            f"_para_{args.paraphrased_knowledge_probes_version}"
+            f"{args.paraphrased_knowledge_probe_filename_suffix}"
+        )
+    if not getattr(args, "disable_inference_probes", False):
+        probes_version += f"_inf_{args.inference_probes_version}{args.inference_probe_filename_suffix}"
+    if getattr(args, "mcqa_probes", False):
+        mcqa_probes_version = getattr(
+            args,
+            "mcqa_probes_version",
+            args.knowledge_probes_version,
+        )
+        probes_version += f"_mcqa_{mcqa_probes_version}"
+        mcqa_prompt_column = getattr(args, "mcqa_prompt_column", "formatted_question")
+        if mcqa_prompt_column != "formatted_question":
+            probes_version += f"_prompt_{_safe_tag(mcqa_prompt_column)}"
+    if getattr(args, "inference_mcqa_probes", False):
+        inference_mcqa_probes_versions = _coerce_version_list(
+            getattr(
+                args,
+                "inference_mcqa_probes_version",
+                DEFAULT_INFERENCE_MCQA_PROBES_VERSION,
+            )
+        )
+        probes_version += f"_inf_mcqa_{'+'.join(_safe_tag(v) for v in inference_mcqa_probes_versions)}"
+        inference_mcqa_prompt_column = getattr(args, "inference_mcqa_prompt_column", "formatted_question")
+        if inference_mcqa_prompt_column != "formatted_question":
+            probes_version += f"_inf_prompt_{_safe_tag(inference_mcqa_prompt_column)}"
+    return probes_version
 
 
 def _validate_probe_rows(probe_df: pd.DataFrame, required_columns: Tuple[str, ...]) -> List[str]:
@@ -566,54 +618,7 @@ def construct_experiment_name(args):
     else:
         model_size = args.model_id.replace('/', '_')
     
-    # 3. Probes Version: e.g., 'probes_v7'
-    probes_version = f"probes_{args.knowledge_probes_version}"
-    if args.knowledge_probe_filename_suffix:
-        probes_version += args.knowledge_probe_filename_suffix
-    if getattr(args, "paraphrased_knowledge_probes", False):
-        probes_version += (
-            f"_para_{args.paraphrased_knowledge_probes_version}"
-            f"{args.paraphrased_knowledge_probe_filename_suffix}"
-        )
-    if not getattr(args, "disable_inference_probes", False):
-        probes_version += f"_inf_{args.inference_probes_version}{args.inference_probe_filename_suffix}"
-    if getattr(args, "mcqa_probes", False):
-        mcqa_probes_version = getattr(
-            args,
-            "mcqa_probes_version",
-            args.knowledge_probes_version,
-        )
-        probes_version += f"_mcqa_{mcqa_probes_version}"
-        mcqa_prompt_column = getattr(args, "mcqa_prompt_column", "formatted_question")
-        if mcqa_prompt_column != "formatted_question":
-            prompt_tag = "".join(
-                char if char.isalnum() or char in {"_", "-"} else "_"
-                for char in mcqa_prompt_column
-            )
-            probes_version += f"_prompt_{prompt_tag}"
-    if getattr(args, "inference_mcqa_probes", False):
-        inference_mcqa_probes_versions = _coerce_version_list(
-            getattr(
-                args,
-                "inference_mcqa_probes_version",
-                DEFAULT_INFERENCE_MCQA_PROBES_VERSION,
-            )
-        )
-        probes_version += f"_inf_mcqa_{'+'.join(_safe_tag(v) for v in inference_mcqa_probes_versions)}"
-        inference_mcqa_prompt_column = getattr(args, "inference_mcqa_prompt_column", "formatted_question")
-        if inference_mcqa_prompt_column != "formatted_question":
-            prompt_tag = _safe_tag(inference_mcqa_prompt_column)
-            probes_version += f"_inf_prompt_{prompt_tag}"
-
-    # 4. Chunking Style: e.g., 'sec_no-ovp', 'sec_ovp_1_4', 'tok'
-    if args.chunk_by_section:
-        chunking_style = "section"
-        if args.overlap_sections:
-            chunking_style += f"_overlap_{args.overlap_ratio}"
-        else:
-            chunking_style += "_no-overlap"
-    else:
-        chunking_style = "newline2"
+    eval_bundle = _construct_eval_bundle_name(args)
 
     # 5. Data Mix: e.g., 'source_only', 'para9', 'para9_expl'
     if args.num_paraphrased_texts > 0:
@@ -704,8 +709,6 @@ def construct_experiment_name(args):
     path_parts = [
         training_type,
         model_size,
-        probes_version,
-        chunking_style,
         data_mix,
     ]
 
@@ -742,6 +745,7 @@ def construct_experiment_name(args):
         shuffle_marker = '_shuffle_paragraphs'
 
     path_parts.append(run_name + shuffle_marker)
+    path_parts.extend(["eval_bundles", eval_bundle])
     
     return os.path.join(*path_parts)
 
@@ -1760,6 +1764,8 @@ if __name__ == "__main__":
         args.experiment_name = args.override_experiment_name
     else:
         args.experiment_name = construct_experiment_name(args)
+    args.eval_bundle_name = _construct_eval_bundle_name(args)
+    args.legacy_probe_bundle_name = _construct_legacy_probe_bundle_name(args)
 
     # --- Save Hyperparameters ---
     experiment_dir = os.path.join(args.base_results_dir, args.experiment_name)

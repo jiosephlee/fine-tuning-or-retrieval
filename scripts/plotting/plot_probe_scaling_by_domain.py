@@ -23,6 +23,7 @@ from scripts.plotting.plot_probe_scaling_by_model import (  # noqa: E402
     INFERENCE_MCQA_REEVAL_CHOICES,
     METHOD_COLORS,
     PANELS,
+    REEVAL_DIR_CHOICES,
     iter_run_items,
     load_configured_values,
 )
@@ -58,6 +59,7 @@ def load_grouped_values(
     reviewed_fallback: str,
     use_reeval: bool,
     inference_mcqa_reeval: Optional[str],
+    reeval_dir: str,
 ) -> Dict[str, dict]:
     grouped = {}
     for group, domains in domain_groups.items():
@@ -74,6 +76,7 @@ def load_grouped_values(
             reviewed_fallback=reviewed_fallback,
             use_reeval=use_reeval,
             inference_mcqa_reeval=group_inference_mcqa_reeval,
+            reeval_dir=reeval_dir,
         )
     return grouped
 
@@ -186,6 +189,12 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         help="Use canonical run metrics instead of nearby final-model re-eval metrics.",
     )
     parser.add_argument(
+        "--reeval_dir",
+        choices=REEVAL_DIR_CHOICES,
+        default="reeval",
+        help="Re-eval result directory to use when re-eval loading is enabled.",
+    )
+    parser.add_argument(
         "--inference_mcqa_reeval",
         choices=INFERENCE_MCQA_REEVAL_CHOICES,
         help="Override inference MCQA loading with a specific re-eval result tree.",
@@ -209,6 +218,7 @@ def main(argv: Optional[Sequence[str]] = None):
         reviewed_fallback=args.reviewed_fallback,
         use_reeval=not args.no_reeval,
         inference_mcqa_reeval=args.inference_mcqa_reeval,
+        reeval_dir=args.reeval_dir,
     )
 
     missing = []

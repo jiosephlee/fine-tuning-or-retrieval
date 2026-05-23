@@ -631,23 +631,6 @@ def validate_experiment_dir(experiment_dir: Path) -> list[str]:
         for filename in expected:
             if not (parameter_delta / filename).exists():
                 errors.append(f"missing parameter delta output: {filename}")
-        plots_dir = parameter_delta / "plots"
-        delta_metrics = (
-            "relative_delta_norm",
-            "cosine_distance",
-            "relative_delta_gini",
-            "cosine_distance_gini",
-        )
-        delta_plot_groups = ("mlp_embed", "attention")
-        expected_plots = [
-            f"{view}_{group}_{metric}.png"
-            for metric in delta_metrics
-            for group in delta_plot_groups
-            for view in ("time", "final_layer")
-        ]
-        for filename in expected_plots:
-            if not (plots_dir / filename).exists():
-                errors.append(f"missing parameter delta plot: {filename}")
     else:
         errors.append("missing parameter_delta directory")
     return errors

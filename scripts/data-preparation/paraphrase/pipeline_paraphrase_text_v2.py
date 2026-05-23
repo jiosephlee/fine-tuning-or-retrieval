@@ -136,12 +136,15 @@ def paraphrase_paragraph(
 ):
     if is_preserved_paragraph(part, verbatim_char_threshold=verbatim_char_threshold):
         return part
-    else:
-        prompt = {
-            'system': get_system_prompt(prompt_domain),
-            'user': f"Text: {sanitize_for_api(part)}",
-        }
-        return utils.query_llm(
+    prompt = {
+        'system': get_system_prompt(prompt_domain),
+        'user': f"Text: {sanitize_for_api(part)}",
+    }
+    # query_llm returns None when all retries are exhausted (e.g. persistent
+    # rate-limit or transient API failure). Fall back to the original text so
+    # one bad paragraph doesn't take down a whole paraphrase generation.
+    for attempt in range(3):
+        result = utils.query_llm(
             prompt=prompt,
             model=model,
             temperature=1.25,
@@ -150,6 +153,11 @@ def paraphrase_paragraph(
             is_hippa=is_hippa,
             reasoning_effort=reasoning_effort,
         )
+        if result is not None:
+            return result
+        print(f"[paraphrase_paragraph] query_llm returned None (attempt {attempt+1}/3); retrying...")
+    print(f"[paraphrase_paragraph] giving up after 3 attempts; falling back to original text for paragraph of length {len(part)}")
+    return part
 
 def split_and_merge_paragraphs(
     text,
