@@ -22,12 +22,16 @@ ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
 CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E2_paraphrase_all_domains_local_no_explanation_match}"
 MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v15}"
 MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
+MCQA_PROBE_BATCH_SIZE="${MCQA_PROBE_BATCH_SIZE:-8}"
+INFERENCE_MCQA_PROBES="${INFERENCE_MCQA_PROBES:-1}"
+INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v14}"
+INFERENCE_MCQA_PROMPT_COLUMN="${INFERENCE_MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 USE_PARCC="${USE_PARCC:-0}"
 SAVE_LOCAL_MODEL="${SAVE_LOCAL_MODEL:-1}"
 SPARSE_CALLBACKS="${SPARSE_CALLBACKS:-0}"
-PARAMETER_DELTA_EVERY_N_STEPS="${PARAMETER_DELTA_EVERY_N_STEPS:-5}"
-PROBE_EVERY_N_STEPS="${PROBE_EVERY_N_STEPS:-1}"
-MCQA_PROBE_EVERY_N_STEPS="${MCQA_PROBE_EVERY_N_STEPS:-2}"
+PARAMETER_DELTA_EVERY_N_STEPS="${PARAMETER_DELTA_EVERY_N_STEPS:-10}"
+PROBE_EVERY_N_STEPS="${PROBE_EVERY_N_STEPS:-2}"
+MCQA_PROBE_EVERY_N_STEPS="${MCQA_PROBE_EVERY_N_STEPS:-4}"
 
 EXTRA_ARGS=()
 if [[ "$USE_PARCC" == "1" ]]; then
@@ -41,12 +45,32 @@ fi
 if [[ "$SPARSE_CALLBACKS" == "1" ]]; then
     EXTRA_ARGS+=(--no_callback_every_step)
 fi
+if [[ "$INFERENCE_MCQA_PROBES" == "1" ]]; then
+    read -r -a INFERENCE_MCQA_PROBE_VERSION_ARGS <<< "$INFERENCE_MCQA_PROBES_VERSION"
+    EXTRA_ARGS+=(
+        --inference_mcqa_probes
+        --inference_mcqa_probes_version "${INFERENCE_MCQA_PROBE_VERSION_ARGS[@]}"
+        --inference_mcqa_prompt_column "$INFERENCE_MCQA_PROMPT_COLUMN"
+    )
+else
+    EXTRA_ARGS+=(--disable_inference_mcqa_probes)
+fi
+
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+TORCHRUN_LOG_DIR="${TORCHRUN_LOG_DIR:-logs/E20_para49_no_explanation_match_${RUN_ID}}"
+mkdir -p "$TORCHRUN_LOG_DIR"
+export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
+export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-DETAIL}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
 if [[ "${CONDA_DEFAULT_ENV:-}" == "$CONDA_ENV" ]]; then
-    LAUNCH=(torchrun --standalone --nproc_per_node "$NPROC_PER_NODE")
+    LAUNCH=(torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" --log-dir "$TORCHRUN_LOG_DIR" --tee 3)
 else
-    LAUNCH=(conda run --no-capture-output -n "$CONDA_ENV" torchrun --standalone --nproc_per_node "$NPROC_PER_NODE")
+    LAUNCH=(conda run --no-capture-output -n "$CONDA_ENV" torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" --log-dir "$TORCHRUN_LOG_DIR" --tee 3)
 fi
+
+echo "torchrun logs: $TORCHRUN_LOG_DIR"
 
 "${LAUNCH[@]}" finetuning_knowledge_v9.py \
     --custom_suffix "$CUSTOM_SUFFIX" \
@@ -59,6 +83,7 @@ fi
     --mcqa_probes \
     --mcqa_probes_version "$MCQA_PROBES_VERSION" \
     --mcqa_prompt_column "$MCQA_PROMPT_COLUMN" \
+    --mcqa_probe_batch_size "$MCQA_PROBE_BATCH_SIZE" \
     --num_train_epochs "$NUM_EPOCHS" \
     --learning_rate "$LEARNING_RATE" \
     --lr_scheduler_min_lr_ratio 0.1 \

@@ -22,6 +22,7 @@ import wandb
 import logging
 import pandas as pd
 import torch
+from transformers import AutoTokenizer
 # wandb.init(project="fine_tuning_study")
 # Local callback types are no longer used directly; delegated to utils.experiment_utils
 
@@ -130,7 +131,15 @@ def _construct_legacy_probe_bundle_name(args) -> str:
     return probes_version
 
 
-def _validate_probe_rows(probe_df: pd.DataFrame, required_columns: Tuple[str, ...]) -> List[str]:
+def _encode_probe_text(tokenizer, text: str) -> List[int]:
+    return tokenizer.encode(str(text), add_special_tokens=False)
+
+
+def _validate_probe_rows(
+    probe_df: pd.DataFrame,
+    required_columns: Tuple[str, ...],
+    tokenizer=None,
+) -> List[str]:
     missing_columns = [
         column for column in required_columns
         if column not in probe_df.columns
@@ -146,18 +155,44 @@ def _validate_probe_rows(probe_df: pd.DataFrame, required_columns: Tuple[str, ..
             f"{probe_df.index[null_mask].tolist()[:10]}"
         )
 
-    reconstructed = (
-        probe_df["probe"].astype(str)
-        + probe_df["target"].astype(str)
-    )
-    mismatch_mask = reconstructed != probe_df["fact"].astype(str)
-    if mismatch_mask.any():
-        messages.append(
-            "probe + target != fact at row indices "
-            f"{probe_df.index[mismatch_mask].tolist()[:10]}"
+    if tokenizer is None:
+        reconstructed = (
+            probe_df["probe"].astype(str)
+            + probe_df["target"].astype(str)
         )
+        mismatch_mask = reconstructed != probe_df["fact"].astype(str)
+        if mismatch_mask.any():
+            messages.append(
+                "probe + target != fact at row indices "
+                f"{probe_df.index[mismatch_mask].tolist()[:10]}"
+            )
+    else:
+        mismatch_indices = []
+        for row_idx, row in probe_df.iterrows():
+            probe_ids = _encode_probe_text(tokenizer, row["probe"])
+            target_ids = _encode_probe_text(tokenizer, row["target"])
+            fact_ids = _encode_probe_text(tokenizer, row["fact"])
+            if probe_ids + target_ids != fact_ids:
+                mismatch_indices.append(row_idx)
+        if mismatch_indices:
+            messages.append(
+                "tokenize(probe) + tokenize(target) != tokenize(fact) "
+                f"at row indices {mismatch_indices[:10]}"
+            )
 
     return messages
+
+
+def load_probe_validation_tokenizer(args, log):
+    """Load only the tokenizer needed to validate probe/target/fact boundaries."""
+    tokenizer_id = "jiosephlee/olmo2-lima" if getattr(args, "use_existing_lima_tokenizer", False) else args.model_id
+    log.info(f"Loading tokenizer '{tokenizer_id}' for probe boundary validation.")
+    return AutoTokenizer.from_pretrained(
+        tokenizer_id,
+        trust_remote_code=True,
+        use_fast=True,
+        cache_dir=getattr(args, "cache_dir", None),
+    )
 
 
 def distributed_world_size() -> int:
@@ -261,7 +296,7 @@ def resolve_domains_and_sources(args, log) -> Tuple[Optional[List[str]], Dict[st
     return resolved_domains, domain_sources
 
 
-def validate_selected_knowledge_probes(args, log) -> None:
+def validate_selected_knowledge_probes(args, log, tokenizer=None) -> None:
     """Fail early if the selected factual probe files are absent or malformed."""
     missing_paths = []
     malformed = []
@@ -284,6 +319,7 @@ def validate_selected_knowledge_probes(args, log) -> None:
         malformed_messages = _validate_probe_rows(
             probe_df,
             REQUIRED_KNOWLEDGE_PROBE_COLUMNS,
+            tokenizer=tokenizer,
         )
         if malformed_messages:
             malformed.append((str(probe_path), malformed_messages))
@@ -316,7 +352,7 @@ def validate_selected_knowledge_probes(args, log) -> None:
     )
 
 
-def validate_selected_paraphrased_knowledge_probes(args, log) -> None:
+def validate_selected_paraphrased_knowledge_probes(args, log, tokenizer=None) -> None:
     """Fail early if optional paraphrased factual probe files are absent or malformed."""
     if not getattr(args, "paraphrased_knowledge_probes", False):
         return
@@ -343,6 +379,7 @@ def validate_selected_paraphrased_knowledge_probes(args, log) -> None:
         malformed_messages = _validate_probe_rows(
             probe_df,
             REQUIRED_KNOWLEDGE_PROBE_COLUMNS,
+            tokenizer=tokenizer,
         )
         if malformed_messages:
             malformed.append((str(probe_path), malformed_messages))
@@ -1755,8 +1792,9 @@ if __name__ == "__main__":
         )
 
     args.resolved_domains, args.domain_data_sources = resolve_domains_and_sources(args, log)
-    validate_selected_knowledge_probes(args, log)
-    validate_selected_paraphrased_knowledge_probes(args, log)
+    probe_validation_tokenizer = load_probe_validation_tokenizer(args, log)
+    validate_selected_knowledge_probes(args, log, tokenizer=probe_validation_tokenizer)
+    validate_selected_paraphrased_knowledge_probes(args, log, tokenizer=probe_validation_tokenizer)
     validate_selected_inference_probes(args, log)
     validate_selected_mcqa_probes(args, log)
 

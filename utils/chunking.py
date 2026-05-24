@@ -1,6 +1,11 @@
 from typing import List
 import math
+import os
 import re
+
+_CHUNK_PREVIEW_LOG_LIMIT = int(os.environ.get("CHUNK_PREVIEW_LOG_LIMIT", "20"))
+_chunk_preview_log_count = 0
+_chunk_preview_suppression_logged = False
 
 
 def _normalize_title(title: str) -> str:
@@ -24,6 +29,31 @@ def _is_title_block(text: str) -> bool:
         or re.match(r'(?is)^Case\s+(?:Title|Name)\s*:', stripped)
         or re.match(r'(?im)^#\s+Cited\s+[^:\n]+:\s*.+$', stripped)
     )
+
+
+def _log_chunking_preview(log, chunks: List[str], total_tokens: int, tokenizer) -> None:
+    global _chunk_preview_log_count, _chunk_preview_suppression_logged
+
+    if not log or not chunks or _CHUNK_PREVIEW_LOG_LIMIT <= 0:
+        return
+
+    if _chunk_preview_log_count >= _CHUNK_PREVIEW_LOG_LIMIT:
+        if not _chunk_preview_suppression_logged:
+            log.info(
+                "Suppressing further chunk preview logs after %s chunking calls. "
+                "Set CHUNK_PREVIEW_LOG_LIMIT to adjust.",
+                _CHUNK_PREVIEW_LOG_LIMIT,
+            )
+            _chunk_preview_suppression_logged = True
+        return
+
+    _chunk_preview_log_count += 1
+    log.info(f"Chunking results: {len(chunks)} chunks, {total_tokens} total tokens.")
+    first_chunk_tokens = len(tokenizer(chunks[0], add_special_tokens=False)["input_ids"])
+    log.info(f"First chunk ({first_chunk_tokens} tokens): '{chunks[0][:150]}...'")
+    if len(chunks) > 1:
+        second_chunk_tokens = len(tokenizer(chunks[1], add_special_tokens=False)["input_ids"])
+        log.info(f"Second chunk ({second_chunk_tokens} tokens): '{chunks[1][:150]}...'")
 
 
 def extract_title_prefix(text_content: str) -> str:
@@ -159,14 +189,7 @@ def chunk_text(text_content: str, tokenizer, max_tokens: int, delimiter: str = "
         chunks.append(current_chunk)
 
     total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in chunks)
-    if log and chunks: 
-        log.info(f"Chunking results: {len(chunks)} chunks, {total_tokens} total tokens.")
-        if len(chunks) > 0:
-            first_chunk_tokens = len(tokenizer(chunks[0], add_special_tokens=False)["input_ids"])
-            log.info(f"First chunk ({first_chunk_tokens} tokens): '{chunks[0][:150]}...'")
-        if len(chunks) > 1:
-            second_chunk_tokens = len(tokenizer(chunks[1], add_special_tokens=False)["input_ids"])
-            log.info(f"Second chunk ({second_chunk_tokens} tokens): '{chunks[1][:150]}...'")
+    _log_chunking_preview(log, chunks, total_tokens, tokenizer)
     return chunks, total_tokens
 
 def split_text_by_subsections(text_content: str, tokenizer, max_tokens: int = 2048):
@@ -374,12 +397,5 @@ def chunk_text_by_sections(text_content: str, tokenizer, max_tokens: int = 2048,
         chunks.append(current_chunk)
     
     total_tokens = sum(len(tokenizer(c, add_special_tokens=False)["input_ids"]) for c in chunks)
-    if log and chunks: 
-        log.info(f"Chunking results: {len(chunks)} chunks, {total_tokens} total tokens.")
-        if len(chunks) > 0:
-            first_chunk_tokens = len(tokenizer(chunks[0], add_special_tokens=False)["input_ids"])
-            log.info(f"First chunk ({first_chunk_tokens} tokens): '{chunks[0][:150]}...'")
-        if len(chunks) > 1:
-            second_chunk_tokens = len(tokenizer(chunks[1], add_special_tokens=False)["input_ids"])
-            log.info(f"Second chunk ({second_chunk_tokens} tokens): '{chunks[1][:150]}...'")
+    _log_chunking_preview(log, chunks, total_tokens, tokenizer)
     return chunks, total_tokens
