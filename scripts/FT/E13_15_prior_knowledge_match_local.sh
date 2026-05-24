@@ -1,13 +1,8 @@
 #!/bin/bash
 
-# Document-match baseline for E13/E14/E15 only: trains with the same schedule shape
-# as the prior-knowledge runs, but replaces PK chapter chunks with same-shape
-# source+paraphrase replay chunks. Isolates the PK *content* effect from the
-# extra compute/exposure introduced at the splice position.
-#
-# Sweep position via PRIOR_KNOWLEDGE_INSERTION env var (front|middle|end).
-# E16 uses a different document-match insert-content setup and is not covered
-# by this helper.
+# Train with prior_knowledge inserted into a matched auxiliary track shaped
+# against the ordinary textbooks/stackexchange/blogs granular explanation
+# schedule. No explanations are actually trained on the matched track.
 
 set -euo pipefail
 
@@ -18,20 +13,19 @@ MODEL_ID="${MODEL_ID:-allenai/OLMo-2-1124-7B}"
 CONDA_ENV="${CONDA_ENV:-openrlhf}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NUM_EPOCHS="${NUM_EPOCHS:-100}"
-NUM_PARAPHRASED="${NUM_PARAPHRASED:-9}"
+NUM_PARAPHRASED="${NUM_PARAPHRASED:-49}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-8}"
 EFFECTIVE_BATCH_SIZE="${EFFECTIVE_BATCH_SIZE:-256}"
 LEARNING_RATE="${LEARNING_RATE:-4e-5}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
-PRIOR_KNOWLEDGE_INSERTION="${PRIOR_KNOWLEDGE_INSERTION:-front}"
-PRIOR_KNOWLEDGE_CYCLE="${PRIOR_KNOWLEDGE_CYCLE:-full}"
-CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E13_15_prior_knowledge_match_${PRIOR_KNOWLEDGE_INSERTION}_local}"
-MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v14}"
+CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E13_15_prior_knowledge_expl_match_all_domains_local}"
+PUSH_TO_HUB_CPT_ID="${PUSH_TO_HUB_CPT_ID:-e13-15-olmo2-7b-para49-prior-knowledge-expl-match-20260524}"
+MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v15}"
 MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 MCQA_PROBE_BATCH_SIZE="${MCQA_PROBE_BATCH_SIZE:-32}"
 INFERENCE_MCQA_PROBES="${INFERENCE_MCQA_PROBES:-1}"
-INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v12_reviewed v12}"
+INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v14}"
 INFERENCE_MCQA_PROMPT_COLUMN="${INFERENCE_MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 USE_PARCC="${USE_PARCC:-0}"
 SAVE_LOCAL_MODEL="${SAVE_LOCAL_MODEL:-0}"
@@ -39,6 +33,10 @@ SPARSE_CALLBACKS="${SPARSE_CALLBACKS:-0}"
 PARAMETER_DELTA_EVERY_N_STEPS="${PARAMETER_DELTA_EVERY_N_STEPS:-5}"
 PROBE_EVERY_N_STEPS="${PROBE_EVERY_N_STEPS:-2}"
 MCQA_PROBE_EVERY_N_STEPS="${MCQA_PROBE_EVERY_N_STEPS:-4}"
+DOCUMENT_TRACK_BASELINE="${DOCUMENT_TRACK_BASELINE:-1}"
+DOCUMENT_MATCH_EXPLANATION_TYPES="${DOCUMENT_MATCH_EXPLANATION_TYPES:-textbooks stackexchange blogs}"
+DOCUMENT_MATCH_EXPLANATIONS_CYCLE="${DOCUMENT_MATCH_EXPLANATIONS_CYCLE:-full}"
+DOCUMENT_MATCH_INSERT_CONTENT="${DOCUMENT_MATCH_INSERT_CONTENT:-prior_knowledge}"
 
 EXTRA_ARGS=()
 if [[ "$USE_PARCC" == "1" ]]; then
@@ -60,6 +58,16 @@ if [[ "$INFERENCE_MCQA_PROBES" == "1" ]]; then
         --inference_mcqa_prompt_column "$INFERENCE_MCQA_PROMPT_COLUMN"
     )
 fi
+if [[ "$DOCUMENT_TRACK_BASELINE" == "1" ]]; then
+    read -r -a DOCUMENT_MATCH_EXPLANATION_TYPE_ARGS <<< "$DOCUMENT_MATCH_EXPLANATION_TYPES"
+    EXTRA_ARGS+=(
+        --document_track_baseline
+        --document_match_specific_explanation "${DOCUMENT_MATCH_EXPLANATION_TYPE_ARGS[@]}"
+        --document_match_insert_content "$DOCUMENT_MATCH_INSERT_CONTENT"
+        --explanations_insertion_strategy granular
+        --granular_explanations_cycle "$DOCUMENT_MATCH_EXPLANATIONS_CYCLE"
+    )
+fi
 
 if [[ "${CONDA_DEFAULT_ENV:-}" == "$CONDA_ENV" ]]; then
     LAUNCH=(torchrun --standalone --nproc_per_node "$NPROC_PER_NODE")
@@ -70,10 +78,13 @@ fi
 "${LAUNCH[@]}" finetuning_knowledge_v9.py \
     --custom_suffix "$CUSTOM_SUFFIX" \
     --wandb_group finetuning_official \
+    --wandb_panel_sources arxiv legal medical \
     --model_id "$MODEL_ID" \
-    --knowledge_probes_version v13 \
+    --push_to_hub_cpt_id "$PUSH_TO_HUB_CPT_ID" \
+    --include_sources arxiv legal medical \
+    --knowledge_probes_version v14 \
     --paraphrased_knowledge_probes \
-    --paraphrased_knowledge_probes_version v13 \
+    --paraphrased_knowledge_probes_version v14 \
     --paraphrased_knowledge_probe_filename_suffix _paraphrased \
     --mcqa_probes \
     --mcqa_probes_version "$MCQA_PROBES_VERSION" \
@@ -83,10 +94,6 @@ fi
     --learning_rate "$LEARNING_RATE" \
     --lr_scheduler_min_lr_ratio 0.1 \
     --num_paraphrased_texts "$NUM_PARAPHRASED" \
-    --with_prior_knowledge \
-    --prior_knowledge_insertion "$PRIOR_KNOWLEDGE_INSERTION" \
-    --prior_knowledge_cycle "$PRIOR_KNOWLEDGE_CYCLE" \
-    --prior_knowledge_match_document_track \
     --overlap_sections \
     --overlap_ratio 1_16 \
     --device_batch_size "$DEVICE_BATCH_SIZE" \
