@@ -57,6 +57,8 @@ V13_LEGAL_INFERENCE_MCQA_TAG = (
     "inf_mcqa_v13_legal"
 )
 INFERENCE_MCQA_REEVAL_CHOICES = ("v13_legal", "v13_mixed")
+VALUE_MODE_CHOICES = ("final", "delta")
+FACTUAL_PROBE_VARIANT_CHOICES = ("canonical", "paraphrased")
 
 
 def _abs_path(path: str) -> str:
@@ -90,6 +92,8 @@ def inference_mcqa_reeval_run_path(
     if reeval_canonical != run_path and find_latest_run(os.path.join(reeval_canonical, reeval_dir)):
         return reeval_canonical
     if reeval_canonical != run_path:
+        return run_path
+    if (Path(run_path) / "eval_bundles").is_dir():
         return run_path
 
     parts = Path(run_path).parts
@@ -179,15 +183,38 @@ def load_probe_pair(
     use_reeval: bool = True,
     inference_mcqa_reeval: Optional[str] = None,
     reeval_dir: str = "reeval",
+    classic_metric_file_variant: str = "default",
 ):
+    classic_run_path = (
+        reeval_mcqa_run_path(
+            run_path,
+            model,
+            probe_type,
+            reeval_dir=reeval_dir,
+            probe_family="classic",
+        )
+        if use_reeval
+        else run_path
+    )
     classic = load_metrics(
-        run_path,
+        classic_run_path,
         probe_type,
         domains,
         str(REPO_ROOT),
         metrics=("log_prob",),
         probe_family="classic",
+        metric_file_variant=classic_metric_file_variant,
     )
+    if classic is None and classic_run_path != run_path:
+        classic = load_metrics(
+            run_path,
+            probe_type,
+            domains,
+            str(REPO_ROOT),
+            metrics=("log_prob",),
+            probe_family="classic",
+            metric_file_variant=classic_metric_file_variant,
+        )
     actual_variant = mcqa_variant
     mcqa_base_run_path = (
         inference_mcqa_reeval_run_path(run_path, inference_mcqa_reeval, reeval_dir=reeval_dir)
@@ -211,6 +238,7 @@ def load_probe_pair(
                 model,
                 probe_type,
                 reeval_dir=reeval_dir,
+                probe_family="mcqa",
             ) if use_reeval else regular_run_path
         elif reviewed_fallback == "drop":
             return classic, None, "dropped", mcqa_run_path
@@ -246,6 +274,7 @@ def load_probe_pair(
                 model,
                 probe_type,
                 reeval_dir=reeval_dir,
+                probe_family="mcqa",
             ) if use_reeval else regular_run_path
             mcqa = load_metrics(
                 mcqa_run_path,
@@ -334,10 +363,23 @@ def load_configured_values(
     use_reeval: bool = True,
     inference_mcqa_reeval: Optional[str] = None,
     reeval_dir: str = "reeval",
+    value_mode: str = "final",
+    factual_probe_variant: str = "canonical",
 ):
+    if value_mode not in VALUE_MODE_CHOICES:
+        raise ValueError(f"Unsupported value mode: {value_mode}")
+    if factual_probe_variant not in FACTUAL_PROBE_VARIANT_CHOICES:
+        raise ValueError(f"Unsupported factual probe variant: {factual_probe_variant}")
     values: Dict[Tuple[str, str, str], dict] = {}
     for method, model, run_path in iter_run_items(mcqa_variant):
         for probe_type, _ in PROBE_TYPES:
+            classic_baseline = None
+            mcqa_baseline = None
+            classic_metric_file_variant = (
+                "paraphrased"
+                if probe_type == "knowledge" and factual_probe_variant == "paraphrased"
+                else "default"
+            )
             if probe_type == "inference" and inference_mcqa_reeval == "v13_mixed":
                 classic, _, actual_variant, mcqa_run_path = load_probe_pair(
                     run_path,
@@ -349,6 +391,7 @@ def load_configured_values(
                     use_reeval=use_reeval,
                     inference_mcqa_reeval=None,
                     reeval_dir=reeval_dir,
+                    classic_metric_file_variant=classic_metric_file_variant,
                 )
                 mcqa, mcqa_run_path = load_mixed_v13_inference_mcqa(
                     run_path,
@@ -358,6 +401,24 @@ def load_configured_values(
                     use_reeval=use_reeval,
                     reeval_dir=reeval_dir,
                 )
+                if value_mode == "delta":
+                    classic_baseline = load_metrics(
+                        run_path,
+                        probe_type,
+                        domains,
+                        str(REPO_ROOT),
+                        metrics=("log_prob",),
+                        probe_family="classic",
+                        metric_file_variant=classic_metric_file_variant,
+                    )
+                    mcqa_baseline, _ = load_mixed_v13_inference_mcqa(
+                        run_path,
+                        model,
+                        domains,
+                        mcqa_variant=mcqa_variant,
+                        use_reeval=False,
+                        reeval_dir=reeval_dir,
+                    )
             else:
                 classic, mcqa, actual_variant, mcqa_run_path = load_probe_pair(
                     run_path,
@@ -369,10 +430,36 @@ def load_configured_values(
                     use_reeval=use_reeval,
                     inference_mcqa_reeval=inference_mcqa_reeval,
                     reeval_dir=reeval_dir,
+                    classic_metric_file_variant=classic_metric_file_variant,
                 )
+                if value_mode == "delta":
+                    classic_baseline = load_metrics(
+                        run_path,
+                        probe_type,
+                        domains,
+                        str(REPO_ROOT),
+                        metrics=("log_prob",),
+                        probe_family="classic",
+                        metric_file_variant=classic_metric_file_variant,
+                    )
+                    mcqa_baseline_path = (
+                        inference_mcqa_reeval_run_path(run_path, inference_mcqa_reeval, reeval_dir=reeval_dir)
+                        if probe_type == "inference"
+                        else run_path
+                    )
+                    if actual_variant != "dropped":
+                        mcqa_baseline = load_metrics(
+                            mcqa_baseline_path,
+                            probe_type,
+                            domains,
+                            str(REPO_ROOT),
+                            metrics=("mcqa_accuracy",),
+                            probe_family="mcqa",
+                            mcqa_variant=actual_variant,
+                        )
             values[(probe_type, method, model)] = {
-                "log_prob": final_value(classic, "log_prob"),
-                "mcqa_accuracy": final_value(mcqa, "mcqa_accuracy"),
+                "log_prob": metric_value(classic, "log_prob", value_mode, classic_baseline),
+                "mcqa_accuracy": metric_value(mcqa, "mcqa_accuracy", value_mode, mcqa_baseline),
                 "mcqa_variant": actual_variant,
                 "run_path": find_latest_run(run_path),
                 "mcqa_run_path": (
@@ -384,7 +471,64 @@ def load_configured_values(
     return values
 
 
-def plot_probe_scaling(values, output: str):
+def delta_value(df, metric: str) -> Optional[float]:
+    if df is None or df.empty or "step" not in df.columns or metric not in df.columns:
+        return None
+    valid = df[["step", metric]].dropna()
+    if valid.empty:
+        return None
+    if valid["step"].nunique() < 2:
+        return None
+    min_step = valid["step"].min()
+    max_step = valid["step"].max()
+    initial = valid.loc[valid["step"] == min_step, metric].mean()
+    final = valid.loc[valid["step"] == max_step, metric].mean()
+    return float(final - initial)
+
+
+def initial_value(df, metric: str) -> Optional[float]:
+    if df is None or df.empty or "step" not in df.columns or metric not in df.columns:
+        return None
+    valid = df[["step", metric]].dropna()
+    if valid.empty:
+        return None
+    min_step = valid["step"].min()
+    return float(valid.loc[valid["step"] == min_step, metric].mean())
+
+
+def metric_value(df, metric: str, value_mode: str, baseline_df=None) -> Optional[float]:
+    if value_mode == "final":
+        return final_value(df, metric)
+    if value_mode == "delta":
+        delta = delta_value(df, metric)
+        if delta is not None:
+            return delta
+        final = final_value(df, metric)
+        initial = initial_value(baseline_df, metric)
+        if final is None or initial is None:
+            return None
+        return float(final - initial)
+    raise ValueError(f"Unsupported value mode: {value_mode}")
+
+
+def panel_ylabel(ylabel: str, value_mode: str) -> str:
+    if value_mode == "delta":
+        return ylabel.replace("Final", "Delta")
+    return ylabel
+
+
+def panel_title(title: str, probe_type: str, metric: str, factual_probe_variant: str) -> str:
+    if factual_probe_variant == "paraphrased" and probe_type == "knowledge" and metric == "log_prob":
+        return "Paraphrased Factual Probes"
+    return title
+
+
+def plot_probe_scaling(
+    values,
+    output: str,
+    value_mode: str = "final",
+    factual_probe_variant: str = "canonical",
+):
     apply_plot_style()
     fig, axes = plt.subplots(1, 4, figsize=(15, 4.2), sharex=True)
     x = np.arange(len(MODEL_LABELS))
@@ -410,11 +554,13 @@ def plot_probe_scaling(values, output: str):
                 linestyle="--" if metric == "mcqa_accuracy" else "-",
             )
 
-        ax.set_title(title)
+        ax.set_title(panel_title(title, probe_type, metric, factual_probe_variant))
         ax.set_xticks(x)
         ax.set_xticklabels(model_tick_labels)
         ax.set_xlabel("Model Size")
-        ax.set_ylabel(ylabel)
+        ax.set_ylabel(panel_ylabel(ylabel, value_mode))
+        if value_mode == "delta":
+            ax.axhline(0, color="black", linewidth=0.8, alpha=0.35)
         ax.grid(True, axis="y", alpha=0.25)
 
         ylim = compute_unified_ylim(panel_values, padding=0.05)
@@ -467,6 +613,18 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         choices=INFERENCE_MCQA_REEVAL_CHOICES,
         help="Override inference MCQA loading with a specific re-eval result tree.",
     )
+    parser.add_argument(
+        "--value_mode",
+        choices=VALUE_MODE_CHOICES,
+        default="final",
+        help="Plot final metric values or final-minus-initial deltas.",
+    )
+    parser.add_argument(
+        "--factual_probe_variant",
+        choices=FACTUAL_PROBE_VARIANT_CHOICES,
+        default="canonical",
+        help="Use canonical or paraphrased factual log-prob probe metrics in the factual probe panel.",
+    )
     return parser.parse_args(argv)
 
 
@@ -485,6 +643,8 @@ def main(argv: Optional[Sequence[str]] = None):
         use_reeval=not args.no_reeval,
         inference_mcqa_reeval=args.inference_mcqa_reeval,
         reeval_dir=args.reeval_dir,
+        value_mode=args.value_mode,
+        factual_probe_variant=args.factual_probe_variant,
     )
 
     missing = [
@@ -497,7 +657,12 @@ def main(argv: Optional[Sequence[str]] = None):
         for probe_type, method, model, metric in missing:
             print(f"Warning: missing {probe_type} {metric} for {method} {model}")
 
-    plot_probe_scaling(values, args.output)
+    plot_probe_scaling(
+        values,
+        args.output,
+        value_mode=args.value_mode,
+        factual_probe_variant=args.factual_probe_variant,
+    )
 
 
 if __name__ == "__main__":

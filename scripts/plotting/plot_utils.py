@@ -89,8 +89,8 @@ STYLE_PRESETS = {
         },
         "line_width": 1.8,
         "batch_line_width": 1.8,
-        "marker_size": 4.5,
-        "marker_edge_width": 1.2,
+        "marker_size": 6.5,
+        "marker_edge_width": 0.5,
         "grid_alpha": 0.25,
         "legend": {"frameon": False},
         "strategy_styles": {
@@ -405,10 +405,22 @@ def _is_reviewed_inference_mcqa_root(run_path: str) -> bool:
     )
 
 
-def _candidate_metric_paths(probe_dir: str, domain: str, probe_type: str) -> List[str]:
+def _candidate_metric_paths(
+    probe_dir: str,
+    domain: str,
+    probe_type: str,
+    metric_file_variant: str = "default",
+) -> List[str]:
     """Return metric CSV paths in a probe directory, excluding training-loss files."""
     if not os.path.isdir(probe_dir):
         return []
+    if metric_file_variant not in {"default", "paraphrased"}:
+        raise ValueError("metric_file_variant must be one of: default, paraphrased")
+
+    if metric_file_variant == "paraphrased":
+        paraphrased = os.path.join(probe_dir, f"{os.path.basename(probe_dir)}_paraphrased_metrics.csv")
+        return [paraphrased] if os.path.exists(paraphrased) else []
+
     expected = os.path.join(probe_dir, f"{os.path.basename(probe_dir)}_metrics.csv")
     if os.path.exists(expected):
         return [expected]
@@ -433,6 +445,7 @@ def aggregate_across_domains(
     lima: bool = False,
     probe_family: str = "classic",
     mcqa_variant: str = "preferred",
+    metric_file_variant: str = "default",
 ) -> pd.DataFrame:
     """
     Load and concatenate probe CSVs across all *domains* from a single run.
@@ -457,6 +470,9 @@ def aggregate_across_domains(
     mcqa_variant : str
         ``"regular"`` for non-reviewed MCQA folders, ``"reviewed"`` for reviewed
         MCQA folders, or ``"preferred"`` for reviewed-first fallback.
+    metric_file_variant : str
+        ``"default"`` for canonical ``*_metrics.csv`` files, or
+        ``"paraphrased"`` for ``*_paraphrased_metrics.csv`` files.
 
     Returns
     -------
@@ -476,7 +492,12 @@ def aggregate_across_domains(
         )
         metric_paths: List[str] = []
         for probe_dir in probe_dirs:
-            metric_paths = _candidate_metric_paths(probe_dir, domain, probe_type)
+            metric_paths = _candidate_metric_paths(
+                probe_dir,
+                domain,
+                probe_type,
+                metric_file_variant=metric_file_variant,
+            )
             if metric_paths:
                 break
 
@@ -552,6 +573,7 @@ def load_metrics(
     aggregate: bool = True,
     probe_family: str = "classic",
     mcqa_variant: str = "preferred",
+    metric_file_variant: str = "default",
 ) -> Optional[pd.DataFrame]:
     """
     High-level loader: resolve path -> load CSVs -> optionally filter probes
@@ -588,6 +610,9 @@ def load_metrics(
     mcqa_variant : str
         ``"regular"`` for non-reviewed MCQA folders, ``"reviewed"`` for reviewed
         MCQA folders, or ``"preferred"`` for reviewed-first fallback.
+    metric_file_variant : str
+        ``"default"`` for canonical ``*_metrics.csv`` files, or
+        ``"paraphrased"`` for ``*_paraphrased_metrics.csv`` files.
 
     Returns
     -------
@@ -605,6 +630,7 @@ def load_metrics(
         project_root=project_root,
         probe_family=probe_family,
         mcqa_variant=mcqa_variant,
+        metric_file_variant=metric_file_variant,
     )
     if base_df.empty:
         return None
@@ -651,6 +677,7 @@ def load_metrics(
         lima=True,
         probe_family=probe_family,
         mcqa_variant=mcqa_variant,
+        metric_file_variant=metric_file_variant,
     )
     if lima_df.empty:
         return base_agg
@@ -865,6 +892,9 @@ def compute_unified_ylim(
             y_max = max(y_max, d.y1)
     if not np.isfinite(y_min) or not np.isfinite(y_max):
         return None
+    if y_min == y_max:
+        pad = max(abs(y_min) * padding, padding)
+        return (y_min - pad, y_max + pad)
     pad = (y_max - y_min) * padding
     return (y_min - pad, y_max + pad)
 

@@ -31,31 +31,25 @@ from scripts.plotting.plot_utils import (  # noqa: E402
 
 
 E17_SOURCE_PATH = (
-    "results/FT/full/7b/"
-    "probes_v13_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13+v12_inf_prompt_formatted_question_5shot/"
-    "newline2/source_only/fill_dclm/domains_arxiv_all-legal_all/"
+    "results/FT/full/7b/source_only/fill_dclm/domains_arxiv_all-legal_all/"
     "e100/bs256_lr4e-05/overlap_1_8/E17_source_arxiv_legal_local"
 )
 
 E18_PARA_PATH = (
-    "results/FT/full/7b/"
-    "probes_v13_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13+v12_inf_prompt_formatted_question_5shot/"
-    "newline2/para9/fill_dclm/domains_arxiv_all-legal_all/"
+    "results/FT/full/7b/para9/fill_dclm/domains_arxiv_all-legal_all/"
     "e100/bs256_lr4e-05/overlap_1_8/E18_paraphrase_arxiv_legal_local"
 )
 
 E16_PRIOR_PATH = (
-    "results/FT/full/7b/"
-    "probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13+v12_inf_prompt_formatted_question_5shot/"
-    "newline2/para9_docmatch_expl_insertprior_knowledge/fill_dclm/domains_arxiv_all-legal_all/"
-    "e100/bs256_lr4e-05/overlap_1_16/E16_prior_knowledge_arxiv_legal_match_local"
+    "results/FT/full/7b/para9_docmatch_expl_insertprior_knowledge/fill_dclm/"
+    "domains_arxiv_all-legal_all/e100/bs256_lr4e-05/overlap_1_16/"
+    "E16_prior_knowledge_arxiv_legal_match_local"
 )
 
 E19_CITED_PATH = (
-    "results/FT/full/7b/"
-    "probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13+v12_inf_prompt_formatted_question_5shot/"
-    "newline2/para9_docmatch_expl_insertcited_works/fill_dclm/domains_arxiv_all-legal_all/"
-    "e100/bs256_lr4e-05/overlap_1_16/E19_cited_textbooks_arxiv_legal_match_local"
+    "results/FT/full/7b/para9_docmatch_expl_insertcited_works/fill_dclm/"
+    "domains_arxiv_all-legal_all/e100/bs256_lr4e-05/overlap_1_16/"
+    "E19_cited_textbooks_arxiv_legal_match_local"
 )
 
 RUNS = [
@@ -100,6 +94,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output_dir", default="plots")
     parser.add_argument("--filename", default="prior_knowledge_match_by_group_7B.pdf")
+    parser.add_argument(
+        "--averaged_filename",
+        default="prior_knowledge_match_averaged_7B.pdf",
+        help="Filename for the second figure averaging across all domains.",
+    )
     args = parser.parse_args()
 
     setup_style("default")
@@ -160,6 +159,33 @@ def main() -> None:
 
     fig.tight_layout()
     save_plot(args.filename, output_dir=args.output_dir)
+
+    # ---- Second figure: averaged across all shared domains ----
+    all_shared = sorted(shared_domains)
+    print(f"averaged: {len(all_shared)} domains")
+    fig2, axes2 = make_subplots(1, 4, figsize=(20, 4.2), sharey=False)
+    axes2 = axes2.flatten()
+    for ax, (probe_type, metric, probe_family, title, ylabel) in zip(axes2, PANELS):
+        for _key, label, run_path, color in RUNS:
+            df = load_metrics(
+                str(REPO_ROOT / run_path),
+                probe_type,
+                all_shared,
+                str(REPO_ROOT),
+                metrics=(metric,),
+                probe_family=probe_family,
+            )
+            if df is None or df.empty or metric not in df.columns:
+                print(f"Warning: no data for {label} / averaged / {probe_type}/{metric}")
+                continue
+            ax.plot(df["step"], df[metric], color=color, label=label, lw=1.8)
+        ax.set_title(title)
+        ax.set_xlabel("Training Step")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+    add_legend(axes2[0], loc="lower right", fontsize="small")
+    fig2.tight_layout()
+    save_plot(args.averaged_filename, output_dir=args.output_dir)
 
 
 if __name__ == "__main__":

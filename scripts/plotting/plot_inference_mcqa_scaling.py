@@ -35,7 +35,7 @@ MODEL_LABELS = {
     "13b": "13B",
     "32b": "32B",
 }
-REEVAL_DIR_CHOICES = ("reeval", "reeval_v1", "reeval_v2")
+REEVAL_DIR_CHOICES = ("reeval", "reeval_v1", "reeval_v2", "reeval_v3", "reeval_v4")
 
 DEFAULT_RUNS: Dict[str, Dict[str, str]] = {
     "source_only": {
@@ -90,7 +90,76 @@ def eval_bundle_path(path: str, bundle_names: Sequence[str], require_leaf: bool 
     return path
 
 
+def has_root_metrics(path: str) -> bool:
+    root = canonical_run_root(path)
+    candidate = root or Path(path)
+    if not candidate.is_absolute():
+        candidate = REPO_ROOT / candidate
+    return any(candidate.glob("*_knowledge_probe/*_knowledge_probe_metrics.csv"))
+
+
+def reeval_dir_candidates(reeval_dir: str) -> Tuple[str, ...]:
+    if reeval_dir == "reeval_v4":
+        return ("reeval_v4", "reeval_v3")
+    return (reeval_dir,)
+
+
+def has_metric_file_in_probe_dir(
+    path: Path,
+    dir_suffix: str,
+    metric_suffix: str,
+    excluded_dir_suffix: Optional[str] = None,
+) -> bool:
+    if not path.is_dir():
+        return False
+    return any(
+        child.is_dir()
+        and child.name.endswith(dir_suffix)
+        and not (excluded_dir_suffix and child.name.endswith(excluded_dir_suffix))
+        and any(child.glob(f"*{metric_suffix}"))
+        for child in path.iterdir()
+    )
+
+
+def has_reeval_probe_type(path: str, probe_type: str, probe_family: Optional[str] = None) -> bool:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = REPO_ROOT / candidate
+    if probe_type == "knowledge":
+        if probe_family == "classic":
+            return has_metric_file_in_probe_dir(candidate, "_knowledge_probe", "_knowledge_probe_metrics.csv")
+        if probe_family == "mcqa":
+            return has_metric_file_in_probe_dir(
+                candidate,
+                "_mcqa_probe",
+                "_mcqa_probe_metrics.csv",
+                excluded_dir_suffix="_inference_mcqa_probe",
+            )
+        return has_reeval_probe_type(str(candidate), probe_type, "classic") or has_reeval_probe_type(
+            str(candidate),
+            probe_type,
+            "mcqa",
+        )
+    if probe_type == "inference":
+        if probe_family == "classic":
+            return has_metric_file_in_probe_dir(candidate, "_inference_probe", "_inference_probe_metrics.csv")
+        if probe_family == "mcqa":
+            return has_metric_file_in_probe_dir(
+                candidate,
+                "_inference_mcqa_probe",
+                "_inference_mcqa_probe_metrics.csv",
+            )
+        return has_reeval_probe_type(str(candidate), probe_type, "classic") or has_reeval_probe_type(
+            str(candidate),
+            probe_type,
+            "mcqa",
+        )
+    return False
+
+
 def regular_mcqa_run_path(path: str) -> str:
+    if has_root_metrics(path):
+        return path
     canonical = eval_bundle_path(path, ("inf_mcqa_v12",))
     if canonical != path:
         return canonical
@@ -112,6 +181,8 @@ def reviewed_mcqa_run_path(path: str, reeval_dir: Optional[str] = None) -> str:
     )
     root = canonical_run_root(path)
     if root is not None:
+        if reeval_dir and find_latest_run(str(root / "eval_bundles" / reeval_dir)):
+            return str(root)
         if reeval_dir:
             for bundle_name in reviewed_bundles:
                 candidate = root / "eval_bundles" / bundle_name
@@ -157,6 +228,8 @@ def legacy_reviewed_mcqa_run_paths(path: str, model: Optional[str] = None) -> Li
 
 
 def run_path_for_variant(path: str, mcqa_variant: str) -> str:
+    if has_root_metrics(path):
+        return path
     if mcqa_variant == "regular":
         return regular_mcqa_run_path(path)
     direct_reviewed = eval_bundle_path(
@@ -178,22 +251,45 @@ def reeval_mcqa_run_path(
     model: Optional[str],
     probe_type: str = "inference",
     reeval_dir: str = "reeval",
+    probe_family: Optional[str] = None,
 ) -> str:
-    """Use final-model re-evaluation outputs for inference MCQA when present."""
+    """Use final-model re-evaluation outputs when present."""
     if reeval_dir not in REEVAL_DIR_CHOICES:
         raise ValueError(f"Unsupported re-eval directory: {reeval_dir}")
-    if probe_type != "inference":
-        return run_path
     candidates = [run_path]
-    if canonical_run_root(run_path) is None:
+    root = canonical_run_root(run_path)
+    if root is not None:
+        for candidate_reeval_dir in reeval_dir_candidates(reeval_dir):
+            top_level = root / "eval_bundles" / candidate_reeval_dir
+            if find_latest_run(str(top_level)) and has_reeval_probe_type(
+                str(top_level),
+                probe_type,
+                probe_family,
+            ):
+                return str(top_level)
+        bundle_names = (
+            "inf_mcqa_v13+v12",
+            "inf_mcqa_v13",
+            "inf_mcqa_v12_reviewed+v12",
+            "inf_mcqa_v12_reviewed",
+            "inf_mcqa_v13_legal",
+            "inf_mcqa_v12",
+        )
+        candidates.extend(str(root / "eval_bundles" / name) for name in bundle_names)
+    else:
         candidates.extend(legacy_reviewed_mcqa_run_paths(run_path, model))
-    for candidate in candidates:
+    for candidate in dict.fromkeys(candidates):
         resolved = find_latest_run(candidate) or (candidate if os.path.isdir(candidate) else None)
         if not resolved:
             continue
-        reeval_path = os.path.join(resolved, reeval_dir)
-        if find_latest_run(reeval_path):
-            return reeval_path
+        for candidate_reeval_dir in reeval_dir_candidates(reeval_dir):
+            reeval_path = os.path.join(resolved, candidate_reeval_dir)
+            if find_latest_run(reeval_path) and has_reeval_probe_type(
+                reeval_path,
+                probe_type,
+                probe_family,
+            ):
+                return reeval_path
     return run_path
 
 
@@ -253,7 +349,7 @@ def mcqa_run_path_for_variant(
         if os.path.isdir(reviewed_path):
             base_run_path = reviewed_path
     mcqa_run_path = (
-        reeval_mcqa_run_path(base_run_path, model, probe_type, reeval_dir=reeval_dir)
+        reeval_mcqa_run_path(base_run_path, model, probe_type, reeval_dir=reeval_dir, probe_family="mcqa")
         if use_reeval
         else base_run_path
     )
@@ -300,6 +396,7 @@ def _load_mcqa(
                 model,
                 "inference",
                 reeval_dir=reeval_dir,
+                probe_family="mcqa",
             ) if use_reeval else regular_run_path
         elif reviewed_fallback == "drop":
             return None, "dropped", mcqa_run_path
@@ -336,6 +433,7 @@ def _load_mcqa(
             model,
             "inference",
             reeval_dir=reeval_dir,
+            probe_family="mcqa",
         ) if use_reeval else regular_run_path
         return load_metrics(
             mcqa_run_path,

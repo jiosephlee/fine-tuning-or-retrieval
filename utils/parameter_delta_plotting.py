@@ -10,7 +10,12 @@ from scripts.plotting import plot_utils
 from scripts.plotting.plot_inference_mcqa_scaling import apply_plot_style
 
 try:
-    from utils.parameter_delta_metrics import COMPONENTS, LAYER_COMPONENTS, METRICS
+    from utils.parameter_delta_metrics import (
+        COMPONENTS,
+        GINI_MEAN_ABS_EPS,
+        LAYER_COMPONENTS,
+        METRICS,
+    )
 except ModuleNotFoundError as exc:
     if exc.name != "torch":
         raise
@@ -31,6 +36,7 @@ except ModuleNotFoundError as exc:
         "relative_delta_gini",
         "cosine_distance_gini",
     )
+    GINI_MEAN_ABS_EPS = 1e-6
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_PLOTS_DIR = os.path.join(PROJECT_ROOT, "plots", "parameter_delta")
@@ -148,6 +154,34 @@ def _metric_axis_label(metric: str) -> str:
     return metric_label
 
 
+def _zero_tiny_gini_metrics(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    df = metrics_df.copy()
+    id_cols = [
+        col
+        for col in df.columns
+        if col not in {"metric", "value", "num_values"}
+    ]
+    key_cols = [f"__key_{col}" for col in id_cols]
+    for col, key_col in zip(id_cols, key_cols):
+        df[key_col] = df[col].where(df[col].notna(), "__nan__")
+
+    for base_metric, gini_metric in (
+        ("relative_delta_norm", "relative_delta_gini"),
+        ("cosine_distance", "cosine_distance_gini"),
+    ):
+        base = df[df["metric"] == base_metric][key_cols + ["value"]].rename(
+            columns={"value": "__base_value"}
+        )
+        if base.empty:
+            continue
+        gini_mask = df["metric"] == gini_metric
+        merged = df.loc[gini_mask, key_cols].merge(base, on=key_cols, how="left")
+        tiny = merged["__base_value"].fillna(np.inf).to_numpy(dtype=float) <= GINI_MEAN_ABS_EPS
+        df.loc[df.index[gini_mask][tiny], "value"] = 0.0
+
+    return df.drop(columns=key_cols)
+
+
 def _plot_group_view_grid(
     metrics_df: pd.DataFrame,
     output_dir: str,
@@ -256,7 +290,7 @@ def plot_parameter_delta_mlp_comparison(
     if not frames:
         return []
 
-    metrics_df = pd.concat(frames, ignore_index=True)
+    metrics_df = _zero_tiny_gini_metrics(pd.concat(frames, ignore_index=True))
     saved_paths = []
     for view, view_name in VIEW_FILENAME_PARTS.items():
         view_df = metrics_df[
@@ -364,7 +398,9 @@ def plot_parameter_delta_outputs(
 ) -> List[str]:
     _setup_style()
     plots_dir = plots_dir or DEFAULT_PLOTS_DIR
-    metrics_df = _read_csv(os.path.join(output_dir, "parameter_delta_metrics.csv"))
+    metrics_df = _zero_tiny_gini_metrics(
+        _read_csv(os.path.join(output_dir, "parameter_delta_metrics.csv"))
+    )
     if metrics_df.empty:
         return []
 

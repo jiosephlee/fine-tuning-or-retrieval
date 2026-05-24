@@ -192,54 +192,61 @@ def collect_strategy_trajectory_data(batch_size=32, probe_type="inference"):
 
 
 def plot_combined_log_prob(df_traj, df_bs, model_colors, style):
-    print("Plotting combined legacy log-prob figure...")
+    print("Plotting legacy 4-panel log-prob figure...")
 
-    fig = plt.figure(figsize=(16, 5))
-    gs = fig.add_gridspec(1, 4, width_ratios=[1.1, 0.18, 1, 1], wspace=0.15)
+    fig = plt.figure(figsize=(16.8, 4.8))
+    gs = fig.add_gridspec(1, 5, width_ratios=[1, 1, 0.15, 1, 1], wspace=0.1)
     axes = [
         fig.add_subplot(gs[0, 0]),
-        fig.add_subplot(gs[0, 2]),
+        fig.add_subplot(gs[0, 1]),
         fig.add_subplot(gs[0, 3]),
+        fig.add_subplot(gs[0, 4]),
     ]
 
     strategy_styles = style["strategy_styles"]
-    trajectory_styles = {
-        "Para 9": {"linestyle": strategy_styles["Para 9"]["linestyle"], "label": "Paraphrased"},
-        "Source": {"linestyle": strategy_styles["Source"]["linestyle"], "label": "Source Only"},
-    }
     trajectory_values = []
-    ax_traj = axes[0]
-    for strategy in ("Para 9", "Source"):
+    trajectory_steps = []
+    trajectory_panels = [
+        ("Source", "Source", axes[0]),
+        ("Para 9", "Paraphrased", axes[1]),
+    ]
+    for strategy, title, ax in trajectory_panels:
         subset = df_traj[df_traj["Strategy"] == strategy]
         for model in ("1B", "7B", "13B", "32B"):
             series = subset[subset["Model"] == model].sort_values("Step")
             if series.empty:
                 continue
-            ax_traj.plot(
+            ax.plot(
                 series["Step"],
                 series["Value"],
                 color=model_colors[model],
-                linestyle=trajectory_styles[strategy]["linestyle"],
+                linestyle="-",
                 linewidth=style["line_width"],
             )
             trajectory_values.extend(series["Value"].dropna().tolist())
+            trajectory_steps.extend(series["Step"].dropna().tolist())
 
-    ax_traj.set_title("Source vs. Paraphrased")
-    ax_traj.set_xlabel("Training Step")
-    ax_traj.set_ylabel("Inference Log Prob")
-    ax_traj.grid(True, alpha=style["grid_alpha"])
-    ax_traj.set_xlim(left=0)
-    ax_traj.margins(x=0)
+        ax.set_title(title)
+        ax.set_xlabel("Exposure #")
+        ax.grid(True, alpha=style["grid_alpha"])
+        if trajectory_steps:
+            ax.set_xlim(0, max(trajectory_steps))
+
+    axes[0].set_ylabel("Log Prob.")
+    axes[1].set_yticklabels([])
+    axes[0].set_xticks([0, 25, 50, 75, 100])
+    axes[1].set_xticks([0, 25, 50, 75, 100])
+    axes[1].set_xticklabels(["", "25", "50", "75", "100"])
 
     trajectory_ylim = compute_unified_ylim(trajectory_values, padding=0.05)
     if trajectory_ylim:
-        apply_ylim([ax_traj], trajectory_ylim)
+        apply_ylim(axes[:2], trajectory_ylim)
 
     batch_panels = [
-        ("Factual", axes[1]),
-        ("Compositional", axes[2]),
+        ("Factual", axes[2]),
+        ("Compositional", axes[3]),
     ]
-    for probe_type, ax in batch_panels:
+    for index, (probe_type, ax) in enumerate(batch_panels):
         subset = df_bs[df_bs["Type"] == probe_type]
         for _, pair in subset[["Model", "Strategy"]].drop_duplicates().iterrows():
             model = pair["Model"]
@@ -259,8 +266,8 @@ def plot_combined_log_prob(df_traj, df_bs, model_colors, style):
                 marker=series_style.get("marker", "o"),
                 linewidth=style["batch_line_width"],
                 markersize=style["marker_size"],
-                markerfacecolor="white",
-                markeredgecolor=model_colors[model],
+                markerfacecolor=model_colors[model],
+                markeredgecolor="#444444",
                 markeredgewidth=style["marker_edge_width"],
             )
 
@@ -270,30 +277,39 @@ def plot_combined_log_prob(df_traj, df_bs, model_colors, style):
         ax.set_xticklabels(["32", "64", "128", "256"])
         ax.set_xlabel("Batch Size")
         ax.grid(True, which="major", ls="-", alpha=style["grid_alpha"])
+        if index != 0:
+            ax.set_yticklabels([])
 
-    axes[1].set_ylabel("Final Log Prob")
-    axes[2].set_ylabel("")
-    axes[2].set_yticklabels([])
+    axes[2].set_ylabel("Final Log Prob")
 
     batch_ylim = compute_unified_ylim(df_bs["Value"].dropna().tolist(), padding=0.05)
     if batch_ylim:
-        apply_ylim(axes[1:], batch_ylim)
+        apply_ylim(axes[2:], batch_ylim)
 
-    legend_elements = [
+    trajectory_legend_elements = [
         Line2D([0], [0], color=model_colors["1B"], lw=style["line_width"], linestyle="-", label="1B"),
         Line2D([0], [0], color=model_colors["7B"], lw=style["line_width"], linestyle="-", label="7B"),
         Line2D([0], [0], color=model_colors["13B"], lw=style["line_width"], linestyle="-", label="13B"),
         Line2D([0], [0], color=model_colors["32B"], lw=style["line_width"], linestyle="-", label="32B"),
+    ]
+    trajectory_legend = axes[0].legend(
+        handles=trajectory_legend_elements,
+        loc="lower right",
+        **style["legend"],
+    )
+    trajectory_legend.get_frame().set_facecolor("none")
+
+    batch_legend_elements = [
         Line2D(
             [0], [0],
             color="gray",
             lw=style["line_width"],
             linestyle="-",
             marker="o",
-            markerfacecolor="white",
-            markeredgecolor="gray",
-            markersize=style["marker_size"],
+            markerfacecolor="gray",
+            markeredgecolor="#444444",
             markeredgewidth=style["marker_edge_width"],
+            markersize=style["marker_size"],
             label="Paraphrased",
         ),
         Line2D(
@@ -302,22 +318,25 @@ def plot_combined_log_prob(df_traj, df_bs, model_colors, style):
             lw=style["line_width"],
             linestyle="--",
             marker="s",
-            markerfacecolor="white",
-            markeredgecolor="gray",
-            markersize=style["marker_size"],
+            markerfacecolor="gray",
+            markeredgecolor="#444444",
             markeredgewidth=style["marker_edge_width"],
-            label="Source Only",
+            markersize=style["marker_size"],
+            label="Source",
         ),
+        Line2D([0], [0], color=model_colors["1B"], lw=style["line_width"], linestyle="-", label="1B"),
+        Line2D([0], [0], color=model_colors["7B"], lw=style["line_width"], linestyle="-", label="7B"),
+        Line2D([0], [0], color=model_colors["13B"], lw=style["line_width"], linestyle="-", label="13B"),
+        Line2D([0], [0], color=model_colors["32B"], lw=style["line_width"], linestyle="-", label="32B"),
     ]
-    legend = axes[1].legend(
-        handles=legend_elements,
-        loc="lower right",
-        ncol=1,
+    batch_legend = axes[2].legend(
+        handles=batch_legend_elements,
+        loc="lower left",
         **style["legend"],
     )
-    legend.get_frame().set_facecolor("none")
+    batch_legend.get_frame().set_facecolor("none")
 
-    fig.subplots_adjust(left=0.075, right=0.99, bottom=0.16, top=0.88, wspace=0.15)
+    fig.subplots_adjust(left=0.06, right=0.99, bottom=0.16, top=0.88, wspace=0.1)
     out_path = os.path.join(REPO_ROOT, "plots", "legacy", "batch_scaling_log_prob")
     save_figure(fig, out_path)
 

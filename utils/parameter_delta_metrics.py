@@ -39,6 +39,7 @@ COMPONENT_ORIENTATIONS = {
     "o_proj": "cols",
 }
 EPS = 1e-12
+GINI_MEAN_ABS_EPS = 1e-6
 
 
 @dataclass(frozen=True)
@@ -286,7 +287,7 @@ def gini(values: np.ndarray) -> float:
         return np.nan
     finite = np.sort(np.abs(finite))
     total = float(np.sum(finite))
-    if total <= EPS:
+    if total <= EPS or (total / finite.size) <= GINI_MEAN_ABS_EPS:
         return 0.0
     n = finite.size
     index = np.arange(1, n + 1, dtype=np.float64)

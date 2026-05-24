@@ -21,11 +21,15 @@ from scripts.plotting.plot_inference_mcqa_scaling import (  # noqa: E402
 )
 from scripts.plotting.plot_probe_scaling_by_model import (  # noqa: E402
     INFERENCE_MCQA_REEVAL_CHOICES,
+    FACTUAL_PROBE_VARIANT_CHOICES,
     METHOD_COLORS,
     PANELS,
     REEVAL_DIR_CHOICES,
+    VALUE_MODE_CHOICES,
     iter_run_items,
     load_configured_values,
+    panel_title,
+    panel_ylabel,
 )
 from scripts.plotting.plot_utils import compute_unified_ylim  # noqa: E402
 
@@ -60,6 +64,8 @@ def load_grouped_values(
     use_reeval: bool,
     inference_mcqa_reeval: Optional[str],
     reeval_dir: str,
+    value_mode: str,
+    factual_probe_variant: str,
 ) -> Dict[str, dict]:
     grouped = {}
     for group, domains in domain_groups.items():
@@ -77,11 +83,18 @@ def load_grouped_values(
             use_reeval=use_reeval,
             inference_mcqa_reeval=group_inference_mcqa_reeval,
             reeval_dir=reeval_dir,
+            value_mode=value_mode,
+            factual_probe_variant=factual_probe_variant,
         )
     return grouped
 
 
-def plot_domain_scaling(grouped_values: Dict[str, dict], output: str):
+def plot_domain_scaling(
+    grouped_values: Dict[str, dict],
+    output: str,
+    value_mode: str = "final",
+    factual_probe_variant: str = "canonical",
+):
     apply_plot_style()
     groups = [group for group in DOMAIN_GROUPS if group in grouped_values]
     if not groups:
@@ -120,7 +133,7 @@ def plot_domain_scaling(grouped_values: Dict[str, dict], output: str):
                 )
 
             if row == 0:
-                ax.set_title(title)
+                ax.set_title(panel_title(title, probe_type, metric, factual_probe_variant))
             if row == len(groups) - 1:
                 ax.set_xlabel("Model Size")
                 ax.set_xticks(x)
@@ -134,12 +147,14 @@ def plot_domain_scaling(grouped_values: Dict[str, dict], output: str):
                 ax.text(
                     0.02,
                     0.98,
-                    ylabel,
+                    panel_ylabel(ylabel, value_mode),
                     transform=ax.transAxes,
                     ha="left",
                     va="top",
                     fontsize=10,
                 )
+            if value_mode == "delta":
+                ax.axhline(0, color="black", linewidth=0.8, alpha=0.35)
             ax.grid(True, axis="y", alpha=0.25)
 
             ylim = compute_unified_ylim(panel_values, padding=0.05)
@@ -199,6 +214,18 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         choices=INFERENCE_MCQA_REEVAL_CHOICES,
         help="Override inference MCQA loading with a specific re-eval result tree.",
     )
+    parser.add_argument(
+        "--value_mode",
+        choices=VALUE_MODE_CHOICES,
+        default="final",
+        help="Plot final metric values or final-minus-initial deltas.",
+    )
+    parser.add_argument(
+        "--factual_probe_variant",
+        choices=FACTUAL_PROBE_VARIANT_CHOICES,
+        default="canonical",
+        help="Use canonical or paraphrased factual log-prob probe metrics in the factual probe panel.",
+    )
     return parser.parse_args(argv)
 
 
@@ -219,6 +246,8 @@ def main(argv: Optional[Sequence[str]] = None):
         use_reeval=not args.no_reeval,
         inference_mcqa_reeval=args.inference_mcqa_reeval,
         reeval_dir=args.reeval_dir,
+        value_mode=args.value_mode,
+        factual_probe_variant=args.factual_probe_variant,
     )
 
     missing = []
@@ -231,7 +260,12 @@ def main(argv: Optional[Sequence[str]] = None):
         for group, probe_type, method, model, metric in missing:
             print(f"Warning: missing {group} {probe_type} {metric} for {method} {model}")
 
-    plot_domain_scaling(grouped_values, args.output)
+    plot_domain_scaling(
+        grouped_values,
+        args.output,
+        value_mode=args.value_mode,
+        factual_probe_variant=args.factual_probe_variant,
+    )
 
 
 if __name__ == "__main__":

@@ -1,35 +1,43 @@
 #!/bin/bash
-#SBATCH --job-name=E20_para_no_exp_p4
-#SBATCH --output=logs/E20_para_no_exp_p4-%j.out
-#SBATCH --error=logs/E20_para_no_exp_p4-%j.err
-#SBATCH --time=10:00:00
+#SBATCH --job-name=E20_para_no_exp_p4_13b
+#SBATCH --output=logs/E20_para_no_exp_p4_13b-%j.out
+#SBATCH --error=logs/E20_para_no_exp_p4_13b-%j.err
 #SBATCH --partition=dgx-b200
-#SBATCH --gpus=8
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=128GB
+#SBATCH --gpus=4
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=512G
+#SBATCH --time=0-6:00:00
 
 set -euo pipefail
 
 # SLURM E20 paraphrase run without the matched explanation/document auxiliary track.
 
-cd "$(dirname "$0")"
+if [[ -n "${SLURM_SUBMIT_DIR:-}" && -d "$SLURM_SUBMIT_DIR/scripts/FT" ]]; then
+    cd "$SLURM_SUBMIT_DIR/scripts/FT"
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "$SLURM_SUBMIT_DIR/finetuning_knowledge_v9.py" ]]; then
+    cd "$SLURM_SUBMIT_DIR"
+else
+    cd "$(dirname "$0")"
+fi
 mkdir -p logs
 
-MODEL_ID="${MODEL_ID:-allenai/OLMo-2-1124-7B}"
+MODEL_ID="${MODEL_ID:-allenai/OLMo-2-1124-13B}"
 CONDA_ENV="${CONDA_ENV:-openrlhf}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 # In this CPT pipeline, NUM_EPOCHS is used as the target number of
 # knowledge-injection batches when >1. The default 100 matches E1/E3 local.
 NUM_EPOCHS="${NUM_EPOCHS:-50}"
-NUM_PARAPHRASED="${NUM_PARAPHRASED:-4}"
-DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-8}"
+NUM_PARAPHRASED="${NUM_PARAPHRASED:-9}"
+DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"
 EFFECTIVE_BATCH_SIZE="${EFFECTIVE_BATCH_SIZE:-256}"
 LEARNING_RATE="${LEARNING_RATE:-4e-5}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
-CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E2_paraphrase_all_domains_no_explanation_match_para4}"
+CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E2_paraphrase_13b_all_domains_no_explanation_match_para9}"
 MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v15}"
 MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
+MCQA_PROBE_BATCH_SIZE="${MCQA_PROBE_BATCH_SIZE:-32}"
 USE_PARCC="${USE_PARCC:-0}"
 SAVE_LOCAL_MODEL="${SAVE_LOCAL_MODEL:-1}"
 SPARSE_CALLBACKS="${SPARSE_CALLBACKS:-0}"
@@ -50,13 +58,13 @@ if [[ "$SPARSE_CALLBACKS" == "1" ]]; then
     EXTRA_ARGS+=(--no_callback_every_step)
 fi
 
-if [[ "${CONDA_DEFAULT_ENV:-}" == "$CONDA_ENV" ]]; then
-    LAUNCH=(torchrun --standalone --nproc_per_node "$NPROC_PER_NODE")
-else
-    LAUNCH=(conda run --no-capture-output -n "$CONDA_ENV" torchrun --standalone --nproc_per_node "$NPROC_PER_NODE")
+if command -v module >/dev/null 2>&1; then
+    module load anaconda3 || true
 fi
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$CONDA_ENV"
 
-"${LAUNCH[@]}" finetuning_knowledge_v9.py \
+torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" finetuning_knowledge_v9.py \
     --custom_suffix "$CUSTOM_SUFFIX" \
     --model_id "$MODEL_ID" \
     --wandb_group finetuning_official \
@@ -67,6 +75,7 @@ fi
     --mcqa_probes \
     --mcqa_probes_version "$MCQA_PROBES_VERSION" \
     --mcqa_prompt_column "$MCQA_PROMPT_COLUMN" \
+    --mcqa_probe_batch_size "$MCQA_PROBE_BATCH_SIZE" \
     --num_train_epochs "$NUM_EPOCHS" \
     --learning_rate "$LEARNING_RATE" \
     --lr_scheduler_min_lr_ratio 0.1 \
