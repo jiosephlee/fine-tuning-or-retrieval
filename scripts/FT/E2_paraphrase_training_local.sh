@@ -11,11 +11,11 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 # In this CPT pipeline, NUM_EPOCHS is used as the target number of
 # knowledge-injection batches when >1. The default 10 is one full
 # source+9-paraphrase cycle, matching E1/E3 compute.
-NUM_EPOCHS="${NUM_EPOCHS:-100}"
-NUM_PARAPHRASED="${NUM_PARAPHRASED:-49}"
+NUM_EPOCHS="${NUM_EPOCHS:-49}"
+NUM_PARAPHRASED="${NUM_PARAPHRASED:-0}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-8}"
 EFFECTIVE_BATCH_SIZE="${EFFECTIVE_BATCH_SIZE:-256}"
-LEARNING_RATE="${LEARNING_RATE:-8e-5}"
+LEARNING_RATE="${LEARNING_RATE:-4e-5}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
 CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E2_paraphrase_docmatch_expl_all_domains_local}"
