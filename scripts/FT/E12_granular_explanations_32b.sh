@@ -3,11 +3,11 @@
 #SBATCH --output=logs/E12_granular_32b-%j.out
 #SBATCH --error=logs/E12_granular_32b-%j.err
 #SBATCH --partition=dgx-b200
-#SBATCH --gpus=4
+#SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=14
 #SBATCH --mem=512G
-#SBATCH --time=1-0:00:00
+#SBATCH --time=2-0:00:00
 
 set -euo pipefail
 
@@ -22,21 +22,21 @@ mkdir -p logs
 
 MODEL_ID="${MODEL_ID:-allenai/OLMo-2-0325-32B}"
 CONDA_ENV="${CONDA_ENV:-openrlhf}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 # In this CPT pipeline, NUM_EPOCHS is used as the target number of
 # knowledge-injection batches when >1. The default 100 matches E1/E2 local.
 NUM_EPOCHS="${NUM_EPOCHS:-100}"
-NUM_PARAPHRASED="${NUM_PARAPHRASED:-9}"
+NUM_PARAPHRASED="${NUM_PARAPHRASED:-49}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-1}"
 EFFECTIVE_BATCH_SIZE="${EFFECTIVE_BATCH_SIZE:-256}"
 LEARNING_RATE="${LEARNING_RATE:-4e-5}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
-OFFLOAD_TO_CPU="${OFFLOAD_TO_CPU:-0}"
+OFFLOAD_TO_CPU="${OFFLOAD_TO_CPU:-1}"
 DEVICE_MAP_AUTO="${DEVICE_MAP_AUTO:-$OFFLOAD_TO_CPU}"
 ACTIVATION_OFFLOADING="${ACTIVATION_OFFLOADING:-1}"
 CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E12_granular_explanations_32b_all_domains}"
-PUSH_TO_HUB_CPT_ID="${PUSH_TO_HUB_CPT_ID:-e12-olmo2-32b-para9-expl-20260517}"
+PUSH_TO_HUB_CPT_ID="${PUSH_TO_HUB_CPT_ID:-e12-olmo2-32b-para9-expl-20260524}"
 EXPLANATION_TYPES="${EXPLANATION_TYPES:-textbooks stackexchange blogs}"
 EXPLANATIONS_INSERTION_STRATEGY="${EXPLANATIONS_INSERTION_STRATEGY:-granular}"
 EXPLANATIONS_CYCLE="${EXPLANATIONS_CYCLE:-full}"
@@ -44,11 +44,11 @@ EXPLANATIONS_NUM_TRACKS="${EXPLANATIONS_NUM_TRACKS:-1}"
 EXPLANATION_GRANULARITY="${EXPLANATION_GRANULARITY:-file}"
 EXPLANATION_TRACK_SIZE_BY_CHUNK="${EXPLANATION_TRACK_SIZE_BY_CHUNK:-4}"
 MATCH_EXPLANATION_SOURCE_REPLAY="${MATCH_EXPLANATION_SOURCE_REPLAY:-0}"
-MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v14}"
+MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v15}"
 MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 MCQA_PROBE_BATCH_SIZE="${MCQA_PROBE_BATCH_SIZE:-32}"
 INFERENCE_MCQA_PROBES="${INFERENCE_MCQA_PROBES:-1}"
-INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v12_reviewed v12}"
+INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v14}"
 INFERENCE_MCQA_PROMPT_COLUMN="${INFERENCE_MCQA_PROMPT_COLUMN:-formatted_question}"
 USE_PARCC="${USE_PARCC:-0}"
 SAVE_LOCAL_MODEL="${SAVE_LOCAL_MODEL:-0}"
@@ -129,9 +129,9 @@ fi
     --wandb_group finetuning_official \
     --push_to_hub_cpt_id "$PUSH_TO_HUB_CPT_ID" \
     --model_id "$MODEL_ID" \
-    --knowledge_probes_version v13 \
+    --knowledge_probes_version v14 \
     --paraphrased_knowledge_probes \
-    --paraphrased_knowledge_probes_version v13 \
+    --paraphrased_knowledge_probes_version v14 \
     --paraphrased_knowledge_probe_filename_suffix _paraphrased \
     --mcqa_probes \
     --mcqa_probes_version "$MCQA_PROBES_VERSION" \

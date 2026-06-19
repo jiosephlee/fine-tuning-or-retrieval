@@ -37,13 +37,13 @@ CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
 CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E19_cited_textbooks_arxiv_legal_match}"
 PUSH_TO_HUB_CPT_ID="${PUSH_TO_HUB_CPT_ID:-e19-olmo2-7b-para9-cited-match-20260517}"
-MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v14}"
+MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v15}"
 MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 MCQA_PROBE_BATCH_SIZE="${MCQA_PROBE_BATCH_SIZE:-32}"
 INFERENCE_MCQA_PROBES="${INFERENCE_MCQA_PROBES:-1}"
-INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v12_reviewed v12}"
-INFERENCE_MCQA_PROMPT_COLUMN="${INFERENCE_MCQA_PROMPT_COLUMN:-formatted_question}"
-USE_PARCC="${USE_PARCC:-0}"
+INFERENCE_MCQA_PROBES_VERSION="${INFERENCE_MCQA_PROBES_VERSION:-v14}"
+INFERENCE_MCQA_PROMPT_COLUMN="${INFERENCE_MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
+USE_PARCC="${USE_PARCC:-1}"
 SAVE_LOCAL_MODEL="${SAVE_LOCAL_MODEL:-0}"
 SPARSE_CALLBACKS="${SPARSE_CALLBACKS:-0}"
 PARAMETER_DELTA_EVERY_N_STEPS="${PARAMETER_DELTA_EVERY_N_STEPS:-5}"
@@ -97,9 +97,9 @@ torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" finetuning_knowledge_v9
     --push_to_hub_cpt_id "$PUSH_TO_HUB_CPT_ID" \
     --model_id "$MODEL_ID" \
     --include_sources arxiv legal \
-    --knowledge_probes_version v13 \
+    --knowledge_probes_version v14 \
     --paraphrased_knowledge_probes \
-    --paraphrased_knowledge_probes_version v13 \
+    --paraphrased_knowledge_probes_version v14 \
     --paraphrased_knowledge_probe_filename_suffix _paraphrased \
     --mcqa_probes \
     --mcqa_probes_version "$MCQA_PROBES_VERSION" \

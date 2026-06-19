@@ -36,13 +36,18 @@ except ModuleNotFoundError as exc:
         "relative_delta_gini",
         "cosine_distance_gini",
     )
-    GINI_MEAN_ABS_EPS = 1e-6
+    GINI_MEAN_ABS_EPS = 1.5e-9
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_PLOTS_DIR = os.path.join(PROJECT_ROOT, "plots", "parameter_delta")
 
 
 MLP_COMPONENTS = ("gate_proj", "up_proj", "down_proj")
+MLP_COMPARISON_LABELS = {
+    "source_only": "Source.",
+    "para9": "Para. 9",
+    "with_explanations": "Para. 9 + Aux.",
+}
 PLOT_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("mlp", MLP_COMPONENTS),
 )
@@ -87,8 +92,9 @@ def _setup_style() -> None:
 
 
 def _save(fig, output_dir: str, filename: str, dpi: int = 200) -> str:
-    plt.figure(fig.number)
-    return plot_utils.save_plot(filename, output_dir=output_dir, dpi=dpi)
+    output_path = os.path.join(output_dir, filename)
+    plot_utils.save_figure(fig, output_path, suffixes=(".pdf", ".png"))
+    return output_path
 
 
 def _safe_filename_part(value: str, max_len: int = 80) -> str:
@@ -275,6 +281,14 @@ def plot_parameter_delta_mlp_comparison(
     prefix: str = "7b",
 ) -> List[str]:
     _setup_style()
+    plt.rcParams.update({
+        "axes.labelsize": 13,
+        "axes.titlesize": 15,
+        "font.size": 12,
+        "legend.fontsize": 11,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
+    })
     output_dir = output_dir or DEFAULT_PLOTS_DIR
 
     frames = []
@@ -284,7 +298,7 @@ def plot_parameter_delta_mlp_comparison(
             continue
         df = df.copy()
         df["method"] = method
-        df["label"] = label
+        df["label"] = MLP_COMPARISON_LABELS.get(method, label)
         df["color"] = color
         frames.append(df)
     if not frames:
@@ -344,16 +358,17 @@ def plot_parameter_delta_mlp_comparison(
         if handles_by_label:
             labels = list(handles_by_label.keys())
             handles = [handles_by_label[label] for label in labels]
-            plot_utils.add_legend(
-                fig,
-                loc="lower center",
-                handles_labels=(handles, labels),
-                bbox_to_anchor=(0.5, -0.01),
-                ncol=len(labels),
-                frameon=False,
+            axes[0, 0].legend(
+                handles,
+                labels,
+                loc="lower right",
+                frameon=True,
+                framealpha=0.9,
+                borderpad=0.4,
+                handlelength=1.8,
             )
 
-        fig.tight_layout(rect=(0, 0.07, 1, 1))
+        fig.tight_layout(pad=0.8, w_pad=0.7, h_pad=0.55)
         saved_paths.append(
             _save(
                 fig,

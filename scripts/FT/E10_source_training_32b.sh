@@ -3,10 +3,10 @@
 #SBATCH --output=logs/E10_source_32b-%j.out
 #SBATCH --error=logs/E10_source_32b-%j.err
 #SBATCH --partition=dgx-b200
-#SBATCH --gpus=4
+#SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=512G
+#SBATCH --cpus-per-task=14
+#SBATCH --mem=128G
 #SBATCH --time=1-0:00:00
 
 set -euo pipefail
