@@ -42,23 +42,26 @@ E18_PARA_PATH = (
     "eval_bundles/inf_mcqa_v14"
 )
 
+# Latest re-evaluated runs store probes under eval_bundles/inf_mcqa_v14 (full
+# trajectory, single v14 inference-MCQA folder). Point at the bundle directly so
+# find_latest_run/load_metrics resolve the per-domain probe folders.
 E16_PRIOR_PATH = (
     "results/FT/full/7b/para9_docmatch_expl_insertprior_knowledge/fill_dclm/"
     "domains_arxiv_all-legal_all/e100/bs256_lr4e-05/overlap_1_16/"
-    "E16_prior_knowledge_arxiv_legal_match_local"
+    "E13_15_prior_knowledge_expl_match_all_domains/eval_bundles/inf_mcqa_v14"
 )
 
 E19_CITED_PATH = (
     "results/FT/full/7b/para9_docmatch_expl_insertcited_works/fill_dclm/"
     "domains_arxiv_all-legal_all/e100/bs256_lr4e-05/overlap_1_16/"
-    "E19_cited_textbooks_arxiv_legal_match_local"
+    "E19_cited_textbooks_arxiv_legal_match/eval_bundles/inf_mcqa_v14"
 )
 
 RUNS = [
-    ("source",       "Source Only (E17)",            E17_SOURCE_PATH, "#1f77b4"),
-    ("para",         "Paraphrased (E18)",            E18_PARA_PATH,   "#ff7f0e"),
-    ("prior_match",  "Para. + Prior Knowledge (E16)", E16_PRIOR_PATH, "#d62728"),
-    ("cited_match",  "Para. + Cited Works (E19)",     E19_CITED_PATH, "#2ca02c"),
+    ("source",       "Source Only",              E17_SOURCE_PATH, "#1f77b4"),
+    ("para",         "Paraphrased",              E18_PARA_PATH,   "#ff7f0e"),
+    ("prior_match",  "Para. + Prior Knowledge",  E16_PRIOR_PATH,  "#d62728"),
+    ("cited_match",  "Para. + Cited Works",      E19_CITED_PATH,  "#2ca02c"),
 ]
 
 PANELS = [

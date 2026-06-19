@@ -30,7 +30,9 @@ PROBE_CONFIGS = {
         "title": "Factual",
         "probe_type": "knowledge",
         "probe_folder": "facts",
-        "probe_file": "probes_v13.csv",
+        # v13 was moved under intermediate/ during the probe directory cleanup
+        # (commit c42e5c413); it matches the evaluated classic factual metrics.
+        "probe_file": "intermediate/probes_v13.csv",
     },
     "inference": {
         "title": "Inference",

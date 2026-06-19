@@ -43,10 +43,22 @@ PROBE_TYPES = (
 )
 PANELS = (
     ("knowledge", "log_prob", "Factual Probes", "Final Log Prob"),
-    ("knowledge", "mcqa_accuracy", "Factual MCQA", "Final Accuracy"),
     ("inference", "log_prob", "Inference Probes", "Final Log Prob"),
+    ("knowledge", "mcqa_accuracy", "Factual MCQA", "Final Accuracy"),
     ("inference", "mcqa_accuracy", "Inference MCQA", "Final Accuracy"),
 )
+# Columns grouped by metric: cols 0-1 are log-prob probes, cols 2-3 are MCQA.
+PANEL_GROUPS = ((0, 1), (2, 3))
+TARGET_RANK_PANELS = (
+    ("knowledge", "Factual Probes"),
+    ("inference", "Inference Probes"),
+)
+# Shorter labels used only in the scaling-plot legends.
+LEGEND_LABELS = {
+    "source_only": "Source",
+    "para9": "Para. 9",
+    "with_explanations": "Para. 9 + Aux.",
+}
 METHOD_COLORS = {
     "source_only": COLORS["method"]["source"],
     "para9": COLORS["paraphrase_level"]["para9"],
@@ -471,6 +483,78 @@ def load_configured_values(
     return values
 
 
+def load_target_rank_values(
+    domains: Sequence[str],
+    mcqa_variant: str,
+    use_reeval: bool = True,
+    reeval_dir: str = "reeval",
+    value_mode: str = "final",
+    factual_probe_variant: str = "canonical",
+):
+    if value_mode not in VALUE_MODE_CHOICES:
+        raise ValueError(f"Unsupported value mode: {value_mode}")
+    if factual_probe_variant not in FACTUAL_PROBE_VARIANT_CHOICES:
+        raise ValueError(f"Unsupported factual probe variant: {factual_probe_variant}")
+
+    values: Dict[Tuple[str, str, str], dict] = {}
+    for method, model, run_path in iter_run_items(mcqa_variant):
+        for probe_type, _ in PROBE_TYPES:
+            classic_metric_file_variant = (
+                "paraphrased"
+                if probe_type == "knowledge" and factual_probe_variant == "paraphrased"
+                else "default"
+            )
+            target_run_path = (
+                reeval_mcqa_run_path(
+                    run_path,
+                    model,
+                    probe_type,
+                    reeval_dir=reeval_dir,
+                    probe_family="classic",
+                )
+                if use_reeval
+                else run_path
+            )
+            target_rank = load_metrics(
+                target_run_path,
+                probe_type,
+                domains,
+                str(REPO_ROOT),
+                metrics=("target_rank",),
+                probe_family="classic",
+                metric_file_variant=classic_metric_file_variant,
+            )
+            if target_rank is None and target_run_path != run_path:
+                target_rank = load_metrics(
+                    run_path,
+                    probe_type,
+                    domains,
+                    str(REPO_ROOT),
+                    metrics=("target_rank",),
+                    probe_family="classic",
+                    metric_file_variant=classic_metric_file_variant,
+                )
+
+            baseline = None
+            if value_mode == "delta":
+                baseline = load_metrics(
+                    run_path,
+                    probe_type,
+                    domains,
+                    str(REPO_ROOT),
+                    metrics=("target_rank",),
+                    probe_family="classic",
+                    metric_file_variant=classic_metric_file_variant,
+                )
+
+            values[(probe_type, method, model)] = {
+                "target_rank": metric_value(target_rank, "target_rank", value_mode, baseline),
+                "run_path": find_latest_run(run_path),
+                "target_rank_run_path": find_latest_run(target_run_path),
+            }
+    return values
+
+
 def delta_value(df, metric: str) -> Optional[float]:
     if df is None or df.empty or "step" not in df.columns or metric not in df.columns:
         return None
@@ -518,7 +602,11 @@ def panel_ylabel(ylabel: str, value_mode: str) -> str:
 
 
 def panel_title(title: str, probe_type: str, metric: str, factual_probe_variant: str) -> str:
-    if factual_probe_variant == "paraphrased" and probe_type == "knowledge" and metric == "log_prob":
+    if (
+        factual_probe_variant == "paraphrased"
+        and probe_type == "knowledge"
+        and metric in {"log_prob", "target_rank"}
+    ):
         return "Paraphrased Factual Probes"
     return title
 
@@ -530,54 +618,66 @@ def plot_probe_scaling(
     factual_probe_variant: str = "canonical",
 ):
     apply_plot_style()
-    fig, axes = plt.subplots(1, 4, figsize=(15, 4.2), sharex=True)
+    plt.rcParams.update(
+        {
+            "axes.labelsize": 16,
+            "axes.titlesize": 18,
+            "font.size": 15,
+            "legend.fontsize": 14,
+            "xtick.labelsize": 14,
+            "ytick.labelsize": 14,
+        }
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4), sharey=True)
+    all_values: List[float] = []
     x = np.arange(len(MODEL_LABELS))
     model_tick_labels = [MODEL_LABELS[model] for model in MODEL_LABELS]
 
-    for ax, (probe_type, metric, title, ylabel) in zip(axes, PANELS):
-        panel_values = []
+    for row, (ax, (probe_type, title)) in enumerate(zip(axes, TARGET_RANK_PANELS)):
         for method in METHODS:
             color = METHOD_COLORS[method]
             metric_values = []
             for model in MODEL_LABELS:
                 item = values[(probe_type, method, model)]
-                value = item[metric]
+                value = item["target_rank"]
                 metric_values.append(np.nan if value is None else value)
 
-            panel_values.extend([v for v in metric_values if not np.isnan(v)])
+            all_values.extend([v for v in metric_values if not np.isnan(v)])
             ax.plot(
                 x,
                 metric_values,
                 color=color,
                 linewidth=2,
                 marker="o",
-                linestyle="--" if metric == "mcqa_accuracy" else "-",
+                linestyle="-",
             )
 
-        ax.set_title(panel_title(title, probe_type, metric, factual_probe_variant))
+        ax.set_title(panel_title(title, probe_type, "target_rank", factual_probe_variant))
         ax.set_xticks(x)
         ax.set_xticklabels(model_tick_labels)
+        ax.set_ylabel(panel_ylabel("Final Target Rank", value_mode))
         ax.set_xlabel("Model Size")
-        ax.set_ylabel(panel_ylabel(ylabel, value_mode))
         if value_mode == "delta":
             ax.axhline(0, color="black", linewidth=0.8, alpha=0.35)
         ax.grid(True, axis="y", alpha=0.25)
 
-        ylim = compute_unified_ylim(panel_values, padding=0.05)
-        if ylim:
+    ylim = compute_unified_ylim(all_values, padding=0.05)
+    if ylim:
+        for ax in axes:
             ax.set_ylim(ylim)
 
     method_handles = [
-        Line2D([0], [0], color=METHOD_COLORS[method], linewidth=2, marker="o", label=METHOD_LABELS[method])
+        Line2D([0], [0], color=METHOD_COLORS[method], linewidth=2, marker="o", label=LEGEND_LABELS[method])
         for method in METHODS
     ]
-    axes[1].legend(
+    axes[0].legend(
         handles=method_handles,
-        loc="lower right",
+        loc="best",
         frameon=True,
         framealpha=0.9,
         borderpad=0.4,
         handlelength=1.8,
+        fontsize=12,
     )
     fig.tight_layout()
     save_figure(fig, output)
@@ -595,7 +695,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         choices=("regular", "drop", "error"),
         default="regular",
     )
-    parser.add_argument("--output", default="plots/probe_scaling_by_model")
+    parser.add_argument("--output", default="plots/probe_scaling_by_model_target_rank")
     parser.add_argument("--domains", nargs="+")
     parser.add_argument(
         "--no_reeval",
@@ -636,26 +736,23 @@ def main(argv: Optional[Sequence[str]] = None):
         raise RuntimeError("No domains found in configured result folders")
 
     print(f"Using {len(domains)} domains")
-    values = load_configured_values(
+    values = load_target_rank_values(
         domains,
         mcqa_variant=args.mcqa_variant,
-        reviewed_fallback=args.reviewed_fallback,
         use_reeval=not args.no_reeval,
-        inference_mcqa_reeval=args.inference_mcqa_reeval,
         reeval_dir=args.reeval_dir,
         value_mode=args.value_mode,
         factual_probe_variant=args.factual_probe_variant,
     )
 
     missing = [
-        (probe_type, METHOD_LABELS[method], MODEL_LABELS[model], metric)
+        (probe_type, METHOD_LABELS[method], MODEL_LABELS[model])
         for (probe_type, method, model), item in values.items()
-        for metric in ("log_prob", "mcqa_accuracy")
-        if item[metric] is None
+        if item["target_rank"] is None
     ]
     if missing:
-        for probe_type, method, model, metric in missing:
-            print(f"Warning: missing {probe_type} {metric} for {method} {model}")
+        for probe_type, method, model in missing:
+            print(f"Warning: missing {probe_type} target_rank for {method} {model}")
 
     plot_probe_scaling(
         values,

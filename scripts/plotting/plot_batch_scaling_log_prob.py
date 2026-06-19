@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 
@@ -20,10 +21,17 @@ from scripts.plotting.plot_utils import (  # noqa: E402
     apply_plot_style,
     save_figure,
 )
+from scripts.plotting.plot_probe_scaling_by_model import (  # noqa: E402
+    DEFAULT_RUNS as NEW_TRAJECTORY_RUNS,
+    MODEL_LABELS as NEW_MODEL_LABELS,
+    _abs_path as new_abs_path,
+    discover_domains_from_runs as discover_new_domains_from_runs,
+)
 
 
 LEGACY_RESULTS_ROOT = os.path.join(REPO_ROOT, "results", "legacy")
 LEGACY_DOMAINS = ["DPO", "1_58", "GRPO", "BOFT", "OFT", "QLoRA"]
+TRAJECTORY_PATH_CHOICES = ("legacy", "new")
 
 
 def legacy_path(path):
@@ -140,7 +148,7 @@ def collect_batch_scaling_data():
                                 "Model": model,
                                 "Strategy": strategy,
                                 "BatchSize": batch_size,
-                                "Type": "Compositional",
+                                "Type": "Inference",
                                 "Metric": metric_name,
                                 "Value": compositional_value,
                             }
@@ -149,49 +157,84 @@ def collect_batch_scaling_data():
     return pd.DataFrame(rows)
 
 
-def collect_strategy_trajectory_data(batch_size=32, probe_type="inference"):
+def _append_trajectory_rows(rows, strategy, model, run_path, domains, probe_type):
+    resolved = find_latest_run(run_path)
+    if not resolved:
+        print(f"Warning: could not resolve trajectory run path: {run_path}")
+        return
+
+    df = aggregate_across_domains(
+        resolved,
+        probe_type,
+        domains,
+        split_probes=False,
+        project_root=REPO_ROOT,
+    )
+    if df.empty or "step" not in df.columns or "log_prob" not in df.columns:
+        return
+
+    series = (
+        df[["step", "log_prob"]]
+        .dropna()
+        .groupby("step", as_index=False)["log_prob"]
+        .mean()
+        .sort_values("step")
+    )
+    for _, row in series.iterrows():
+        rows.append(
+            {
+                "Strategy": strategy,
+                "Model": model,
+                "Step": int(row["step"]),
+                "Value": float(row["log_prob"]),
+            }
+        )
+
+
+def collect_legacy_strategy_trajectory_data(batch_size=32, probe_type="inference"):
     rows = []
     config = get_batch_scaling_config()
 
     for strategy in ("Source", "Para 9"):
         for model in ("1B", "7B", "13B", "32B"):
             path = config.get(model, {}).get(strategy, {}).get(batch_size)
-            resolved = find_latest_run(path)
-            if not resolved:
-                print(f"Warning: could not resolve legacy run path: {path}")
-                continue
-
-            df = aggregate_across_domains(
-                resolved,
-                probe_type,
-                LEGACY_DOMAINS,
-                split_probes=False,
-                project_root=REPO_ROOT,
-            )
-            if df.empty or "step" not in df.columns or "log_prob" not in df.columns:
-                continue
-
-            series = (
-                df[["step", "log_prob"]]
-                .dropna()
-                .groupby("step", as_index=False)["log_prob"]
-                .mean()
-                .sort_values("step")
-            )
-            for _, row in series.iterrows():
-                rows.append(
-                    {
-                        "Strategy": strategy,
-                        "Model": model,
-                        "Step": int(row["step"]),
-                        "Value": float(row["log_prob"]),
-                    }
-                )
+            _append_trajectory_rows(rows, strategy, model, path, LEGACY_DOMAINS, probe_type)
 
     return pd.DataFrame(rows)
 
 
-def plot_combined_log_prob(df_traj, df_bs, model_colors, style):
+def collect_new_strategy_trajectory_data(probe_type="inference"):
+    rows = []
+    run_items = []
+    strategy_to_method = {
+        "Source": "source_only",
+        "Para 9": "para9",
+    }
+    for strategy, method in strategy_to_method.items():
+        for model_key, model_label in NEW_MODEL_LABELS.items():
+            run_path = new_abs_path(NEW_TRAJECTORY_RUNS[method][model_key])
+            run_items.append((strategy, model_label, run_path))
+
+    domains = discover_new_domains_from_runs([run_path for _, _, run_path in run_items])
+    if not domains:
+        print("Warning: could not discover domains for new trajectory runs")
+        return pd.DataFrame(rows)
+
+    for strategy, model, run_path in run_items:
+        _append_trajectory_rows(rows, strategy, model, run_path, domains, probe_type)
+
+    return pd.DataFrame(rows)
+
+
+def collect_strategy_trajectory_data(path_source="legacy", probe_type="inference"):
+    if path_source == "legacy":
+        return collect_legacy_strategy_trajectory_data(probe_type=probe_type)
+    if path_source == "new":
+        return collect_new_strategy_trajectory_data(probe_type=probe_type)
+    raise ValueError(f"Unsupported trajectory path source: {path_source}")
+
+
+def plot_combined_log_prob(df_traj, df_bs, model_colors, style, output_name="batch_scaling_log_prob"):
     print("Plotting legacy 4-panel log-prob figure...")
 
     fig = plt.figure(figsize=(16.8, 4.8))
@@ -244,7 +287,7 @@ def plot_combined_log_prob(df_traj, df_bs, model_colors, style):
 
     batch_panels = [
         ("Factual", axes[2]),
-        ("Compositional", axes[3]),
+        ("Inference", axes[3]),
     ]
     for index, (probe_type, ax) in enumerate(batch_panels):
         subset = df_bs[df_bs["Type"] == probe_type]
@@ -337,11 +380,22 @@ def plot_combined_log_prob(df_traj, df_bs, model_colors, style):
     batch_legend.get_frame().set_facecolor("none")
 
     fig.subplots_adjust(left=0.06, right=0.99, bottom=0.16, top=0.88, wspace=0.1)
-    out_path = os.path.join(REPO_ROOT, "plots", "legacy", "batch_scaling_log_prob")
+    out_path = os.path.join(REPO_ROOT, "plots", "legacy", output_name)
     save_figure(fig, out_path)
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Plot legacy batch scaling with selectable Source/Paraphrased trajectory runs."
+    )
+    parser.add_argument(
+        "--trajectory-paths",
+        choices=TRAJECTORY_PATH_CHOICES,
+        default="legacy",
+        help="Run paths for the left Source/Paraphrased trajectory panels. Batch panels always use legacy paths.",
+    )
+    args = parser.parse_args()
+
     style = apply_plot_style("legacy")
 
     model_colors = {
@@ -351,8 +405,11 @@ def main():
         "32B": COLORS["model"]["32b"],
     }
     df_bs = collect_batch_scaling_data()
-    df_traj = collect_strategy_trajectory_data()
-    plot_combined_log_prob(df_traj, df_bs, model_colors, style)
+    df_traj = collect_strategy_trajectory_data(args.trajectory_paths)
+    output_name = "batch_scaling_log_prob"
+    if args.trajectory_paths == "new":
+        output_name = "batch_scaling_log_prob_new_trajectories"
+    plot_combined_log_prob(df_traj, df_bs, model_colors, style, output_name=output_name)
 
 
 if __name__ == "__main__":

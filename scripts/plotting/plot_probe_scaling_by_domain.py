@@ -22,8 +22,10 @@ from scripts.plotting.plot_inference_mcqa_scaling import (  # noqa: E402
 from scripts.plotting.plot_probe_scaling_by_model import (  # noqa: E402
     INFERENCE_MCQA_REEVAL_CHOICES,
     FACTUAL_PROBE_VARIANT_CHOICES,
+    LEGEND_LABELS,
     METHOD_COLORS,
     PANELS,
+    PANEL_GROUPS,
     REEVAL_DIR_CHOICES,
     VALUE_MODE_CHOICES,
     iter_run_items,
@@ -96,25 +98,49 @@ def plot_domain_scaling(
     factual_probe_variant: str = "canonical",
 ):
     apply_plot_style()
+    plt.rcParams.update(
+        {
+            "axes.labelsize": 16,
+            "axes.titlesize": 18,
+            "font.size": 15,
+            "legend.fontsize": 14,
+            "xtick.labelsize": 14,
+            "ytick.labelsize": 14,
+        }
+    )
     groups = [group for group in DOMAIN_GROUPS if group in grouped_values]
     if not groups:
         raise RuntimeError("No domain groups to plot")
 
-    fig, axes = plt.subplots(
-        len(groups),
-        len(PANELS),
-        figsize=(15, 3.2 * len(groups)),
-        sharex=True,
-        squeeze=False,
-    )
+    n_rows = len(groups)
+    fig = plt.figure(figsize=(15, 3.2 * n_rows))
+    # 5-column grid with a thin spacer between the two metric groups: panels in
+    # each group stay flush, while the middle gap leaves room for the second
+    # group's y-axis label and tick labels.
+    gs = fig.add_gridspec(n_rows, 5, width_ratios=[1, 1, 0.02, 1, 1], wspace=0.2, hspace=0.22)
+    grid_cols = (0, 1, 3, 4)
+    axes = np.empty((n_rows, len(PANELS)), dtype=object)
+    first_ax = None
+    for row in range(n_rows):
+        for col, grid_col in enumerate(grid_cols):
+            ax = fig.add_subplot(gs[row, grid_col], sharex=first_ax)
+            first_ax = first_ax or ax
+            axes[row, col] = ax
+    group_for_col = {col: panel_group for panel_group in PANEL_GROUPS for col in panel_group}
+    # Share the y-axis within each metric group (per row) so one y-label suffices.
+    for row in range(n_rows):
+        for panel_group in PANEL_GROUPS:
+            for col in panel_group[1:]:
+                axes[row, col].sharey(axes[row, panel_group[0]])
     x = np.arange(len(MODEL_LABELS))
     model_tick_labels = [MODEL_LABELS[model] for model in MODEL_LABELS]
 
     for row, group in enumerate(groups):
         values = grouped_values[group]
+        group_values: Dict[tuple, List[float]] = {pg: [] for pg in PANEL_GROUPS}
         for col, (probe_type, metric, title, ylabel) in enumerate(PANELS):
             ax = axes[row, col]
-            panel_values = []
+            panel_group = group_for_col[col]
             for method in METHODS:
                 metric_values = []
                 for model in MODEL_LABELS:
@@ -122,7 +148,7 @@ def plot_domain_scaling(
                     value = item[metric]
                     metric_values.append(np.nan if value is None else value)
 
-                panel_values.extend([v for v in metric_values if not np.isnan(v)])
+                group_values[panel_group].extend([v for v in metric_values if not np.isnan(v)])
                 ax.plot(
                     x,
                     metric_values,
@@ -143,7 +169,9 @@ def plot_domain_scaling(
                 ax.set_xticklabels([])
             if col == 0:
                 ax.set_ylabel(DOMAIN_LABELS.get(group, group.title()))
-            if row == 0:
+            elif col != panel_group[0]:
+                plt.setp(ax.get_yticklabels(), visible=False)
+            if row == 0 and col == panel_group[0]:
                 ax.text(
                     0.02,
                     0.98,
@@ -157,9 +185,10 @@ def plot_domain_scaling(
                 ax.axhline(0, color="black", linewidth=0.8, alpha=0.35)
             ax.grid(True, axis="y", alpha=0.25)
 
-            ylim = compute_unified_ylim(panel_values, padding=0.05)
+        for panel_group, vals in group_values.items():
+            ylim = compute_unified_ylim(vals, padding=0.05)
             if ylim:
-                ax.set_ylim(ylim)
+                axes[row, panel_group[0]].set_ylim(ylim)
 
     method_handles = [
         Line2D(
@@ -168,19 +197,19 @@ def plot_domain_scaling(
             color=METHOD_COLORS[method],
             linewidth=2,
             marker="o",
-            label=METHOD_LABELS[method],
+            label=LEGEND_LABELS[method],
         )
         for method in METHODS
     ]
-    axes[0, 1].legend(
+    axes[-1, -1].legend(
         handles=method_handles,
         loc="lower right",
         frameon=True,
         framealpha=0.9,
         borderpad=0.4,
         handlelength=1.8,
+        fontsize=12,
     )
-    fig.tight_layout()
     save_figure(fig, output)
 
 

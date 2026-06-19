@@ -39,7 +39,7 @@ COMPONENT_ORIENTATIONS = {
     "o_proj": "cols",
 }
 EPS = 1e-12
-GINI_MEAN_ABS_EPS = 1e-6
+GINI_MEAN_ABS_EPS = 1.5e-9
 
 
 @dataclass(frozen=True)

@@ -28,14 +28,14 @@ def main():
     # Structure: Strategy -> Model Size -> Path
     data_config = {
         "Para. 9": {
-            "7B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_20_22_51",
-            "13B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_13_18",
-            "32B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_06_44",
+            "7B": os.path.join(project_root, "results/FT/full/7b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_20_22_51"),
+            "13B": os.path.join(project_root, "results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_13_18"),
+            "32B": os.path.join(project_root, "results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_06_44"),
         },
         "Para. 9 + Humans": {
-            "7B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/7b/probes_v9/newline2/para9_expl_human_cyclefull/fill_dclm/domains_DPO-GRPO/e100/bs64_lr2e-05/overlap_1_4/11_24_05_15",
-            "13B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para9_expl_human_cyclefull/fill_dclm/domains_DPO-GRPO/e100/bs64_lr2e-05/overlap_1_4/11_24_06_09",
-            "32B": "/Users/jlee0/Desktop/research/fine-tuning-or-retrieval/results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9_expl_human_cyclefull/fill_dclm/domains_DPO-GRPO/e100/bs64_lr2e-05/overlap_1_4/11_26_12_57/",
+            "7B": os.path.join(project_root, "results/FT/full/7b/probes_v9/newline2/para9_expl_human_cyclefull/fill_dclm/domains_DPO-GRPO/e100/bs64_lr2e-05/overlap_1_4/11_24_05_15"),
+            "13B": os.path.join(project_root, "results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para9_expl_human_cyclefull/fill_dclm/domains_DPO-GRPO/e100/bs64_lr2e-05/overlap_1_4/11_24_06_09"),
+            "32B": os.path.join(project_root, "results/FT/full/allenai_OLMo-2-0325-32B/probes_v9/newline2/para9_expl_human_cyclefull/fill_dclm/domains_DPO-GRPO/e100/bs64_lr2e-05/overlap_1_4/11_26_12_57"),
         }
     }
 
@@ -76,7 +76,8 @@ def main():
 
     # --- Plotting ---
     # Make plot thinner (width 4 instead of 8)
-    fig, ax = plt.subplots(figsize=(4, 6))
+    fig, ax = plt.subplots(figsize=(4, 4))
+    ax.set_box_aspect(2/3)
     
     x = np.arange(len(deltas['labels']))
     # Thinner bars
@@ -89,12 +90,11 @@ def main():
     ax.bar(x - width/2, deltas['f'], width, label='Factual', color=bar_color, alpha=0.8)
     
     # Compositional Bars (Hatched)
-    ax.bar(x + width/2, deltas['c'], width, label='Compositional', color=bar_color, hatch='//', alpha=0.5, edgecolor='black')
+    ax.bar(x + width/2, deltas['c'], width, label='Inference', color=bar_color, hatch='//', alpha=0.5, edgecolor='black')
     
     ax.set_xticks(x)
     ax.set_xticklabels(deltas['labels'], fontsize=12)
-    ax.set_title("Effect of Human Explanations", fontsize=14)
-    ax.set_ylabel(r"$\Delta$ Final Log Prob. (W/ Human - W/o Human)", fontsize=12)
+    ax.set_ylabel(r"$\Delta$ Final Log Prob.", fontsize=12)
     ax.set_xlabel("Model Size", fontsize=12)
     
     ax.grid(axis='y', alpha=0.3)
@@ -103,7 +103,7 @@ def main():
     # Custom Legend
     legend_elements = [
         mpatches.Patch(facecolor=bar_color, alpha=0.8, label='Factual'),
-        mpatches.Patch(facecolor=bar_color, alpha=0.5, hatch='//', edgecolor='black', label='Compositional')
+        mpatches.Patch(facecolor=bar_color, alpha=0.5, hatch='//', edgecolor='black', label='Inference')
     ]
     ax.legend(handles=legend_elements, loc='best', fontsize=10)
 
