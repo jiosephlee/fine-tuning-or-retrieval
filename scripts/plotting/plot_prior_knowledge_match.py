@@ -31,13 +31,15 @@ from scripts.plotting.plot_utils import (  # noqa: E402
 
 
 E17_SOURCE_PATH = (
-    "results/FT/full/7b/source_only/fill_dclm/domains_arxiv_all-legal_all/"
-    "e100/bs256_lr4e-05/overlap_1_8/E17_source_arxiv_legal_local"
+    "results/FT/full/7b/source_only_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all/"
+    "e100/bs256_lr4e-05/overlap_1_16/E17_source_arxiv_legal_local/"
+    "eval_bundles/inf_mcqa_v14"
 )
 
 E18_PARA_PATH = (
-    "results/FT/full/7b/para9/fill_dclm/domains_arxiv_all-legal_all/"
-    "e100/bs256_lr4e-05/overlap_1_8/E18_paraphrase_arxiv_legal_local"
+    "results/FT/full/7b/para9_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all/"
+    "e100/bs256_lr4e-05/overlap_1_16/E18_paraphrase_arxiv_legal_local/"
+    "eval_bundles/inf_mcqa_v14"
 )
 
 E16_PRIOR_PATH = (
