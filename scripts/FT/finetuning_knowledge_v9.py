@@ -212,6 +212,24 @@ def distributed_barrier() -> None:
         torch.distributed.barrier()
 
 
+def append_chronological_result_record(args, log) -> str:
+    manifest_path = getattr(args, "results_chronological_log", None)
+    if not manifest_path:
+        manifest_path = os.path.join(args.base_results_dir, "chronological_results.txt")
+    if not os.path.isabs(manifest_path):
+        manifest_path = os.path.abspath(manifest_path)
+
+    result_path = os.path.abspath(args.experiment_dir)
+    timestamp = getattr(args, "result_created_timestamp", None)
+    if not timestamp:
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+    with open(manifest_path, "a", encoding="utf-8") as f:
+        f.write(f"{timestamp}\t{result_path}\n")
+    log.info(f"Recorded completed run in chronological results list: {manifest_path}")
+    return manifest_path
+
+
 def _domain_catalog_root(source: str, args) -> str:
     if args.prior_knowledge:
         return f'../../data/{source}/prior_knowledge'
@@ -1072,6 +1090,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--custom_suffix", type=str, default="", help="Custom text to append to experiment name")
     parser.add_argument("--override_experiment_name", type=str, default="", help="Override experiment name")
+    parser.add_argument(
+        "--results_chronological_log",
+        type=str,
+        default=None,
+        help=(
+            "Append successful run records here as '<timestamp>\\t<result_path>'. "
+            "Defaults to chronological_results.txt under --base_results_dir."
+        ),
+    )
     parser.add_argument("--model_id", type=str, default="allenai/OLMo-2-0425-1B") # allenai/OLMo-2-1124-7B
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument(
@@ -1810,6 +1837,7 @@ if __name__ == "__main__":
     # --- Save Hyperparameters ---
     experiment_dir = os.path.join(args.base_results_dir, args.experiment_name)
     args.experiment_dir = experiment_dir
+    args.result_created_timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
     os.makedirs(experiment_dir, exist_ok=True)
     hyperparameters_path = os.path.join(experiment_dir, 'hyperparameters.json')
     if is_world_process_zero():
@@ -1858,9 +1886,11 @@ if __name__ == "__main__":
     # Model compilation is handled by TrainingArguments via compile flag in TrainingConfig
     # --- Continue Pretraining / Debug-only dataloader check ---
     run_cpt = args.num_train_epochs > 0 or args.debug_dataloader_only
+    completed_training_run = False
     if run_cpt:
         train_cpt = not args.debug_dataloader_only
         model, tokenizer = continue_pretraining(model, tokenizer, log, args, train=train_cpt)
+        completed_training_run = completed_training_run or train_cpt
         if train_cpt and args.save_local_model and is_world_process_zero():
             cpt_save_path = os.path.join(args.experiment_dir, args.cpt_model_subdir)
             llm_training.save_model(model, tokenizer, log, cpt_save_path)
@@ -1876,8 +1906,13 @@ if __name__ == "__main__":
     if args.lima_afterwards:
         lima_epochs = 1 if args.test_script else 10
         model, tokenizer = lima_training(model, tokenizer, log, args, num_train_epochs=lima_epochs)
+        completed_training_run = True
         if args.save_local_model and is_world_process_zero():
             lima_save_path = os.path.join(args.experiment_dir, args.lima_model_subdir)
             llm_training.save_model(model, tokenizer, log, lima_save_path)
             log.info(f"LIMA checkpoint saved to {lima_save_path}")
         distributed_barrier()
+
+    if completed_training_run and is_world_process_zero():
+        append_chronological_result_record(args, log)
+    distributed_barrier()
