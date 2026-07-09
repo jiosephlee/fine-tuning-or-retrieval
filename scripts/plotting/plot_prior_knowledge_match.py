@@ -48,13 +48,13 @@ E18_PARA_PATH = (
 E16_PRIOR_PATH = (
     "results/FT/full/7b/para9_docmatch_expl_insertprior_knowledge/fill_dclm/"
     "domains_arxiv_all-legal_all/e100/bs256_lr4e-05/overlap_1_16/"
-    "E13_15_prior_knowledge_expl_match_all_domains/eval_bundles/inf_mcqa_v14"
+    "E16_prior_knowledge_arxiv_legal_match_local/eval_bundles/inf_mcqa_v14"
 )
 
 E19_CITED_PATH = (
     "results/FT/full/7b/para9_docmatch_expl_insertcited_works/fill_dclm/"
     "domains_arxiv_all-legal_all/e100/bs256_lr4e-05/overlap_1_16/"
-    "E19_cited_textbooks_arxiv_legal_match/eval_bundles/inf_mcqa_v14"
+    "E19_cited_textbooks_arxiv_legal_match_local/eval_bundles/inf_mcqa_v14"
 )
 
 RUNS = [
@@ -97,7 +97,7 @@ def domains_in_run(run_path: str) -> List[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output_dir", default="plots")
+    parser.add_argument("--output_dir", default="plots/prior_knowledge")
     parser.add_argument("--filename", default="prior_knowledge_match_by_group_7B.pdf")
     parser.add_argument(
         "--averaged_filename",

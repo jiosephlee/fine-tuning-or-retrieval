@@ -375,7 +375,7 @@ def plot_metric(
 
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"{comparison}_{metric}_all_projections.png")
-    save_figure(fig, path)
+    save_figure(fig, path, suffixes=(".png",))
     print(f"Saved heatmap: {path} (vmax={vmax:.6f}, clip_percentile={args.clip_percentile})")
     return path
 

@@ -1316,7 +1316,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_title_prefix", action="store_false", help="Add title prefix to chunks when chunking")
     parser.add_argument("--overlap_sections", default=False, action="store_true", help="Overlap sections when chunking")
     parser.add_argument("--overlap_ratio", type=str, default="1_4", help="Ratio of overlap when chunking")
-    parser.add_argument("--with_specific_explanation", type=str, nargs='+', default=None, help="Use specific explanation type(s). For granular these are subfolders; for whole/legacy these map to flat files (e.g., textbooks -> textbook.txt).")
+    parser.add_argument("--with_specific_explanation", type=str, nargs='+', default=None, help="Use specific explanation type(s). For granular/granular_queue/legacy_v2 these are subfolders; for whole/legacy these map to flat files (e.g., textbooks -> textbook.txt).")
     parser.add_argument("--document_track_baseline", action="store_true", help="Add an auxiliary track matched to a granular explanation schedule.")
     parser.add_argument("--document_match_specific_explanation", type=str, nargs='+', default=None, help="Explanation subfolder type(s) used only to size --document_track_baseline, e.g. textbooks blogs stackexchange.")
     parser.add_argument(
@@ -1342,13 +1342,15 @@ if __name__ == "__main__":
         "--explanations_insertion_strategy",
         type=str,
         default="granular",
-        choices=["granular", "granular_queue", "whole", "legacy", "random_splice"],
+        choices=["granular", "granular_queue", "whole", "legacy", "legacy_v2", "random_splice"],
         help=(
             "How explanations are inserted: 'granular' (per-batch cycling), "
             "'granular_queue' (shuffle selected explanation files into K tracks), "
             "'whole' (insert explanation-only batch every N steps), 'legacy' "
-            "(older coupled splice behavior), or 'random_splice' (legacy-style "
-            "chunk replacement starting at a deterministic random paraphrase batch)."
+            "(older coupled splice behavior), 'legacy_v2' (stream selected "
+            "subfolder explanation chunks into paraphrase tails, capped at 50%% "
+            "per batch), or 'random_splice' (legacy-style chunk replacement "
+            "starting at a deterministic random paraphrase batch)."
         ),
     )
     parser.add_argument(
@@ -1620,7 +1622,7 @@ if __name__ == "__main__":
     ):
         raise ValueError(
             "--whole_explanations_insert_every_n is only supported with --explanations_insertion_strategy whole "
-            "(set it to 1 for granular/granular_queue/legacy/random_splice)."
+            "(set it to 1 for granular/granular_queue/legacy/legacy_v2/random_splice)."
         )
 
     if args.granular_explanations_num_tracks <= 0:
@@ -1638,7 +1640,7 @@ if __name__ == "__main__":
     ):
         raise ValueError(
             "--granular_explanations_num_tracks is only supported with --explanations_insertion_strategy granular or granular_queue "
-            "(set it to 1 for whole/legacy/random_splice)."
+            "(set it to 1 for whole/legacy/legacy_v2/random_splice)."
         )
 
     if (
@@ -1659,7 +1661,7 @@ if __name__ == "__main__":
     if args.explanations_insertion_strategy != "granular" and args.granular_explanations_cycle != 0:
         raise ValueError(
             "--granular_explanations_cycle is only supported with --explanations_insertion_strategy granular. "
-            "For granular_queue/whole/legacy/random_splice, leave --granular_explanations_cycle at the default 0."
+            "For granular_queue/whole/legacy/legacy_v2/random_splice, leave --granular_explanations_cycle at the default 0."
         )
 
     if args.match_explanation_source_replay:

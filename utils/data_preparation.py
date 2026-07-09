@@ -250,6 +250,47 @@ def _paraphrase_splice_order(
     raise ValueError(f"Unsupported splice insertion strategy: {insertion_strategy}")
 
 
+def _flatten_legacy_v2_queue_from_objects(
+    type_objects: dict,
+    times_explanations: int = 1,
+) -> List[str]:
+    flat_chunks = []
+    for _, e_list in type_objects.items():
+        for _, chunks in e_list:
+            flat_chunks.extend(chunks)
+    if times_explanations > 1 and flat_chunks:
+        flat_chunks = flat_chunks * times_explanations
+    return flat_chunks
+
+
+def _extend_legacy_v2_spliced_document_batches(
+    target_batches: List[List[str]],
+    source_chunks: List[str],
+    paraphrased_chunks_by_doc: List[List[str]],
+    explanation_chunks: List[str],
+) -> None:
+    """Append source plus paraphrase batches with capped tail explanation replacement."""
+    if target_batches:
+        target_batches[0].extend(source_chunks)
+
+    to_insert = list(explanation_chunks)
+    for batch_idx, original_chunks in enumerate(paraphrased_chunks_by_doc, start=1):
+        if batch_idx >= len(target_batches):
+            break
+
+        max_insert = len(original_chunks) // 2
+        insert_count = min(max_insert, len(to_insert))
+        if insert_count <= 0:
+            target_batches[batch_idx].extend(original_chunks)
+            continue
+
+        keep_count = len(original_chunks) - insert_count
+        target_batches[batch_idx].extend(
+            original_chunks[:keep_count] + to_insert[:insert_count]
+        )
+        to_insert = to_insert[insert_count:]
+
+
 def _extend_spliced_document_batches(
     target_batches: List[List[str]],
     source_chunks: List[str],
@@ -637,7 +678,7 @@ def prepare_training_mix(
                 files_to_load[expl_type] = [os.path.join(subfolder_path, f) for f in all_files]
             return files_to_load
 
-        def _load_granular_type_objects(explanation_dir: str, files_to_load: dict):
+        def _load_granular_type_objects(explanation_dir: str, files_to_load: dict, repeat_file_chunks: bool = True):
             type_objects = {}
             for expl_type, file_list in files_to_load.items():
                 objs = []
@@ -645,7 +686,7 @@ def prepare_training_mix(
                     # filename is already a full path (relative to cwd or absolute) — opened directly.
                     with open(filename, 'r', encoding='utf-8') as f:
                         file_chunks = _chunk_explanation(f.read())
-                    if times_explanations > 1 and file_chunks:
+                    if repeat_file_chunks and times_explanations > 1 and file_chunks:
                         file_chunks = file_chunks * times_explanations
                     objs.append((filename, file_chunks))
                 type_objects[expl_type] = objs
@@ -776,11 +817,11 @@ def prepare_training_mix(
         if include_explanations:
             explanation_dir = f'../../data/{domain_source}/explanations/{domain}/'
             files_to_load = {}
-            use_subfolder_loading = explanations_insertion_strategy in ("granular", "granular_queue")
+            use_subfolder_loading = explanations_insertion_strategy in ("granular", "granular_queue", "legacy_v2")
 
             # Identify files
             if use_subfolder_loading and specific_explanation_type:
-                if explanations_insertion_strategy == "granular_queue":
+                if explanations_insertion_strategy in ("granular_queue", "legacy_v2"):
                     files_to_load = _select_granular_queue_explanation_files(explanation_dir, specific_explanation_type)
                 else:
                     files_to_load = _select_granular_explanation_files(explanation_dir, specific_explanation_type)
@@ -840,6 +881,30 @@ def prepare_training_mix(
                     insertion_strategy=explanations_insertion_strategy,
                     shuffle_seed=shuffle_seed,
                     domain=domain,
+                )
+            elif explanations_insertion_strategy == "legacy_v2":
+                type_objects = _load_granular_type_objects(
+                    explanation_dir,
+                    files_to_load,
+                    repeat_file_chunks=False,
+                )
+                splice_expl_chunks = _flatten_legacy_v2_queue_from_objects(
+                    type_objects,
+                    times_explanations=times_explanations,
+                )
+
+                if explanation_spliced_document_batches is None:
+                    explanation_spliced_document_batches = [[] for _ in range(len(unique_document_batches))]
+
+                log.info(
+                    f"Domain {domain}: built LEGACY_V2 explanation queue "
+                    f"({len(splice_expl_chunks)} chunks from {sum(len(v) for v in files_to_load.values())} files)."
+                )
+                _extend_legacy_v2_spliced_document_batches(
+                    target_batches=explanation_spliced_document_batches,
+                    source_chunks=source_chunks,
+                    paraphrased_chunks_by_doc=paraphrased_chunks_by_doc,
+                    explanation_chunks=splice_expl_chunks,
                 )
             elif explanations_insertion_strategy in ("granular", "granular_queue", "whole"):
                 # Build base objects {type: [(filename, chunks)]}
@@ -931,7 +996,7 @@ def prepare_training_mix(
             else:
                 raise ValueError(
                     f"Unsupported explanations_insertion_strategy: {explanations_insertion_strategy}. "
-                    "Expected one of: granular, granular_queue, whole, legacy, random_splice."
+                    "Expected one of: granular, granular_queue, whole, legacy, legacy_v2, random_splice."
                 )
 
         if match_explanation_source_replay and current_domain_tracks:

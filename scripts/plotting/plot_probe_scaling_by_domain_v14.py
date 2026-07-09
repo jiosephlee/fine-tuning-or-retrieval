@@ -176,7 +176,7 @@ def plot_domain_scaling(
 
 def parse_args(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", default="plots/probe_scaling_by_domain_v14")
+    parser.add_argument("--output", default="plots/probe_scaling/probe_scaling_by_domain_v14")
     parser.add_argument("--groups", nargs="+", choices=DOMAIN_GROUPS, default=list(DOMAIN_GROUPS))
     parser.add_argument(
         "--value_mode",

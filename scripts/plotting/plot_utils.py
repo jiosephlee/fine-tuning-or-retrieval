@@ -142,7 +142,7 @@ def apply_plot_style(preset: str = "new") -> dict:
     return style
 
 
-def save_figure(fig, output: str, suffixes: Sequence[str] = (".pdf", ".png")):
+def save_figure(fig, output: str, suffixes: Sequence[str] = (".pdf",)):
     output_path = Path(output)
     if output_path.suffix:
         output_path = output_path.with_suffix("")

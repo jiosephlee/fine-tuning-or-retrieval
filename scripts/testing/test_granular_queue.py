@@ -16,6 +16,12 @@ def _missing_module(module_name):
 
 missing_torch = _missing_module("torch")
 
+if _missing_module("numpy"):
+    numpy_stub = types.ModuleType("numpy")
+    numpy_stub.__spec__ = importlib.machinery.ModuleSpec("numpy", loader=None)
+    numpy_stub.load = lambda *args, **kwargs: None
+    sys.modules["numpy"] = numpy_stub
+
 if missing_torch:
     torch_stub = types.ModuleType("torch")
     torch_stub.__spec__ = importlib.machinery.ModuleSpec("torch", loader=None)

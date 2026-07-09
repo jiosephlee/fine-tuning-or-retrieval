@@ -226,12 +226,12 @@ def plot(df_traj: pd.DataFrame, df_final: pd.DataFrame) -> None:
     axes[2].legend(handles=model_legend, loc="lower left", **style["legend"])
 
     fig.subplots_adjust(left=0.06, right=0.99, bottom=0.16, top=0.88, wspace=0.1)
-    save_figure(fig, str(REPO_ROOT / "plots" / "batch_scaling_log_prob_para49_e50_recent"))
+    save_figure(fig, str(REPO_ROOT / "plots" / "batch_scaling" / "batch_scaling_log_prob_para49_e50_recent"))
 
 
 def main() -> None:
     df_traj, df_final, missing = collect_data()
-    csv_path = REPO_ROOT / "plots" / "batch_scaling_log_prob_para49_e50_recent.csv"
+    csv_path = REPO_ROOT / "plots" / "batch_scaling" / "batch_scaling_log_prob_para49_e50_recent.csv"
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     df_final.to_csv(csv_path, index=False)
     print(f"Saved {csv_path}")

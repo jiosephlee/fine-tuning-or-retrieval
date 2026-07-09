@@ -157,7 +157,7 @@ def plot(values: Dict[tuple, Optional[float]], output: str):
 
 def parse_args(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", default="plots/probe_32b_conditions_2x2_reeval_v3")
+    parser.add_argument("--output", default="plots/probe_scaling/probe_32b_conditions_2x2_reeval_v3")
     parser.add_argument("--domains", nargs="+")
     return parser.parse_args(argv)
 

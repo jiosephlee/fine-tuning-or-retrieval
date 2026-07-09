@@ -420,7 +420,7 @@ def plot_current_and_legacy(
 
 def parse_args(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", default="plots/probe_scaling_by_paraphrase")
+    parser.add_argument("--output", default="plots/probe_scaling/probe_scaling_by_paraphrase")
     parser.add_argument(
         "--run_set",
         choices=("current_v14_e50", "legacy_e100", "current_and_legacy"),

@@ -320,7 +320,7 @@ def plot_probe_scaling(
 
 def parse_args(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", default="plots/probe_scaling_by_model_v14")
+    parser.add_argument("--output", default="plots/probe_scaling/probe_scaling_by_model_v14")
     parser.add_argument("--domains", nargs="+")
     parser.add_argument(
         "--value_mode",

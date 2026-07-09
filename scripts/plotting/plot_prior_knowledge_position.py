@@ -29,10 +29,10 @@ from scripts.plotting.plot_utils import (  # noqa: E402
 
 
 RUN_BASE = (
-    "results/FT/full/7b/"
-    "probes_v13_para_v13_paraphrased_inf_v11_reviewed_mcqa_v14_prompt_formatted_question_5shot_inf_mcqa_v13+v12/"
-    "newline2/para9/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16"
+    "results/FT/full/7b/para9/fill_dclm/"
+    "domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16"
 )
+EVAL_BUNDLE = "eval_bundles/inf_mcqa_v14"
 
 POSITIONS = [
     ("front",  "Prior Knowledge at Front",  "E13_prior_knowledge_front_local",  "#1f77b4"),
@@ -43,8 +43,8 @@ POSITIONS = [
 PANELS = [
     ("knowledge", "log_prob",       "classic", "Factual Probes",      "Mean Log Probability"),
     ("knowledge", "mcqa_accuracy",  "mcqa",    "Factual MCQA",        "MCQA Accuracy"),
-    ("inference", "log_prob",       "classic", "Compositional Probes", "Mean Log Probability"),
-    ("inference", "mcqa_accuracy",  "mcqa",    "Compositional MCQA",  "MCQA Accuracy"),
+    ("inference", "log_prob",       "classic", "Inference Probes",    "Mean Log Probability"),
+    ("inference", "mcqa_accuracy",  "mcqa",    "Inference MCQA",      "MCQA Accuracy"),
 ]
 
 
@@ -62,7 +62,7 @@ def discover_domains(run_path: str) -> List[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output_dir", default="plots")
+    parser.add_argument("--output_dir", default="plots/prior_knowledge")
     parser.add_argument("--filename", default="prior_knowledge_position_7B.pdf")
     args = parser.parse_args()
 
@@ -70,7 +70,7 @@ def main() -> None:
 
     # Discover the union of domains across the three runs.
     run_paths = {
-        key: str(REPO_ROOT / RUN_BASE / subdir)
+        key: str(REPO_ROOT / RUN_BASE / subdir / EVAL_BUNDLE)
         for key, _label, subdir, _color in POSITIONS
     }
     domains_union: List[str] = sorted({

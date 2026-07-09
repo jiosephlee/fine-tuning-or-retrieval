@@ -341,7 +341,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output",
-        default="plots/explanation_source_comparison_7b_reeval_v5_delta_by_domain",
+        default="plots/explanation_sources/explanation_source_comparison_7b_reeval_v5_delta_by_domain",
     )
     parser.add_argument(
         "--reeval_dir",

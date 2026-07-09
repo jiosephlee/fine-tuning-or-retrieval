@@ -267,7 +267,7 @@ def plot_values(runs, values, output: str):
 
 def parse_args(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", default="plots/7b_lr_sweep_para49_main_metrics")
+    parser.add_argument("--output", default="plots/batch_scaling/7b_lr_sweep_para49_main_metrics")
     parser.add_argument(
         "--eval_bundle",
         default="inf_mcqa_v14",

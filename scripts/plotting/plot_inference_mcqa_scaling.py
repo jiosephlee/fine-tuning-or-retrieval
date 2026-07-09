@@ -501,14 +501,14 @@ def apply_plot_style():
         })
 
 
-def save_figure(fig, output: str):
+def save_figure(fig, output: str, suffixes=(".pdf",)):
     output_path = Path(output)
     if output_path.suffix:
         output_path = output_path.with_suffix("")
     if not output_path.is_absolute():
         output_path = REPO_ROOT / output_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    for suffix in (".pdf", ".png"):
+    for suffix in suffixes:
         fig.savefig(str(output_path) + suffix, bbox_inches="tight", dpi=300)
         print(f"Saved {output_path}{suffix}")
     plt.close(fig)
@@ -677,7 +677,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         choices=("regular", "drop", "error"),
         default="regular",
     )
-    parser.add_argument("--output", default="plots/inference_mcqa_scaling")
+    parser.add_argument("--output", default="plots/probe_scaling/inference_mcqa_scaling")
     parser.add_argument("--domains", nargs="+")
     parser.add_argument(
         "--mode",

@@ -57,17 +57,9 @@
 
 ## How To Run
 
-From `scripts/FT`:
-
-```bash
-bash E99_7B_ffn_channel_heatmaps_quick.sh
-```
-
-Primary outputs:
-- Manifest:
-  - `plots/ffn_channel_heatmaps/quick_7b_e50/manifest_quick_7b_e50.json`
-- Heatmaps + arrays:
-  - `plots/ffn_channel_heatmaps/quick_7b_e50`
+Retained primary outputs:
+- `plots/ffn_channel_heatmaps/e123_7b_20260516`
+- `plots/ffn_channel_heatmaps/e456_1b_20260516`
 
 
 ## Notes

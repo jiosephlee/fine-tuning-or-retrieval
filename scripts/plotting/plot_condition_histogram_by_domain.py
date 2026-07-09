@@ -267,7 +267,7 @@ def plot_condition_histogram(
 def parse_args(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--output", default="plots/prior_knowledge_match_histogram_by_group_7B"
+        "--output", default="plots/diagnostics/prior_knowledge_match_histogram_by_group_7B"
     )
     parser.add_argument(
         "--groups", nargs="+", choices=DOMAIN_GROUPS, default=list(DEFAULT_GROUPS)

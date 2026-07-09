@@ -174,7 +174,7 @@ def plot(merged: pd.DataFrame, output: str, max_tokens: int = 40, min_count: int
 
 def parse_args(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", default="plots/factual_probe_delta_vs_target_tokens_7b")
+    parser.add_argument("--output", default="plots/diagnostics/factual_probe_delta_vs_target_tokens_7b")
     parser.add_argument("--max_tokens", type=int, default=40,
                         help="Clip the x-axis (and binned-mean curve) to this many target tokens.")
     parser.add_argument("--min_count", type=int, default=5,

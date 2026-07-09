@@ -140,7 +140,7 @@ def plot_difference_heatmap(args: argparse.Namespace) -> str:
         cbar.ax.yaxis.get_offset_text().set_fontsize(15)
 
     output = os.path.join(args.input_dir, f"{args.comparison}_{args.metric}_all_projections.png")
-    save_figure(fig, output, suffixes=(".pdf", ".png"))
+    save_figure(fig, output, suffixes=(".png",))
     return output
 
 

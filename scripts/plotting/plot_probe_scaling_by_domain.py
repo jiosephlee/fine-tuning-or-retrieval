@@ -225,7 +225,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         choices=("regular", "drop", "error"),
         default="regular",
     )
-    parser.add_argument("--output", default="plots/probe_scaling_by_domain")
+    parser.add_argument("--output", default="plots/probe_scaling/probe_scaling_by_domain")
     parser.add_argument("--groups", nargs="+", choices=DOMAIN_GROUPS, default=list(DOMAIN_GROUPS))
     parser.add_argument(
         "--no_reeval",
