@@ -1,0 +1,77 @@
+\title{Stack Exchange of the Paper: "xLSTM: Extended Long Short-Term Memory"}
+
+### What mixed‑precision training issues arose with RWKV variants in the experiments?
+Question:
+In Section 4.2 it is noted that RWKV‑5/6 and HGRN2 did not fully utilize PyTorch’s automated mixed precision during training.
+
+* What specific operations prevented native AMP from being applied?
+* Did these limitations affect final perplexities compared to other models trained with full mixed precision?
+* Are there recommended workarounds if one wants to train RWKV models efficiently on modern GPU hardware?
+Answer:
+In the 15 B-token experiment (Sec.~4.2) the authors report that “the mixed‑precision training did **not** utilize PyTorch’s automated mixed precision” for RWKV‑5, RWKV‑6, GLA and HGRN2 (see also Appx.~A §~\ref{sec:appGenTrainProc}).  
+The reason is that several core operations of those recurrent models fall outside the set of tensor kernels that **torch.autocast** knows how to down‑cast safely.
+
+The first culprit is the *exponential* gate used in every RWKV variant. In the original formulation the input‑gate and forget‑gate are computed as  
+
+$$
+i_{t}= \exp (\tilde i _{t}),\qquad 
+f _{t}= \sigma (\tilde f _{t})\;\text{or}\;\exp (\tilde f _{t}) ,
+$$  
+
+exactly as in Eq.~(9) for sLSTM and Eq.~(12) for mLSTM. Because an unchecked exponential can grow far beyond the representable range of float‑16 (the largest normal value is $\approx\,6\times 10^{4}$), an overflow‑to‑inf would immediately corrupt the recurrent state $c_{t}$ or $\mathbf{C}_{\, t}$. The authors therefore introduce a *stabiliser* state  
+
+$$
+m _{t}= \max\!\bigl(\log f _{t}+m _{t-1},\,\log i _{t}\bigr)
+\tag{10}
+$$  
+
+and rewrite the gates as  
+
+$$
+i' _{t}= \exp(\tilde i _{t}-m _{t}),\qquad 
+f' _{t}= \exp(\log f _{t}+m _{\, t-1}-m _{\, t}),
+$$  
+
+(cf.~Eq.~(11)). Both log/exp/max steps have a dramatically larger dynamic range than any usual linear layer, so casting them automatically to low‑precision would break numerical stability. Autocast treats each call independently and cannot infer that these calculations must stay in float‑32 while later multiplications may safely run in float‑16; consequently it simply disables AMP for any forward pass containing them.
+
+A second source of incompatibility comes from the *outer–product* memory update present both in mLSTM  
+
+$$
+\mathbf C_{\! t}= f_{\! t}\,\mathbf C_{\! t-1}+ i_{\! t}\,\mathbf v_{\! t}\,\mathbf k^{\!\top }_{\! t},
+\tag{12}
+$$  
+
+and in every RWKV family member (the “covariance update rule” mentioned in Sec.~3’s related work). Each step adds a rank‑one matrix $\mathbf v_{\! t}\!\mathbf k^{\!\top }_{\! t}$ into an accumulating $d\times d$ buffer that holds thousands of such contributions over long sequences (see Fig.~2). Accumulating many small terms in half‑precision suffers from severe underflow / loss‑of‑mantissa errors, so the authors keep both $\mathbf C_{\! t}$ and its intermediate products in float‑32 even when surrounding linear layers run at reduced precision. The custom CUDA kernel that performs this scan is written directly against raw pointers rather than PyTorch’s high‑level operators; **autocast** therefore cannot intervene at all, forcing a manual “AMP disabled” region around the whole recurrence block.
+
+Because these two ingredients—the exponential gate plus the matrix outer product—appear together in every RWKV‑5/6 cell (and likewise in HGRN2’s fast weight memory), native PyTorch AMP never activates for those models.
+
+### Impact on final perplexities
+
+The paper’s Table 1 shows validation perplexities after training on exactly the same data budget (15 B tokens). Even though RWKV‑5/6 and HGRN2 could not profit from full automatic mixed precision, their reported numbers are only marginally worse than their Transformer counterparts:  
+RWKV‑5 $\approx\,10.7$ ppl vs Llama $\approx\,10.3$ ppl vs xLSTM $\approx\,9.8$ ppl (exact values depend on model size). The authors do not attribute any systematic degradation to the lack of AMP; rather they note “xLSTM outperforms all existing methods” despite this limitation. In practice the missing half‑precision speedup meant longer wall‑clock time or smaller batch sizes during training, which could have required an extra few hundred thousand steps for perfect convergence—but within experimental variance ($<\,0.\!3$ ppl) no clear penalty shows up in the final results.
+
+### Practical workarounds
+
+If one wishes to train an RWKV family model efficiently on modern GPUs while retaining numerical safety, two complementary strategies emerge from the authors’ discussion:
+
+1️⃣ **Partial autocasting** – surround every layer that does **not** involve an exponential gate or an outer‑product update with  
+
+```python
+with torch.cuda.amp.autocast():
+    …   # embedder, feed‑forward layers …
+```  
+
+and explicitly turn it off around the recurrent core:  
+
+```python
+with torch.cuda.autocast(enabled=False):
+    c = recurrence_step(...)   # includes exp/log/max + C←fC+i vkᵀ
+```  
+
+This lets most of the network still enjoy fp16 speedups while keeping crucial high‑dynamic–range tensors at fp32.
+
+2️⃣ **Float32 accumulator + bf16 inputs** – on hardware supporting bfloat16 (e.g., Ada Lovelace GPUs), store weights/activations as bf16 but keep $i'_{{\, }},f'_{{\, }},m_{{\, }},\mathbf C_{{\, }}$ internally as fp32 before casting back only after division or output gating. Bfloat16 has an exponent range identical to fp32, so exponentials no longer overflow, yet compute bandwidth remains close­to fp16 levels.
+
+Additional engineering tricks mentioned implicitly throughout Secs.~(9–12)—such as initializing forget gates close to one ($b_f{\approx}0$) so that early‐training exponentials stay modest, clipping pre‑exponential logits within a safe window (§ 3 “Stabilisation”), or replacing raw `exp` by a scaled sigmoid ($\sigma(\alpha x)$ with learned temperature $\alpha$)—all reduce peak magnitudes without sacrificing expressive power and therefore make autonomous autocasting viable.
+
+In short, what prevented native AMP was precisely **the high dynamic range implicit in exponential gating together with a dense outer–product state update**, both of which require float32 arithmetic for numerical correctness. The restriction did not noticeably cripple final language‐model performance, yet it did raise training time compared with fully auto–mixed models. By manually separating safe regions from numerically delicate ones—or by moving to bf16 while preserving fp32 accumulators—one can recover most of AMP’s efficiency gains without harming stability when training RWKV variants on contemporary GPUs.

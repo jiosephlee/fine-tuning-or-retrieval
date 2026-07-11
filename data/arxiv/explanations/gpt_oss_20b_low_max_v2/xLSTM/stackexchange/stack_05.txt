@@ -1,0 +1,184 @@
+\title{Stack Exchange of the Paper: "xLSTM: Extended Long Short-Term Memory"}
+
+### How can mLSTM be parallelised across layers despite having recurrent updates?
+Question:
+$m C_t=f_tm C_{t-1}+i_tm v_tm k_t^	op$ looks like a conventional recurrence because $m C_{t-1}$ depends on previous time steps. The paper says mLSTM can be reformulated in a fully parallel version but provides no details. What are the mathematical steps to rewrite this as a scan-like or cumulative sum operation over the entire sequence? Does this involve pre‑computing cumulative products of forget gates or accumulative sums of outer products? Also, technically, what changes if we use softmax instead of exponential gates for $f_t$, or if we remove the stabilizer?
+Answer:
+**Short answer**
+
+The recurrence in an mLSTM
+
+\[
+\mathbf{C}_t = f_t\,\mathbf{C}_{t-1} + i_t\,\mathbf{v}_t \mathbf{k}_t^{\!\top}
+        \qquad
+\mathbf{n}_t = f_t\,\mathbf{n}_{t-1} + i_t\,\mathbf{k}_t
+\]
+
+can be rewritten as a *scan* over the sequence:
+
+\[
+\boxed{
+  \mathbf{C}_t  = \sum_{\tau=1}^{t} \Bigl(\prod_{s=\tau+1}^{t} f_s \Bigr)
+                   i_{\tau}\,\mathbf{v}_{\tau}\mathbf{k}_{\tau}^{\!\top},
+  \quad
+  \mathbf{n}_t = \sum_{\tau=1}^{t} \Bigl(\prod_{s=\tau+1}^{t} f_s \Bigr)
+                   i_{\tau}\,\mathbf{k}_{\tau}
+}
+\]
+
+The product of forget gates that precedes each outer‑product term is a *cumulative product* that can be computed with a single `torch.cumprod`.  
+Both sums are simple matrix‑vector or matrix‑matrix weighted sums and can therefore be implemented in parallel on a GPU without any explicit loop over timestamps.
+
+Below we spell out the algebra, the GPU implementation sketch, and the effect of changing the gate activation from an exponential to a softmax or dropping the stabiliser.
+
+-------------------------------------------------------------------
+
+## 1. From recurrence to scan
+
+Write the forward recursion for the two states:
+
+```
+C0   = 0
+n0   = 0
+
+Ct   = ft·Ct‑1 + it·vt·ktᵀ
+nt   = ft·nt‑1 + it·kt
+```
+
+Iterating once gives
+
+```
+Ct   = ft·(ft‑1·Ct‑2 + it‑1·vt‑1·kt-1ᵀ) + it·vt·ktᵀ
+     = ft·ft‑1·Ct‑2 + ft·it‑1·vt‑1·kt-1ᵀ + it·vt·ktᵀ
+```
+
+Continuing for **all** past time steps yields
+
+```
+Ct   = Στ=1…t (Πs=τ+1…t fs) · it · vt · ktᵀ
+nt   = Στ=1…t (Πs=τ+1…t fs) · it · kt
+```
+
+(The empty product for τ = t equals one.)
+
+Thus every state is a weighted sum of past outer products (`vt ktᵀ`) or key vectors (`kt`), where the weight is the product of the forget gates that come *after* that time step.
+
+Let  
+
+* \(F_t = f_t f_{t-1}\dotsm f_2 f_1\)  – cumulative product up to \(t\).
+
+Then  
+
+\(F_t/F_{\tau}\) is exactly the product \(f_{\tau+1}\dotsm f_t\).  
+Hence we can compute all weights in one pass:
+
+```
+F   ← cumprod(f[ :T])          # size (T,)
+Wτ  ← F / F[τ:]                # broadcasting gives Πs>τ fs
+C   ← Σ Wτ ⊙ (iτ vt ktᵀ)        # batched outer products weighted by Wτ
+N   ← Σ Wτ ⊙ (iτ kt)           # similarly for key sum
+```
+
+Because \(W_\tau = F_\tau^{-1} F_{>\tau}\), we can avoid explicit division by re‑using `cumprod` and `cumprod_rev` if desired.
+
+The final hidden state uses simply
+
+```
+h_t = o_t ⊙ ( C_t q_t / max(|N_tᵀ q_t|, 1) )
+```
+
+All operations are purely tensor operations; no explicit Python loop over `t` is required. At inference time we can therefore do one forward pass for the whole sequence.
+
+-------------------------------------------------------------------
+
+## 2. What parts actually *need* to be serial?
+
+Only two places a serial dependence appears in the original formulation:
+
+| **Place** | **Why serial in plain LSTM** | **Is it serial here?** |
+|-----------|------------------------------|------------------------|
+| `h_t` depends on `C_t` | true | Yes, but after we have all values of `C_t` (parallel), computing each `h_t` is pointwise |
+| `C_t` depends on `C_{t-1}` | yes | replaced by cumulative sum of weighted terms – fully parallel |
+
+Hence, mLSTM has no hidden-hidden recurrent coupling; its state update is reducible to a scan.
+
+-------------------------------------------------------------------
+
+## 3. Implementation sketch (PyTorch)
+
+```python
+# x, pseq: (T,d) tensors; bias and proj layers already applied.
+f  = torch.exp(tilde_f)            # or softmax variant below
+i  = torch.exp(tilde_i)
+k  = k / math.sqrt(d)
+v  = v                              
+
+# cumulative products of forget gates:
+F = f.cumprod(dim=0)                     # shape [T]
+# Reverse cumprod gives prod_{s>τ} fs efficiently:
+Fr_back = torch.flip(F.flip(0).cumprod(dim=0), dims=[0])
+weights = Fr_back / F[:, None]           # shape [T,T]
+# weights[τ,t] == prod_{s>τ}^{ t } fs
+
+Wt_outer     = weights.unsqueeze(-2).unsqueeze(-3) * i.view(T,1,1)
+Wt_key       = weights.unsqueeze(-2)                * i.view(T, -)
+
+C            = (Wt_outer * v[..., None] @ k[..., None]).sum(0)    # (d,d)
+N            = (Wt_key * k).sum(0)
+
+# Now compute h for all t at once:
+q            = W_q @ x.t()                         # (d,T)
+Cq           = C @ q                               # (d,T)
+norm_den     = torch.max(torch.abs(N.unsqueeze(-2).transpose(-2,-3).bmm(q)).abs(), torch.ones( ) )
+h            = o.tensor().unsqueeze(-2)* Cq/norm_den
+```
+
+The forward pass uses only matrix–matrix and matrix–vector multiplications plus elementwise ops; all are fully parallel on GPU.
+
+-------------------------------------------------------------------
+
+## 4. What if we use a softmax forget gate?
+
+Replacing \(f_t=\exp(\tilde f_t)\) with a softmax across time would enforce that \(f_1+\dots+m)=100\%\); this removes the ability to *decay* arbitrarily fast and would break the derivation above because the recurrence becomes *not* geometric. The scalar recurrence would read
+
+```
+Ct   := g(t)*Ct-1 + …
+```
+
+with multiple tf's summing to one. In that case  
+\(C_t\neq \sum_\tau (\prod_{s>\tau} g(s)) …\); rather we would need a full matrix power series, which no longer admits a simple cumulative‑product form. Consequently the scan rewrite only works when each step scales the previous state by a *scalar* forget factor, as in exponential gating or sigmoid gating (the sigmoid case also yields scalar multiplicative update – just replace exp with sigmoid).
+
+-------------------------------------------------------------------
+
+## 5. Removing the stabilizer (`m_t`)
+
+The paper introduces
+
+```math
+m_t      ← max(log(f_t)+m_{t-1}, log(i_t))
+i'_t     ← exp(log(i_t)-m_t)
+f'_t     ← exp(log(f_t)+m_{i,t}-m_t)
+```
+
+to avoid overflow when gates become large or tiny. The stabilized gates have exactly the same product as the raw ones:
+
+```
+Π_s>τ f'_s   == Π_s>τ f_s          ────────────────────────────── (★)
+Π_s>τ i'_s   == Π_s>τ i_s          ────────────────────────────── (★★)
+```
+
+Proof: each log–term cancels out pairwise when forming cumulative products because `m_s` accumulates the maximum of log‐forget and log‐input along the path. Therefore equations in § 3 stay valid whether we use raw or stabilized gates – they differ only numerically during training.
+
+If you drop stabilisation entirely you risk overflowing/underflowing during training, especially with very large batch‐sizes or deep stacks. The derived scan still holds analytically, but numerically you might get very wrong results if you rely on floating–point saturations.
+
+-------------------------------------------------------------------
+
+## Summary
+
+* The mLSTM recursion reduces to a weighted sum over past key–value outer products and weighted key sums using cumulative products of forget gates.
+* These are exactly what you get from a “scan” operation: compute all cumulative forget products once (`cumprod`) then weight each outer product by its corresponding coefficient and sum.
+* The operation is fully parallel; only other layers in an xLSTM block add sequential dependence.
+* Changing gate activation from exponential to softmax destroys this property because forgetting is no longer multiplicative across steps.
+* The stabiliser does not change the algebraic form; it simply keeps intermediate values numerically well­behaved.
+
+With these observations you can replace any naive loop over timestamps in mLSTM with efficient tensor ops – precisely what makes xLSTM’s **matrix memory variant** practically as fast as Transformers while retaining RNN expressivity.

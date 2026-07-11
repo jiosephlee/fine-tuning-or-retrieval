@@ -1,0 +1,295 @@
+\title{A Textbook about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+# Chapter Title  
+**Efficient Finetuning of Large Language Models with QLoRA**
+
+---
+
+## 1. Introduction to Finetuning Large Language Models
+
+Large language models (LLMs) have become the cornerstone of modern natural‑language processing. A single pretrained model, such as LLaMA or GPT‑like architectures, can generate fluent text, answer questions, and even perform reasoning tasks that were once the domain of highly manual systems. Yet the raw, pretrained parameters encode only the knowledge that was available during training on large public corpora and contain no task‑specific or safety constraints. Consequently, researchers routinely **finetune** these models on curated instruction‑following or dialogue datasets to transform a generalist network into a domain‑specific assistant.
+
+Finetuning, however, is a profoundly memory‑bottlenecked operation. In a conventional 16‑bit (FP16) setup, each weight tensor must be loaded in full precision in GPU memory along with activations and their gradients, leading to terabyte‑scale memory footprints for the largest models. For a 65B parameter LLaMA model, the required memory exceeds $780$ GB per forward–backward step—orders of magnitude beyond the capacity of any single commodity GPU. This barrier forces research groups to rely on expensive multi‑GPU clusters or specialized hardware, effectively limiting which institutions can experiment at scale.
+
+Quantization offers relief during inference: by representing weights with fewer bits (e.g., 8 bits or even 4 bits) we can shrink the model size dramatically while preserving accuracy for many downstream tasks. Unfortunately, quantized weights cannot be naively trained with backpropagation because the forward pass uses discrete values and gradients would be ill‑defined or lead to catastrophic loss of information. While some recent works propose sub‐optimal heuristics (e.g., straight‑through estimation), they often produce unstable training dynamics or introduce irrecoverable precision loss.
+
+The breakthrough paper “QLoRA: Efficient Finetuning of Quantized LLMs” introduces a framework that reconciles efficient inference‐style quantization with robust backpropagation. By quantizing a pretrained LLM to **4 bits** using a novel NormalFloat data type and by learning only a small set of **Low‑Rank Adapters (LoRA)** that are updated during training, QLoRA achieves state‑of‑the‑art instruction finetuning while requiring less than 48 GB of GPU memory on a single RTX 3090 or professional A100 device.
+
+In this chapter we dissect each ingredient of QLoRA, explain why it is needed, and motivate how its combination unlocks efficient finetuning without sacrificing performance.
+
+---
+
+## 2. Motivation: Why and When to Finetune LLMs
+
+Fine‑tuning is driven by three core needs:
+
+1. **Task Specialization**  
+   Base LLMs are generalists; they possess broad world knowledge but lack precise behavior for specific domains such as medical diagnosis or code generation. By exposing them to labeled examples from a target task, we steer their probability distribution toward desirable outputs.
+
+2. **Behavior Mitigation**  
+   Pretrained models can overemphasize biases present in their training data: harmful stereotypes, hallucinations, or refusal to comply with incorrect user instructions. Finetuning on carefully curated instruction datasets (e.g., OASST1 or Alpaca) allows us to penalize undesirable outputs and reinforce compliance with user intent.
+
+3. **Regulatory Constraints**  
+   Certain applications (e.g., healthcare, finance) require accountability and interpretability. Fine‑tuned models provide verifiable mappings from inputs to outputs that can be audited more easily than opaque pretraining corpora.
+
+Efficiently finetuning at scale is therefore essential for both academia and industry wishing to adapt proprietary datasets without resorting to massive compute farms.
+
+---
+
+## 3. Scaling Bottlenecks in Conventional 16‑bit Finetuning
+
+### 3.1 Memory Consumption Overview
+
+In standard FP16 finetuning, memory usage decomposes into three main components:
+
+| Component | Memory Footprint | Explanation |
+|-----------|------------------|-------------|
+| **Model Parameters** | \( N \times 2 \text{ bytes} \) | \(N\): number of weights; FP16 each ≈ 2 bytes |
+| **Activations & Gradients** | \( O(N \times B \times S) \) | \(B\): batch size; \(S\): sequence length |
+| **Optimizer States** | \( O(N \times \text{state\_size}) \) | e.g., Adam requires two additional FP16 tensors per weight |
+
+For large transformers where \(N = 65\times10^9\), activations alone dominate: an attention block may require dozens of intermediate tensors needing up to several gigabytes each when token lengths are long (e.g., 4k). Even with aggressive gradient checkpointing—which trades compute for memory by recomputing activations during backward passes—the tensor overhead remains staggering.
+
+### 3.2 Limitations Under Quantized Models
+
+Directly quantizing weights does not solve this problem because activations are still computed in FP16 or bfloat16 precision during forward passes; thus the weight arrays remain large enough to occupy hundreds of GB in memory. Furthermore, if one attempted to quantize activations as well (e.g., using low-bit integer tensors), accumulating gradients would be impossible: backpropagation requires elementwise floating‐point arithmetic on floating‐point values for numerical stability.
+
+Hence two fundamental issues arise:
+
+1. **Weight storage overwhelms GPU memory even after quantization**—since each weight still occupies at least 4 bits plus extra overhead for scaling constants.
+2. **Backpropagation cannot proceed through discrete functions**—the nondifferentiable rounding operation removes meaningful gradient signal unless special tricks are used.
+
+QLoRA addresses both: it keeps weights quantized yet differentiable via dequantization during forward computation; it restricts trainable parameters to adapters so that gradients never flow into the base weights themselves.
+
+---
+
+## 4. Quantization and Its Limitations for Training
+
+### 4.1 Block-Wise k-Bit Quantization
+
+Standard k-bit quantization maps continuous floating-point weights \(x \in \mathbb{R}\) into an integer representation within a finite set of \(2^k\) symbols:
+\[
+x^{\text{Int}k} = \text{round}\!\left( c^{\text{FP32}} \cdot x^{\text{FP32}} \right),
+\]
+where \(c^{\text{FP32}}\) is an adaptive *quantization constant* (scale) chosen per block so that the range per block covers most valuable entries while mitigated outliers are smoothed away by clamping.
+
+A *block* consists of contiguous weight indices—forming a tensor slice—typically sized between 32 and 128 elements depending on hardware. Each block gets its own scale factor to preserve dynamic range locally, avoiding severe granularity loss caused by global scaling.
+
+While blockwise quantization works remarkably well for inference (SmoothQuant, GPTQ), it does not circumvent two issues:
+
+- The need for high-precision *scaling constants* stored separately;
+- The inability to backpropagate through discrete rounding when weights change during training.
+
+### 4.2 The Curse of Outliers
+
+Most pretraining weight distributions resemble zero-centered Gaussians but exhibit rare extreme values (“outliers”) in transformer attention matrices due to residual bridges or initialization artifacts.
+If scales were fixed by global maximum absolute value (\(\max|x|\)), many bins would be underutilized leading to huge errors for moderate values.
+Blockwise scaling curtails this but at the cost of storing more *constants*. For instance:
+- A 64-element block with float32 constants requires \(64/4 = 0.5\) bits per parameter.
+- Across billions of parameters this amounts to hundreds of gigabytes for scaling data alone.
+
+Thus reducing precision from FP32 → k-bit *does not* always shrink memory if you ignore constants’ costs—a key insight motivating Double Quantization later in QLoRA.
+
+---
+
+## 5. Overview of QLoRA’s Key Contributions
+
+QLoRA packs several innovations together:
+
+| Contribution | Problem Addressed | Mechanism |
+|--------------|-------------------|-----------|
+| **NormalFloat–NF4 quantization** | Information loss due to bin underutilization | A theoretically optimal mapping derived from fitting normal distribution quantiles into four-bit asymmetric bins preserving zero exactly |
+| **Double Quantization** | Excessive constant storage overhead | Re-quantizes scaling constants (FP32 → FP8) using symmetric blocks; drastically cut average bits/parameter |
+| **Paged Optimizers** | Memory spikes during gradient checkpointing | Uses NVIDIA Unified Memory manager; optimizer states spill safely onto host RAM when GPU runs low |
+| **Full-layer LoRA adapters** | Reduced modeling capacity when adapters are sparse | Inserts low-rank adapters into every linear layer (attention projections + FFNs + residual connections), restoring full fine-tuned performance |
+| **High-precision dequant & compute flow** | Incompatible low-precision weights vs computation accuracy | Stores NF4 tensors but temporarily dequantizes them into BF16 before every matmul; gradients flow through dequantized representation |
+
+Combined these changes allow finetuning a *65B* param model on a *single* RTX 3090 (48 GB VRAM), achieving roughly $<200$ GB total footprint due to aggressive sparsification of adapter updates and efficient use of blocks during calibration.
+
+---
+
+## 6. Impact on Accessibility and Future Research
+
+The practical consequences are far-reaching:
+
+1. **Cost Reduction:** Researchers no longer need multi‑node clusters; a single consumer GPU can train large open-source chatbots within hours rather than days.
+2. **Rapid Prototyping:** Model developers can iterate quickly over new instruction datasets or architecture variants without incurring prohibitive compute budgets.
+3. **Model Democratization:** Smaller labs can now contribute high-quality open-source chatbots comparable to commercial offerings like ChatGPT without owning proprietary infrastructure.
+4. **Privacy-Aware Personalization:** End users could train personal assistants directly on their devices using local data sets permissible under privacy constraints.
+5. **Research Opportunities:** The ability to finetune many variants across scales facilitates large-scale ablation studies—for example evaluating dataset size vs quality trade‑offs, adapter size effects across architectures (LLaMA vs T5), or exploring new PEFT strategies beyond LoRA within resource limits.
+
+In short, QLoRA breaks down one major entry barrier for advanced deep‑learning experimentation involving very large language models—a barrier that had largely stalled progress outside well-funded corporations.
+
+---
+
+## Epilogue
+
+Below we present two small examples illustrating QLoRA’s benefits—the impact starkly evident when comparing typical fine‑tuned models versus their QLoRA counterparts:
+
+1. **Vicuna benchmark score jump:** Guanaco 65B finetuned with QLoRA reaches $99$ % relative performance versus ChatGPT while consuming under 5 GB at inference compared with $26$ GB for fully-finetuned Vicuna.
+2. **Training time collapse:** The same Guanaco runs from scratch on OASST1 data in under $24$ h on an RTX 3080Ti instead of over $96$ h needed for full-finetune approaches due mainly to reduced accelerator utilization bottlenecks from low bit-width computations.
+
+These numbers underscore how QLoRA moves us closer to truly *open* AI research ecosystems while keeping fidelity intact—a combination rarely seen before in the context of public LLM finetuning frameworks.
+
+
+
+---
+
+# 2. Background Concepts
+
+Large language models (LLMs) have become indispensable engines for natural‐language generation, instruction following, and a variety of downstream tasks. Yet, the sheer scale of these models raises several practical challenges at training time: memory consumption dominates the cost, and traditional fine‑tuning—updating every weight in a 10‑billion‑parameter network—many times consumes hundreds of gigabytes of GPU memory. The **QLoRA** framework addresses these constraints by marrying two powerful ideas: *block‑wise k‑bit quantization* of pretrained weights and *low‑rank adapters* (LoRA) that restrict learning to a small set of additional parameters. Understanding these components—and their interaction with the memory budget—is essential for appreciating why QLoRA can reliably fine‑tune extremely large models on a single consumer GPU.
+
+In this chapter we unpack the foundational concepts that QLoRA leverages:
+
+- **Block‑wise k‑bit quantization**: how tensors are discretised, how per‑block scaling constants are computed and stored, and the inverse dequantization process.
+- **Low‑Rank Adapters (LoRA)**: the rank‑decomposition of linear projections, hyperparameters that govern capacity and regularisation, and the dynamics of gradient flow during training.
+- **Memory footprint analysis**: a comparative study between full finetuning and LoRA as applied to a large language model, revealing where storage is saved and where it remains necessary.
+- **Key limitations of existing PEFT methods** when applied to models in the tens of billions of parameters range.
+
+With these pieces in place we can later see precisely how QLoRA lowers the bar for research teams that would otherwise be unable to experiment with state‑of‑the‑art LLMs.
+
+---
+
+## # Block–wise k–bit Quantization
+
+Quantisation is the act of mapping a continuous or high‑precision representation into a discrete set with fewer bits per element. A typical scenario in deep learning is converting from 32‑bit floating point (\textsf{FP32}) weights into an 8– or 4–bit format so that the model fits on limited hardware or achieves faster inference throughput.
+
+### Normalising by blockwise constants
+
+When a tensor $\mathbf{X}\in\mathbb{R}^{b\times h}$ is subdivided into contiguous blocks of size $B$, we obtain $n=\frac{b\,h}{B}$ blocks $\{\mathbf{X}_i\}_{i=1}^n$. For each block we compute an absolute maximum
+\[
+c_i = \operatorname{absmax}(\mathbf{X}_i),
+\]
+which captures the largest magnitude value inside that block. This constant scales all entries in $\mathbf{X}_i$ into a target numeric range, chosen here as $[-127,127]$ for an 8–bit signed integer representation. The blockwise scaling guarantees that *all* possible 8–bit values are utilised; otherwise outlier values would saturate a few bins and leave many others unused—a wasteful allocation especially for highly skewed distributions.
+
+The quantised tensor $\mathbf{X}^{\text{Int8}}$ is then computed as
+\[
+\boxed{
+\mathbf{X}^{ \text{Int8}} = \operatorname{round}\!\bigl(c_i^{-1}\,\mathbf{X}_i\bigr)
+}
+\tag{2}
+\]
+where $c_i^{-1} = \frac{127}{\,\operatorname{absmax}(\mathbf{X}_i)}$ is sometimes called the *quantisation constant* or *scale*. Importantly, this operation is applied independently per block; no inter‐block normalisation takes place.
+
+To recover approximate real values during inference or backward passes we perform *dequantisation*:
+\[
+\boxed{
+   \operatorname{dequant}(c_i,\mathbf{b}) = c_i\,\mathbf{b},
+}
+\tag{3}
+\]
+where $\mathbf{b}$ are the stored low‑bit integers and $c_i$ restores them to floating point space (often BF16 or FP16). Equation (3) is exact whenever the quantiser was perfect; in practice it introduces some small rounding error.
+
+### Why block size matters
+
+Choosing $B$ trades off precision against memory overhead. Larger blocks mean fewer scaling constants but potentially less accurate mapping: all values in a big block share one scale which can lead to bin underutilisation when there is high variance across elements. Conversely, small blocks drastically increase the number of constants—each requiring extra storage but keeping scaling granular.
+
+For LLMs, it has been empirically observed that a blocksize around $64$ works well for a 4–bit quantisation while maintaining model performance when combined with LoRA training techniques such as QLoRA’s double quantisation scheme described later.
+
+---
+
+## # Low‑Rank Adapters (LoRA)
+
+Parameter‑efficient finetuning trains only a small set of auxiliary weights while keeping the pretrained model frozen—an attractive strategy when GPU memory is scarce or privacy concerns forbid altering public weights.
+
+### Rank‐decomposition form
+
+A standard linear projection within an LLM maps input $\mathbf{X}\in \mathbb{R}^{b\times h}$ through weight $\mathbf{W}\in \mathbb{R}^{h\times o}$:
+\[
+    \mathbf{Y} = \mathbf{X}\,\mathbf{W}.
+\]
+The LoRA trick augments this projection with an extra low–rank term,
+\[
+    \boxed{
+   \mathbf{\widetilde Y} = \underbrace{\mathbf X\,\mathbf W}_{\textstyle pretrain}}
+   + 
+   s\, 
+   {\underbrace{\bigl(\mathbf X\, \mathbf L_1\bigr)}_{\mathbb R^{b\times r}}
+   {\underbrace{\bf L_2}_{r\times o}}},
+}
+\tag{4}
+\]
+where:
+- $\mathbf L_1 \in \mathbb R^{h\times r}$ and $\mathbf L_2 \in \mathbb R^{r\times o}$ are learned adapters.
+- $r$ is the *rank*, typically far smaller than $h$ and $o$ (often 8–64).
+- $s$ is a scalar that rescales the adapter so its contribution at initialization matches typical weight values (often set to $1/r$).
+
+Because $\|{\bf W}\|_F$ dominates training dynamics before learning begins, LoRA keeps ${\bf W}$ frozen; gradients flow only through ${\bf L}_1$ and ${\bf L}_2$, making adaptation extremely lightweight physically and computationally.
+
+### Hyperparameters guiding capacity
+
+Several LoRA hyperparameters dictate how strongly and flexibly adapters can modulate the pretrained representations:
+
+| Hyperparameter | Typical range | Effect |
+|----------------|---------------|--------|
+| Rank $r$ | $8 - 128$ | Higher ranks increase expressiveness but add memory & compute |
+| Scale $s$ | $(0,\infty)$ | Adjusts magnitude of adapter update |
+| Adapter placement | Layer-wise vs selective | Mapping more layers yields better performance but increases parameters |
+
+In practice QLoRA applies an adapter to virtually every weight matrix inside transformer blocks—q/qkv projections, feed-forward dense layers—rather than saving on adapters sparingly; because LoRA's parameter count stays negligible compared to base memories this “full coverage” strategy eliminates most accuracy loss present in earlier sparse-adapter schemes.
+
+### Gradient flow during training
+
+During backpropagation gradients must propagate between frozen weights $\bf W$, adapter matrices ${\bf L}_i$, and upstream activations $\bf X$. The forward pass uses dequantised representations $\bf W$, so gradients with respect to ${\bf X}$ are computed exactly as if real precision were used:
+$\frac{\partial E}{\partial {\bf X}} = \frac{\partial E}{\partial {\bf Y}}\,{\bf W}^\top$.  
+However, because ${\bf W}$ remains unmodified during updates, no weight decay or adaptive optimizer step needs be computed for it; only Adam/W optimizer updates loTra parameters (${L}_1,L_2$). Hence LoRA reduces both memory footprint due to tiny gradient tensors for active weights and compute overhead tied to Adam steps.
+
+---
+
+## # Memory Footprint Analysis for Full Finetuning vs. LoRA
+
+*(All numbers refer loosely to GPU VRAM assuming typical BF16/BFloat16 usage.)*
+
+### Full 16-bit finetuning
+
+For a generic Transformer such as LLaMA’s decoder head:
+
+- **Model parameters**: A 7B parameter example occupies about $7B\times16/8=14~GB$, disregarding overhead such as optimizer slots or activation tensors.
+- **Gradient buffers**: During training each weight needs paired activation gradients (~50% overhead). With checkpointing enabled many frameworks store only activations at output ends of layers which leads to additional memory usage up to ~70% of raw weight storage.
+- **Optimiser state**: Adam’s per-parameter momentum adds another ~128 % on top of base weight size at BF16 precision (~18 GB).
+
+Overall a full finetuning run can thus exceed 60 GB even before accounting for batch tensors or hidden state buffers.
+
+### LoRA Finetuning
+
+Assume we keep all base weights frozen but add adapters:
+
+- **Adapter parameters**: Adding two matrices per linear layer with rank $r=8$ yields roughly \(2\times r\times (h+o)\) parameters per layer—a tiny share ($<0.2$\%) relative to base weights.
+    - For a model with ~30 layers each handling matrices sized ~\(8192\times8192$, this comes out around \(30\times2\times8\times8192~≈~3~MB.\)
+- **Gradient buffers**: Because only adapters are updated and stored as BF16/FP16 quantities, their gradients occupy equivalent size (~3 MB).
+- **Optimizer state**: Similar logic applies; Adam slots are tied only to adapters, providing another few megabytes.
+
+The critical takeaway showcased by QLoRA is that *the majority* of GPU budget continues to be consumed by storing activations during forward passes (\(~5~GB embryos for 4-bit bases*)—the freszoned map forces them up briefly—but by freezing all other parameters we eliminate billions of bytes from integer storage previously allocated for weight updates.
+
+When combined with QLoRA’s quantisation (downscaling base tensors from ~54 GB down to ~5 GB) plus double quantisation savings (~3 GB), you move from >780 GB down to <48 GB on a single modern card—a transformation achieved without any loss in performance according once adapters learn freely through backpropagation across frozen rhythmble quantised kernels.
+
+---
+
+## # Key Limitations of Existing PEFT Methods in Context of Large Models
+
+As PEFT approaches grew popular (prompt tuning, prefix tuning), certain weaknesses became apparent when strictly applied to 10⁹+ sized models:
+
+1. **Sparse Placement Leads To Accuracy Gap**  
+   Traditional LoRA variants often inserted adapters into select layers (e.g., only query/key/value projections). For mid-size models this marginal approach balances cost vs accuracy; however, at scaling >33 B the removed layers hold legible amount of information whose fine-tuning cannot be approximated by narrow local changes—leading noticeably lower final perplexity or instruction-following fidelity compared to full finetuning.
+
+2. **Hyperparameter Sensitivity Overheads**  
+   Because higher ranks involve more parameters scattered across many layers, many frameworks require exhaustive grid searches over learning rate schedules, batch sizes etc., which becomes polynomially expensive when repeats are forced across numerous dataset/scale permutations as done in QLoRA’s experiment sweep (>1 000 models).  
+
+3. **Backwards Compatibility With Quantized Bases**  
+   Earlier PEFT libraries often expect full precision weights during forward computation; when fetching from ∼4– bit tensors there exists mismatched dtype propagation causing spontaneous NaNs or overflow if not explicitly handled via dequant – compute – re-upload pipelines that most open-source toolkits simply omit until recently.
+
+4. **Compatibility With Advanced Optimises (\emph e.g., AdamW under distributed mixed precision)**  
+   Using BF16 accumulators when some partitions reside at INT4 necessitates complex mixed precision handling not standardized across frameworks; even small GPU fragmentation can cause OOM if not internally patched (as Paged Optimisers highlight).
+
+QLoRA addresses these shortcomings systematically:
+
+- By training adapters *everywhere* while keeping them minuscule participants.
+- By leveraging specialised NF4 data types that match pretrained weight statistics.
+- By introducing Double Quantisation that reduces constant overhead fivefold.
+- And by employing paged optimisation memory allocation so gradient checkpointing never exceeds VRAM capacities even under long sequence lengths.
+
+Thus QLoRA opens up fully scalable PEFT on large parameter regimes without dexterous hyperparameter hunting or fragile upstream frameworks.
+
+--- 
+
+By mastering these concepts you will be ready to delve deeper into QLoRA’s algorithmic specifics—such as its blockwise normalizations routine—or ultimately design your own low‑bit finetuning pipelines attuned for institutional constraints.

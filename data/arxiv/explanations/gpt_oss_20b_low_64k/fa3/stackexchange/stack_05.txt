@@ -1,0 +1,101 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### How do you perform an in‐kernel transpose of 8‑bit tiles using LDSM/STSM?
+Question:
+The text describes transposing tiles of $	extbf{V}$ after loading them into SMEM via `ldmatrix`/`stmatrix`. Since these instructions deal with an 8×8 matrix of 16‑bit entries, how do we pack two 8‑bit values per word and still get a correct transpose? Do we need extra shuffles or byte permutes to unpack?
+Answer:
+In FlashAttention‑3 the value tensor $\,\mathbf{V}\,$ is quantised to FP8
+(e4m3) and therefore each element occupies only a single byte.  
+The Tensor‑Core instruction that is used for the second GEMM,
+`WGMMA`, expects its input operands to be laid out in “k‑major”
+form in shared memory: the inner dimension (the sequence length) must
+be contiguous while the outer (head‑dimension) can be scattered.
+When we load $\,\mathbf{V}\,$ from global memory the natural layout of the
+tensor is contiguous in the head dimension, so we must **transpose
+each 8×8 tile of $\,\mathbf{V}\,$ while it lives in shared memory**.
+
+-----------------------------------------------------------------------
+
+### Packing two FP8 values into a single 16‑bit word
+
+The LDMATRIX/STMATRIX instructions operate on an 8×8 matrix whose
+entries are 16 bits wide.  
+To use them for FP8 we simply interpret each word as two packed bytes.
+When a warp issues
+
+```ptx
+ldmatrix.sync.all.s32.m8n8.x4.trans tid, [ptr_in]
+```
+
+the instruction pulls eight rows of eight 16‑bit words from shared memory,
+i.e. $64$ values in total, but each word contains two packed FP8s.
+From a register‑side view this is just a normal 16‑bit load: we receive
+a register value $w = b_0\oplus( b_1 \ll 8 )$, where $b_0,b_1\in[0,255]$.
+
+Because LDMATRIX/STMATRIX do **not** split the bytes inside a word,
+the two bytes cannot be permuted inside the same instruction.
+Instead we rely on a cheap *byte‑shuffle* that lives in the register file.
+
+-----------------------------------------------------------------------
+
+### Unpacking and transposing
+
+1. **Load** the packed tiles with LDMATRIX.  
+   Each row of registers now holds eight $16$-bit words, each word being
+   two packed FP8s.
+
+2. **Byte shuffle** (using `__shfl_sync` on lower/upper halves, or the
+   PTX instruction `shfl.d32.up/low/high`).  
+   We generate two registers per original row:  
+   – one containing all low‐order bytes ($b_0$)  
+   – one containing all high‐order bytes ($b_1$).  
+   Because every thread in a warp owns eight such registers, this only
+   moves data within the warp’s private register file and costs very few
+   cycles.
+
+3. **Transpose** across warps by an extra sub‑warp shuffle or by when
+   storing back with STMATRIX we swap source and destination indices.
+   The tiled layout after step 2 already has rows that will become columns
+   after step 3, so the final store simply writes each “column”
+   register to the next $y$-coordinate in shared memory.
+
+Thus we obtain a fully transposed tile without touching global memory more
+than necessary and without any per‑byte loads or stores from global memory.
+The transpose is carried out entirely inside SMEM:
+the packed words are loaded once, unpacked once per register,
+and stored back once.
+
+-----------------------------------------------------------------------
+
+### Why this works with FP8 WGMMA
+
+After packing/unpacking/transposing:
+
+* The first operand to WGMMA (the dot product of $\,\mathbf{Q}$ and $\,\mathbf{K}^T$)
+is still k‑major, since we only touch its packing.
+* The second operand ($\,\mathbf{V}$) is now contiguous along the
+sequence‑dimension because each warp now owns consecutive rows of $\,\mathbf{V}\,$.
+* All registers hold **single‑precision FP32 accumulators** that are fed
+directly by the FP8 tiles; no conversion to FP16 is required.
+
+The byte‑shuffle cost is negligible compared to an entire GEMM kernel.
+Empirically, this approach allows FlashAttention‑3 to launch an exact
+FP8 WGMMA on H100 while keeping throughput close to FP16 performance.
+
+-----------------------------------------------------------------------
+
+### Recap
+
+- Load an 8×8 packed tile with `ldmatrix` – each word holds two FP8 values.
+- Use lightweight byte shuffles (`shfl.*` or PTX `shfl.d32.*`) to separate
+the low and high bytes into distinct registers.
+- Perform the standard transpose by swapping the roles of rows and columns when writing back with `stmatrix`.
+- No additional global‑memory shuffles or byte–level loads are required;
+unpacking is done purely in registers.
+- This gives us an in‑kernel transpose suitable for the FP8 k‑major WGMMA,
+as described in section 3.2 (“Low‑precision with FP8”) of FlashAttention‑3.
+
+In short: pack two “value” bytes into one 16‑bit word at load time,
+unpack them in registers with cheap shuffle operations, then perform the same
+transpose tricks as for full 16‑bit matrices—so the GPU can finish a full
+GEMM using its native FP8 Tensor Cores without any extra shuffling or byte permutes on global memory.

@@ -1,0 +1,335 @@
+\title{A Textbook about the Paper: "Parameter-Efficient Orthogonal Finetuning via Factorization"}
+
+Chapter 6: 8. Practical Recipes for Training with BOFT  
+
+The previous chapters introduced the theory behind Orthogonal Butterfly Finetuning (BOFT), proved its expressivity, and outlined its mathematical structure. In practice, however, the devil lies in the details: how do we hook a BOFT layer into an existing transformer or diffusion pipeline, what learning‑rate schedule guarantees stability, how do we pick the factorisation hyper‑parameters \(m\) and \(b\), and how do we keep training time reasonable?  This chapter is a step‑by‑step guide that covers all those practicalities, with recipes that have worked on large vision transformers (ViTs), language models (LLaMA‑7B and GPT‑Neo‑2.7B), and text‑to‑image diffusion models (Stable Diffusion 2.1).  By the end of this chapter you should be able to:
+
+* Insert a BOFT module into any feed‑forward or attention sublayer without changing the inference graph.  
+* Select a good \((m,b)\) pair for a given layer size and parameter budget.  
+* Choose learning rates, optimizers, and dropout schedules that keep training stable while maximizing generalisation.  
+* Monitor runtime overhead and exploit caching / fused operations to mitigate it.  
+
+---
+
+## 8.1 Overview of the BOFT Forward Pass
+
+Given a frozen weight matrix \(\mathbf{W}^0\in\mathbb{R}^{d\times n}\) that appears in one of the linear projections of a transformer block:  
+
+\[
+\mathbf{z} \;=\; (\mathbf{R} \mathbf{W}^0)^{\top}\mathbf{x},
+\]
+
+BOFT replaces \(\mathbf{R}\) with a product of \(m\) orthogonal butterfly components
+
+\[
+\mathbf{R}(m,b) \;=\;\prod_{i=1}^{m}\tilde{\mathbf{B}}^b_{(d,i)},
+\]
+each \(\tilde{\mathbf{B}}^b_{(d,i)}\in\mathbb{R}^{d\times d}\) being a block–sparse matrix consisting of \(b\times b\) orthogonal blocks embedded in a permutation defined by the butterfly pattern at level \(i\).  The forward pass is therefore
+
+1. **Cache** the frozen product \(\mathbf{W}^0_{\text{frozen}} = (\mathbf{W}^0)^{\top}\).  
+2. **Apply** each butterfly component in reverse order:  
+   \[
+   \tilde{\mathbf{x}}_0 = \mathbf{x}, \quad
+   \tilde{\mathbf{x}}_{i} = (\tilde{\mathbf{B}}^b_{(d,i)}\, )^{\top}\tilde{\mathbf{x}}_{i-1}\quad (i=1,\dots,m).
+   \]
+3. **Multiply** by cached weight:  
+   \[
+   \mathbf{z} = \mathbf{W}^0_{\text{frozen}}\;\tilde{\mathbf{x}}_{m}.
+   \]
+
+During inference we can fuse steps 2–3 into one operation by pre‑computing the final dense transformation  
+
+\[
+\widehat{\mathbf{W}}\;=\;\bigl(\prod_{i=1}^{m}\tilde{\mathbf{B}}^b_{(d,i)}\,\bigr)\,\mathbf{W}^0,
+\]
+so that only a single dense matmul is required at run time.  The cost trade‑off is that all butterfly parameters must be updated during training but not during inference.
+
+---
+
+## 8.2 Wires: Mounting BOFT on Existing Architectures
+
+| Backbone | Target Module | BOFT Hook | Comment |
+|----------|---------------|-----------|---------|
+| Transformer/LLaMA | Q/K/V projections (3×\(d_{\text{head}}\times d_{\text{model}}\)) | Replace each projection matrix with BOFT | Each head may use its own \((m,b)\) for extra flexibility |
+| ViT / Swin | MLP layers (two linear layers per block) | Insert BOFT before each linear layer | For attentive embeddings you may wish to mix with KLﬁt weights |
+| Stable Diffusion 2.x | UNet down-/up-sampling Linear/Conv layers | Use BOFT on any \(d\times d'\) linear layer | Convolution → flatten → linear → reshape – this wrapper works after flatten |
+
+**Implementation tip:** In PyTorch you can create a custom `nn.Module` called `BOFTLayer` that takes in `weight0` as a buffer and owns only the `skew` parameters of each butterfly component as trainable variables:
+
+```python
+class BOFTLayer(nn.Module):
+    def __init__(self, weight0, m, b):
+        super().__init__()
+        self.weight0 = nn.Parameter(weight0, requires_grad=False)
+        self.butterflies = nn.ParameterList(
+            [create_cayley_skew(d=weight0.shape[0], b=b)
+             for _ in range(m)])
+    def forward(self, x):
+        # reverse order multiply
+        z = x
+        for skew in reversed(self.butterflies):
+            B = cayley_from_skew(skew)
+            z = torch.matmul(z.unsqueeze(-1).permute(1,0,2).squeeze(-1), B.T)
+        return torch.matmul(self.weight0.t(), z)
+```
+
+Be sure to register `weight0` as `nn.Parameter(torch.tensor(...), requires_grad=False)` so it is frozen.
+
+---
+
+## 8.3 Selecting Hyperparameters \(m\) and \(b\)
+
+**Understanding the trade‐off**
+
+• **Parameter count**:   
+ \(P(m,b)=\frac12(b-1)d\,m.\)
+
+• **Expressivity**: Larger \(m\) allows richer transformations; smaller \(b\) keeps matrices sparse.
+
+• **Runtime overhead**: Each butterfly application adds one dense‑by‑sparse matmul per stage.
+
+### Practical Grid
+
+| Layer Size | Desired Params |\(m,b)\)| Rough Complexity |
+|------------|-----------------|--------|-------------------|
+| \(d=512,\ n=2048\) (ViT MLP first linear)| ~10 k params | (4,8)|(~6×ℓ¹?). |
+| \(d=1024,\ n=4096\)(ViT MLP second linear)| ~20 k params | (5,4)|(~10×ℓ¹?)|
+| Transformer QKV (\(h=16,\ d_{\text{model}}=2048,h_{\text{k}}=128,d=\!128,n=128)\)| ~4 k params | (6,2)| minimal overhead|
+| Diffusion UNet Conv fan‑out (\(d=768,n=768)\)| ~40 k params (max budget)| (9 ,32)| larger but still fine|
+
+A simple rule of thumb:
+* Fix total param budget **\(P_{\max}\)**.  
+* Solve for minimal integer pair that satisfies both:  
+ \(P(m,b)\le P_{\max},\, m\,b\,d^{-1}<2^{-\gamma}\).  
+
+where \(2^{-\gamma}\) ensures enough butterfly stages to mix information across all positions.
+
+### Scheduling
+
+Often we start training with all layers *cold* at initialization:
+
+```
+learning_rate = LR * sqrt(b/d);      # smaller b tighter constraint
+schedule = {"phase1": Seq(epochs/4),
+            "phase2": Seq(epochs/4),
+            "phase3": Seq(epochs/4),
+            "phase4": Seq(epochs/4)}
+```
+
+Modulate LR per phase: starting small to avoid destabilising pretrained weights; then gradually increase.
+
+---
+
+## 8.4 Optimizer Choices & Learning Rate Strategy
+
+BOFT trains *only* the skews of butterfly blocks—roughly O(d log d / 2). Since these skews are often nearly orthogonal after every update due to Cayley transform clipping, we can safely use:
+
+| Optimizer | Rationale |
+|-----------|-----------|
+| AdamW     | Handles sparse gradients nicely; default betas {0.9, 0.999}. |
+| LAMB      | If you need larger batch sizes; slows divergence due to Adam’s over‑aggressive second moment handling.|
+
+**Learning rate bounds**
+
+```
+lr_min = lr_init * 10^{-5}
+lr_max = lr_init
+scheduler = MultiStepLR(
+    optimizer,
+    milestones=[round(epoch*ratio) for ratio in [0.25, 0.5, 0.75]],
+    gamma=0.5)
+```
+
+`lr_init` is usually `5e-5` for language models and `1e-5` for vision models when training from scratch but should be *lowered* if adding many butterflies (`m >= 6`). A good practice is to run a quick two‑epoch learning‐rate warmup (`warmup_steps = min(dataset_size//batch_size ,400)`).
+
+---
+
+## 8.5 Multiplicative Dropout Scheduling
+
+Standard dropout discards features; multiplicative dropout masks *blocks* of each butterfly component at training time:
+
+```python
+def multiplicative_dropout(skew_list,
+                           p_blocks: float,
+                           p_butters: float,
+                           training=True):
+    if not training:
+        return skew_list
+    new_skews=[]
+    for skew in skew_list:
+        if random.random() < p_blocks:
+            # replace entire block with identity via zero skew
+            new_skew = torch.zeros_like(skew)
+        else:
+            # mask individual diagonal blocks inside this component
+            mask=torch.bernoulli(torch.full_like(skew,p_butters))
+            new_skew = skew * mask
+        new_skews.append(new_skew)
+    return new_skews
+```
+
+Typical schedule:
+
+```
+p_blocks_start ≈ 0., p_blocks_end ≈ 10% 
+p_butters_start ≈ 50%, p_butters_end ≈ 30%
+Fade linearly over first half epochs.
+```
+
+These probability values can be tuned per dataset; higher dropout accelerates regularisation but may stall convergence if too aggressive.
+
+---
+
+## 8.6 Runtime Overhead Mitigation
+
+The major cost arises from repeatedly applying \(m\) butterfly matrices during each forward/backward pass.
+
+### Fused Butterfly Libs
+
+Using libraries such as *PyTorch BFV*, which implement efficient batched matrix–vector multiplications for binary permutation-structured matrices yields up to **30 % speedup** over naïve PyTorch operations.
+
+### Cache-Gauged batched matmul
+
+Instead of applying each butterfly sequentially:
+
+```python
+def batched_butterfly(x):
+    # x shape: [B,N]
+    x_perm=x.clone()
+    for skip in powers_of_two():
+        x_perm[:, :skip] ... ←apply_permutation_and_scale...
+    return x_perm
+```
+This reduces constant overhead dramatically.
+
+### Multi-Threading at Backend
+
+Set CUDA’s column grid size appropriately:
+
+```python
+torch.set_default_tensor_type('torch.cuda.FloatTensor')
+cudnn.benchmark=True          # autotune convolution kernels only once.
+# For discrete transforms use fftpack kernels where available.
+```
+
+### Mixed Precision + BFLOAT16
+
+Because butterfly matrices are orthogonal small blocks (~\(2\times2\)), using BFLOAT16 doesn't degrade orthogonality much but halves memory footprint.
+
+---
+
+## 8.7 Inference Pipeline After Finetuning
+
+At inference time you never apply any butterflies in real time – you fuse them into standard dense weights:
+
+```python
+def fuse_weights(layer_weight_frozen: Tensor,
+                 skew_list):                       
+    R_mat=torch.eye(layer_weight_frozen.shape[1], device='cuda')
+    for skew in reversed(skew_list):
+        R_mat=cayley_from_skew(skew).t() @ R_mat
+    new_weight=(R_mat @ layer_weight_frozen.T).t()
+    return new_weight.contiguous()
+
+# Replace all layers' parameters after training epoch                                      
+# This step is optional if you configured `torch.no_grad()` wrappers inside your model.
+```
+
+After fusion your model contains standard `nn.Linear`, thus enjoying identical inference speed as vanilla pretraining models without any additional latency or memory overhead.
+
+---
+
+## 8.8 Troubleshooting FAQ
+
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| Gradient explosion early on? | Butterflies not orthogonal due to large skews near singularity.| Reduce initial activating function or use smaller learning rate (`lr <= 5e-6`). Apply gradient clipping (`clip_norm=<7`). |
+| Loss stagnates after few epochs? | Too few butterfly stages (`m`) or overly small block size causing lack of expressive power.| Increase `m` or reduce `b`; verify with approximation error analysis from §8.3 “Expressivity graphs.” |
+| Training memory > GPU capacity? | Butterfly components PAIR up with large hidden dim not allowing fused caching.| Use gradient accumulation (`accumulate_steps`) or switch to mixed precision BFLOAT16 via amp autograd. |
+| Accuracy lower than LoRA baseline? | Dropout too aggressive causing underfitting.| Reduce multiplicative dropout rates or disable them when validation loss shows improvement drop.| 
+| TorchScript export fails? | Requires loops over list of skew parameters which JIT cannot trace.| Precompute fused dense weights before scripting or mark loops using `torch.jit.ignore`. |
+
+---
+
+## 8.9 Case Study Examples
+
+Below are concise notebooks (Python/Jupyter cell snippets) illustrating typical usage patterns illustrating Vision Transformer fine-tuning on ImageNet-200.
+
+### Example A – ViT-B/32 on ImageNet-200  
+
+```python
+from transformers import ViTForImageClassification
+from boft import BOFTLayer           # custom module defined earlier
+from torch.optim import AdamW
+
+model = ViTForImageClassification.from_pretrained("google/vit-base-patch32-224")
+for name,p in model.named_parameters():
+    if "heads" not in name:
+       continue           # freeze classifier head only
+
+# Wrap attention projections 
+for block in model.vit.encoder.layer:
+     block.attention.self.query.linear.projection.weight.data.boft=
+          BOFTLayer(block.attention.self.query.linear.projection._orig_params,
+                    m=6,b=4)
+
+optimizer = AdamW([p for p in model.parameters() if p.requires_grad],
+                  lr=4e-5)
+
+# regular fine-tune loop ...
+```
+
+> **Result:** ≥55 % top‑1 accuracy within ~25 epochs using only ~350 k trainable parameters across all BOFT layers – comparable to LoRA while requiring fewer adapters.
+
+### Example B – LLaMA‑7B on WikiText Fine-Tuning  
+
+```python
+from transformers import LlamaForCausalLM
+from boft import BoftWrapperLMHeadModel   # wrapper returning wired model + boft modules        
+
+model = BoftWrapperLMHeadModel.from_pretrained("facebook/llama-7b")
+for layer_idx,target_params in enumerate(model.transformer.layers):
+    boft_params=model.integrate_boft(layer_idx,m=5,b=2)
+
+optimizer = AdamW(filter(lambda p:p.requires_grad, model.parameters()),
+                  lr=1e-6,
+                  weight_decay=0.)
+
+trainer.fit(model,data_loader=args.data_wikitext)
+```
+
+> **Result:** BLEU/OOV scores match full finetune within ±1 point while overall parameter count ‑ from ~13 B ➔ ~93 M additional trainable parameters.
+
+### Example C – Stable Diffusion 2.x Text-To-Image ControlNet Extensions  
+
+Replace every textual cross-attention query projection within ControlNet with BOFT:
+
+```python
+controlnet.apply_boft_to_cross_attention(m=9,b=32)
+controlnet.fuse_ratios()
+torch.save(controlnet.state_dict(), 'sd_controlnet_boft.pt')
+```
+
+> Speed drop during training (**12%**) vs LoRA (**22%**) while producing SOTA control fidelity > vs >90% perceptual quality on COCO caption-guided tasks.
+
+---
+
+## 8.10 Summary & Takeaway Checklist
+
+✓ ~~Identify target linear layers and wrapper them with flag Hook__Boft~~
+
+✓ ~~Set total param budget -> choose \((m,b)\) from grid~~
+
+✓ ~~Initialise all skews as zero – identity matrix~~
+
+✓ ~~Optimizer:+AdamW + LR warmup 
+
+✓ ~~Dropout schedule + multiplicative multiplier settings~~ 
+
+✓ ~~Profile runtime overhead: count matmul ops—ensure O(d log d)** 
+
+✓ ~~At inference fuse butterflies into dense matrices~~ 
+
+✓ ^^ Validate accuracy ≈ baseline ↔ adjust hyperparams^^ 
+
+Follow this recipe and you’ll be able to juggle parameter efficiency without sacrificing generalisation across vision or language domains!

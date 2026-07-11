@@ -1,134 +1,106 @@
 \title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
 
-### What bottleneck prevents softmax being fused completely
-with GEMM even when asynchronous execution exists?
+### "Why must FP8 WGMMA operands satisfy a k-major layout while FP16 allows both mn-major and k-major layouts?
 Question:
-In many CUDA kernels GEMM finishes before softmax can start
-because softmax depends on matmul output.
-FlashAttention‑3 nevertheless overlaps the two.
-Can anyone clarify which dependencies have been broken
-(and why watching barriers win(…) helps overlay GAP‐WIN permitted!
-
+"Section 2.2 mentions that WGMMA for fp8 only accepts operands whose inner dimension $k$ is contiguous.
+Could you explain why this requirement exists at >hardware> or PTX>level and what would go wrong if I attempted an mn-major operand with fp8 tensors?
 Answer:
-> **Question** – *What bottleneck prevents soft‑max from being fused completely with GEMM even when asynchronous execution exists?  
-> In many CUDA kernels GEMM finishes before soft‑max can start because soft‑max depends on matmul output. FlashAttention‑3 nevertheless overlaps the two. Can anyone clarify which dependencies have been broken (and why watching barriers helps overlay gap‑WIN permitted!)*
+**Short answer**
+
+The “inner‑dimension‑contiguous” rule for FP8 WGMMA comes from how Hopper’s Tensor-Core fabric was built.  
+The low‑precision accelerator uses *DP4-A* units that read a 4×4 tile of the first operand at a time, and those tiles are laid out in registers exactly according to a **k-major** (inner-dimension-contiguous) fragment.  
+When the stride isn’t along k, the needed stretches of memory would be non-contiguous across warp threads; such scatters are not supported by those HW blocks, so an assembler error is produced or the load becomes a slow generic gather that defeats all of the acceleration advantage we want.  
+With FP16/WP it is still possible because two extra “transpose” stages are available in hardware: an extra “mn-major” path can be fed through an internal buffer that swaps axis roles before feeding it back out again. FP8 HW has no equivalent magic path, so it accepts only the natural **k-major** mapping.
+
+Below is a more detailed walk-through.
+
+
 
 ---
 
-### 1.  The naive data dependency
+### What does “mn-major” vs “k-major” mean?
 
-The forward pass of one head is
+For a matrix product \(C = A B^T\) with \(A \in \mathbb{R}^{M\times K}\), \(B \in \mathbb{R}^{N\times K}\):
 
+* **mn-major** – columns of each operand are stored contiguously (`row-major` order when `K` changes slowly). An example memory layout for \(A\) looks like  
 \[
-S\_i^{(j)} = Q\_i K_j^{\!\top}, \qquad
-\tilde P\_i^{(j)} = \mathrm{exp}\!\big(S\_i^{(j)}-\!m\_i\big),   \qquad
-O\_i   \;\mathrel{+=}^{}\;\tilde P\_i^{(j)}V_j .
+[A_{0,\ast}, A_{1,\ast}, \dotsc , A_{M-1,\ast}]
+\]
+* **k-major** – rows are laid out sectionally (`K` runs fastest):  
+\[
+[A_{0,0}, A_{0,1}, \dotsc , A_{0,K-1}, A_{1,0},\dotsc]
 \]
 
-*For every query block \(Q_i\)* we iterate over key/value blocks \(K_j,V_j\).  
-The usual implementation keeps the sequence “GEMM → hard‑soft→ GEMM” strictly
-serial inside an outer loop iteration because:
-
-* **Soft‑max needs the whole score matrix** \(S\_i^{(j)}\).  
-  Even though it is possible to compute a *partial* ROW‑MAX and ROW‑SUM
-  incrementally,
-  nothing in a single kernel invocation has all rows finished until
-  `S` has been produced by **the first** tensor‐core call (`WGMMA`).
-* **The second GEMM** (`RS‐GEMM`) consumes `\tilde P\_i^{(j)}` and `V_j`;
-  therefore it cannot start until the exponential has finished as well.
-* Updating mathematics (`m` = row‑maximum,
-  `l` = row‑sum‐exponential scaling factor) is *row‑wise scoped* – one walk
-  through `S` suffices before moving onto `V`.
-
-When every step waits instantaneously for its predecessor,
-GPU resources sit idle during those few hundred nanoseconds it takes
-the tensor cores finish their multiplies – the classic BARrier stall.
+In a TMA load from global↦shared memory you cannot change these strides – they’re set by how you originally packed your tensors or how you transpose them before loading.
 
 
 
-### 2.  Which dependencies have been “broken”?
+---
 
-FlashAttention‑3 reorders work inside one CTA so that **different warps** perform
-stages that would otherwise have depended on each other *in a serial sense*,
-while keeping *semantic correctness*.  
-The two critical breaking points are
+### How TPUs/Hopper’s Tensor Cores consume these fragments
 
-| Original serial data flow | Overlapped flow |
-|---------------------------|----------------|
-|¹ [GEMM] → exp → add   | `[commit]→[WGMMA]` ← continue calculating [next] [GEMM] |
-| SALVATION | :SoftMax-rescaling → [commit]→[RS‐GEMM] |
-|     | After finishing ↔ swap “current / next” registers |
+The Hopper *WGMMA* instruction operates on “fragments”: small blocks of registers that hold pieces of \(A\), \(B\) and optionally an accumulator for its result (FP32).  
+For **FP16**, two kinds of fragments are accepted:
 
-1️⃣ **SS–GEMM** (`QᵢKⱼᵀ`) **vs** **RS–GEMM** (`˜Pᵢ⁽ʲ⁾Vⱼ`):
-After launching an SS–GEMM we *do not immediately wait*;
-we hand off its result into a temporary register (`S_cur`) and launch
-an exp chain on *the previous* `S_cur`.  
-The next SS–GEMM (`S_next`) proceeds in parallel while the RGEMP works
-on `(old)` values – effectively a two‑stage pipeline:
-`SS(j)` ∥ `RS(j−1)` ∥ `exp(j)` ∥ `row‑accumulate(j−2)` .
+| variant | source (registries / shared) | required ordering |
+|---------|-------------------------------|-------------------|
+| mn_major | can come from shared memory      | **any**            |
+| k_major | shared **or** register           | any                |
 
-2️⃣ **Soft-max updating**:
-The incremental update of `mᵢ`, `ℓᵢ` keeps two copies;
-each loop stores(`old_m`) → computes(`new_m`)
-→ calculates part of `ℓᵢ`.  
-Because these scalars are held entirely in registers,
-they no longer block any subsequent operation on a different
-warpgroup—threads doing tensor‐cores do not touch these scalars at all.
+Because FPGA firmware contains two separate pipelines inside each Tensor-Core tile – one driven by a gromline engine that can perform an implicit 4×4 transpose – an all–mn product can be fed directly into WMMA after an internal rearrange operation inside SMEM.
 
 
 
-### 3. Why “watching barriers” matters
+For **FP8**, Sam requires a stricter setup:
 
-```
-volatile cond = false;
-while (!cond) { … }          // <- Wait
+* The first operand’s fragment must already be laid out *exactly* as produced by reading consecutive `uint64` values (i.e., “packed” along k).
+* That’s exactly what a k-major TMA produced looks like after loading into SMEM with `ldmatrix`/`stmatrix`.
+* There is no internal transpose path available for FP8 because the DP4-A MPAC units were designed without a lane shuffler large enough to handle full transposes on their own – simply because 256 1-byte elements don’t fit into a single 128-byte blade when stored row–by–row without contiguity along *k*.
+
+
+
+Consequently, when you try to give an *mn*-layout fragment on FP8:
+
+
+
+1. **Assembler / PTX Validation** – The PTX assembler sees that fields `C_k` (kernel-mode flag) ≠ `C_mn`, etc., triggers a fatal error (“illegal combination of ordering flags”).  
+
+2. **Hardware Path** – If somehow bypassed (e.g., by hand-writing SASS), each thread group would load non-contiguous words from SMEM using gathers (`ldmatrix / stmatrix` do not support arbitrary strides), causing uncoalesced traffic → massive slowdowns and wrong numeric results since every gather fetch mixes bytes from neighboring columns incorrectly.
+
+
+
+3. **Operand–Accumulator Mismatch** – When chaining two GEMMs back-to-back—necessary for our fused softmax pipeline—the first GEMM produces an **FP32 accumulator whose register order depends on how we read *A*. Subsequent WGMMAs expect that order again. If we had used an mn packet at some stage, we’d have had to permute bytes differently each time—something not tunable by current HW features—so either we’d get garbage values or we'd have to fall back on slower scalar kernels.
+
+
+
+In short— the hardware simply does ​not​ know how to turn an arbitrary mn ordering from stream into its internal DP4-A tile budget when operating in eight-bit mode; only pure kj streams line up with its fixed read pattern.
+
+
+
+---
+
+### What happens if you still try it?
+
+* At compile time most runtimes will catch it immediately: PTX assembly will emit something like  
+
+```text
+error : target segment ignored
+error : WGMMA invalid order...
 ```
 
-A bracing pattern like this appears as `bar.sync`, i.e., *warp group barrier*,
-in source code like Line 13/14 of Algorithm 2 in the paper.
-This synchronisation does NOT stall all warps in a CTA –
-only those enacting waits monitor this flag – a fine‑grained form of obstacle blocking.
-It guarantees
 
-* **Safe reuse of shared‑memory slots** – when SSA writes its fragment,
-  no consumer reads it before decoding.
-* **Correct ordering under interleaved scheduling** –
-  since flushes may be issued out‐of-order by Hopper’s scheduler,
-  these flags tell Warp–group 0 “I’ve finished writing this tile;
-   Warp–group 1 may now read it.”
 
-Thus *watching barriers* lets two different sets of warps share identical SM buffers without hazard:
-there is no hidden global dependency between successive blocks.
+* If you circumvent PTX and hand–produce SASS (extremely rare) you’ll end up with either
+
+    * Extremely poor performance because every `ldmatrix` uses generic loads instead of `STSM/STSM_PACKED`; EM reports many warps stalled waiting for memory.
+    * Or worse → numerical corruption because each symbol representing one ‘row’ actually picks up bytes from two adjacent rows (“row mosaic”), altering every dot product completely.
 
 
 
-### 4. Why fuse isn’t completely trivial
+---
 
-Even absent TMA/GMM latency minuend,
+### Bottom line
 
-* **WGMMA hardware returns asynchronously**, but gets serialized only
-when its destination registers become available.
-If both halves use immediately successive register fragments,
-register spilling increases markedly –
-the compiler may spill into slower local memory,
- destroying any overlap advantage.
-* **Soft‑max involves ‑exponential cache + reduction on CPU logic**
-which lives outside Tensor Core pipelines – they close out exactly one SM’s functional units,
-so even if muls finish early another functional unit might still be busy.
-The adversarial kernel therefore needs explicit de‑scoping through additional registers
-to keep both streams quiet at different SM lanes.
+The special-case design decision was taken at silicon time: implement fast DP4-A units accepting prepacked 4×4 tiles; allow semantic flexibility only where the firmware already contains an implicit transpose path (FP16/BF16). Introducing another path would stretch silicon resources and diminish lifetime — thus Hopper reserves only k-major support for the cheapest precision levels (FP8/FpSupplement).
 
-
-
-### Summary
-
-FlashAttention‑3 punctures the series/parallel wall by giving up strict intra‑iteration seriality:
-it retains semantic correctness via small register buffers (`S_cur/S_next`, `m_old/m_new`,
-`ℓ_bottom/ℓ_top`) while launching new WGMMA kernels without immediate waiting.
-Barriers (`bar.sync`) only guard against data races on shared‐memory slots,
-not against logical construction order;
-they provide just enough fencing so that warmup/warmdown stalls disappear.
-Once Tensor Core workload is hidden behind concurrent exponent calculations,
-soft‑max computation becomes effectively overlapped with continuous matmul progress –
-hence significantly higher utilisation compared to FlashAttention‑2 where 
-the strict order forces GEMMs plus endings to finish before any exp starts.
+So when writing FlashAttention — or any working tensor kernel targeting Hopper GPU — always make sure FB64 operands for second GEMM’re placed contiguously along k (or explicitly transpose them before loading). Once they’re in place your fused softmax pipeline will run at full throughput without any compiler warnings or hidden errors.)

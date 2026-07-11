@@ -13,6 +13,7 @@ CPUS=16
 MEMORY="128G"
 TENSOR_PARALLEL_SIZE=1
 DRY_RUN=0
+EXCLUDE=""
 RUNNER_ARGS=()
 
 usage() {
@@ -35,6 +36,7 @@ while [[ $# -gt 0 ]]; do
         --time) TIME_LIMIT="$2"; shift 2 ;;
         --cpus) CPUS="$2"; shift 2 ;;
         --memory) MEMORY="$2"; shift 2 ;;
+        --exclude) EXCLUDE="$2"; shift 2 ;;
         --tensor-parallel-size)
             TENSOR_PARALLEL_SIZE="$2"
             RUNNER_ARGS+=("$1" "$2")
@@ -77,9 +79,11 @@ SBATCH_CMD=(
     --job-name vllm-multiview
     --output "$PROJECT_ROOT/logs/vllm/slurm-%j.out"
     --error "$PROJECT_ROOT/logs/vllm/slurm-%j.err"
-    "$RUNNER"
-    "${RUNNER_ARGS[@]}"
 )
+if [[ -n "$EXCLUDE" ]]; then
+    SBATCH_CMD+=(--exclude "$EXCLUDE")
+fi
+SBATCH_CMD+=("$RUNNER" "${RUNNER_ARGS[@]}")
 
 if (( DRY_RUN )); then
     printf '%q ' "${SBATCH_CMD[@]}"

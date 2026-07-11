@@ -1,0 +1,141 @@
+\title{Blogs about the Paper: "LongRoPE: Extending LLM Context Window Beyond 2 Million Tokens"}
+
+# Save as JSONL where each line is one token list (already integer IDs)
+with open("data/256k_chunks.jsonl", "w") as out:
+    for c in chunks:
+        out.write(json.dumps({"input_ids": c}) + "\n")
+```
+
+*Tips*  
+
+- Keep about **32–64 GB** of shuffled text on disk – enough for ~1 000 training steps at batch size 32 without exhausting GPU memory.  
+- The same data can be reused for both the 128 K and 256 K stages—just truncate at runtime.
+
+---
+
+## 4️⃣ Evolutionary Search: From 4 K → 128 K / 256 K  
+
+### What is being searched?  
+
+For each rotary dimension *i* we learn a rescale factor `λ_i`. The angle used in Eq.(2) becomes  
+
+\[
+\cos\!\Bigl(\frac{n}{\lambda_i\,\beta^{i}}\Bigr),\qquad
+\sin\!\Bigl(\frac{n}{\lambda_i\,\beta^{i}}\Bigr)
+\]
+
+If token index `n < \hat n` we leave it untouched (`λ_i = 1`).  
+The evolutionary algorithm explores a huge combinatorial space:
+
+- `λ_i ∈ [1.0,\; s·1.25]` with step size `0.01` (`s` = target ratio).  
+- `\hat n ∈ {0,1,2,4,8,…,256}` tokens.
+
+### Running the search  
+
+```bash
+python -m longrope.search_rope \
+    --model meta-llama/Llama-2-7b-hf \
+    --target_len 128000 \          # switch to 256000 for second round
+    --pop_size 64 \
+    --mut_size 16 \
+    --cross_size 16 \
+    --max_iter 40 \
+    --mut_prob 0.3 \
+    --samples pg19_val.jsonl      # five short PG19 samples as in paper
+```
+
+Outputs:
+
+- `best_lambdas.npy` – vector of length *d/2* containing optimal `λ_i`.  
+- `best_n_hat.json` – scalar `\hat n`.  
+
+The script also logs the *perplexity* achieved on your validation samples so you can compare against PI / NTK / YaRN baselines directly.
+
+> **Why evolution?**  
+Even with modest hyper‐parameters (`P=64`, `T=40`) the algorithm finds solutions that beat static PI and YaRN by >10 % perplexity on an 8 K test (see Table 1 of the paper). The monotonic constraint (`λ_i ≤ λ_{i+1}`) dramatically cuts down useless evaluations while preserving NTK‐motivated ordering of frequencies.
+
+---
+
+## 5️⃣ Fine‑Tuning with LongRoPE  
+
+Now we inject those factors into LLaMA/Mistral’s rotary module and do a *tiny* amount of training:
+
+```bash
+python -m longrope.finetune_long \
+    --model meta-llama/Llama-2-7b-hf \
+    --train_data data/256k_chunks.jsonl \
+    --batch_size 32 \
+    --lr 2e-5 \                  # use 1e-6 for Mistral per paper
+    --steps 400 \
+    --target_len 128000 \
+    --rope_scale_file best_lambdas_128k.npy \
+    --rope_n_hat best_n_hat_128k.json
+```
+
+When the checkpoint finishes, **swap** to the next set of scaling factors:
+
+```bash
+python -m longrope.finetune_long \
+    --model_path ./ckpt_128k \   # output folder of previous run
+    --train_data data/256k_chunks.jsonl \
+    --batch_size 32 \
+    --lr 2e-5 \
+    --steps 600 \
+    --target_len 256000 \
+    --rope_scale_file best_lambdas_256k.npy \
+    --rope_n_hat best_n_hat_256k.json
+```
+
+Result: `ckpt_256k` containing an LLM that already *understands* <256 K tokens (the “progressive extension” from Fig. 3 of the paper). No additional data collection is required beyond what we already have—just re‑using those same ~200M tokens works remarkably well thanks to LongRoPE’s better initialization.
+
+---
+
+## 6️⃣ Second Search: Jump From 256 K → 2 048 K  
+
+With the model now comfortable at middle lengths we repeat the evolutionary search **once more**, this time probing extreme lengths:
+
+```bash
+python -m longrope.search_rope \
+    --model_path ./ckpt_256k \
+    --target_len 2048000 \        # two million forty‑eight thousand tokens
+    --pop_size 32 \               # smaller pop since space explodes
+    --mut_size 8 \
+    --cross_size 8 \
+    --max_iter 30 \
+    --mut_prob 0.3 \
+    --samples books3_val.jsonl   # few very long samples (>2M tokens)
+```
+
+You’ll obtain `best_lambdas_2048k.npy` & `best_n_hat_2048k.json`. Plug them into any downstream inference script – no extra fine‑tuning needed! This is precisely how LongRoPE achieves an *8×* non‑fine‑tuned jump followed by an *8×* fine‑tuned jump (overall ×512).
+
+---
+
+## 7️⃣ Short‐Context Recovery (Optional but Recommended)  
+
+Empirically—see Table 5 of the paper—the massive stretch makes positions inside *the original* window overly crowded, harming accuracy on standard benchmarks. A quick extra search restores performance:
+
+```bash
+python -m longrope.search_rope \
+    --model_path ./ckpt_2048k \
+    --target_len 8000 \          # or simply use two runs: one @4K and one @8K
+    --max_lambda_factor 1.25 \   # limit λ_i ≤ s·1.25 where s ≈2 here
+    ...                         # same hyper‑params as before
+```
+
+Store these “short” tables (`short_lambdas.npy`, `short_n_hat.json`). At inference time you will dynamically select either:
+
+| Input length ≤ | Scaling table |
+|----------------|--------------|
+| **8 000** tokens | *short* table |
+| > **8 000** tokens | *full* table (`best_lambdas_2048k`) |
+
+---
+
+## 8️⃣ Inference – Switching On The Fly  
+
+Below is a minimal “plug-and-play” snippet that demonstrates runtime swapping:
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from longrope.rotary import ScaledRotaryEmbedding

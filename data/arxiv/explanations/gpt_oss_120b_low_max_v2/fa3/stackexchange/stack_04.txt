@@ -1,0 +1,78 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### How is block quantization applied to Q, K, V matrices without extra runtime cost?
+Question:
+The paper claims that block quantization "can be fused with an operation right before attention (e.g., rotary embedding) with no additional slowdown". I am trying to understand:
+- What is the exact scaling factor stored per block?
+- At which point in the kernel are these scalars applied (during TMA load, before WGMMA, or after?)
+- Does this require storing additional per‑block metadata in global memory?
+Any implementation details or code references would help.
+Answer:
+In **FlashAttention‑3** the only place where the extra work of block‑wise quantisation appears is in the *pre‑processing* of the $Q$, $K$ and $V$ tensors, i.e. **before any data are moved from global memory**.  
+Because the algorithm already works on a tiled basis (each CTA consumes a $B_r\times d$ tile of $Q$ and a $B_c\times d$ tile of $K,V$), the per‑block scale can be folded into the very first load that brings the tile into shared memory. Consequently there is **no additional runtime overhead**: the load, the scaling, and the TMA‑to‑SMEM copy are issued as one fused instruction sequence.
+
+### What is stored for each block?
+
+For a given block we keep a **single 32‑bit floating‑point scalar** $s_{\text{blk}}$.  
+The block is quantised to FP8 by
+
+$$
+\widehat{X}_{\text{blk}} = \operatorname{round}\!\Bigl(\frac{X_{\text{blk}}}{s_{\text{blk}}}\Bigr)_{\!\! \text{FP8}},
+$$
+
+where $X_{\text{blk}}$ denotes the original FP16 (or FP32) values of the block and “round …$_{\text{FP8}}$” means rounding to the nearest representable FP8 e4m3 value.  
+During inference we simply multiply back by the same scalar after the FP8 GEMM, i.e.
+
+$$
+Y_{\text{blk}} = s_{\text{blk}}^{(Q)}\, s_{\text{blk}}^{(K)} \; ( \widehat{Q}_{\text{blk}} \widehat{K}_{\text{blk}}^{\top} )
+$$
+
+for the first GEMM and analogously for the second one with $s_{\text{blk}}^{(V)}$.
+
+Thus each block carries **one 4‑byte scale**; no per‑element or per‑tensor extra data are required.
+
+### When and where is the scale applied?
+
+The scaling is performed **immediately after the TMA load of a tile** and **before** any WGMMA instruction consumes the data.
+
+1. **Producer warpgroup** issues a TMA that copies a tile of $Q$ (or $K,V$) from global memory into shared memory.  
+2. As soon as the TMA completes (the hardware notifies via a lightweight “done” flag), a few scalar instructions multiply every element of that tile by its pre‑computed block scale $s_{\text{blk}}$. The multiplication is done in registers or shared memory using a single broadcast of the scalar; because all threads of the warpgroup see the same value, only one register needs to hold it.  
+3. The now‑scaled FP8 values are left in shared memory exactly in the layout expected by FP8 WGMMA (k‑major for both operands). The subsequent WGMMA instruction reads those bytes directly; no extra conversion or “de‑quantisation” step appears in the kernel’s main loop.
+
+Because TMA and WGMMA are asynchronous, the producer warp can start loading the *next* block while the consumer warpgroup is already executing a WGMMA on the previously loaded—and already scaled—block. The scaling therefore **happens while data are still in shared memory**, overlapping with computation on other warps and incurring zero extra latency.
+
+### Do we need extra metadata in global memory?
+
+No. The per‑block scales are **not stored alongside the original tensors in global memory**. They are produced on‑the‑fly in a tiny buffer that lives in registers (or, if one prefers, in a small piece of shared memory allocated for metadata). The workflow is:
+
+* Before launching FlashAttention‑3 we run a tiny “pre‑quantisation” pass that scans each logical block (size $B_r\times d$ or $B_c\times d$) of $Q,K,V$, computes its max‑absolute value, derives an appropriate FP8 scale (often using a simple power‑of‑2 rounding so that multiplication can be performed as an integer shift), and stores that scalar in a **per‑CTA register array**.  
+
+* Because each CTA processes contiguous blocks, these scalars are generated once per CTA launch and remain resident for its whole lifetime. No additional global reads/writes are required.
+
+In practice this means that **the only extra global memory traffic compared with pure FP16 attention is the original loading of Q/K/V themselves**; everything else lives on‑chip.
+
+### Putting it together
+
+When you look at the pseudo code in §4.3 (the “block quantisation” paragraph) you will see essentially this pattern:
+
+```cpp
+// producer warpgroup
+tma_load(Q_tile);                     // async copy Q_{i} -> SMEM
+float s_q = compute_block_scale(Q_tile); // cheap reduction over tile
+scale_tile_inplace(Q_tile, s_q);      // broadcast multiply
+notify_consumer();                    // smem ready
+
+// consumer warpgroup
+wait_for_Q();                         // barrier
+wgmma(Q_tile_fp8, K_tile_fp8);        // uses already scaled fp8 values
+```
+
+The same applies to K and V tiles; for K we also need to apply its block scale *before* feeding it to the first GEMM, while for V we apply its scale before the second GEMM (or equivalently multiply out both scales after both GEMMs have completed – both choices are equivalent because they are just scalar factors).
+
+Thus:
+
+* **Exact scaling factor:** one 32‑bit floating point number per logical block (e.g. per $B_r\times d$ slice of $Q$, per $B_c\times d$ slice of $K$, per $B_c\times d$ slice of $V$).  
+* **Application point:** immediately after each TMA load, before any WGMMA instruction; concretely inside the producer warpgroup while data sit in shared memory.  
+* **Metadata storage:** no additional global memory structure; scales reside in registers or a tiny shared‐memory buffer local to each CTA.
+
+Because all three steps—load, scale, and write back to shared memory—are fused into a single asynchronous pipeline, they do not introduce any new latency or bandwidth consumption beyond what would already be required for loading Q/K/V. This is why the authors can claim that block quantisation “can be fused … with no additional slowdown”.

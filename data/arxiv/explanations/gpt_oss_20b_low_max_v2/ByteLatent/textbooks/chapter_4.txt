@@ -1,0 +1,276 @@
+\title{A Textbook about the Paper: "Byte Latent Transformer: Patches Scale Better Than Tokens"}
+
+Chapter 4: # 4. Training Methodology and Data Pipeline  
+
+Large language models (LLMs) are only as good as the data they are trained on and the quality of the training pipeline that delivers that data to the model.  In *Byte Latent Transformer* (BLT) training, we must additionally address the fact that the model operates on raw bytes rather than on a fixed sub‑word vocabulary.  This chapter walks through every practical decision – from choosing and mixing raw data, to estimating entropy for patch selection, to batching on bytes, to computing training cost accurately – that makes it possible to run controlled, yet highly scalable byte‑level experiments.
+
+---
+
+## 4.1 Llama 2 vs BLT‑1T data mixes  
+
+### 4.1.1 The Llama 2 mix  
+The “Llama 2” training data is a curated blend of publicly available text harvested from the web. It contains roughly 2 trillion tokens after cleaning and filtering; a token being a sub‑word piece from the Llama 3 tokenizer.  Even though our BLT models do not have a tokenizer, we still reuse this foundational mixture because it is already parsed into clean, coherent text that covers all major domains that LLMs need to perform well on (internet forums, books, scientific articles, code repositories).
+
+### 4.1.2 The BLT‑1T mix  
+For large‑scale scaling experiments we introduced a new dataset specifically for BLT: the **BLT‑1T** mix. It contains about one trillion tokens (≈ 4 trillion bytes) derived from several high‑volume public sources such as Common Crawl, GitHub archives, news outlets and OpenWebText2.  A key difference is that this blend is *byte‑oriented*: after cleaning the text we keep it as UTF‑8 byte streams without performing any tokenization step – exactly what BLT consumes downstream.
+
+| Dataset | Source | Token count | Byte count |
+|---------|--------|-------------|------------|
+| Llama 2 | Web & curated corpora | ~2 T | not directly used for BLT |
+| BLT‑1T   | Common Crawl + GitHub + others | ~1 T | ~4 T |
+
+### 4.1.3 Why two mixes?  
+Using two distinct mixtures enables controlled comparisons:
+
+* **Small‑to‑medium scale** – Run the same number of steps on *Llama 2* data for all architectures so that compute is comparable.
+* **Ongoing scaling** – Run *BLT‑1T* at larger scales to test how BLT behaves when we exceed the compute‐optimal regime proposed for sub‑word models.
+
+---
+
+## 4.2 Entropy model architecture & training procedure  
+
+A cornerstone of BLT is *dynamic patching*, i.e., deciding where to split a byte stream into patches based on an estimate of future predictability.  This estimate comes from an auxiliary **entropy model**.
+
+### 4.2.1 Model specification  
+The entropy model is an autoregressive transformer trained to predict the next byte in a stream:
+
+* **Parameters:** 100 M (≈ 10 × fewer than a full BLT global transformer)
+* **Layers:** 14
+* **Hidden size:** 512
+* **Attention window:** Sliding window of length \(512\) bytes
+* **Activation:** SwiGLU (same as in BLT)
+* **Positional encoding:** Rotary Position Embedding (RoPE) with \(\theta=500\,000\)
+
+Because we tune patch boundaries using entropy scores evaluated only on past context, we train this model **strictly with masked auto‐regression**: the prediction at position \(i\) depends solely on \(\mathbf{x}_{<i}\). No teacher forcing or future look‑ahead is used.
+
+### 4.2.2 Training procedure  
+We treat entropy modeling as a standard language modeling task:
+
+1. **Sharding** – Input byte streams are broken into chunks of length exactly \(1280\) bytes; each chunk becomes an independent training example.
+2. **Masking** – No masking beyond autoregressive constraints; every position predicts its next byte.
+3. **Loss** – Standard cross-entropy over the \(256\)-byte vocabulary.
+4. **Optimizer** – AdamW with \(\beta_1=0.9\), \(\beta_2=0.95\), \(\epsilon=10^{-8}\).
+5. **Schedule** – Linear warmup over \(2000\) steps followed by cosine decay to zero.
+6. **Batch size** – Chosen such that each GPU processes \(128\,000\) bytes per batch; typical GPU multi‑node training uses 32 GPUs.
+
+Training stops when validation cross-entropy falls below a threshold or after \(50\,000\) updates—enough to achieve stable entropy estimates across most contexts.
+
+---
+
+## 4.3 Patch size tuning via entropy thresholds  
+
+Once an entropy model has been trained, we embed its outputs into the feed‑forward pipeline of the batched dataset loader.
+
+### 4.3.1 Entropy computation  
+For each byte position \(i\) in input stream \(\mathbf{x}\):
+
+\[
+H(x_i)= - \sum_{v \in \mathcal{V}} p_e(x_i=v \mid \mathbf{x}_{<i}) \log p_e(x_i=v \mid \mathbf{x}_{<i})
+\]
+
+where \(p_e(\cdot)\) comes from the trained small LM and \(\mathcal{V}\) contains all \(256\) possible UTF‑8 continuation or code bytes.
+
+This rolling entropy gives us a per-byte measure of *future uncertainty*.
+
+### 4.3.2 Boundary predicates  
+We compare two heuristics for deciding where to start a new patch:
+
+| Predicate                | Formulation                           |
+|--------------------------|----------------------------------------|
+| Global constraint        | \(H(x_t) > \theta_g\)                 |
+| Monotonicity constraint | \(H(x_t)-H(x_{t-1}) > \theta_r\)      |
+
+*Global*: Introduces patches whenever even a single unknown byte has high predicted uncertainty relative to all unseen terms in the vocabularic distribution.
+
+*Monotonicity*: Captures local spikes—if uncertainty suddenly rises relative to its immediate predecessor—indicating potential new semantic boundary.
+
+The thresholds \(\theta_g,\theta_r\) are tuned empirically by targeting a desired average patch size (see § 4.3).
+
+### 4.3.3 Targeted average patch sizes  
+We desire different *average patch sizes* across runs:
+
+| Target Average Patch Size | Entropy method                |
+|---------------------------|--------------------------------|
+| ~\(6\) bytes              | Global constraint (\(\theta_g =0{,.}6\)) |
+| ~\(8\) bytes              | Global constraint (\(\theta_g =0{,.}5\)) |
+| ~\(16\) bytes             | Monotonicity constraint (\(\theta_r=0{,.}02\)) |
+
+In practice we select thresholds by sorting candidate bytes by entropy and probing average patch size until it converges close (< 5%) to target value across held‐out validation splits.
+
+---
+
+## 4.4 Maintaining constant expected batch size (bytes) across patch systems  
+
+Different patching schemes change how many patches result from processing the same raw sequence; with more aggressive patching fewer global transformer steps are invoked, whereas with slower (larger patches) fewer steps but bigger attention domains arise.
+
+To neutralize this confounder:
+
+### 4.4.1 Fixed expected batches  
+We fix an *expected total number of bytes per batch*, denoted by \(B_{\text{bytes}}\). For instance:
+
+- On LLaMA 2 data: set \(B_{\text{bytes}} =8\,000\).
+- On BLT‑1T: set \(B_{\text{bytes}} =16\,000\).
+
+During dataloader construction each worker samples enough contiguous sequences until cumulative byte length ≈ \(B_{\text{bytes}}\). Because sentence fragmentary boundaries are respected in parallel shards per GPU, all workers produce batches with identical byte buffer sizes in expectation.
+
+### 4.4.2 Adjusting context length  
+Let \(C_{\text{ctx}}\) denote the context window in *bytes*. For higher-average-patch-size models we reduce \(C_{\text{ctx}}\):
+
+- Patch–size \(6–8\): keep same context window (e.g., `4096` or `8192`).
+- Patch–size ≥\(10\): shrink context window linearly such that every batch still aggregates approximately \(B_{\text{bytes}}\).
+
+This preserves identical memory envelope across models while keeping inference cost comparable.
+
+---
+
+## 4.5 Dynamic batching & padding for latent transformer  
+
+Because patches do not have uniform length across examples or even within examples, naive batching would lead either to heavy padding or under-utilized tensor shapes.
+
+### 4.5.1 Variable-length batching strategy  
+We adopt two-stage packing:
+
+1️⃣ **Patch packing** – All encoded patches in a batch are first prefixed with a *patch-length list*. We sort examples by their number of patches in ascending order within each batch so that concatenated patches are contiguous blockwise without explicit padding between examples.
+
+2️⃣ **Local encoder/decoder packing** – Each encoder/decoder attends over its own sequence length:
+   - For encoders: each instance’s PDF-size bounded by configurable `max_local_seq` (e.g., `4096`).
+   - For decoders: same limit but adjusted for local decoder receptive field size (`max_dec_local_seq = w_\mathcal{D}`).
+
+Hence per-batch tensors are contiguous with minimal padding—padding only encodes local positions within their sequences but never needs cross-example padding.
+
+### 4.5.2 Pseudocode snapshot
+
+```python
+def pack_batch(samples):
+    # Sample list: [(byte_seq_i), ...]
+    # Step Early: compute patch(s)
+    patches_list = [entropy_patch(s.bytes,
+                                   ent_thr=theta_g,
+                                   monot_thr=theta_r)
+                    for s in samples]
+    
+    # Sorting by number of patches
+    sorted_idx = np.argsort([len(p[0]) for p in patches_list])
+    patched_samples = [patches_list[i] for i in sorted_idx]
+    
+    # Concatenate latents => shape [batch_len]
+    latent_concat = torch.cat([p[0] for p in patched_samples], dim=0)
+    # Build mask/pointer structure
+    lens = [p[0].shape[0] for p in patched_samples]
+    
+    return latent_concat, torch.tensor(lens)
+```
+
+After this stage we feed `latent_concat` into the global transformer where queries can mask off padding using `lazy_mask = build_pad_mask(lens)` – this pattern ensures zero compute waste.
+
+---
+
+## 4.6 Flop estimation – equations & assumptions  
+
+Accurate cost accounting is crucial because all scaling claims hinge on matching or beating tokenizers’ efficiency budget here rules out unfair advantage just from smaller average sequence lengths.
+
+### 4.6.1 General flop expression  
+We sum flops contributed by five components:
+
+\[ 
+FL_{\text{BLT}} = FL_{\text{Global}} + FL_{\text{Encoder}} + FL_{\text{Decoder}} 
++ FL_{\text{EncCross}} + FL_{\text{DecCross}}
+\]
+
+Where each term quantifies flops per *byte*, normalised by dividing over total number of pseudo-batches delivered during iteration.
+
+
+#### Global Latent Transformer  
+For each patch:
+
+```
+FL_Global = Transf.FL(metainfo=global_h_dim,
+                      n_layers=l_G,
+                      seq_len=m=n_patches_per_sample,
+                      vocabulary_size=0          // no output vocab
+                      ) / n_patches_per_sample
+```
+
+(See Appendix C for explicit function.)
+
+#### Local Encoder / Decoder Transformers  
+Both operate over sliding windows:
+```
+FL_Encoder = Transf.FL(local_h_dim,
+                       n_layers=l_E,
+                       seq_len=w_E,
+                       vocab_size=0)/w_E            // only self-attention
+
+FL_Decoder = Transf.FL(dec_h_dim,
+                       n_layers=l_D,
+                       seq_len=w_D,
+                       vocab_size=256          // output byte probability
+                       ) / w_D
+```
+
+#### Cross-Attention modules  
+Representations mapping/from mid-level latent vectors costs word‐length inverse ratios:
+```
+FL_CrossEnc ≈ Cross.FL(...)
+FL_CrossDec ≈ Cross.FL(...)
+```
+
+The final calculation normalises per byte so that running higher numbers or lengths does not skew flops relative to small ones.
+
+### 4\.6 .7 Simplifying assumptions  
+
+- Embedding lookups counted as zero flops because they are addressed as indexed reads.
+- Backward pass doubles forward‐pass flops due to gradient propagation.
+- All attention layers use Flash Attention except cross blocks which use Flex Attention due to dynamic paddings – these both have linear (~\(O(n)\)) rather than quadratic memory terms but flops count remains quadratic as per baseline Transformer flop equations.
+- The global transformer flops dominate overall cost; encoder/decoder add ≈ 10–20% depending on hyperparameters and chosen `$k$`.
+
+This framework lets us estimate *flops per generation step*, which then can be multiplied by average tokenisation counts (or generative steps per inference request). The resulting metric can be compared directly even if two different architectures use dissimilar effective sequence lengths.
+
+---
+
+## 4\.7 Metric choice: Bits‑Per‑Byte (BPB) instead of perplexity  
+
+Perplexity struggles when there is no fixed tokenizer because it normalises over vocabulary occurrences—not pixels or symbols—in which case different models may optimistically hide their ignorance behind variable vocab sizes.
+
+Thus we adopt **Bits-per-Byte (BPB)** as defined:
+
+\[ 
+BPB(x)=
+   \frac{\mathcal C_{CE}(x)}{\ln(2)\,\cdot n_\text{\#bytes}}
+   , 
+   ~~ 
+   \mathcal C_{CE}(x)= -\!\sum_{i} \log_2 p(x_i|\mathbf x_{<i})
+     .
+\]
+
+Intuitively BPB measures how many bits on average would be needed if an optimal encoder knew all underlying probabilities at each final Byte step—exactly what RLHF thinks about "semantic efficiency."   
+
+---
+
+## 4\.8 Optimizers, learning rate schedules and regularisation   
+
+Below tables capture our default regimen used throughout scaling experiments; all numbers were found via quick grid-seeds tuned at small scales then fixed everywhere else unless stated otherwise.
+
+| Piece      | Value                                       |
+|------------|---------------------------------------------|
+| Optimizer   | AdamW                                      |
+| $\beta_1$   | $0.$9                                       |
+| $\beta_2$   | $0.$95                                      |
+| $\epsilon$   | $10^{-8}$                                   |
+| Warmup steps | $2000$                                    |
+| LR schedule | Cosine decay from init LR → $0$            |
+| Init LR     | $4\times10^{-4}$                            |
+| Weight decay | $0.$1                                      |
+| Gradient clipping     | Global norm ≤ $1.$             |
+| Dropout      | $d_\texttt{ff}=0.$05                        |
+
+Training was performed in mixed precision (`bf16`) using TensorFlow or PyTorch → both yield similar results once same random seed distribution followed; utilities capture same weight configuration metrics so reproducibility checks hold everywhere else.
+
+A further subtle regulariser is early stopping upon stagnation—if every epoch added <3d llqe improvement after roundtrip evaluation I recommend halting early—although we never did this for fairness due time constraints described earlier.
+
+---
+
+## Summary  
+
+Chapter &nbsp; sec.\! indicates how every detail—from picking corpora up through precise flop calculation—ensures balanced experimentation between token-based baselines and our novel pixelation scheme built around entropy-driven dynamic patching.
+These choices collectively deliver balanced training costs against matching performance—and give insight into future extensions like end-to-end patch learning or deeper architectural adjustment horizons unexplored yet examined primarily within Section 7’s “future work” remarks.“

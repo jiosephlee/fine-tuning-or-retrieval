@@ -1,0 +1,135 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# FP8 on Hopper: Turning Low Precision into High‑Performance Attention  
+
+Transformer models owe a lot of their power to the attention layer, but that same layer can become a performance bottleneck—especially when we push toward longer contexts or larger models. The original **FlashAttention** kernels already shaved off a lot of overhead by fusing the softmax and the matrix‑multiplications into a single GPU kernel. Yet they were built around FP16 (or BF16) Tensor Cores, leaving a sizeable performance gap on NVIDIA’s newest Hopper GPUs.
+
+Hopper introduced two major upgrades that are game‑changing for attention:
+
+1. **Tensor Core asynchrony** – matrix‑multiply instructions (WGMMA) can now run in parallel with data movement (TMA) and other non‑matrix operations.  
+2. **FP8 Tensor Cores** – a 4‑bit exponent / 3‑bit mantissa format that roughly doubles the raw throughput of GEMM compared to FP16.
+
+In this post we walk through how **FlashAttention‑3** converts those hardware capabilities into a practical speedup, focusing on the *FP8* path. We’ll cover the quirks of the FP8 layout, why an in‑kernel transpose is necessary, how register permutations stitch the two GEMMs together, and finally the accuracy tricks—*block quantization* and *incoherent processing*—that keep numerical error in check despite the aggressive 4‑bit exponent format.
+
+---
+
+## 1. Why FP8 is not just “FP16 with half the bits”
+
+At first glance you might think “just cast everything to FP8 and let the Tensor Cores do their thing”. Unfortunately, the Hopper FP8 WGMMA instruction has strict **k‑major layout constraints**:
+
+| Operand | Accepted layout for FP16 | Accepted layout for FP8 |
+|--------|--------------------------|--------------------------|
+| A (M × K) | mn‑major **or** k‑major | **only** k‑major |
+| B (N × K) | mn‑major **or** k‑major | **only** k‑major |
+
+`k-major` means that consecutive elements in memory correspond to the *inner* dimension of the GEMM (the K dimension). In attention we need two GEMMs per block:
+
+1. **SS‑GEMM**:  \( \mathbf{S} = \mathbf{Q}\,\mathbf{K}^\top \)
+2. **RS‑GEMM**:  \( \mathbf{O} = \mathbf{P}\,\mathbf{V} \)
+
+While the first GEMM can be satisfied by loading \(\mathbf{K}\) in a k‑major fashion, the second GEMM requires \(\mathbf{V}\) to be k‑major as well. In most model checkpoints, however, \(\mathbf{V}\) is stored *contiguously along the head dimension* (the d axis), i.e., mn‑major. This mismatch forces us to **reshape** \(\mathbf{V}\) inside the kernel.
+
+---
+
+## 2. In‑kernel transpose with LDSM / STSM
+
+Rather than paying a full‑GPU-memory transpose before launching FlashAttention (which would double traffic), FlashAttention‑3 performs a *tile‑wise* transpose right after loading each \(\mathbf{V}\) block from global memory into shared memory.
+
+The steps are:
+
+1. **TMA load** – issue an asynchronous tensor memory accelerator (TMA) copy of a \(B_c\times d\) tile of \(\mathbf{V}\) into shared memory using its native mn‑major layout.
+2. **LDSM** – each warp issues `ldmatrix` instructions that read 128 bytes from shared memory and scatter them into registers as an 8 × 8 matrix of 16‑bit values. By packing two FP8 values into each 16‑bit lane we can reuse these instructions for FP8.
+3. **Register shuffle** – because `ldmatrix` reads rows while we need columns for k‑major, we perform a cheap permutation within registers (swap halves of each 8‑value vector). This operation is essentially free compared to global memory traffic.
+4. **STSM** – finally `stmatrix` stores the permuted registers back to shared memory, now arranged column‑wise (k‑major). The next GEMM can directly consume this tile.
+
+Since LDSM/STSM work at warp granularity, they fit naturally into the **warp‐specialized producer–consumer pipeline** introduced by FlashAttention‑3: a dedicated “producer” warpgroup handles all TMA loads and transposes, while “consumer” warpgroups run the WGMMA GEMMs.
+
+---
+
+## 3. Stitching two GEMMs together: register permutation magic
+
+Even after we have both \(\mathbf{K}\) and \(\mathbf{V}\) in k‑major layout, there is one more hidden obstacle: the **FP32 accumulator layout** produced by the first FP8 WGMMA does not match the operand layout expected by the second WGMMA.
+
+- After SS‑GEMM (`\mathbf{Q}` × `\mathbf{K}`ᵀ), each thread’s registers contain an accumulator block whose elements are ordered like  
+  $$[d_0,d_1,d_4,d_5,d_2,d_3,d_6,d_7]$$
+  (see Fig. 5 in the paper).  
+- The RS‑GEMM expects its left operand to be laid out columnwise exactly as produced by an `ldmatrix` from shared memory.
+
+The solution is a tiny **byte‐permute** step right after SS‑GEMM finishes:
+
+```c
+// pseudo assembly
+prmt.b32   r_acc, r_acc, 0x2010;   // reorder within each 8‐byte chunk
+```
+
+This reorders the eight values per register to match the pattern required by the second WGMMA. Because it only touches registers—no shared or global memory—it incurs virtually no overhead.
+
+Together with the in‑kernel transpose, these two data‐movement tricks allow us to chain two FP8 GEMMs back-to-back inside a single kernel without any extra global loads or costly layout conversions.
+
+---
+
+## 4. Accuracy when you only have 4 exponent bits
+
+FP8’s “e4m3” format gives us a huge speed boost but also introduces two sources of error:
+
+1. **Coarse dynamic range** – outlier values common in large language models can overflow or be severely rounded.
+2. **Per-tensor scaling** – using one scale factor for an entire matrix discards information about local magnitude variations.
+
+FlashAttention‑3 tackles both with two complementary tricks.
+
+### 4.1 Block Quantization
+
+Instead of one scalar per tensor, we compute a scale for every *tile* processed by FlashAttention (e.g., \(B_r\times d\) for Q or \(B_c\times d\) for K/V). The procedure:
+
+- Compute the max absolute value inside a tile.
+- Derive a scale factor `s = max / max_fp8`.
+- Multiply the tile by `1/s`, cast to FP8, and store `s` alongside.
+
+Because FlashAttention already works tilewise, block quantization adds essentially no extra memory traffic; we just keep an extra vector of scales that is read during dequantization inside the kernel.
+
+### 4.2 Incoherent Processing (random orthogonal rotation)
+
+Even with block scales, outliers can still dominate a tile’s dynamic range and waste precision on other entries. To “spread out” those large values we precondition both Q and K with an *orthogonal* random matrix \( \mathbf{M} \):
+
+\[
+\tilde{\mathbf{Q}} = \mathbf{Q}\,\mathbf{M},\qquad
+\tilde{\mathbf{K}} = \mathbf{K}\,\mathbf{M}.
+\]
+
+Since \( \mathbf{M}\mathbf{M}^\top = \mathbf I\), attention scores are unchanged:
+\[
+\tilde{\mathbf{Q}}\,\tilde{\mathbf{K}}^\top = \mathbf Q\,\mathbf K^\top .
+\]
+
+Choosing \( \mathbf M = D\,H\,D'\) where \(D,D'\) are diagonal matrices with entries ±1 and \(H\) is a Walsh–Hadamard matrix gives us an orthogonal transform that can be applied in \(O(d\log d)\) time using fast Hadamard transforms—effectively “free” when fused with existing linear layers such as rotary embeddings.
+
+The net effect is a *more uniform distribution* of magnitudes before quantization, which reduces clipping and rounding errors dramatically. Empirically flashAttention-3 reports a **2.6× reduction in RMSE** for FP8 compared with naïve per-tensor scaling.
+
+---
+
+## 5. Putting it all together: performance numbers
+
+Using these tricks on an H100 SXM5 GPU yields:
+
+| Precision | Peak TFLOPs/s (forward) | Utilization |
+|-----------|------------------------|-------------|
+| FP16 (FlashAttention‑2) | ~480 | ~35 % |
+| FP16 (FlashAttention‑3) | **740** | ~75 % |
+| FP8 (FlashAttention‑3) | **≈1200 TFLOPs/s** (≈1.2 PFLOPs/s) | — |
+
+The raw throughput jump from FP16 to FP8 stems mainly from the doubled Tensor Core bandwidth; thanks to our layout handling and register permutations there is virtually no extra latency introduced. Moreover, thanks to block quantization + incoherent processing, numerical error stays well within acceptable limits for LLM inference—far better than previous “FP8 per tensor” baselines.
+
+---
+
+## 6. Takeaways for practitioners
+
+1. **Don’t just cast to FP8** – you need to respect Hopper’s k-major constraints; otherwise you’ll end up with costly transposes or suboptimal kernels.
+2. **Leverage warp specialization** – letting dedicated warps handle TMA loads and transposes hides memory latency while leaving other warps free for high-throughput WGMMA math.
+3. **Apply simple preconditioning** – random orthogonal rotations cost virtually nothing when fused with other linear ops and pay off big time on quantization error.
+4. **Tile-aware quantization wins** – block quantization aligns perfectly with FlashAttention’s blocking strategy; it’s an easy win over per-tensor scaling.
+
+With FlashAttention‑3 now open source, integrating these ideas into PyTorch or Hugging Face pipelines should be straightforward: just drop in the new kernel and enable `dtype=fp8`. Expect up to twice the raw throughput on Hopper GPUs while keeping error within acceptable bounds—a compelling combination for next‑generation long-context Transformers.
+
+--- 
+
+*Happy coding on Hopper!*

@@ -1,0 +1,147 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# FP8 Low‑Precision Attention: Speed Without Sacrificing Accuracy  
+
+*How a careful redesign of the attention kernel makes the new FP8 Tensor Cores on NVIDIA Hopper both fast **and** numerically stable.*
+
+---
+
+## 1. The pressure point – attention at scale  
+
+Transformer models rely on the scaled dot‑product attention  
+
+\[
+\mathbf{S}= \frac{1}{\sqrt{d}}\;\mathbf{Q}\mathbf{K}^{\!\top},
+\qquad
+\mathbf{P}= \operatorname{softmax}(\mathbf{S}),
+\qquad
+\mathbf{O}= \mathbf{P}\mathbf{V},
+\]
+
+where $\mathbf{Q},\mathbf{K},\mathbf{V}\in\mathbb{R}^{N\times d}$ are the query, key and value matrices, $N$ is the sequence length and $d$ is the head dimension.  
+Because $\mathbf{S}$ has size $N\times N$, the computation scales quadratically in $N$ and quickly becomes the dominant cost in large language models (LLMs) or long‑context applications.
+
+Exact‐attention kernels such as **FlashAttention‑2** removed costly global‑memory traffic by fusing all operations into a single kernel, but even there the compute units on modern GPUs were under‑utilized—only about 35 % of the Hopper H100’s peak performance was reached. The authors of *FlashAttention‑3* asked a simple question: **Can we tap the new hardware features—especially asynchronous Tensor Core execution and native FP8 support—to double our FLOP throughput without breaking numerical fidelity?**
+
+---
+
+## 2. From FP16 to native FP8 – what changes?  
+
+Hopper’s Tensor Cores expose a new `WGMMA` instruction that can operate directly on **FP8** operands (`e4m3`). In raw terms this gives roughly **2× higher matmul throughput** compared with FP16 or BF16—an attractive proposition for a FLOP‑heavy operation like attention.
+
+However, moving from FP16 to FP8 is not a drop‑in change because `WGMMA` imposes stricter **layout constraints**:
+
+| Operand | Acceptable layout (FP16) | Acceptable layout (FP8) |
+|--------|--------------------------|------------------------|
+| $A$ (first matrix) | mn‑major **or** k‑major | **k‑major only** |
+| $B$ (second matrix) | mn‑major **or** k‑major | **k‑major only** |
+| Accumulator (FP32) | mn‑major | **k‑major mismatch** |
+
+*mn‑major* means contiguous along the outer dimension (rows), while *k‑major* means contiguous along the inner reduction dimension. For attention we normally store $\mathbf{V}$ column‑wise (contiguous in head dimension) which satisfies the fp16 requirement but fails the fp8 *k‑major* rule for the second GEMM ($\widetilde{\mathbf P}\,\mathbf V^{\top}$). Moreover, after the first GEMM the fp32 accumulator’s registers are laid out differently from what the second GEMM expects as its input tile.
+
+If we tried to keep the original memory layout unchanged, we would need an expensive global transpose—precisely what FlashAttention was designed to avoid. The solution in FlashAttention‑3 is twofold:
+
+1. **In‑kernel transposition using LDSM/STSM** – These warp‐level matrix load/store instructions can move data between shared memory (SMEM) and registers while performing a transpose at virtually no extra bandwidth cost.
+2. **Register‐level permutation** – After each `WGMMA` we permute registers (`d0 d1 d4 d5 …`) so that the fp32 accumulator matches the *k–major* shape expected by the next `WGMMA`. This permutation is cheap because it operates only on registers inside a warp.
+
+Together these tricks let us feed each `WGMMA` exactly what it needs without any extra global memory passes, preserving FlashAttention’s hallmark of **no intermediate reads/writes to HBM**.
+
+---
+
+## 3. Quantization error – why naïve FP8 fails  
+
+Even if layout constraints are solved, moving from 16 bits to only **8 bits** introduces *quantization noise*. The standard practice for low‐precision kernels is *per‑tensor scaling*: a single scale factor $\sigma$ compresses an entire tensor into FP8 before matmul, while accumulators stay in fp32.
+
+In practice LLMs contain *outlier* activations—rare entries that are orders of magnitude larger than most values (e.g., due to layer normalization or residual connections). With only three mantissa bits (`e4m3`), a single scale factor cannot simultaneously preserve fine granularity for typical values *and* represent outliers without severe clipping or overflow. The consequence observed in earlier work was a noticeable degradation of attention quality when using naïve fp8 quantization.
+
+FlashAttention‑3 addresses this problem with **two complementary techniques** that naturally fit into its blockwise algorithmic structure:
+
+### 3.1 Block quantization  
+
+Instead of one scale per whole tensor, we compute a separate scale per *tile* (the same tiles that are already processed independently by the kernel). Concretely:
+
+- Divide $\mathbf Q$, $\mathbf K$, $\mathbf V$ into blocks of size $B_r\times d$ or $B_c\times d$.
+- For each block compute $\sigma_{\text{block}} = \max(|x|)$ over its entries and use it to map values into fp8.
+- Because each block is already loaded into shared memory anyway, applying its own scale costs essentially nothing extra—just a multiplication before writing into fp8 registers.
+
+This *blockwise* scaling dramatically reduces saturation of outliers while keeping most values within fp8’s dynamic range, thereby lowering quantization error without impacting throughput.
+
+### 3.2 Incoherent processing  
+
+Even block scales cannot fully eliminate bias introduced by extremely large entries spreading across many blocks. To “even out” these outliers before quantization we premultiply both $\mathbf Q$ and $\mathbf K$ by an orthogonal matrix $\mathbf M$:
+
+\[
+\widetilde{\mathbf Q}= \mathbf Q \,\mathbf M,
+\qquad
+\widetilde{\mathbf K}= \mathbf K \,\mathbf M,
+\qquad
+\widetilde{\mathbf Q}\,\widetilde{\mathbf K}^{\!\top}= \mathbf Q\,\mathbf K^{\!\top}.
+\]
+
+Since $\mathbf M$ is orthogonal ($\mathbf M\,\mathbf M^{\!\top}=I$), the dot product—and thus all attention scores—stay unchanged mathematically. In implementation we use a product of random sign diagonal matrices and a Hadamard matrix, which can be applied in $O(d \log d)$ time per block and fused with other linear operations such as rotary embeddings at zero extra cost.
+
+The net effect is that each entry of $\widetilde{\mathbf Q}$ or $\widetilde{\mathbf K}$ becomes a random linear combination of many original entries, dispersing any rare spikes across all dimensions. When subsequently quantized with block scales, this “incoherence” yields markedly smaller absolute errors than directly quantizing raw tensors.
+
+---
+
+## 4. Putting it together – FlashAttention‑3’s fp8 pipeline  
+
+FlashAttention‑3 retains the producer–consumer warp specialization introduced in FlashAttention‑2:
+
+- A *producer* warpgroup asynchronously loads blocks of $\mathbf K$/$\mathbf V$ from global memory using Tensor Memory Accelerator (TMA).
+- A *consumer* warpgroup runs two `WGMMA` calls per iteration:
+  1. Compute $\mathbf S = \frac{1}{\sqrt d}\,\widetilde{\mathbf Q}\,\widetilde{\mathbf K}^{\!\top}$.
+  2. After softmax operations generate $\widetilde{\mathbf P}$, compute $\widetilde{\mathbf O}= \widetilde{\mathbf P}\,\widetilde{\mathbf V}$.
+
+Because `WGMMA` is asynchronous on Hopper, the kernel pipelines these two GEMMs across iterations (`pingpong` schedule). Meanwhile softmax’s exponential and reduction—a comparatively slow operation—runs while another warpgroup performs its GEMMs, fully hiding non‐matmul latency.
+
+Crucially, **block quantization** fits seamlessly: each tile’s scale is known before it reaches shared memory so loading can be performed already in fp8 form; likewise incoherent processing can be folded into the same launch that applies rotary embeddings or any other pre‐attention linear transform—all without additional memory traffic or kernel launches.
+
+The overall effect is an *exact* attention implementation (softmax still computed in fp32 accumulation) that enjoys:
+
+- **~2× higher raw FLOP throughput**, measured at ≈ 1.2 PFLOPs /s on an H100 SXM5 when running in fp8.
+- **~75 % utilisation** of Hopper’s theoretical tensor core peak (~740 TFLOPs /s for fp16), showing that asynchrony fully saturates compute units.
+- **Significant accuracy improvement**, achieving **2.6× lower RMSE** compared with a baseline fp8 kernel that uses only per‐tensor scaling—a result validated on synthetic data containing heavy-tailed outliers typical for large language models.
+
+---
+
+## 5. Why this matters  
+
+### Faster inference for long contexts  
+Long‐sequence tasks (e.g., document retrieval over > 10k tokens or codebase navigation) are limited by quadratic attention cost. Doubling matmul throughput directly translates into lower latency for these workloads without sacrificing model quality because numerical error stays within twice–fp16 precision bounds.
+
+### Power efficiency  
+FP8 halves both arithmetic intensity and memory bandwidth per element compared with fp16 while delivering roughly double performance—meaning more FLOPs per watt. For data centre deployments where power budget dominates TCO, this improvement carries tangible economic benefits.
+
+### Compatibility with existing software stacks  
+FlashAttention‑3 is released under an permissive license and already integrates with PyTorch/HuggingFace via an easy drop-in call (`flash_attn`). Users can continue training or serving models written for standard FlashAttention without code changes—only an optional flag selects fp8 mode together with block quantization turned on automatically when appropriate precision hardware is detected.
+
+---
+
+## 6. Takeaways  
+
+| Aspect | Traditional FlashAttention (​FP16​) | FlashAttention‑3 (​FP8​) |
+|-------|------------------------------------|--------------------------|
+| Compute throughput | ≈ 740 TFLOPs /s (~75 % peak) | ≈ 1.2 PFLOPs /s (~80–85 % peak) |
+| Memory traffic | One pass per tile | Same single pass – no extra transposes |
+| Layout handling | Simple mn/k–major flexibility | In‐kernel transpose + register permute |
+| Quantization error | N/A (full precision) | 2.6× lower RMSE vs baseline fp8 |
+| Complexity | Unified kernel | Additional pre/post processing fused into existing pipeline |
+
+The key message: **Hardware aware kernel design plus modest algorithmic tricks can unlock native FP8 speed without compromising numerical stability**, making low precision an attractive default for future Transformer workloads on Hopper—and likely on any accelerator that provides asynchronous matmul units plus fast low‐precision support.
+
+---
+
+## 7. Looking forward  
+
+FlashAttention‑3 demonstrates how much room remains in well‐studied primitives when we let software follow hardware evolution closely:
+
+- Future work may bring persistent kernels for fp8 as well as deeper pipelining stages beyond two.
+- Extending incoherent processing to training pipelines could further shrink rounding errors during backpropagation.
+- Similar ideas should translate to other GPUs (e.g., Blackwell with FP4 support) or even specialized AI accelerators where asynchronous compute paths exist.
+
+For now, developers eager to squeeze more performance out of their H100 nodes can try FlashAttention‑3 directly from its GitHub repo (`https://github.com/Dao-AILab/flash-attention`) and enjoy near‐optimal utilization whether they run decoder-only LLMs or encoder models handling multi–modal long streams.
+
+---
+
+*FlashAttention‑3 shows that precision loss need not be synonymous with accuracy loss—a well–engineered pipeline can give you both speed and confidence.*

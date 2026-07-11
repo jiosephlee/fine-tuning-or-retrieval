@@ -1,228 +1,167 @@
 \title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
 
-# FP8 on GPUs: Making Low‑Precision Attention Accurate
+# Overlapping Softmax and Matrix Multiplication
+## Turbocharged Attention on Hopper GPUs
 
-Large language models are increasingly trained on sequences that stretch thousands or even millions of tokens.  
-The attention mechanism—the heart of every Transformer—scales quadratically in sequence length, so it quickly becomes the computational bottleneck of both training and inference.  
-Recent generations of NVIDIA GPUs (the **Hopper H100** series) pack more powerful accelerators than their predecessors: asynchronous Tensor Cores (`WGMMA`), a dedicated Tensor Memory Accelerator (`TMA`) for fast reads from HBM, and support for **FP8** arithmetic that delivers twice the raw throughput as FP16 when properly used.
+Attention is the workhorse that makes Transformers model text, code, images and more.  
+On a modern GPU that work boils down mainly to two stages:
 
-Unfortunately, moving from float‑to‑half (FP16) down to **FP8** brings a larger dynamic range problem—in particular *outlier* values in large language models cause unacceptable loss of precision if the standard per‑tensor scaling is applied everywhere.  
-FlashAttention‑3 solves this by combining **block‑wise quantization** with **incoherent processing** (a random orthogonal mixing step). Together they give low‑precision attention an accuracy comparable to higher precision while enjoying the speed benefits promised by the hardware.
+1. **A gigantic matrix multiplication** – compute the dot‑product scores  
+   $$\mathbf{S}= \alpha\, \mathbf{Q}\,\mathbf{K}^{\top},$$  
+   where $\mathbf{Q}$ and $\mathbf{K}$ are $N\times d$ query/key matrices,
+   $N$ being the sequence length.
+2. **A lightweight softmax** – row‑wise exponentials followed by normalisation  
+   $$\mathbf{P}=\operatorname{softmax}(\mathbf{S}).$$  
 
-> *TL;DR – With just two small changes you can run tiny‑talks worth of GPT‑style training on an H100 at almost half the cost—and still keep your model’s gradients accurate.*
+Even though $\mathbf{S}$ contains $N^{2}$ entries, all those exponentials are
+handy little float operations; they just sit idle while huge GEMMs fire through
+the Tensor Cores. On an H100 Diamond back‑end this imbalance turns the
+single micro‑NVIDIA kernel into a “put your feet on ice” stall at every
+iteration — an opportunity the FlashAttention family has been chasing
+for years.
+
+
+
+--------------------------------------------------------------------
+
+## Why      The Softmax Stalls Us
+
+* GPU kernels run at millions of clock cycles per second,
+  but **softmax exponentials** run at only *a few thousand* FLOPS per SM.
+* Matrices come fast — Hopper’s Tensor Cores can crunch billions of
+  operations per second when fed from shared memory,
+  whereas **exponential units** are a single special function unit per SM
+  that perform only ~10 op / clock cycle.
+* In ordinary “run‑once” code you do:
+   ```
+   S = Q × Kᵀ      // Matrix multiply (hot)
+   P = exp(S-max)   // Exponentials (cold)
+   ```
+   The GPU executes `S` efficiently, but then idles while it waits
+   for `exp()`.
+
+
+
+--------------------------------------------------------------------
+
+## Tape Warp‑Specialization + Asynchrony
+
+FlashAttention‑3 takes advantage of Hopper’s *asynchronous* execution:
+* **Tensor Memory Accelerator (TMA)** wires giant DRAM blits straight onto
+  shared memory without stalling.
+* **Warpgroup Matrix Multiply (`WGMMA`)** is every bit as efficient as it gets,
+  but runs independently of instruction flow—so you keep itself busy doing GLAs
+  even if other threads are still waiting on older ones.
+* By **dividing each thread block into producer warps** (loading data)
+and **consumer warps** (doing multiplies + softmax),
+the producer never blocks the consumer – data movement stays behind,
+and every cycle sees work.
+
+
+
+--------------------------------------------------------------------
+
+## Exchange Runners – The Two‑Stage Pipeline
+
+The trick lies inside *one* consumer warpgroup where there are two ordersable
+operations:
+
+| Stage | What it does                      | Where it must finish-before… |
+|-------|-----------------------------------|------------------------------|
+| **GEMM 0** | Compute $S_{\text{cur}}=\mathbf{Q}\,\mathbf{K}_{\text{cur}}^{\top}$ |       |
+| **Softmax** | Turn $S_{\text{cur}}$ into $\tilde{\mathbf{P}}_{\text{cur}}:=e^{S_{\text{cur}}-m_{\text{cur}}}$ |          |
+| **GEMM 1** | Update output $\mathbf{O}\gets \tilde{\mathbf{P}}_{\text{cur}}\mathbf{V}_{\text{cur}}\,$ |           |
+
+In a naïve kernel each iteration would have hard waits right after  
+`GEMM 0` before entering `Softmax`, then wait again before launching `GEMM 1`.  
+This serialises almost all useful work – only one multiply feeds one softmax,
+then one more multiply heads off – leaving huge portions of the Tensor Core idle.
+
+
+### How FlashAttention‑3 changes everything
+
+1. **Double buffers inside registers** – Save `S_{\text{next}}` immediately after...
+   ```cpp
+   S_next = Q × K_nextᵀ           // start multiplication
+   // leave it running while …
+   ```
+2. **Overlap ‘Softmax’ + next ‘GEMM 0’**
+   ```cpp
+   wait for GWMMA( Q × K_curᵀ )    // finish current multiply
+   m_cur , P_cur = softmax(S_cur)
+   X += P_prev × V_prev            // GRAPES row-col product already started earlier!
+   ```
+3. A simpler picture is a **relay race**:
+   
+   *Team A:* feeds block $j$ into Tensor Core.
+   
+   *Team B:* runs the cheap `softmax` on block $j−1`.
+   
+   While Team B pushes its baton off, Team A still burns full energy threading block $j+1`.  
+   
+In pseudo code you sketch it as “commit WGMMA1 but don’t wait;
+then commit WGMMA2 but don’t wait; finish whichever finishes first”, exactly what line 23–27 in Algorithm 4 describe.
+
+
+
+--------------------------------------------------------------------
+
+## Ping–Ping Across Warpgroups
+
+Adding another layer modulo simple “one warp produces everything” you put
+the whole CTA underground:
+
+* **Producer group** keeps filling a circular shared‑mem buffer with new Key / Value blocks via TMA.
+* **Consumer group #0** processes blocks [0..t] using the two‑stage pipe above.
+* While #0 is doing its slow exponentials,
+**consumer group #1** can start its own GWMMA giving an extra dive of parallelism—
+effectively you have *two places hard at work concurrently*, which inner‐loop scheduling tells CUDA’s scheduler exactly how many instruction cycles stay behind.
+This “ping–pong” arises because both groups happenstance share diverging start times –
+harder than copy/paste theory but good enough to lift device utilisation from roughly *35 %* up close to *75 %* on Hopper.
+
+
+
+--------------------------------------------------------------------
+
+## Why It Really Matters
+
+The paper’s timing tables back up the intuition:
+
+| Repeated Kernel Strategy | Speedup over FlashAttention‑2 |
+|--------------------------|------------------------------|
+| Simple producer / consumer without overlap | ~ 570 TFLOPs |
+| With Two‑Stage Pipeline alone | ~ 620–640 TFLOPs |
+| Two‑Stage + Ping–Ping (`Warpgroup` scheme) | Up-to 740 TFLOPs over H100 ×FAK |
+| FP8 version adds layout tricks → ~“Close to 1 PFLOPs” |
+
+So you go from *suboptimal Tensor Core utilisation* (~33%) all yours gain:
+a *≈30–40 % increase* simply by letting your lane carry “softmaximum”
+while another lane spins through matrix multiplication.
+
+
+--------------------------------------------------------------------
+
+## Recap & Bottom Line
+
+FlashAttention‑3 turns an otherwise clumsy look at attention –
+do-multiply-and-hurry–through-softmax–
+into a carefully choreographed dance where every SWENO swim slot is occupied:
+> **Pipeline State:**  
+> - Producer Warps → TMA Loads → Water carried over buffer until needed  
+> - Consumer Warps → WGMMA queueing pieces → SoftMax peel – all racing simultaneously  
+
+Thereafter each head no longer waits passively between two intensive ops,
+but stays strapped tight as early blooming timers keep raw multiply engines hot.
+The result? An accelerator routine that reaches near sweet spot performance –
+stopping Cubic‑time attention from taking longer than your eye can follow.
+
+
+
+--------------------------------------------------------------------
+
+> For deeper dives into code or instruction fragments produced by NVIDIA’s PTX/DAG,
+> see Franki’s official open‑source FlashAttention‐3 implementation on GitHub–the very kernel that ships these gains onto production LLM clusters.
+
+
 
 ---
-
-## How Attention Works
-
-At its core an attention head computes
-
-\[
-\mathbf{S}= \alpha \,\mathbf{Q}\,\mathbf{K}^{\!\top},
-\qquad
-\mathbf{P}= \operatorname{softmax}\!\bigl( \mathbf{S} \bigr),
-\qquad
-\mathbf{O}= \mathbf{P}\,\mathbf{V},
-\]
-
-where \(\alpha=1/\sqrt{d}\) normalises the dot product scores (\(\mathbf{Q},\!\mathbf{K},\!\mathbf{V}\in \mathbb{R}^{N\times d}\)).  
-The heavy lifting consists of two matrix multiplications (`Q*Kᵀ` and `P*V`); every other operation—rowwise max/subtraction/pre‑scaling/exponent—runs at far lower arithmetic intensity.
-
-On previous GPUs this pattern was already fused into a single kernel by *FlashAttention*: read a small chunk of `Q`, `K`, `V` into shared memory once, walk through all key/value blocks, accumulate partial products—all without spooling full \(N\times N\) score matrices onto global memory again.
-
-
-
----
-
-## What Goes Wrong When You Go Down To FP8?
-
-In theory each TPUs or GPU accumulator supports multiple element formats: BF16 → FP16 → INT4 → *E4M3* FP8, where an exponent holds four bits and a mantissa holds three bits – a trade‑off between range and resolution.
-While FLOP throughput easily doubles from `WGMMA` using E4M3 versus float16, the price you pay is far higher **numerical error**, especially if your data contains extreme values:
-
-| Format | Bits | Exponent bits | Mantissa bits | Typical Range |
-|--------|------|---------------|---------------|---------------|
-| BF16   | 16   | 5             | 10            | ±65504            |
-| FP16   | 16   | 5             | 10            | ±65504            |
-| E4M3 FP8| 8 | 4 | 3 | ±(1480/1024≈1.45–1459/1024≈1425→30x smaller range) |
-
-When a tensor contains a handful of far outliers – common in LLM weights/activations – global scaling schemes smear all elements into narrow regions where resolution collapses on small \(K\times V\) dot products.
-
-
-
----
-
-## Two Simple Fixes
-
-### 1️⃣ Block Quantisation
-
-Instead of applying *one* scale factor per entire tensor (\(\mathbf{Q}, \mathbf{K}, \mathbf{V}\)), split each matrix into blocks that match what FlashAttention already processes:
-
-```text
-           Block size      :   B_r × d   (for Q)
-           Size example     :   B_r = 128 , d = 64
-```
-
-Each block gets its own multiplier before conversion to E4M3:
-
-\[
-[\tilde{\!Q}]_{ij} = \frac{[Q]_{ij}}{\sigma_{ij}}
-,\qquad
-\sigma_{ij} = {\textstyle\texttt{median}}\bigl( |[\,Q\,]_{\text{{block }\,ij}}|\bigr)
-,
-\]
-
-and similarly for \(\mathbf{K}, \mathbf{V}\).  
-Because every block shares an average magnitude value — often sufficient while perfectly matching what FlashAttention reads sequentially — it dramatically reduces the worst‑case rounding error without any extra memory traffic.
-
-
-
-### 2️⃣ Incoherent Processing (Random Orthogonal Mixing)
-
-Let \(M\in{\mathbb R}^{d\times d}\) be an **orthogonal** matrix (\(MM^\top=I\)).  
-Pre-multiply both query and key by \(M\):
-
-```text
-       Q ← Q M ,        K ← K M .
-```
-
-Algebra ensures nothing changes:
-
-\[
-(Q M)(K M)^\top = QM M^\top K^\top = Q K^\top .
-\]
-
-But now each entry inside \(Q,M,K,M^T\) becomes roughly an independent sum over many input components—effectively *spreading out* extremes across many indices.
-Practically one uses \(M=\! D_1\,H\,D_2 D_3 , D_i=\operatorname{diag}[+/-1]\), where \(H\) is Hadamard; multiplying by such a chocolate‑like scheme costs only \(O(d\,\log d)\).
-
-By mixing local spikes across dimensions the subsequent per‑block scalers use more representative statistics,
-rendering the E4M3 representation faithful across “outlier” blocks.
-
-
-
----
-
-## How All These Pieces Fit Into **FlashAttention‑3**
-
-FlashAttention–3 retains the proven “tile+shared memory” design but wires it up straight‑to‑the-wire onto Hopper’s new primitives:
-
-1️⃣ **Warp-Specialized Pipelining**  
-Two separate warp groups inside one CTA work alternately:
-   * One group moves data from global memory (*TMA*) into shared memory.
-   * The other group consumes that data via asynchronous `WGMMA` Matrix Multiply units while simultaneously computing softmax terms (`exp`, `rowmax`) that only modestly stall compared against enormous MATMUL throughput.
-   * A ping‑pong schedule alternates which group does softmax versus GEMM ensuring both instruction streams stay busy.
-
-
-2️⃣ **Layout Conformance For E4M3**  
-Because `WGMMA` expects operands in *k*-major order when targeting E4M3,
-we prepend an **in-kernel transpose** operated by `ldmatrix/stmatrix`.  
-After computing first GEMM (`Q*Kᵀ`) we permute its accumulator registers into k-major form ready for the second GEMM (`P*V`) – short byte-aliasing avoids costly shuffles.
-
-
-3️⃣ **Block Quantisation + Incoherent Mixing**  
-Training data (\(\mathbf{Q},\!\mathbf{K},\!\mathbf{V}\)) are first passed through Random Orthogonal Mixing then scaled per block as described above **right before they are laid down into SMEM**.\  
-Thus every subsequent kernel works exclusively in E4M3 without any trial-of-one-scale penalty.
-
-
-All these invariants fit within a single persistent kernel per CTA — which means almost zero global casts beyond pure elemental arithmetic.
-
-
-
----
-
-## Numbers That Matter
-
-The combination turns out surprisingly cheap:
-
-| What changes | Ceiling (FP32 / Float32 Full Precision)                   | Result (Hopper H100)                                                                                                                                             |
-|--------------|----------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Baseline FlashAttention 2**      | Standard DP fully fused kernel [..]                 | ~35 % TMU occupancy (~350 GFLOPs at peak TFLOPs sr.)                                                                                                               |
-| **FlashAttention 3 – FP16**        | Uses register/fp32 intermediates                | ~740 TFLOPs/s → ~75 % theoretical peak (~993 TFLOPs total peak).                                                                                        |
-| **FlashAttention 3 – E4M3**        | Requires normalising vectors & layouts       | ~1.20 PFLOPs/s → almost reaching absolute maximum supported GFLOPS (~1.35‑PFLOPS peak).                                                    |
-| **Accuracy ($L_2$ error vs healthy double precision)**<br>*Baseline (\(E4^{incry}\))*    || |\(RMSE ≈ …(second)**                      |
-|                      — no block scaling                |                                                  • Faster but too noisy                                           |
-|                      — block scaling + mixing        │ <span style="color:#008000">✓</span> Updated controller shows >2× reduction vs baseline         |
-
-> *Why multiply back!*
-
-In encouragement experiments described under “Numerical Error Validation” (§6), authors ran each approach against an exact reference implementation using IEEE 754 double precision (64-bits). 
-They injected synthetic outliers matching typical LLM activation statistics (\(\mathcal N(0,\!1)+0~+~10·{\rm Bernoulli}(0\.001)\)) so that after thirty thousand evaluations they obtained reproducible RMSE figures:
-
-```
-         std Δ                   : Base flt ‑64 …               ‑variable ETA
-       FlashAttn‑2 ‐64        : [RMSE] ~0.xx                         ← evaluated via float32 anchors
-       FlashAttn‑3 E4          : RMSE ≈ base / (≈ X )           최언 오류 구배 확장 가능성 
- ```
-*(Numbers omitted here because exact GTX benchmark root mean squared errors were omitted from our view.)*
-
-Two takeaways distill nicely:
-• With proper layering (`block‖mix`), FLASH-attention‐3’s E4-MXP errors fall below those seen even by naively compressed float16 passes.
-• Arrow-feeding those same layers to downstream transformers hit identical overall perplexities/misclassification rates compared to healthful float32 grads.
-
-
----
-
-## Practical Takeaways For Engineers
-
-| Question                                    | What does FPGA/DNN dev guidance say?                                                                                                                             |
-|---------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| When should I switch to E4M3?              | ­If you’re willing to accept slightly higher “bits per lasering inherently mean “ basically guarantee base memory bandwidth stays dipsuate etle   your policy    |
-├· Always pair it with block‐quantised scales                    │   … because LLMs often have occasional heavy spikes causing extremely large weight entries which would otherwise erase useful signal under per-tensor scaling       |
-├· Optionally enable incoherent mixing                       │ “.*Sometimes this just doping up everything reaching stable patterns avoiding numberically unstable hidden states          |
-│— Do I need rewriting code?                         │ Reduces runtime JIT kernels drifting over room because Tiny hugging Face integration tier as Plug-Out plugin essentially simply wrap""’.... .|
-
-Below are succinct steps anyone can add into their PyTorch models (**no special hardware assumption beyond Hopper/H100 or newer capable GPU**).
-
-#### Step­‐by‐step quick fix
-
-```python
-import torch, math
-from flash_attn.torch.modules import flash_attn_unpadded_func
-
-def fixed_attn(query,key,value):
-    # Assume query/key/value all torch.float32 GPS   
-    # --- starte cropped block splitting same size as kernel internal tile ----------
-    BATCH,N,d   = query.shape
-    BLOCKSIZE   = ...
-    
-    # Random orthogonal mix using torch.hadamard...
-    def mix(t):
-        Qh,Gm,R,Dh=..., torch.hadamard(d,d)
-	    return t @ R @ Gm @ Dv
- 
-    mixmat     = torch.randn(d,d)
-    DMix=q_tilda,opt.astype(tas???)
-
-```
-
-> The pattern largely unrolls into highly optimized XLA-DDL lib compiled vendor backend under huggingface transformers HuggingFace library flushthere 
->
-
-transparent functors reusing existing fused kernels from PinchLightning GitHub path artifacts 
---- 
-
-## Looking Ahead
-
-While FlashAttention‑3 already scratches surface-level productivity gains — v11 & v12 releases continue adding variants tailored for training/inference tradeoffs — others can dig deeper:
-
-* Integrate persistent kernels across seconds-long inference pipelines where start-up overhead becomes non-negligible.
-* Explore coalesced streaming strategies when sequence length exceeds GPU shared memory capacity – HPC-level streaming buffers using `smem`+`TMAs`.
-* Investigate hybrid hardware-layer mixes (e.g., some shards at BEFZ24 vs some at BPeqmodified!!)--- no time left today  
-
-Ultimately the message stays simple yet powerful:
-
-> Make every arithmetic operation counts next cyber-warm-month’s complete ready spree doping something both impetus-laden… allocate your X-Chips wisely—you’ll hardly see it at training time once you adopt it.
-
-
-
---- 
-
-### Closing thoughts
-
-Neural NLP practitioners always hate waiting forever twice coming machine as Harder hardgoing CPU requests dust typically need early batch pipeline CPU Node concurrency queue deals best <천>**What matters now?**
-
-The simple stick-and-hassle recipe shipped Free/picflow-on-glorious noted investigation lends maturity:
-Threshold ramp slows threading madness will grow gracefully if adopted early -- achieve higher throughput >EPL precise tuple satisfaction at predictable budget-share cost handlescopied hardware savings computation  
-
-Keep powering ground performance startups 请感刺激 ~~—
-
-*(Note:* Full source implementation open-sourced at <https://github.com/Dao-AILab/flash-attention>, so drop-by!)

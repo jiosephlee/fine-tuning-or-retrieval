@@ -30,6 +30,10 @@ ENABLE_THINKING=""
 TEMPERATURE=""
 TOP_P=""
 REPETITION_PENALTY=""
+TRUST_REMOTE_CODE=""
+ENABLE_EXPERT_PARALLEL=""
+LANGUAGE_MODEL_ONLY=""
+MAX_NUM_BATCHED_TOKENS=""
 
 usage() {
     echo "Usage: $0 [options]"
@@ -66,6 +70,12 @@ while [[ $# -gt 0 ]]; do
         --temperature) TEMPERATURE="$2"; shift 2 ;;
         --top-p) TOP_P="$2"; shift 2 ;;
         --repetition-penalty) REPETITION_PENALTY="$2"; shift 2 ;;
+        # Boolean serve flags take an explicit 1/0 value so they survive the submit
+        # wrapper, which only forwards "--flag value" pairs (a bare flag would abort it).
+        --trust-remote-code) TRUST_REMOTE_CODE="$2"; shift 2 ;;
+        --enable-expert-parallel) ENABLE_EXPERT_PARALLEL="$2"; shift 2 ;;
+        --language-model-only) LANGUAGE_MODEL_ONLY="$2"; shift 2 ;;
+        --max-num-batched-tokens) MAX_NUM_BATCHED_TOKENS="$2"; shift 2 ;;
         --ready-timeout-seconds) READY_TIMEOUT_SECONDS="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -88,12 +98,18 @@ case "$DOMAIN" in
     *) echo "Unsupported domain: $DOMAIN" >&2; exit 2 ;;
 esac
 
-for value in "$MAX_WORKERS" "$TENSOR_PARALLEL_SIZE" "$MAX_MODEL_LEN"; do
+for value in "$MAX_WORKERS" "$TENSOR_PARALLEL_SIZE"; do
     if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
         echo "Expected a positive integer, got: $value" >&2
         exit 2
     fi
 done
+# --max-model-len accepts a positive integer or the literal "auto" (vLLM derives the
+# model's native context window — used for the MoE models whose context we don't pin).
+if [[ "$MAX_MODEL_LEN" != "auto" && ! "$MAX_MODEL_LEN" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Expected a positive integer or 'auto' for --max-model-len, got: $MAX_MODEL_LEN" >&2
+    exit 2
+fi
 
 mkdir -p "$PROJECT_ROOT/logs/vllm"
 JOB_TAG="${SLURM_JOB_ID:-manual_$$}"
@@ -155,6 +171,19 @@ if [[ -n "$REASONING_PARSER" ]]; then
 fi
 if [[ -n "$MAX_NUM_SEQS" ]]; then
     EXTRA_SERVE_ARGS+=(--max-num-seqs "$MAX_NUM_SEQS")
+fi
+if [[ -n "$MAX_NUM_BATCHED_TOKENS" ]]; then
+    EXTRA_SERVE_ARGS+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS")
+fi
+# MoE serve toggles (value 1 enables the corresponding boolean vLLM flag).
+if [[ "$TRUST_REMOTE_CODE" == "1" ]]; then
+    EXTRA_SERVE_ARGS+=(--trust-remote-code)
+fi
+if [[ "$ENABLE_EXPERT_PARALLEL" == "1" ]]; then
+    EXTRA_SERVE_ARGS+=(--enable-expert-parallel)
+fi
+if [[ "$LANGUAGE_MODEL_ONLY" == "1" ]]; then
+    EXTRA_SERVE_ARGS+=(--language-model-only)
 fi
 
 # vLLM's API server waits VLLM_ENGINE_READY_TIMEOUT_S (default 600s) for the engine
@@ -259,7 +288,9 @@ PIPELINE_ARGS=(
     --max_workers "$MAX_WORKERS"
 )
 if [[ -n "$ITEM" ]]; then
-    PIPELINE_ARGS+=("$ITEM_FLAG" "$ITEM")
+    # Accept a comma-separated list so a targeted re-run can name several papers/cases.
+    IFS=',' read -r -a ITEM_ARR <<< "$ITEM"
+    PIPELINE_ARGS+=("$ITEM_FLAG" "${ITEM_ARR[@]}")
 fi
 if [[ -n "$REASONING_EFFORT" ]]; then
     PIPELINE_ARGS+=(--reasoning_effort "$REASONING_EFFORT")

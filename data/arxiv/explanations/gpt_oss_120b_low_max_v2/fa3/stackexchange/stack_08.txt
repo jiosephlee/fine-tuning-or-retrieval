@@ -1,0 +1,79 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### What would a 3‑stage GEMM–softmax pipeline look like and why is it more register‑intensive?
+Question:
+The paper briefly mentions a 3‑stage variant that could further hide softmax latency but requires more registers. Could someone sketch the algorithmic changes compared to Algorithm 2 (the 2‑stage version), specifically indicating what additional buffers need to be kept across iterations? Also, why does each extra stage multiply register pressure by roughly the tile size rather than a constant amount?
+Answer:
+**Answer**
+
+In the 2‑stage pipeline of FlashAttention‑3 (Algorithm 2) the consumer warp‑group executes, for every key‑value block *j*, the following logical steps  
+
+1. **GEMM 0** – compute the score tile $S^{(j)} = Q\,K_j^{\!\top}$.  
+2. **Soft‑max** – from $S^{(j)}$ obtain the normalised probabilities $\tilde P^{(j)}$ and update the running maximum $m$ and normaliser $\ell$.  
+3. **GEMM 1** – multiply the probability tile by the corresponding value block $V_j$ and accumulate into the output tile $O$.
+
+Because the soft‑max work is much slower than a Tensor‑Core GEMM, the authors overlap the **soft‑max of iteration *j*** with **GEMM 0 of iteration *j+1***. This yields a *two‑stage* pipeline: while one WGMMA instruction is busy in the Tensor Core, the warp that is not currently producing a GEMM can run the exponentials, reductions and max/scale updates for the previous tile.
+
+---
+
+### Extending to three stages
+
+The idea of a third stage is to also hide the **second GEMM (the $ \tilde P^{(j)}V_j $ multiplication)** behind a still‑running soft‑max. In a 3‑stage pipeline each iteration *j* looks like
+
+| Stage | What is issued in iteration *j* | When it finishes |
+|------|---------------------------------|-------------------|
+| **Stage A** | **GEMM 0** for tile *$j+1$* (compute $S^{(j+1)}$) | after a few cycles (Tensor‑Core latency) |
+| **Stage B** | **Soft‑max** for tile *$j$* (use $S^{(j)}$) | when GEMM 0 of *$j$* has completed |
+| **Stage C** | **GEMM 1** for tile *$j-1$* (multiply $\tilde P^{(j-1)}V_{j-1}$) | after GEMM 0 of *$j-1$* + soft‑max of *$j-1$* |
+
+Thus three independent streams are in flight at any point:
+* the current soft‑max,
+* the next score GEMM,
+* and the previous value‑multiply GEMM.
+
+To make this work we must keep *two* score tiles and *two* probability tiles alive in registers:
+
+```
+S_cur   = Q K_j^T          // produced by GEMM 0 of iteration j
+S_next  = Q K_{j+1}^T      // produced by GEMM 0 of iteration j+1 (already launched)
+P_cur   = softmax(S_cur)   // needs S_cur
+P_next  = softmax(S_next)  // will need S_next later
+```
+
+The extra buffers are:
+
+* **S_next** – a full $B_r \times B_c$ matrix of scores for the *next* key block, kept until its soft‑max runs.  
+* **P_cur** – the probability tile that has just been produced and must survive until it can be multiplied with $V_j$.  
+
+In the 2‑stage algorithm only one score tile ($S_{\text{cur}}$) and one probability tile ($\tilde P_{\text{cur}}$) are required, because GEMM 1 never overlaps with soft‑max. Adding a third stage therefore introduces one additional score buffer and one additional probability buffer.
+
+---
+
+### Why register pressure grows by *≈ tile size*
+
+Each buffer occupies registers for every thread in the CTA. A tile has dimensions $B_r \times B_c$; each element is stored as a 32‑bit float (or FP16 accumulator) after being loaded from shared memory into registers before being fed to WGMMA. Consequently, one full tile consumes
+
+$$
+B_r \times B_c \times \text{sizeof}(float)
+$$
+
+bytes per threadblock (the exact per‑thread amount depends on how many threads share a tile, but the total register count scales linearly with the number of elements).
+
+When we add another stage we add another whole tile of each kind (score and probability). The increase in register usage is therefore proportional to the area of a tile rather than to a constant “one extra word”. In other words, each new stage adds $O(B_r B_c)$ registers, which for typical block sizes ($B_r,B_c \in \{64,128\}$) can be dozens or even hundreds of registers per thread. Because each SM can allocate at most 256 registers per thread, this quickly becomes the limiting factor: beyond a certain depth we would have to shrink $B_r,B_c$ or accept spilling to shared memory, both of which hurt performance.
+
+Hence the statement in the paper: “each extra stage multiplies register pressure by roughly the tile size.” The multiplication comes from replicating an entire tile’s worth of intermediate data; it is not merely an additive constant.
+
+---
+
+### Summary of algorithmic changes
+
+1. **Buffers:** Keep two score tiles (`S_cur`, `S_next`) and two probability tiles (`P_cur`, `P_next`) in registers across loop iterations instead of one each.
+2. **Loop body:**  
+   * Launch `S_next = Q K_{j+1}^T` (WGMMA) without waiting.  
+   * While that GEMM executes, finish soft‑max on `S_cur` → `P_cur`.  
+   * Launch `O += P_cur V_j` (second WGMMA) without waiting.  
+   * Wait for `S_next`, then promote it to `S_cur` for the next iteration; likewise promote `P_cur` to `P_next` after its soft‑max.
+3. **Synchronization:** Use lightweight `bar.sync` only when moving data between stages; otherwise rely on the asynchronous nature of WGMMA and TMA.
+4. **Register allocation:** Because each stage stores an extra full tile, total registers ≈ (stage count) × $B_r B_c$. Going from 2 to 3 stages therefore adds roughly another $B_r B_c$ registers per threadblock.
+
+In practice this gives more overlap between costly non‑GEMM work (exponential, reduction, max/scale) and Tensor‑Core work, improving utilisation on Hopper’s high‑throughput cores, but it forces a trade‑off: larger block sizes give higher GEMM efficiency yet may exceed the register budget once three stages are used. Selecting $B_r,B_c$ that respect both occupancy and register limits is therefore essential when employing the 3‑stage pipeline.

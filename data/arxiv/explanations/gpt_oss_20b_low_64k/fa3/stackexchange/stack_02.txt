@@ -1,0 +1,69 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### How does the ping‑pong scheduling actually overlap softmax and WGMMA in practice?
+Question:
+The paper claims that by splitting warp‑groups into producers and consumers and using `bar.sync` one can have softmax calculations of one block executed while another block’s GEMM is running. Since softmax uses a multiplicative exponential kernel, how are its arithmetic operations mapped to the multiple SMs? Does this result in costly traffic between register files of different warps, or is it entirely in‑SM?
+Answer:
+**Short answer**  
+Ping‑pong scheduling in FlashAttention‑3 does not move the softmax math off‑the‑SM.  
+All the floating‑point operations of the exponential kernel run on the *same* SM that is busy with the WGMMA instruction.  They are expressed as warpgroup‑wide PTX instructions (`v.exp.f32`) and are scheduled by the same warpthread group that issued the GEMM.  The only thing that is overlapped is *when* these two units are busy: while one warpgroup’s WGMMA is running, a different warpgroup’s softmax executes on that same SM (or on a different SM if you have several).  No register‑file traffic is needed between warps because each warpgroup keeps its own copies of the intermediate results in its private registers and shared memory.  The overlap is achieved by inserting `bar.sync` barriers so that the producer warps load and issue WGMMA, then hand off control to the consumer warps which immediately start computing `exp` on the latest `S` tile.
+
+---
+
+## What happens inside a warpgroup
+
+1. **SS‑GEMM** (`Q_i · K_j^T`)  
+   The first operand (`Q_i`) lives in registers; the second operand (`K_j`) is in shared memory.  
+   A single warp group issues a single `$wgmma$` instruction for this multiplication.
+
+2. **Softmax** (row‑wise)  
+   After the SS‑GEMM completes, the same warp group executes three separate small kernels:  
+   * `rowmax(S)` – find max per row, stored in a local register array of size `B_r`.  
+   * `exp(S - max)` – element‑wise exponential, using the PTX op `$v.exp.f32$.`  
+   * `rowsum(exp(..))` – compute partial sum per row.
+
+3. **RS‑GEMM** (`\widetilde{P} · V_j`)  
+   A second `$wgmma$` multiplies the exponentiated scores with a block of values from `V`.
+
+All these steps run on **the same SM**, but they are handed out to different warpgroups spaced by one kernel launch.  Once a warpgroup finishes its SS‑GEMM it does not immediately wait for another step; it simply calls `bar.sync`, letting another warpgroup run its softmax while this one idles for a cycle or two waiting for PMEM/TMA writes.
+
+---
+
+## Why no extra traffic
+
+* **Register isolation** – Each warp has exclusive access to its private registers; there is no inter‑warp register sharing.  
+* **Shared‑memory partitioning** – In FlashAttention‑3, each block of keys/values occupies a unique slice of shared memory; only one warpgroup touches a particular slice at any time because of `bar.sync`.  
+* **No copy between SMs** – All data live either on-chip (SMEM and RMEM) or in GMEM; there is never an explicit copy from one SM’s register file to another’s.
+
+Thus, when a consumer warpgroup starts computing `$exp(S - max)$`, it is simply operating on operands already resident in its own registers/SMEM.  No traffic to or from other warps is required.
+
+---
+
+## How the overlap actually works
+
+The pseudo code in §5.2 shows two “stages”:
+
+```
+stage 0 (warpgroup A):  WGMMA(Q · K_0^T)
+                       bar.sync
+stage 1 (warpgroup B):  exp(S_0 - m)
+                       bar.sync
+```
+
+In practice:
+
+1. Warpgroup A loads K and V tiles into SMEM asynchronously via TMA, then launches WGMMA for SS‑GEMM.
+2. While GPU cores are busy chasing Tensor Core requests from A’s WGMMA, Warpgroup B has already finished its own previous WGMMA and immediately begins computing softmax on S produced by A (because all operands are still on-chip).  
+3. When A’s WGMMA completes, it signals B via `bar.sync`, which allows B to start its next RS‑GEMM or move on to the next S tile.
+
+Because Tensor Cores can run independently from scalar units (`v.exp`), the machine cycle that would otherwise be idle while waiting for an exponential call gets used by an independent WGMMA.
+
+If there are more than two warpgroups, they form a simple ring: A feeds softmax to B, B feeds SAM to C, etc., hence “ping–pong”.
+
+---
+
+## Performance impact
+
+The authors report that turning this ping–pong scheme on increases FP16 forward throughput from ~570 TFLOPs to ~620–640 TFLOPs when head dimension = 128 and seqlen = 8192—about an 8–10 % gain—because the exponential unit stops becoming a bottleneck.
+
+The key take‐away is that **ping–pong does not offload any arithmetic off‐the‑SM nor incur data transfers across register files; it simply schedules different subsets of warps so that their compute pipelines occupy independent hardware units at overlapping times**.

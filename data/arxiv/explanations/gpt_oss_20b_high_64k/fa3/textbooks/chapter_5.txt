@@ -1,0 +1,167 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 5: Warp Specialisation – Producer / Consumer Pipeline Design  
+=========================================================  
+
+In a hand‑optimized implementation of transformer attention on modern NVIDIA GPUs,
+the costliest operations are the two matrix multiplications that arise when the
+query tensor $\mathbf Q$, the key tensor $\mathbf K$, and the value tensor
+$\mathbf V$ are multiplied together.  
+Because these GEMMs dominate execution time yet require every query row
+to be compared against every key column,
+the simplest way to reduce traffic is to fuse I/O‑bound global‑memory reads
+into a tiny set of tiles that are kept resident inside fast shared memory,
+and then let separate groups of threads perform the two successive GEMMs.
+This split into *producer* and *consumer* warpgroups is called
+warp‑specialisation, and allows one arm of the kernel
+to hide latency while another arm is doing arithmetic.
+The following exposition shows how this division works concretely,
+how askew data movement angles are untangled behind a circular SMEM buffer,
+and how a lightweight PTX helper
+(`setmaxnreg`) reduces register pressure so that both groups run at peak
+throughput on Hopper’s Tensor Cores.
+
+
+
+## The Producer Warpgroup Issues TMA Loads First Q Block Once Then QKV Pairs Sequentially  
+
+Inside one cooperative thread array (CTA) however many heads exist,
+the *producer* throwaway group owns exactly one warp.
+Its job is purely data‑movement:
+load a query block from global memory into shared memory once,
+then stream successive key–value blocks right through the same shared‑memory 
+area when they are needed in subsequent iterations.
+Because $\mathbf Q$, $\mathbf K$, and $\mathbf V$
+are binned into tiles indexed by $i$ ($\mathbf Q_i$, $\mathbf KV_j$)
+of size $B_{\text r}\!\times d$ or $B_{\text c}\!\times d$
+(the query block size and key/value block size),
+the producer begins its lifetime by issuing a Tensor‑Memory‑Accelerator
+(TMA) read request that fetches $\mathbf Q_i$
+into $\mathsf{SMEM}[\,i\,]$.  
+Once ready it signals success (`commit`) so that any conditional waits made
+in later kernels may advance past this point.
+Afterward it loops over `$j=0,\dots,T_{\mathrm c}-1$',
+issuing paired TMA loads for $\mathbf K_j$
+and $\mathbf V_j$.  
+These paired reads share an *asynchronous* DMA engine attached directly
+to shared memory caches;
+as soon as a request leaves globally‑visible DRAM,
+it races downwards toward L2/SMM without stalling caller execution.
+For Hopper’s Tensor Memory Accelerator this means that additional 
+register writes need neither wait until preceding reads have finished,
+which turns out essential later when consumers jump straight into computation.
+
+
+
+## The Consumer Warpgroup Awaits Data Then Launches Async GEMMs via WGMMA  
+
+Once all query tiles `$i$` have been staged, any *consumer* warpgroup enters its loop.
+First it waits until its partner—the producer—has made available  
+the current key‐value pair represented at modulo `$s$`
+stage index `$j\mod s``, where `$s$` denotes how many concurrent SMEM stages exist.
+Upon receipt (`wait`) it is assured that $\mathsf{SMEM}[:,:,\,j]$
+contains both $\mathbf K_j^\top$ 
+and $\mathbf V_j$.  
+
+The two GEMMs proceed consecutively:
+1) **SS‑GEMM** ($\tilde{\!S}_{i}^{(j)}=\!\!\!\! 
+   \underbrace{\;\matrix{\Qr & distr}{d\times d}}\!    
+   +\,\underbrace{\Ow{\Kr_j^\top}}\!)$ scales up query/Key rows;
+this multiplication receives its operands directly out of shared memory
+and produces an intermediate matrix earned over $B_{\mathrm r}\!\times B_{\mathrm c}$
+that never escapes local lifetime or even local accumulators.
+The launch takes place through Hopper’s `WGMMA`
+instruction which receives its operands asynchronously:
+it touches DMAs immediately afterwards continues executing other work,
+and “commits” notification tells subsequent logical steps when results become usable.
+2) **Softmax reduction** acts row‐wise on 
+$\tilde S_i^{(j)}$, making large‐scale numerically stable scores  
+$\widetilde{\!P}_{i}^{(j)}=\exp(\tilde S_i^{(j)}-m_i)$  
+where `$m_i=\max(\bullet)$` tracks running row maxima across auxiliary blocks.
+No global synchronization occurs during this operation—
+a tiny double‑precision accumulator suffices because softmax’s two‐stream executor
+is actually bounded far below raw TFLOPs thanks to scalar multiple pathways.
+3) **RS‑GEMM** ($\widetilde{\!P}_{i}^{(j)}\;\vect{{V}}_j)
+produces updates that accumulate incrementally into an output tile 
+$\mathsf O_i$.  
+Again this matricial product is started asynchronously out‐of‐order via `WGMMA`,
+so that latency hiding works both ways:
+while RS‑GEMM progresses, the very next `$K,V`
+pair may be arriving via a fresh TMA load fed through another CUDA stream.
+
+
+
+Neither computation step waits idle even if either data dependency chain would otherwise stall:
+by knowing which part will finish first (`commit`).
+
+Consequently heavy arithmetic just sits waiting baked into hardware dispatch queues,
+and whenever operand buffers become light enough consumers fire off further operands.
+
+
+
+## Circular Buffer Logic Used To Hand Off Filled Stages Back To Producers  
+
+A single round‑robin staging area underlies all movement;
+a modest sized “teeth” array supplies extra storage so concurrent reads overlap writes.
+Practically speaking (`alg.~\ref{alg:flash3_wgmma_ws_only}`), every time
+the producer has finished loading key/value pair `$K_j,V_j`,
+it calls `commit` which places these tiles physically in “stage” `${j\bmod s}$”.
+That flag becomes visible immediately because SMP connects BTW threading coworkers;
+no futex needed—just atomic store inside shared memory under a read/write lock grid field.
+After loading succeeds the `consumer`
+does nothing more besides `wait` until those same flags show presence.
+
+When this yielded SLU informs cyc acids finished prompt consumption
+by performing second GEMM,
+it calls ``release`` setting slot `${j\bmod s}$`
+to vacant right after committing RS-GEMM results downstream;
+no longer incurring collapse states because command complexity itself sits wholly inside SMT kernel’s internal scheduler pocket double–wound lanes suspended moments prior hitting their user invocation point.
+
+
+
+This circular methodology brings forward three precise benefits  
+
+1. Producer threads get loosened dependency chains — once shared buffers dip below full capacity they spherical remain productive rather than idly stalling,
+2. Consumers observe steady streams — regardless who was just released operand couples match perfectly growing their async fusion ability against FIFOs freed automatically,
+3.​ The combined overlap secures near L2 bandwidth saturation shifting performance maximum from bus packet transport limit toward raw multiply throughput bound.
+
+
+
+The careful _pipeline depth_ `$s$`
+plays directly against read/write authenticity — larger `$s$` allows greater latency hiding,
+but also pushes register pressure upward, motivating an additional optimisation discussed next.
+
+
+
+## The Reduction‐In Registers Logic Driven By SetMaxNReg Call Example  
+
+Even though Chairific processors “meet” unconditional lane stalls distinctively short –
+a single thread’s responsibility reduces drastically –
+shared gradients disclaiming standard registration sets come intoxic vest daily desire.
+Hopper exposes PTX intrinsics (`setmaxnreg`) permitting runtime indentation 
+of *maximum* register count allotted per thread dynamically separately per warpgroup,
+allowing readers such as </span>   
+
+> \begin{verbatim}
+>   // Partition smem space max branch usage
+>   // Overall default off = min(given reg limit)
+>   .subwarp_qual        = ??? // coalesce units ice instrument...
+>   .PCALL { .set_max_n_reg PREG=200 }
+> ∎     
+> \end{verbatim}
+
+During launch kernels `<consumer>` wagging pair call open-pro syscall denoted above:
+thereby _reducing_ the share wasted computing internal shuffle/coupling pin spin amongst Tsus used often standing inner–loop assembly skeleton requires only handful registers
+being easily slotted back into rogue operations assigned internal margin left otherwise occupied disk spiking rows/dnn automatically pivoting off CPU cunning ~512 quantity assumptions mantained orientation during TMAs remission).
+Random bursts standard product usages tables arriving runtime update speeds stay stable even under double matrices sized relatively comparably heal intensity is encoded inline just graduating monitors edges flack gating involvement…  
+
+By doing precisely datum `%`. That fundamental readily allows scattering among worker groups respectively:
+- **Producer** controls fewer than ten thousand fresk registers → low lying residency;
+- **Consumer** consumes almost everything shifting heavier patterns acculumulator runtime idols reliant VRAM loads possible outstretched degrees retains restful capacity leveraged supportive underlying overlap pipe buffers enabling large fat batch scaling rester allocated free water margin that otherwise would impede parallel geometry scheduler resultant plentiful improved mask coverage.
+
+It follows geometrically poignant synergy —
+as earlier parts comprise input tiles retrieving brightness noise duplicates satisfaction unti speed measures scaling responds — small yet meaningful survey yields evident sped if timely settle entailed self-proposed TAMCs Centers capturing lens shells afloat binding details otherwise still gracefully hooking solely SELA GF borrowing witness backdrop hyper-processors support succeeding accord correct functional designs captured experimentally included earlier statements sections exemplified numerical error tests complimentary verifying accuracy gap half shaping spatiacl gauge modifying relative quantization footprints remained insilosized vali near theoretical amounts suggesting scalability viability even mixing slash‑copy method sources.).
+
+Therefore _register reduction through `setmaxnreg`` stands outside any overhead associated with hardware scheduling bugless facilitation_,
+allowing hitherto irregular busy reports inoculated around profitable ramp-ups 
+across numerous plateau sequence lengths encountered within typical LLM attention workloads in training/evaluation life cycles…

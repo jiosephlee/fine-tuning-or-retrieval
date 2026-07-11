@@ -1,0 +1,361 @@
+\title{Blogs about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+# Step‑by‑Step Guide: Fine‑tuning a 7B Model with QLoRA on Your Own GPU  
+
+*TL;DR – With just a single consumer‑grade GPU you can take a frozen 7 billion‑parameter LLM, compress it to **four‑bit NormalFloat (NF4)**, attach lightweight LoRA adapters at every layer, and finish an instruction‑tuning run in only a few hours.*  
+
+The trick behind this “magic” is **QLoRA**, the method introduced by Dettmers & Artidoro et al. (2023).  
+QLoRA combines three orthogonal ideas:
+
+| Innovation | What it does | Why it matters |
+|------------|--------------|----------------|
+| **NF4 Quantization** | Stores each weight with four bits using an information‑theoretically optimal codebook for normally distributed data | Keeps almost all the representational power of a full‑precision model while shaving the weight footprint by ≈ 75 % |
+| **Double Quantization** | Quantizes the *quantization constants* themselves (usually FP8), saving ≈ 0.37 bits per parameter | Cuts another few gigabytes off the total VRAM budget |
+| **Paged Optimizers** | Leverages NVIDIA unified memory so optimizer states can spill to RAM when needed | Prevents sudden out‑of‑memory spikes caused by gradient checkpointing |
+
+In practice these tricks shrink a **65 B** LLaMA model from > 780 GB RAM (full‑precision fine‑tuning) down to < 48 GB while preserving **100 %** of the original performance ‑– the authors’ best chatbot family **Guanaco** reaches *99.3 %* of ChatGPT’s Vicuna score despite being trained entirely in four bit precision[^1].
+
+Below we walk through an end‑to‑end pipeline that reproduces this workflow for a **7 B** decoder‑only model (LLaMA‑7B). All commands are Linux/macOS oriented; Windows users can use WSL2 or an equivalent Conda environment.
+
+---
+
+## 📦 Prerequisites  
+
+| Item | Minimum spec | Why it’s needed |
+|------|--------------|----------------|
+| **GPU** | ≥ 12 GiB VRAM (e.g., RTX 3060 12 GiB / RTX 3070 8–16 GiB / RTX 3080/3090 10–24 GiB) | A four‑bit LLaMA‑7B occupies ~**5 GiB** in VRAM; extra space covers activations, optimizer states and LoRA parameters |
+| **OS** | Linux or macOS (Windows → WSL2) | Needed for CUDA driver & kernel compilation |
+| **CUDA** | ≥ 11.6 matching your PyTorch build | Enables bf16 arithmetic used by QLoRA |
+| **Python** | ≥ 3.9 | Required by recent 🤗 Transformers / PEFT |
+| **Disk space** | ≥ 30 GiB free | Model weights + dataset + checkpoints |
+
+---
+
+## 🛠️ 1️⃣ Set Up the Conda Environment  
+
+```bash
+# Create isolated env
+conda create -n qlora python=3.9 -y
+conda activate qlora
+
+# Install PyTorch (+CUDA); replace cu117 if you have another version
+conda install pytorch torchvision torchaudio cudatoolkit=11.7 -c pytorch -y
+```
+
+> **Tip:** Verify CUDA is visible → `python -c "import torch; print(torch.cuda.is_available())"` should print `True`.
+
+---
+
+## 📦 2️⃣ Install `bitsandbytes` With NF⁴ Support  
+
+The official binary wheels ship FP8/FP16 kernels only; **NF⁴** lives behind custom compilation (`bitsandbytes>=0.41`).  
+
+```bash
+# Install build tools first
+conda install gcc_linux-64 gxx_linux-64 cmake -y   # Ubuntu/Debian equivalents if apt-get preferred
+# Clone Tim Dettmers’ repo (contains our required kernels)
+git clone https://github.com/TimDettmers/bitsandbytes.git
+cd bitsandbytes
+git checkout v0.41            # latest tag supporting nf4 & double quant
+python setup.py install       # builds CUDA kernels locally
+cd ..
+```
+
+> After installation you’ll see log lines mentioning "`NF`" – that confirms the quartet kernel was built successfully[^2].
+
+---
+
+## 📦 3️⃣ Install Remaining Python Packages  
+
+```bash
+pip install transformers==4.34.*      # latest stable release at time of writing  
+pip install datasets tqdm peft accelerate markdown-it-py tqdm                      # helper libs  
+pip install git+https://github.com/artidoro/qlora.git   # optional helper scripts  
+```
+
+---
+
+## 📥 4️⃣ Get a Base Model  
+
+QLoRA works with any frozen pretrained decoder (LLaMA, T5…). For this tutorial we’ll use Meta’s **LLaMA‑7B** which must be obtained legally through Meta’s request form and uploaded to HuggingFace 🤗 Hub (`decapoda-research/llama-7b-hf`).  
+
+```bash
+# Log into HF first so private repos are accessible:
+huggingface-cli login        # paste your token
+```
+
+> The authors report that after four‐bit compression ‑– *the smallest Guanaco(7B)* – needs *only~5 GiB* of memory during inference[^3]. The same footprint holds during training thanks to adapter‐only gradients.
+
+---
+
+## 📊 5️⃣ Prepare an Instruction Dataset  
+
+Quality beats quantity — the paper shows a modest ~9k high‑quality collection (**OASST1**) outperforms larger noisy corpora[^4].  
+A minimal Alpaca‐style JSONL entry looks like:
+
+```json
+{
+  "instruction": "Summarize the plot of *The Little Prince*.",
+  "output": "The Little Prince tells..."
+}
+```
+
+If you have multiple turns (OpenAssistant style), concatenate prior turns before each new user message so that each example contains a *single* prompt → response pair.
+
+Load it with 🤗 Datasets:
+
+```python
+from datasets import load_dataset
+
+# Replace path with your own file/location:
+train_data = load_dataset("json", data_files={"train": "./data/alpaca.json"})["train"]
+```
+
+---
+
+## 🧩 6️⃣ Build the QLoRA Model  
+
+Below is a compact script (`build_qlora.py`) that assembles everything:
+
+```python
+#!/usr/bin/env python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model
+
+MODEL_NAME = "decapoda-research/llama-7b-hf"
+
+# ---- Quantization config -------------------------------------------------
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",               # ⇢ NormalFloat⁴ from the paper
+    bnb_4bit_compute_dtype=torch.bfloat16,   # computation stays at bf16 precision
+    bnb_4bit_use_double_quant=True           # ⇢ Double Quantization saves ~3 GiB
+)
+
+# ---- Load frozen base ----------------------------------------------------
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    quantization_config=bnb_config,
+    device_map="auto",          # splits layers across GPUs / CPU automatically 
+)
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer.pad_token = tokenizer.eos_token   # required for batching
+
+# ---- Enable gradient checkpointing ----------------------------------------
+model.gradient_checkpointing_enable()   # cuts activation memory dramatically
+
+# ---- LoRA adapter configuration -------------------------------------------
+lora_cfg = LoraConfig(
+    r=64,                               # rank ≈ low‐dimensional subspace (paper uses full‐layer adapters)
+    lora_alpha=16,
+    lora_dropout=0.05,
+    target_modules=[
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj"
+    ],                                   # covers every linear projection → essential per Sec 3 ("adapters at every layer")
+    bias="none",
+)
+
+model = get_peft_model(model, lora_cfg)
+print("=== Model ready ===")
+print(f"Trainable params ≈ {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.1f}M")
+```
+
+Running this script prints something like “Trainable params ≈ **13M**”, i.e., less than **0.2 %** of total weights—the hallmark of parameter efficient fine­tuning described in Sect 2 of the paper.
+
+---
+
+## ⚙️ 7️⃣ Optimizer ‑ Paged AdamW  
+
+Instead of vanilla AdamW we use BitsAndBytes’ *paged* variant which automatically swaps rarely accessed state tensors between GPU and CPU, preventing out‑of‑memory spikes when processing long sequences (§ “Paged Optimizers”).
+
+```python
+from bitsandbytes.optim import PagedAdamW
+
+optimizer = PagedAdamW(
+    model.parameters(),
+    lr=2e-5,                     # any value inside [1e−6 , 5e−5] worked well per Sec 3 experimental setup
+    betas=(0.9, 0.999),
+    eps=1e-8,
+)
+```
+
+You may adjust `lr` upward/downward after watching validation loss curves—the authors performed an extensive grid search across exactly this interval[^5].
+
+---
+
+## 📋 8️⃣ Training Loop (HuggingFace Trainer)
+
+We’ll lean on 🤗 Trainer because it already knows how to handle mixed precision and gradient accumulation while respecting our custom optimizer & scheduler.
+
+```python
+from transformers import Trainer, TrainingArguments, DataCollatorForLanguageModeling
+
+# Tokenize once upfront:
+def tokenize_fn(example):
+    prompt = example["instruction"]
+    response = example["output"]
+    # Append EOS token so loss includes assistant output only:
+    full = tokenizer(prompt + "\n\n" + response + tokenizer.eos_token,
+                     truncation=True,
+                     max_length=512)
+    return {"input_ids": full["input_ids"], "labels": full["input_ids"]}
+
+train_dataset = train_data.map(tokenize_fn, remove_columns=train_data.column_names)
+
+data_collator = DataCollatorForLanguageModeling(tokenizer,
+                                                mlm=False)
+
+training_args = TrainingArguments(
+    output_dir="./guanaco-7b",
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,     # effective batch ≈8 samples → fits comfortably into VRAM
+    num_train_epochs=3,
+    learning_rate=2e-5,
+    fp16=False,
+    bf16=True,                         # compute dtype already bf16 → matches QLoRA spec
+    logging_steps=20,
+    save_steps=500,
+    evaluation_strategy="no",
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    data_collator=data_collator,
+    optimizers=(optimizer, None),      # disable default AdamW creation
+)
+
+trainer.train()
+```
+
+### What’s happening under the hood?
+
+* **Forward pass:** each weight tensor (`Wⁿᶠ⁴`) gets dequantized *on demand* into bf16 (`dequant()`), multiplied by activations (`Xᵇᶠ¹⁶`) and summed with LoRA contribution (`X·L₁·L₂`).  
+* **Backward pass:** gradients flow only through LoRA matrices (`L₁`, `L₂`). The frozen base remains untouched → identical to Eq.(6) in Sec 3 (“we compute weight gradients exclusively for adapters”).  
+* **Memory budget:** With NF⁴ (+double quant) plus paged optimizer states you stay well under **15–18 GiB**, leaving headroom even on an RTX 3060/3070 card.*
+
+Training runs typically complete within **≈ 30–45 minutes per epoch** on an RTX 3090—a fraction of what would be required for full‐precision fine‐tuning (>900 GiB according to § Introduction).
+
+---
+
+## 💾 9️⃣ Save & Merge (Optional)
+
+If you plan *only* inference on devices where loading two files isn’t convenient you can merge adapters back into the compressed backbone:
+
+```python
+# Merge then discard adapter tensors – useful when deploying at scale.
+merged_model = model.merge_and_unload()
+merged_model.save_pretrained("./guanaco-7b-merged")
+tokenizer.save_pretrained("./guanaco-7b-merged")
+```
+
+> Merging inflates storage back toward BF16 (~14 GiB) while retaining all learned knowledge—a tradeoff worth considering based on your deployment constraints[^6].
+
+Otherwise keep them separate (`guanaco-7b/` holds both `adapter_model.bin` and `pytorch_model.bin.nf4`) and load both at runtime exactly as shown later.
+
+---
+
+## 🤖 A️⃣10️⃣ Quick Inference Demo  
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+ckpt_dir = "./guanaco-7b"              # or "./guanaco-7b-merged"
+tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
+model     = AutoModelForCausalLM.from_pretrained(
+                ckpt_dir,
+                device_map="auto",
+                torch_dtype=torch.bfloat16      # keeps computation cheap 
+            )
+model.eval()
+
+def chat(prompt):
+    input_ids = tokenizer(prompt + tokenizer.eos_token,
+                          return_tensors="pt").input_ids.to("cuda")
+    
+    gen_ids = model.generate(
+        input_ids,
+        max_new_tokens=150,
+        temperature=0.7,
+        top_p=0.9,
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        repetition_penalty=1.02,
+    )
+    
+    return tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+
+print(chat("Write a short haiku about sunrise"))
+```
+
+You should obtain fluent prose comparable to regular LLaMA without any noticeable degradation—a direct consequence of Section **“QLoRA vs Standard Finetuning”**, where NF⁴ + LoRA reproduced full​‑precision baselines across GLUE/MMLU/etc.
+
+---
+
+## 🧪 Bonus: Light Evaluation  
+
+The authors evaluated dozens of models through *pairwise Elo tournaments* built from GPT‑4 or human judges[^7]. To get an informal hint whether your checkpoint behaves similarly you can run a few Vicuna prompts against GPT®‐ChatGPT:
+
+```bash
+# Example prompt list extracted from Vicuna benchmark:
+PROMPTS=("What is quantum entanglement?" 
+         "Explain why electric cars are environmentally friendly."
+         "...")  
+
+for p in "${PROMPTS[@]}"; do 
+   echo "--- Prompt ---"
+   echo "$p"
+   echo "--- Guanaco answer ---"
+   python -c "from demo import chat; print(chat('$p'))"
+done > guanaco_vicuna.txt
+```
+
+Then feed your answers alongside ChatGPT’s replies into GPT‑4 with a simple meta-prompt similar to Sec “Automated Evaluation”. While professional benchmarking isn’t obligatory here, reproducing even one line of Table 1 (“Guanaco 65B reaches 99.3% relative ChatGPT”) confirms correct implementation.
+
+
+
+---
+
+## 🛠️ Trouble­shooting Cheat Sheet  
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| **CUDA error “kernel launching failed”** | BitsAndBytes compiled against mismatching CUDA version | Reinstall `bitsandbytes` ensuring `$CUDA_HOME` points at your driver’s toolkit version |
+| **GPU OOM after first few steps** | Sequence length >~1024 triggers large activation buffers despite checkpointing | Reduce `max_seq_length` or increase `gradient_checkpointing_enable()` calls |
+| **Adapter does not seem to learn (loss flat)** | Learning rate out of searched interval (`<1e−6` or `>5e−5`) or excessive dropout | Bring LR back into `[1e−6 , 5e−5]`, set `lora_dropout≤0.` |
+| **Merged checkpoint refuses to load** | Merging produced BF16 weights without corresponding `.nf4` metadata file | Keep both files separate during deployment instead—or re-export with `bnb_save_quantized_weights=True`. |
+
+---
+
+## 🎉 Wrap‑up  
+
+You’ve now reproduced what Dettmers & Artidoro call *“the first method able to finetune a quantified LLM without any performance degradation”*. By leveraging four core components—NF⁴ quantization, Double Quantization, Pag​ed Optimizers and thorough layerwise LoRA—you can turn any open-source decoder into an instruction-following chatbot comparable to state-of-the-art proprietary systems—all on hardware most enthusiasts already own.
+
+> **Key takeaways**
+> * Four-bit NormalFloat representations retain essentially all information needed for downstream tasks (§“NF⁴”).  
+> * Double quantizing scale factors squeezes another ∼​​3 GiB off large models (§“Double Quant”).  
+> * Memory spikes are no longer fatal thanks to paged optimizers (§“Paged Optimizers”).  
+> * Fully populated LoRAs (“adapters at every layer”) recover *exactly* full precision results across GLUE/BIO/MMLU (§“QLoRA vs Standard Finetuning”).  
+
+Feel free to experiment! Swap out LLaMA for T5 ➜ same pipeline works out‐of‐the box thanks to 🤗 Transformers’ unified API; change datasets – remember what Section “Data Quality Beats Quantity” taught us and pick clean instruction pairs (~≤10k examples). With QLoRA now open source ([GitHub](https://github.com/artidoro/qlora) / [bitsandbytes](https://github.com/TimDettmers/bitsandbytes)), there’s no reason large language models should stay locked behind multi‑GPU clusters any longer.
+
+Happy tuning! 🚀  
+
+
+---  
+
+### References  
+
+[^1]: Dettmers et al., “QLoRA: Efficient Finetuning of Quantized LLMs”, *arXiv preprint*, July 2023 – noted Guanaco hits *99.3%* relative ChatGPT performance while fitting under single‐GPU limits.
+[^2]: BitsAndBytes README explains NF⁴ implementation details and shows compile logs confirming inclusion.
+[^3]: Abstract mentions “our smallest Guanaco model (7 B parameters) requires just 5 GB of memory”.
+[^4]: Section “Finetuning data quality matters more than size” reports OASST1 (~9k samples) outperforming larger FLAN v2 subsets.
+[^5]: Experimental section §‘Default LoRA hyperparameters…’ reports searching LR ∈ \([10^{-6},\,5×10^{-5}]\); best baselines fall inside this interval.
+[^6]: Merging backs weights into BF16 expands storage (~14 GiB); see §‘Parameter updates… only gradients w.r.t adapters are needed’.
+[^7]: Elo rating methodology described §‘Human Evaluation’, §‘Automated Evaluation’; Table snapshot shows Guanaco family consistently ranks top among open-source chatbots.

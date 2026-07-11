@@ -1,0 +1,164 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# Softmax Meets Matrix Multiplication There Goes Your Bottleneck  
+
+## Why attention still chokes
+
+Transformer models have made astonishing strides because their self‑attention layer lets every token talk directly to every other token.  
+In mathematical notation an attention head takes three tensors  
+\[
+\mathbf{Q},\,\mathbf{K},\,\mathbf{V}\;\in\;\mathbb{R}^{N\times d}
+\]
+and produces an output tensor
+\[
+\mathbf{O}= \operatorname{softmax}\!\bigl(\tfrac1{\sqrt d}\,\mathbf{Q}\mathbf{K}^{\top}\bigr)\,\mathbf{V}.
+\]
+A single forward pass does two large matrix multiplications followed by a row‑wise softmax that fuses exponentials,
+normalisation factors, and another matrix multiplication.\[
+    \text{GFLOPs} =4\,N^2\,d .
+\]
+
+While a generous batch size lets GPUs execute many small matmuls in parallel, the core problem remains that **softmax sits entirely outside the high‑throughput Tensor Core engine** it needs the full score matrix \(\mathbf{s}=\mathbf{Q}\mathbf{K}^{\top}\) before it can run an exponential—a burst that requires the slow “special function unit” (SFU). On an H100 the tensor core delivers well over \(900\,\text{TFLOPs}\) while exponentials run below \(4\,\text{TFLOPs}\). Thus a naïve kernel often carries dozens of seconds worth of latency waiting for a tiny percent‑of‑work step that forces most threads idle.”
+
+FlashAttention‑1 already eliminated this problem by fusing all intermediate tensors into one streaming kernel so there were no global‑memory reads/writes between consecutive operations. Yet even on Hopper GPUs “FlashAttention‑2” still turned out only **35 % GPU utilisation** despite Tensor Cores working hard—far below what an optimized GEMM achieves (≈ 80–90 %).  
+
+What’s missing?
+
+* Explicitly exploiting **asynchronous execution** baked into Hopper’s TMA copies & WGMMA matmul units  
+* Systematic overlap between “slow” softmax and “fast” matmul  
+* Ability to run everything once in **low precision** without blowing up errors  
+
+That’s what FlashAttention‑3 brings.
+
+
+
+--------------------------------------------------------------------
+
+## The new sauce – Warp‑specialisation + pipelining
+
+### Producer–consumer warps  
+
+In Hopper each streaming multiprocessor has four **warpgroups** (32×4 threads) that you can assign distinct roles:
+
+| Warpgroup | Role | Primary work |
+|-----------|------|--------------|
+|producer | load | Asynchronously copies tiles \(Q_i,K_j,V_j\) from GMEM → SMEM via TMA |
+|consumer | compute | Runs SS‑GEMM (\(Q_i K_j^{\top}\)), SHARP‑softmax reductions, RS‑GEMM (\(\tilde P_i V_j\)) using WGMMA |
+
+Because TMA copies online run concurrently with Tensor Core work you immediately get **overlap between data movement and computation** without any special bar`rier` stalls.
+
+
+
+### Ping‑pong scheduling across warpgroups  
+
+With two consumer warpgroups you can let “warp A” finish its SS‑GEMM on key tile \(j+1\) while “warp B” immediately starts its RS‑GEMM on value tile \(j-1\). At the same time each remaining warp group executes **the softmax branch** belonging purely to its own iteration stepping over already computed scores. In pseudo language
+
+```
+for j=0 … Tc:
+    producer copies Kj,Vj async
+    consumer_A SS-GEMM Kj --------------------        // async
+    consumer_B RS-GEMM Vj---------------------        // async
+    consumer_B softmax Kj async-----------------
+    consumer_A wait/SWAPH -------------------------------------------------
+```
+
+This keeps both sets of Tensor Cores busy while SFU work gets hidden underneath them—exactly what would happen if you had a kitchen where someone burns toast while someone else cooks spaghetti 🎯
+
+
+
+### Two‑stage intra-warpgroup pipeline  
+
+Inside one consumer group even tighter overlap is possible. After computing scores \(S_{\text{cur}}\), you simultaneously start computing \(S_{\text{next}} = Q_iK_{j+1}^{\top}\) while feeding current \(\tilde P_{\text{cur}}\) into RS‑GEMM against \(V_{j-1}\). Switching which operation runs when requires only a few extra registers (`S_next` buffer), so register pressure stays manageable yet almost eliminates stalls caused by waiting on previous RS-GEMMs.
+
+
+
+--------------------------------------------------------------------
+
+## Pushing it further into low precision – FP8 everywhere
+
+Larger GPUs increasingly expose **FP8 Tensor Cores**, which give roughly double FLOP rate versus FP16 without eating more power or die area—a boon particularly when you’re working with gigantic contexts where otherwise computation scales as \(O(N^2)\).
+
+Two issues arise:
+
+1. **Operand layout constraints** – GPTools’&nbsp;(FP8）WGMMA accepts operands only in k-major form while ordinary index ordering is mn-major.​  
+   Solution: After loading a tile \(V_j\) into shared memory perform an **in-kernel tile transpose** using LDSM / STSM instructions that swap row-major ↔ column-major views at the register level—this relocates data without resorting either extra host passes or coalesced Global Memory store penalties.
+
+
+
+2. **Accumulators live in FP32**, whereas operands are FP8 → mismatch between register layout expected by WGMMA makes the result wrong unless permuted carefully.\*
+   By applying a byte-hack permutation (`d0 d1 d4 d5 …`) matching WGMMA’s accumulated fragment pattern you convert register contents recorded from one FMAMASICGPU session so they become legal inputs for subsequent ones.
+
+
+
+These rewrites let us run both SS‑GEMMs and RS‑GEMMs entirely in FP8 inside one persistent kernel description despite differing operand shapes.
+
+
+
+--------------------------------------------------------------------
+
+## Accuracy tricks that make it *not* horribly noisy  
+
+FP8 leaves little room for large values—an overshoot turns into wild quantisation errors suited poorly when Large Language Models have super-large activations (“outliers”). Two engineering tricks tame this danger:
+
+* **Block quantisation** – Each query/key/value tile gets its own scale factor instead of one global scatterer. Because FlashAttention already streams data blockwise this costs essentially zero time yet keeps errors sharply bound locally.\*
+* **Incoherent processing** – Multiply both `$Q$` and `$K$` together with a fixed random orthogonal transform `$M$` before quantising.\[
+            (\!QM)(KM)^{\top}=\!QK^{\top}
+          \]  
+Dozens of researchers have shown this spreads extreme entries across many cells so MT VH ``gestgles'' leaving fewer badly scaled items per tile—purely arithmetic gymnastics protected our core equation level accuracy.
+
+
+
+Experimentally this combination cuts RMSE down **≥ × 2 technique versus standard per-tensor FP8**.
+
+
+--------------------------------------------------------------------
+
+## Numbers that matter
+
+| Metric | Input | Result |
+|--------|-------|--------|
+|FP16 Forward* |H100 SXM5 |Up to **740 TFLOPs/s (~75 %)**, fanower than flash-v…wise 보독 |
+|FP16 Backward* |H100 SXM5 |~1½–１¾× faster than FA‐2 |
+|FP8 Forward* |H100 SXM5 |> **1 PFLOP/s**, doubling former TPM rating |
+|Accuracy* |FP8 ESPN ‑ Block+Incoh.|RMSE ≤ twice better than baseline |
+
+(“&nbsp;\* For full‐sequence length ≳ 8192 tokens heads=64–256.”)
+
+Crucially because the kernel is fully fused there are almost zero intermediate round trips through DRAM unlike standard PyTorch implementation where scores $\~O(N^2)$ flood gigabytes every batch cycle—a performance killer hidden behind seemingly modest ops ages ago.
+
+
+
+--------------------------------------------------------------------
+
+## Where could you see it now?
+
+FlashAttention‑3 targets any modern GPU capable of asynchronous WGMMA/TMA—including mixed‐precision models trained on Hood network boards today—and already ships <!-- concise link -->
+<div class="external-links">
+[https://github.com/Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention)
+</div>
+
+The current implementation covers most common invocation patterns:
+* vanilla multi-head self-attention,
+* causal masked attention,
+* multi-query / grouped query variants,
+and works seamlessly inside Hugging Face Transformers’ pipelines—the library’s next release will drop Slow-matrix demos telling backtraces automatically.
+
+
+--------------------------------------------------------------------
+
+## Takeaways  
+
+* Even “tiny” upstream work such as rotating exponential tables has outsized impact if we let them sit idle instead of choking afloat behind fast calls—it turns into hundreds of gigaflops wasted seconds everyday!  
+* GWACK establishes how elementary asynchronous execution concepts become pathways toward real-time acceleration when aligned vis–vis fresh generation hardware features trigger API changes → Warpgroups > async copy > overlapped module intensity ≥ ∼x slowdown mitigation surpassing prior solutions monotonically linear kettle ethic ways.*  
+* Low precision does not have to mean scrambling quality—intra-tile scaling + wide-matrix transformations community-shared tricks give nearly pristine accuracy even under extremely constrained formats.*   
+Larger contextual windows (>10k tokens) become swifter than vendor-shipped libraries ‑ freedom soon given mind-in-the-beacher story folding essential polyglot reality scenarios (*chatbot conversations>multi-document comprehension belt.*)
+
+All told this shows engineers moving beyond simply coding faster kernels towards designing *cooperative pipelines*: Spectrum pairs cropping hardware units together exactly against graph-shaped problem structures gives bursts elsewhere previously bottlenecked away forever.
+
+
+
+---
+
+> “If your GAN worked so fast it preferred your dataset before your code ran.” — Trevor Byrnes Martyn . 
+
+Happy hacking!

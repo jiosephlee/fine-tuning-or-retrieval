@@ -63,7 +63,7 @@ VLLM_MAX_MAX_TOKENS = int(os.environ.get("VLLM_MAX_MAX_TOKENS", "32768"))
 # reasoning channel and emit no final answer. Greedy decoding (temperature 0)
 # makes that deterministic, so a plain re-run repeats it. Retry an empty response
 # up to this many times with a nudged sampler to break the runaway trajectory.
-VLLM_EMPTY_RETRIES = int(os.environ.get("VLLM_EMPTY_RETRIES", "3"))
+VLLM_EMPTY_RETRIES = int(os.environ.get("VLLM_EMPTY_RETRIES", "1"))
 VALID_LLM_PROVIDERS = {"auto", "openai", "litellm", "vllm"}
 
 
@@ -126,6 +126,7 @@ def _create_vllm_completion(client, api_params, require_complete=False):
     """
     params = dict(api_params)
     empty_retries = 0
+    initial_max_tokens = params.get("max_tokens", 1)
     while True:
         try:
             completion = client.chat.completions.create(**params)
@@ -136,15 +137,19 @@ def _create_vllm_completion(client, api_params, require_complete=False):
         choice = completion.choices[0]
         content = (choice.message.content or "").strip()
         truncated = choice.finish_reason == "length"
-        if not content and empty_retries < VLLM_EMPTY_RETRIES:
-            # No final answer: the reasoning channel consumed the turn (finish_reason
-            # "length" when it exhausted the budget, "stop" when it gave up). Greedy
-            # decoding repeats this every time, so nudge temperature/top_p to break the
-            # trajectory rather than returning an empty outline that skips the view.
+        if (not content and truncated and empty_retries < VLLM_EMPTY_RETRIES
+                and params.get("max_tokens", 1) < VLLM_MAX_MAX_TOKENS):
+            # Only length exhaustion is retryable. Keep sampling fixed: changing it
+            # makes recovery non-reproducible and made GPT-OSS degeneration worse.
             empty_retries += 1
-            params["temperature"] = 0.4 + 0.3 * empty_retries
-            params["top_p"] = 0.95
+            params["max_tokens"] = min(
+                max(params.get("max_tokens", initial_max_tokens) * 2,
+                    initial_max_tokens + 1),
+                VLLM_MAX_MAX_TOKENS,
+            )
             continue
+        if not content:
+            return completion
         if not truncated or (content and not require_complete):
             return completion
         current = params.get("max_tokens", 1)
@@ -458,7 +463,7 @@ def query_gpt(prompt: str | dict, model: str = 'gpt-4.1-mini', max_tokens: int =
             api_params.pop("reasoning_effort", None)
             think = os.environ.get("QWEN_ENABLE_THINKING", "1").strip().lower() not in {"0", "false", "no"}
             api_params["extra_body"] = {"chat_template_kwargs": {"enable_thinking": think}}
-        if resolved_provider == "vllm":
+        if resolved_provider == "vllm" and "qwen" in model.lower():
             # Greedy decoding (temperature 0) plus a large token budget can fall into
             # degenerate repetition loops on dense/technical inputs (e.g. runaway
             # "\boldsymbol{\boldsymbol{..." on math-heavy papers). A mild frequency
@@ -478,6 +483,13 @@ def query_gpt(prompt: str | dict, model: str = 'gpt-4.1-mini', max_tokens: int =
                 api_params["temperature"] = float(_t)
             if _p is not None:
                 api_params["top_p"] = float(_p)
+            # Optional multiplicative repetition penalty (vLLM extension via extra_body).
+            # A *mild* value (~1.1) breaks LaTeX-structure loops ("{{{{", "\boldsymbol{")
+            # that sampling alone doesn't on dense math papers; kept low so it doesn't
+            # degrade JSON-key adherence the way 1.3 did. Off unless QWEN_REPETITION_PENALTY set.
+            _rp = os.environ.get("QWEN_REPETITION_PENALTY")
+            if _rp is not None:
+                api_params.setdefault("extra_body", {})["repetition_penalty"] = float(_rp)
     elif 'gpt-5' in model:
         api_params = {
             "model": model,

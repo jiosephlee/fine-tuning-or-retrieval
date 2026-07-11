@@ -1,0 +1,1245 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# Why Attention Slows Down Large Language Models – A Simple Explanation
+
+Large language models (LLMs) have become the workhorse behind chatbots, code assistants, and many other AI products. Yet anyone who has tried to scale these models quickly discovers a recurring roadblock: **the attention layer**. In this post we’ll walk through what attention does, why its cost explodes as models grow, how that limits “long‑context” use cases (reading whole documents or codebases), and finally how the newest FlashAttention‑3 algorithm squeezes out significant speedups on modern GPUs.
+
+---
+
+## What is Attention?
+
+At its core, a Transformer layer computes three matrices from the input token embeddings:
+
+* **Queries** $\mathbf{Q}\in\mathbb{R}^{N\times d}$
+* **Keys**    $\mathbf{K}\in\mathbb{R}^{N\times d}$
+* **Values**  $\mathbf{V}\in\mathbb{R}^{N\times d}$  
+
+where $N$ is the sequence length (how many tokens we process) and $d$ is the head dimension (the size of each “attention head”).
+
+The attention output $\mathbf{O}$ is obtained by three steps:
+
+\[
+\mathbf{S}= \frac{1}{\sqrt{d}}\,\mathbf{Q}\mathbf{K}^{\!\top}\quad
+\mathbf{P}= \operatorname{softmax}(\mathbf{S}) \quad
+\mathbf{O}= \mathbf{P}\,\mathbf{V}.
+\]
+
+* $\mathbf{S}$ holds pairwise similarity scores between every query and every key.
+* $\operatorname{softmax}$ converts each row of $\mathbf{S}$ into a probability distribution.
+* Finally each probability row weights the values $\mathbf{V}$ to form the new representation $\mathbf{O}$.
+
+All of this looks simple on paper, but hidden inside is an operation that scales **quadratically** with $N$—the size of $\mathbf{S}$ is $N\times N$!
+
+---
+
+## Why Does Attention Become a Bottleneck?
+
+### 1️⃣ Quadratic Scaling
+
+The matrix multiplication $\mathbf{Q}\mathbf{K}^{\!\top}$ requires $N^{2}d$ multiply‑adds. Likewise the softmax and the second multiplication $\mathbf{P}\mathbf{V}$ also touch $N^{2}$ entries. As $N$ grows from a few hundred tokens (typical for short prompts) to tens of thousands (whole documents or codebases), the number of operations climbs by orders of magnitude:
+
+\[
+\text{FLOPs}_{\text{forward}} = 4\, N^{2}\, d\, n_{\text{heads}}.
+\]
+
+A modest increase from $N=1\,024$ to $N=16\,384$ multiplies the compute by $256\times$, even though the model size stays unchanged.
+
+### 2️⃣ Memory Traffic
+
+Standard implementations materialize both $\mathbf{S}$ and $\mathbf{P}$ in GPU global memory (HBM). That means two extra reads/writes of an $N\times N$ matrix per head—an enormous bandwidth burden that dwarfs raw compute on modern GPUs.
+
+### 3️⃣ Hardware Mismatch
+
+GPUs excel at dense matrix multiplication (GEMM) thanks to specialized Tensor Cores. But they are comparatively slow at element‑wise ops like exponentials needed for softmax. On an NVIDIA H100 GPU the peak FP16 GEMM throughput is roughly **989 TFLOPs**, while special‑function units can only deliver about **4 TFLOPs** for exponentials—a factor of more than two hundred difference! If attention spends too much time on softmax or on moving data around, overall utilization falls dramatically.
+
+These three factors combine into a classic “attention bottleneck”: even though GPUs have huge raw horsepower, they can’t keep it busy when attention has to shuffle massive $N\times N$ matrices back and forth.
+
+---
+
+## Real‑World Impact: Long‑Context Limits
+
+Because attention scales quadratically, most production LLMs truncate inputs to a few thousand tokens. That restriction hurts many applications:
+
+| Application | Desired Context | Typical Truncation |
+|-------------|-----------------|-------------------|
+| Whole‑document QA | > 10 k tokens | ~ 2 k tokens |
+| Codebase navigation | > 20 k tokens | ~ 4 k tokens |
+| High‑resolution vision (e.g., $1024\times1024$ patches) | > 30 k patches | ~ 6 k patches |
+
+When you can’t feed all relevant data at once, you need workarounds like retrieval‑augmented generation or chunked processing—both add latency and complexity. Faster attention would directly unlock “read‑the‑entire‑document” capabilities without sacrificing speed.
+
+---
+
+## Cutting Through the Bottleneck: Faster Attention with FlashAttention‑3
+
+The original *FlashAttention* algorithm showed that you can avoid storing $\mathbf{S}$ and $\mathbf{P}$ by fusing all operations into a single kernel that streams blocks of data through shared memory. That reduced memory traffic dramatically but still left two major inefficiencies on newer hardware like NVIDIA’s Hopper H100:
+
+* **Low utilization:** FlashAttention‑2 only reaches ~35 % Tensor‑Core utilization on H100, far below the 80–90 % seen for pure GEMM kernels.
+* **No low‑precision path:** The algorithm was designed for FP16/BF16 only, missing out on the higher throughput promised by FP8 Tensor Cores.
+
+*FlashAttention‑3* addresses both gaps with three synergistic ideas:
+
+### 1️⃣ Producer–Consumer Asynchrony via Warp Specialization
+
+GPU warps are groups of 32 threads that execute in lockstep. In *FlashAttention‑3*, some warps (“producers”) focus exclusively on loading data from global memory into shared memory using the Tensor Memory Accelerator (TMA). Other warps (“consumers”) immediately start computing GEMMs as soon as data appear. Because TMA transfers are asynchronous, producers never stall consumers—memory movement and computation overlap perfectly.
+
+### 2️⃣ Overlap Softmax with Block‑wise GEMMs
+
+Recall that softmax is much slower than GEMM. *FlashAttention‑3* interleaves these two stages across blocks:
+
+1️⃣ Compute $\mathbf{Q}\,\mathbf{K}_j^{\!\top}$ for block $j$ → start softmax on that block.  
+2️⃣ While softmax runs, immediately launch the GEMM for block $j+1$ (`WGMMA` – Tensor Core instruction).  
+
+A “ping‑pong” schedule emerges where one warpgroup does softmax while another runs Tensor Core matmuls. This hides the low‑throughput exponential work behind high‐throughput matrix multiplication, boosting overall utilization from ~57 % to > 70 % in practice.
+
+### 3️⃣ Hardware‑Accelerated FP8 GEMM + Block Quantization
+
+Hopper’s Tensor Cores support **FP8** (`e4m3`) format—a roughly 2× speedup over FP16 if you can tolerate reduced precision. However there are two challenges:
+
+* **Layout constraints:** FP8 `WGMMA` only accepts k‑major operand layout (contiguous along the inner dimension). *FlashAttention‑3* solves this by performing an *in‑kernel transpose* using `ldmatrix`/`stmatrix` instructions while loading tiles of $\mathbf V$.
+* **Numerical error from outliers:** LLMs often contain occasional very large activations (“outliers”). A naïve per‑tensor scaling would clip these aggressively and degrade quality.
+
+To keep accuracy high while staying in FP8, *FlashAttention‑3* employs:
+- **Block quantization:** each tile (e.g., $B_r\times d$) gets its own scale factor rather than one global scale per tensor.
+- **Incoherent processing:** before quantizing we multiply $\mathbf Q$ and $\mathbf K$ by a random orthogonal matrix (a signed Hadamard transform). This spreads out outlier values across entries so they become less harmful after quantization—yet because the transform is orthogonal it leaves attention mathematically unchanged.
+
+Together these tricks deliver **2.6× lower RMSE** compared to a baseline FP8 implementation that uses per‑tensor scaling alone.
+
+---
+
+## Real Performance Gains
+
+Benchmarks on an H100 SXM5 GPU confirm that *FlashAttention‑3* translates its clever design into tangible speedups:
+
+| Precision | Speedup vs FlashAttention‑2 | Peak TFLOPs/s | Utilization |
+|-----------|---------------------------|---------------|-------------|
+| FP16      | 1.5–2.0× (forward)        | ~740          | ~75 % |
+| FP8       | ≈1× (baseline already fast) but peaks at **~1.2 PFLOPs/s** thanks to double Tensor Core throughput | — | — |
+| Backward (FP16) | 1.5–1.75×                | —             | — |
+
+For typical long-sequence settings (e.g., $N=8192$, head dimension = 128), forward TFLOPs rise from ~570 TFLOPs (FlashAttention‑2) to ~620–640 TFLOPs when adding softmax‐overlap alone; full *FlashAttention‑3* reaches ~740 TFLOPs—the closest real-world kernel gets to H100’s theoretical peak.
+
+In addition to raw speed:
+
+* **Memory savings:** Still avoids materializing $\mathbf S$/$\mathbf P$, keeping global memory traffic minimal.
+* **Accuracy:** FP16 version matches prior exact‐attention implementations; FP8 version remains within acceptable error margins even with aggressive quantization.
+* **Scalability:** The algorithm works for any batch size or number of heads because each CTA processes its own query tile independently—perfectly suited for multi‐GPU training pipelines.
+
+---
+
+## How These Improvements Enable Longer Contexts
+
+If you can attend over twice as many tokens in the same wall-clock time, you effectively double your context window without needing extra hardware or sacrificing latency. Concretely:
+
+* A model that previously managed $4\,\text{k}$ tokens at 100 ms per forward pass can now handle roughly $7$–$8\,\text{k}$ tokens within the same budget.
+* For inference APIs this means fewer round trips when answering questions about big documents—no need for complex chunking or retrieval pipelines.
+* During training, longer context windows improve gradient quality for tasks like document summarisation or code completion across many files.
+
+Thus *FlashAttention‑3* not only makes existing deployments faster; it expands what is feasible today—paving the way toward truly “whole‐document” LLMs without prohibitive compute costs.
+
+---
+
+## Takeaways
+
+1️⃣ **Quadratic scaling** makes attention inherently expensive as sequence length grows—both compute (`$\mathcal O(N^2)$`) and memory traffic blow up.
+
+2️⃣ **Hardware realities matter:** On modern GPUs most cycles are spent moving data or doing low‐throughput softmax work rather than pure matrix multiply.
+
+3️⃣ **FlashAttention‑3 shows how to bridge this gap** by:
+   - Splitting data movement & computation across dedicated warp groups,
+   - Overlapping cheap softmax ops with heavyweight Tensor Core GEMMs,
+   - Exploiting fast FP8 Tensor Cores while mitigating their numerical pitfalls through block quantization and incoherent orthogonal transforms.
+
+4️⃣ The result is **up to 2× faster exact attention**, near‐peak GPU utilization (≈75 %), and substantially lower error even at ultra‐low precision—directly unlocking longer context windows for LLMs and related modalities.
+
+As LLMs continue scaling in both parameters and application domains, being able to squeeze every ounce of performance out of attention will be essential. *FlashAttention‑3* offers a concrete step toward that goal—and its core ideas—producer/consumer pipelining, softmax‐GEMM overlap, and smart low‐precision handling—are likely to inspire further optimizations across future GPU architectures beyond Hopper as well.
+
+--- 
+
+If you’re curious enough to try it yourself, the implementation is open source under a permissive license at `https://github.com/Dao-AILab/flash-attention`. Expect integration soon with PyTorch and Hugging Face libraries so you can plug faster attention straight into your own models without touching CUDA kernels yourself!
+
+
+
+# From FlashAttention‑2 to FlashAttention‑3: Making GPUs Work Harder  
+
+*How three clever tricks lift H100 utilization from ~35 % to ~75 % and double the throughput of exact attention.*
+
+---
+
+## The Attention Bottleneck  
+
+In a Transformer a single attention head computes  
+
+\[
+\mathbf{S}= \frac{1}{\sqrt{d}}\;\mathbf{Q}\mathbf{K}^{\top},\qquad
+\mathbf{P}= \operatorname{softmax}(\mathbf{S}),\qquad
+\mathbf{O}= \mathbf{P}\mathbf{V},
+\]
+
+where $N$ is the sequence length and $d$ the head dimension.  
+Even though each matrix multiplication is $O(N d)$, forming the $N\times N$ score matrix $\mathbf{S}$ incurs a **quadratic** cost in $N$. For modern large‑language models this step dominates both runtime and memory bandwidth, especially when we try to push context windows beyond a few thousand tokens.
+
+The original **FlashAttention** algorithm sidestepped one major inefficiency: it fused the three steps (matmul → softmax → matmul) into a single GPU kernel so that intermediate $N\times N$ matrices never touch slow global memory. That design gave a huge speed boost on older GPUs but left a lot of headroom on newer hardware such as NVIDIA’s Hopper H100.
+
+---
+
+## What FlashAttention‑2 Got Right – and What It Missed  
+
+FlashAttention‑2 extended the idea by parallelizing over the sequence dimension. Instead of processing one query block against all keys at once, it tiled the keys/values ($B_c$ tokens per block) and streamed them through a **single kernel**. The result was an implementation that already outperformed naïve attention by several times while preserving exact results.
+
+However, on an H100 “the GPU was still mostly sleeping.” Profiling showed only **~35 %** of the theoretical Tensor‑Core capacity being used, compared with **80–90 %** for handcrafted GEMM kernels. Two reasons explain this gap:
+
+1. **Synchronous design** – all threads in a threadblock waited for each other after every memory load or softmax step. The Tensor Cores could not start their next matrix multiplication while other warps were still handling elementwise ops.
+2. **No low‑precision path** – flash kernels continued to run in FP16 even though Hopper offers native FP8 Tensor Cores that can double arithmetic throughput if used correctly.
+
+FlashAttention‑3 addresses both issues head‑on by restructuring *how* work is scheduled on the GPU, turning idle cycles into useful work and finally exploiting Hopper’s fast FP8 units.
+
+---
+
+## Idea 1 – Producer‑Consumer Asynchrony via Warp‑Specialization  
+
+### The hardware angle  
+
+Hopper separates three expensive resources:
+
+* **Tensor Memory Accelerator (TMA)** – moves data between global memory (HBM) and shared memory without stalling compute.
+* **Tensor Cores (exposed as WGMMA)** – perform matrix multiplication asynchronously.
+* **CUDA cores** – handle logic, exponentials, reductions etc.
+
+Because TMA and WGMMA can run independently, we can assign *different warps* within a single threadblock to be either **producers** (issue TMA loads) or **consumers** (launch WGMMA matmuls). This “warp specialization” gives each group a dedicated pipeline without having to constantly synchronize after every load or compute step.
+
+### How it works in practice  
+
+1. A *producer warpgroup* streams $\mathbf{Q}$, $\mathbf{K}$ and $\mathbf{V}$ blocks from HBM into a circular shared‑memory buffer using TMA.  
+2. A *consumer warpgroup* reads the ready blocks from that buffer and launches two GEMMs per iteration:
+   * $\mathbf{Q}_i \mathbf{K}_j^{\top}$ (score block)  
+   * $\widetilde{\mathbf P}_{ij}\,\mathbf V_j$ (value accumulation)
+
+Crucially, once the first load finishes the producer can start loading the next block while the consumer is already crunching the previous one. No warp ever idles waiting for memory; latency is hidden behind ongoing arithmetic.
+
+The net effect on an H100 is immediate: Tensor‑Core occupancy climbs from roughly one third to over half, laying the groundwork for further gains.
+
+---
+
+## Idea 2 – Overlap Softmax with Block‑wise GEMMs (Ping‑Pong Scheduling)  
+
+### Why softmax stalls matter  
+
+Even after we hide TMA latency, each iteration still needs an exponential‐based softmax over the freshly computed score block $\mathbf S_{ij}$. On Hopper the exponential unit yields only about **3–4 TFLOP/s**, whereas Tensor Cores deliver close to **1 PFLOP/s** for FP16 matmul. In practice this mismatch means that softmax can occupy up to half of a cycle’s time budget—still far from ideal.
+
+### Turning two stages into one pipeline  
+
+FlashAttention‑3 introduces a *two‑stage* schedule that lets softmax for block $j$ run concurrently with the GEMMs for block $j+1$. In pseudo code:
+
+```
+# iteration j
+S_cur = Q_i K_j^T      # async WGMMA
+# don't wait yet
+softmax(S_cur) -> P_cur
+O_i += P_cur V_j       # async WGMMA
+# while O_i accumulation proceeds,
+# launch next S_next = Q_i K_{j+1}^T
+```
+
+With careful barrier insertion (`bar.sync`) we guarantee that data dependencies are respected while allowing two independent hardware units—the Tensor Cores and the special‐function unit—to work side by side. This “ping‑pong” pattern essentially doubles the amount of useful work per clock cycle for the non‑GEMM portion of attention.
+
+### Measured impact  
+
+On an H100 running FP16 forward passes (head dimension = 128), raw TFLOP/s rose from ~570 TFLOP/s (FlashAttention‑2) to **620–640 TFLOP/s** just by adding this overlap. When combined with warp specialization the kernel reaches **≈740 TFLOP/s**, i.e., about **75 %** of Hopper’s theoretical peak—far beyond the earlier ~35 % level.
+
+---
+
+## Idea 3 – Harnessing FP8 Tensor Cores Without Losing Accuracy  
+
+### The promise of FP8  
+
+Hopper’s Tensor Cores support an eight‑bit floating point format (E4M3). In pure GEMM this means roughly **twice** the throughput of FP16 while keeping energy usage low—a tempting prospect for long‑context attention where matrix dimensions are huge.
+
+### Layout hurdles  
+
+FP8 WGMMAs impose a stricter memory layout than their FP16 counterparts:
+
+* Operands must be *k‑major* (contiguous along the inner reduction dimension).  
+* Accumulator layout in registers differs from operand layout, making back‑to‑back GEMMs tricky.
+
+FlashAttention‑3 solves this by:
+* Performing an **in‑kernel transpose** of each $\mathbf V_j$ tile using `ldmatrix` / `stmatrix` instructions—no extra global copy needed.
+* Reordering registers between successive WGMMAs with cheap byte‐permute ops so that the output accumulator matches the expected layout for the next multiplication.
+
+### Keeping numerical error low  
+
+FP8’s tiny mantissa (3 bits) makes it vulnerable to outliers—a common occurrence in large language models where a few elements can be orders of magnitude larger than average. FlashAttention‑3 tackles this with two complementary tricks:
+
+| Technique | What it does |
+|-----------|--------------|
+| **Block quantization** | Instead of one scale per tensor, each $B_r\times d$ or $B_c\times d$ block gets its own scaling factor before conversion to FP8. This captures local dynamic range and reduces clipping errors without extra runtime cost. |
+| **Incoherent processing** | Multiply $\mathbf Q$ and $\mathbf K$ by a random orthogonal matrix $\mathbf M$ *before* quantization. Since $\mathbf M\mathbf M^\top = \mathbf I$, attention scores remain unchanged mathematically, but outliers are spread across many entries, making quantization less severe. The orthogonal transform can be folded into existing rotary‐embedding kernels at essentially zero cost. |
+
+When evaluated on synthetic data mimicking LLM outliers (`N(0,1)+N(0,10)\cdot Bernoulli(0.001)`), FP8 FlashAttention‑3 achieved **2.6× lower RMSE** than a baseline FP8 implementation that used only per‐tensor scaling—while still reaching close to **1.2 PFLOP/s** on H100 (the highest reported throughput for exact attention).
+
+---
+
+## What the Numbers Look Like  
+
+| Precision | Speedup vs FlashAttention‑2 | Peak TFLOP/s | GPU Utilization |
+|-----------|-----------------------------|--------------|------------------|
+| FP16 (forward) | 1.5–2× | ≈740 TFLOP/s | ≈75 % |
+| FP16 (backward) | 1.5–1.75× | — | — |
+| FP8 (forward) | ≈1× vs cuDNN; >2× vs FA‑2 | ≈1.2 PFLOP/s | — |
+
+Across sequence lengths from 512 up to 16 k tokens (total token count kept at ≈16 k), FlashAttention‑3 consistently outperformed both PyTorch’s naïve implementation and cuDNN’s vendor‐optimized flash kernel—sometimes by as much as **16×** for very long sequences where memory traffic dominates performance.
+
+Aside from raw speed, accuracy remained solid:
+* In FP16 both FA‑2 and FA‑3 match each other and improve over standard attention because intermediate softmax results stay in FP32.
+* In FP8 FA‑3’s block quant + incoherent scheme beats per‐tensor quantization by more than double in RMSE while preserving exactness at inference time thanks to its fused kernel design.
+
+---
+
+## Bottom Line – GPUs Are Now Working Harder  
+
+FlashAttention‑2 showed us that fusing attention steps can eliminate costly global reads/writes; however, it treated modern hardware as if it were still an older generation—hence ~35 % utilization on Hopper’s massive Tensor Core fleet.
+
+FlashAttention‑3 rewrites that story by:
+1️⃣ Splitting data movement & computation across specialized warps → producer–consumer asynchrony  
+2️⃣ Overlapping cheap softmax work under heavy GEMM pipelines → ping–pong scheduling  
+3️⃣ Exploiting native FP8 Tensor Cores while taming quantization error → layout tricks + block quant + incoherent processing  
+
+Together these ideas push effective utilization up to ~75 %, double throughput for FP16 and open a practical pathway for exact attention at truly long contexts in both training and inference workloads.
+
+The code is open source (`github.com/Dao-AILab/flash-attention`), already being merged into PyTorch/Hugging Face pipelines, so you can try it tomorrow on your own H100 cluster—or adapt its principles once your favorite accelerator ships similar asynchronous compute units.
+
+---
+
+### Looking Ahead  
+
+Future work includes extending these pipelines to *persistent kernels* for even smaller sequence lengths, exploring mixed precision schedules where only parts of attention stay in higher precision, and measuring how low‐precision exact attention behaves during large‐scale LLM training runs.
+
+If you’re building models that need longer context windows—be it code completion across huge repositories or reasoning over multi-document inputs—FlashAttention‑3 gives you more FLOPs per dollar without sacrificing mathematical correctness. It’s another reminder that software designed hand-in-hand with hardware can unlock performance far beyond what raw silicon alone promises.
+
+
+
+# Producer‑Consumer Asynchrony & Warp‑Specialization: Turning Latency into Parallelism  
+
+*In FlashAttention‑3 the first big win comes from rethinking how a CUDA threadblock moves data and does work. By splitting warps into “producers” and “consumers”, using a circular shared‑memory buffer, and exploiting Hopper’s asynchronous Tensor Core and Tensor Memory Accelerator units, we can hide most of the memory latency and push utilization well past 70 %.*
+
+---  
+
+## 1. The bottleneck that still lingers after FlashAttention‑2  
+
+Self‑attention is the quadratic workhorse of every Transformer. FlashAttention‑2 already eliminated the costly round‑trip through global memory by fusing the three attention steps (QKᵀ → softmax → PV) into a single kernel. It also parallelized over the sequence dimension so that each threadblock processes many key/value blocks.  
+
+Yet on NVIDIA Hopper (the H100 GPU) FlashAttention‑2 only reaches **≈ 35 %** tensor‑core utilization—a far cry from the 80–90 % obtained by hand‑tuned GEMM kernels. The reason is simple: the kernel still follows a **synchronous** execution model. All data movement (global‐to‐shared copies) happens first, then every GEMM runs to completion before the next piece of work can start. The result is a long idle period for Tensor Cores while waiting for RAM reads or for softmax reductions to finish.
+
+Hopper gives us two hardware knobs that were completely ignored:
+
+| Hopper feature | What it does |
+|----------------|--------------|
+| **Tensor Memory Accelerator (TMA)** | A dedicated unit that streams data from HBM to shared memory **asynchronously**, without stalling CUDA cores. |
+| **WarpGroup‑wide WGMMA** | A Tensor Core instruction that consumes operands directly from shared memory **asynchronously**, allowing other warps to issue new instructions while it’s running. |
+
+If we can line up these two async units so that one feeds the other continuously, we’ll keep the Tensor Cores busy almost all the time.
+
+---
+
+## 2. Producer–Consumer design at a glance  
+
+### 2.1 Warp specialization  
+
+A CUDA threadblock (CTA) contains multiple *warp groups*—each warp group comprises four contiguous warps (32 × 4 = 128 threads). In FlashAttention‑3 we give each warp group a dedicated role:
+
+* **Producer warp group** – only issues TMA loads (`Q`, `K`, `V`) from global memory into shared memory.
+* **Consumer warp group** – only runs the heavy matrix multiplications (`QKᵀ` and `PV`) via WGMMA and performs the softmax math on those intermediate results.
+
+Because each group never mixes responsibilities, the compiler can schedule instructions without worrying about register contention between loading and compute phases. Moreover, Hopper lets us dynamically reassign registers between warp groups (`setmaxnreg`), giving consumers more registers for GEMM while producers keep just enough for address calculations.
+
+### 2.2 Circular shared‑memory buffer  
+
+The CTA allocates a **multistage circular buffer** in shared memory—think of it as a ring of *slots* that hold one block of `K`/`V` tiles at a time. With `s` slots we get an *s‑stage pipeline*:  
+
+1. Producer writes `K_j`, `V_j` into slot `j % s`.  
+2. Consumer reads from slot `j % s` once producers have signaled completion (via a lightweight barrier).  
+3. After consumption the slot is marked free again for the next producer iteration.
+
+This “ping‑pong” schedule means that while consumer #1 processes block `j`, producer #0 can already start loading block `j+1`. The only synchronization needed is a single `bar.sync` per slot—much cheaper than stalling for global memory reads or waiting for softmax results.
+
+---
+
+## 3. Walking through one CTA step by step  
+
+Below is an informal sketch of what actually happens inside a CTA that processes a query tile `Q_i`:
+
+1. **Initialization**  
+   * Producer warps allocate registers for load descriptors, issue an asynchronous TMA load of `Q_i` into shared memory and announce completion (`commit`).  
+   * Consumer warps allocate larger register files (`setmaxnreg`) and zero out their output accumulator `O_i`, plus vectors `m_i` (row maxes) and `ℓ_i` (row sums).
+
+2. **Main loop over key/value blocks (`j = 0 … T_c-1`)**  
+   *Producer*  
+   - Wait until slot `(j % s)` is free (i.e., consumer has finished using it).  
+   - Issue TMA loads for `K_j` and `V_j` directly into that slot; no stalls because TMA works off‑core.
+   - When loads are done, set a flag so consumers may proceed.
+   
+   *Consumer*  
+   - Wait until `K_j` appears in shared memory.  
+   - Launch an asynchronous WGMMA **SS‑GEMM** (`Q_i × K_jᵀ`) producing score block `S_i^{(j)}`; commit but do *not* wait yet.  
+   - Meanwhile softmax preliminaries run on the **previous** score block (`S_i^{(j-1)}`) — compute new row maxes `m_i`, exponentials, partial row sums `ℓ_i`. This work uses cheap FP32/F16 arithmetic and finishes much faster than GEMM.
+   - Once `V_{j-1}` is ready in shared memory, launch an asynchronous WGMMA **RS‑GEMM** (`P̃_i^{(j-1)} × V_{j-1}`) to update the output accumulator.
+   - Only after both GEMMs complete do we write back results or feed them into the next iteration.
+   
+3. **Epilogue**  
+   After processing all blocks, apply final scaling (`O_i ← O_i / ℓ_i`) and write back both `O_i` and log-sum-exp vector `L_i`.
+
+Notice how each iteration overlaps two pieces of work:
+* The *next* QKᵀ multiplication runs while we finish softmax on the *current* scores.
+* The current PV multiplication runs while loading the *next* K/V pair.
+
+Because WGMMA itself runs asynchronously, these two “soft” stages never block tensor cores—they simply sit in separate instruction streams scheduled by different warp groups.
+
+---
+
+## 4. Why this matters on Hopper  
+
+| Metric | FlashAttention‑2 (baseline) | FlashAttention‑3 (producer–consumer) |
+|--------|-----------------------------|--------------------------------------|
+| FP16 TFLOPs/s (forward) | ~470 TFLOPs/s (~35 % util.) | up to **740 TFLOPs/s** (~75 % util.) |
+| Speedup factor | – | **1.5–2×** across sequence lengths |
+| Barrier overhead | Global sync per iteration | One lightweight per buffer slot |
+
+The gains come almost entirely from hiding two dominant costs:
+
+1️⃣ **Global‐memory latency** – TMA streams data while tensor cores crunch previous tiles; no idle cycles waiting for DRAM bandwidth bursts.
+
+2️⃣ **Softmax throughput limitation** – Softmax involves exponentials which are ~100× slower than FLOP‐heavy GEMM on H100 (!). By moving exponentials onto a separate warp group they execute precisely when tensor cores are busy elsewhere.
+
+The result is an overall pipeline whose critical path is dominated by matrix multiplication—exactly what we want for an attention kernel whose math is inherently GEMM heavy.
+
+---
+
+## 5. Implementation nuances you need to know  
+
+* **Dynamic register redistribution** – Using `setmaxnreg`, producers shrink their register footprint dramatically after they finish loading once per iteration; consumers reclaim those registers for bigger tile sizes or extra buffering.
+* **Barrier granularity** – A single `bar.sync` per buffer stage suffices because each stage holds an entire K/V tile; no need to synchronize individual warps.
+* **Prefetch depth (`s`)** – Empirically we find a three–stage circular buffer (`s = 3`) balances latency hiding against shared‐memory pressure; larger `s` yields diminishing returns due to limited SMEM bandwidth.
+* **Memory layout compatibility** – Both Q/K/V are stored in row‐major (N × d) order which matches Hopper’s TMA expectations; no extra transposes are required for FP16/FP32 paths.
+* **Scalability across heads & batches** – Since each head / batch element gets its own CTA (or multiple CTAs if N is large), this design scales trivially with model width while preserving high occupancy.
+
+---
+
+## 6. Takeaways  
+
+- **Asynchrony isn’t magic—it’s disciplined overlap**: By separating data movement from compute at warp level we let Hopper’s specialized units run independently instead of sequentially.
+- **Circular buffers give cheap pipelining**: A ring of SMEM slots turns what would be serial load–compute loops into a steady‐state pipeline with minimal synchronization.
+- **Warp specialization simplifies scheduling**: Giving each warp group one clear job allows NVCC to allocate registers efficiently and reduces instruction contention.
+- **Performance follows hardware capabilities**: The same ideas can be ported to any GPU that exposes async copy engines (e.g., future NVIDIA architectures or AMD’s CDNA), though instruction names will differ.
+
+FlashAttention‑3 shows that even after heavy algorithmic optimisation (the tiling tricks of FlashAttention‑2), there’s still juice left in modern GPUs—if you know where to look. By turning latency into parallelism through producer–consumer asynchrony and warp specialization, attention becomes fast enough to keep pace with ever larger models and longer context windows.
+
+---  
+
+### References  
+
+Dao et al., “FlashAttention: Fast and Memory-Efficient Exact Attention” (2022).  
+Dao et al., “FlashAttention‑2” (2023).  
+NVIDIA CUDA Programming Guide – sections on Tensor Memory Accelerator & WarpGroup WGMMA instructions.  
+
+*(All numbers refer to measurements performed on an NVIDIA H100 SXM5 GPU as reported in FlashAttention‑3.)*
+
+
+
+# Ping‑Pong Scheduling: Overlapping Softmax with Matrix Multiplication  
+
+*How FlashAttention‑3 hides the low‑throughput softmax behind high‑throughput Tensor‑Core GEMMs.*
+
+---
+
+## 1. The attention bottleneck in a nutshell  
+
+The forward pass of a single Transformer head boils down to three matrix operations  
+
+\[
+\mathbf{S}= \alpha\,\mathbf{Q}\mathbf{K}^{\!\top},\qquad
+\mathbf{P}= \operatorname{softmax}(\mathbf{S}),\qquad
+\mathbf{O}= \mathbf{P}\,\mathbf{V},
+\]
+
+where \(\mathbf{Q},\mathbf{K},\mathbf{V}\in\mathbb{R}^{N\times d}\) are query, key and value tensors,
+\(N\) is the sequence length and \(d\) the head dimension.  
+The two multiplications (\(\mathbf{Q}\mathbf{K}^\top\) and \(\mathbf{P}\mathbf{V}\)) are dense **GEMMs** that run on NVIDIA’s Tensor Cores at several hundred teraflops per GPU.  
+The **softmax** step – essentially a row‑wise exponentiation followed by a reduction – is orders of magnitude slower because it executes on the multi‑function unit (MFU), which on an H100 delivers only a few teraflops of exponential throughput.
+
+If we simply run these three steps sequentially, the MFU becomes a choke point: even though GEMMs dominate the FLOP count, their execution time is limited by how long we spend waiting for the softmax to finish.  
+
+> **Rule of thumb on H100**  
+> *FP16 matmul*: ~989 TFLOPs/s  
+> *Exponential*: ~3.9 TFLOPs/s  
+> → Softmax can eat up ~50 % of total cycles despite contributing <2 % of FLOPs.
+
+FlashAttention‑3 tackles this asymmetry with a clever overlap strategy it calls **ping‑pong scheduling**.
+
+---
+
+## 2. Hopper’s asynchronous engine – why we can overlap
+
+The Hopper architecture introduced two ingredients that make an overlap possible:
+
+| Feature | What it gives us |
+|---|---|
+| **Tensor Core asynchrony** (WGMMA instruction) | A matmul can be *launched* without stalling the issuing warp; results become available later via a hardware completion flag. |
+| **Tensor Memory Accelerator (TMA)** | Asynchronous copy between global memory (HBM) and shared memory (SMEM) runs in parallel with compute units. |
+| **Warp specialisation** | Within a CTA we can assign some warps only to data movement (producers) and other warps only to computation (consumers). This clean separation lets the compiler generate tight pipelines without unnecessary register spilling. |
+
+These primitives allow us to start a GEMM, immediately move on to other work (e.g., exponentials), and later synchronize only when we truly need the result.
+
+---
+
+## 3. Ping‑pong scheduling – the two‑stage pipeline
+
+At its core, ping‑pong scheduling reorganises one iteration of attention into **two overlapping stages** that run on *different* warp groups:
+
+1. **Stage A (producer warpgroup)** – loads the next key/value blocks from HBM into SMEM using TMA. This work is independent of any computation currently happening in Stage B.  
+2. **Stage B (consumer warpgroup)** – simultaneously performs three things:
+   * **GEMM 0** – multiplies the current query block \(\mathbf{Q}_i\) with the *previous* key block \(\mathbf{K}_{j-1}^\top\).  
+   * **Softmax** – takes the score matrix \(\mathbf{S}_{j-1}= \alpha\,\mathbf{Q}_i\mathbf{K}_{j-1}^\top\) produced by GEMM 0, subtracts its row‑wise max, exponentiates and accumulates row sums (\(\ell_i\)).  
+   * **GEMM 1** – multiplies the freshly computed probability block \(\widetilde{\mathbf{P}}_{j-1}=e^{\mathbf{S}_{j-1}-m_i}\) with the *previous* value block \(\mathbf{V}_{j-1}\).
+
+Crucially **the next GEMM 0** – i.e., \(\alpha\,\mathbf{Q}_i \mathbf{K}_{j}^\top\) – is launched *before* we finish Softmax for \(\mathbf{S}_{j-1}\). Because WGMMA is asynchronous we do not wait for its completion; instead we store its output registers (\(\mathbf{S}_{j}^{\text{next}}\)) in temporary buffers and move on to Softmax for \(\mathbf{S}_{j-1}\).  
+
+The sequence looks like this:
+
+```
+loop j = 0 … T_c−1
+    // ---------- Producer ----------
+    async load K_j , V_j  → SMEM          // TMA
+    // ---------- Consumer ----------
+    async WGMMA Q_i × K_j      → S_next // launch GEMM 0
+    async WGMMA P_cur × V_{j−1} → O_i    // launch GEMM 1
+    wait for S_next                // required for next Softmax
+    compute Softmax(S_cur) → P_cur // exponentials + reductions
+    // swap roles for next iteration (ping ↔ pong)
+```
+
+Because each iteration performs both a **GEMM 0** *(future)* and a **GEMM 1** *(past)* while Softmax works on the *current* block, every warp group flips between “softmax” and “matmul” duties—hence the name **ping‑pong**.
+
+### Visualising the timeline
+
+```
+time →
++--------------------------+--------------------------+--------------------------+
+|  Warp A : load K,V       |  Warp B : Softmax        | Warp A : load K,V       |
+|  Warp B : GEMM0(Q,K_j)   |  Warp A : GEMM0(Q,K_{j+1})|  Warp B : GEMM1(P,V_{j})|
+|  Warp A : GEMM1(P,V_{j−1})|  …                      | …                        |
++--------------------------+--------------------------+--------------------------+
+```
+
+While Warp A is busy moving data or launching a new matmul, Warp B is chewing through exponentials that would otherwise sit idle waiting for Tensor Cores.
+
+---
+
+## 4. Breaking dependencies – why this works
+
+Naïvely, softmax depends on `S = QKᵀ`, which depends on `K`, which in turn must be loaded from global memory before any computation can start. FlashAttention‑3 sidesteps these sequential constraints by introducing *double buffering*:
+
+* Two SMEM slots hold key/value tiles (`K_j`, `V_j`) so that while one slot feeds a running Gemm,
+another slot can be filled by an asynchronous TMA issued by a different warp group.
+* Intermediate score matrices (`S_cur`, `S_next`) live in registers across iterations,
+allowing us to issue “next‑block” gemms ahead of time without waiting for their results.
+
+Thus every dependency chain becomes either:
+* **asynchronous** ‑‑​which we simply launch early,
+* **local** ‑‐​which resolves within registers,
+or
+* **synchronised** ­–​via an explicit `bar.sync` only when a result is truly needed (e.g., before computing `exp`).
+
+---
+
+## 5. How much speed do we actually get?
+
+### Theory
+
+Softmax throughput on Hopper ≈ \(3.9~\text{TFLOPs/s}\); FP16 GEMM throughput ≈ \(989~\text{TFLOPs/s}\).  
+If both operations run sequentially, effective speed becomes
+
+\[
+\frac{\text{FLOPs}}{\frac{\text{FLOPs}_\text{gemm}}{\rho_\text{gemm}}+\frac{\text{FLOPs}_\text{sftmx}}{\rho_\text{sftmx}}}
+\simeq
+\rho_\text{gemm} \big/ \!\bigl(1+\tfrac{\rho_\text{sftmx}}{\rho_\text{gemm}}\bigr)
+\,,
+\]
+
+where \(\rho_\*\) denotes per‑operation throughput. Because \(\rho_{\text{sftmx}} / \rho_{\text{gemm}} \approx 0.004\), user‑visible utilisation drops dramatically once we include softmax latency.
+
+When we overlap them as in ping‑pong scheduling, softmax runs *concurrently* with another gemm that already consumes almost all Tensor Core capacity. The effective utilisation climbs close to that of pure gemm—empirically around **75 %**, i.e., ~740 TFLOPs/s for FP16 forward passes—giving us a **1.5–2× speedup** over FlashAttention‑2 which lacks this overlap.
+
+### Real numbers
+
+| Precision | Baseline FlashAttention‑2 | FlashAttention‑3 (ping‑pong) | Speedup |
+|-----------|---------------------------|------------------------------|---------|
+| FP16 FWD  | ~570 TFLOPs/s            | ~620–740 TFLOPs/s            | ×1.5–2 |
+| FP16 BWD  | ~400 TFLOPs/s            | ~600–700 TFLOPs/s            | ×1.5–1.75 |
+| FP8 FWD   | —                         | ~1.2 PFLOPs/s                | — |
+
+The gains come primarily from hiding softmax; other optimisations such as warp‐specialised producers/consumers give additional modest boosts but are not required for ping‑pong scheduling itself.
+
+---
+
+## 6. Practical tips & gotchas
+
+* **Compiler reordering** – NVCC may reshuffle instructions for its own optimisation passes. Verify with SASS inspection that `WGMMA` launches precede `exp`/`reduce` kernels; otherwise insert explicit `bar.sync` fences where needed.
+* **Register pressure** – Holding `S_next` plus temporary accumulators across iterations consumes roughly \(B_r\times B_c\times4~\text{bytes}\) per threadblock. Too large tile sizes (`B_r`, `B_c`) can cause spilling—profile your kernel with `nvprof` or Nsight Compute to find the sweet spot.
+* **Pipeline depth** – Extending from two stages to three stages would let us overlap even *both* gemms (`QKᵀ` and `PV`) with softmax, but each extra stage adds another copy of `S` in registers → higher register demand → potentially lower occupancy.
+* **Causal masking** – When masking halves the score matrix you still get similar overlap benefits; just make sure mask handling occurs before or after applying `exp`, not in between gemms where it would break pipelining.
+* **Mixed precision** – The same scheme works equally well in FP8 once operand layout constraints are satisfied (k-major format). In FP8 you get roughly double matmul throughput while MFU remains unchanged—overlap becomes even more valuable.
+
+---
+
+## 7. Takeaways
+
+* On modern GPUs like Hopper, matrix multiplies are *vastly* faster than elementwise functions such as exponentials.
+* By treating attention as a producer–consumer pipeline across warp groups—and by deliberately swapping responsibilities each iteration—we can keep both Tensor Cores *and* MFUs busy all the time.
+* The resulting “ping‑pong” schedule turns what used to be an idle side effect of serial execution into continuous work, delivering up-to‑2× speedups without changing any mathematical semantics of attention.
+* Because pipelining relies only on asynchronous launches (`WGMMA`, `TMA`) and simple barrier synchronisation, it can be transplanted to any GPU architecture offering similar async primitives—not just NVIDIA H100s.
+
+FlashAttention‑3’s ping‑pong scheduling shows how thoughtful software design—aware of hardware quirks—can squeeze out performance far beyond what raw FLOP counts suggest. If you’re building your own transformer kernels or thinking about long‐context inference on new accelerators, consider whether your “slow” operations can be tucked under a fast matrix multiplication using exactly this idea.
+
+--- 
+
+### References  
+
+(Only papers cited in our discussion)
+
+* Dao et al., “FlashAttention,” *NeurIPS*, 2022.  
+* Dao et al., “FlashAttention‑2,” *arXiv*, 2023.  
+* NVIDIA CUDA Programming Guide – Tensor Core & TMA sections (§7–9).  
+
+Feel free to check out the open‐source implementation at https://github.com/Dao-AILab/flash-attention !
+
+
+
+# FP8 Low‑Precision Attention: Speed Without Sacrificing Accuracy  
+
+*How a careful redesign of the attention kernel makes the new FP8 Tensor Cores on NVIDIA Hopper both fast **and** numerically stable.*
+
+---
+
+## 1. The pressure point – attention at scale  
+
+Transformer models rely on the scaled dot‑product attention  
+
+\[
+\mathbf{S}= \frac{1}{\sqrt{d}}\;\mathbf{Q}\mathbf{K}^{\!\top},
+\qquad
+\mathbf{P}= \operatorname{softmax}(\mathbf{S}),
+\qquad
+\mathbf{O}= \mathbf{P}\mathbf{V},
+\]
+
+where $\mathbf{Q},\mathbf{K},\mathbf{V}\in\mathbb{R}^{N\times d}$ are the query, key and value matrices, $N$ is the sequence length and $d$ is the head dimension.  
+Because $\mathbf{S}$ has size $N\times N$, the computation scales quadratically in $N$ and quickly becomes the dominant cost in large language models (LLMs) or long‑context applications.
+
+Exact‐attention kernels such as **FlashAttention‑2** removed costly global‑memory traffic by fusing all operations into a single kernel, but even there the compute units on modern GPUs were under‑utilized—only about 35 % of the Hopper H100’s peak performance was reached. The authors of *FlashAttention‑3* asked a simple question: **Can we tap the new hardware features—especially asynchronous Tensor Core execution and native FP8 support—to double our FLOP throughput without breaking numerical fidelity?**
+
+---
+
+## 2. From FP16 to native FP8 – what changes?  
+
+Hopper’s Tensor Cores expose a new `WGMMA` instruction that can operate directly on **FP8** operands (`e4m3`). In raw terms this gives roughly **2× higher matmul throughput** compared with FP16 or BF16—an attractive proposition for a FLOP‑heavy operation like attention.
+
+However, moving from FP16 to FP8 is not a drop‑in change because `WGMMA` imposes stricter **layout constraints**:
+
+| Operand | Acceptable layout (FP16) | Acceptable layout (FP8) |
+|--------|--------------------------|------------------------|
+| $A$ (first matrix) | mn‑major **or** k‑major | **k‑major only** |
+| $B$ (second matrix) | mn‑major **or** k‑major | **k‑major only** |
+| Accumulator (FP32) | mn‑major | **k‑major mismatch** |
+
+*mn‑major* means contiguous along the outer dimension (rows), while *k‑major* means contiguous along the inner reduction dimension. For attention we normally store $\mathbf{V}$ column‑wise (contiguous in head dimension) which satisfies the fp16 requirement but fails the fp8 *k‑major* rule for the second GEMM ($\widetilde{\mathbf P}\,\mathbf V^{\top}$). Moreover, after the first GEMM the fp32 accumulator’s registers are laid out differently from what the second GEMM expects as its input tile.
+
+If we tried to keep the original memory layout unchanged, we would need an expensive global transpose—precisely what FlashAttention was designed to avoid. The solution in FlashAttention‑3 is twofold:
+
+1. **In‑kernel transposition using LDSM/STSM** – These warp‐level matrix load/store instructions can move data between shared memory (SMEM) and registers while performing a transpose at virtually no extra bandwidth cost.
+2. **Register‐level permutation** – After each `WGMMA` we permute registers (`d0 d1 d4 d5 …`) so that the fp32 accumulator matches the *k–major* shape expected by the next `WGMMA`. This permutation is cheap because it operates only on registers inside a warp.
+
+Together these tricks let us feed each `WGMMA` exactly what it needs without any extra global memory passes, preserving FlashAttention’s hallmark of **no intermediate reads/writes to HBM**.
+
+---
+
+## 3. Quantization error – why naïve FP8 fails  
+
+Even if layout constraints are solved, moving from 16 bits to only **8 bits** introduces *quantization noise*. The standard practice for low‐precision kernels is *per‑tensor scaling*: a single scale factor $\sigma$ compresses an entire tensor into FP8 before matmul, while accumulators stay in fp32.
+
+In practice LLMs contain *outlier* activations—rare entries that are orders of magnitude larger than most values (e.g., due to layer normalization or residual connections). With only three mantissa bits (`e4m3`), a single scale factor cannot simultaneously preserve fine granularity for typical values *and* represent outliers without severe clipping or overflow. The consequence observed in earlier work was a noticeable degradation of attention quality when using naïve fp8 quantization.
+
+FlashAttention‑3 addresses this problem with **two complementary techniques** that naturally fit into its blockwise algorithmic structure:
+
+### 3.1 Block quantization  
+
+Instead of one scale per whole tensor, we compute a separate scale per *tile* (the same tiles that are already processed independently by the kernel). Concretely:
+
+- Divide $\mathbf Q$, $\mathbf K$, $\mathbf V$ into blocks of size $B_r\times d$ or $B_c\times d$.
+- For each block compute $\sigma_{\text{block}} = \max(|x|)$ over its entries and use it to map values into fp8.
+- Because each block is already loaded into shared memory anyway, applying its own scale costs essentially nothing extra—just a multiplication before writing into fp8 registers.
+
+This *blockwise* scaling dramatically reduces saturation of outliers while keeping most values within fp8’s dynamic range, thereby lowering quantization error without impacting throughput.
+
+### 3.2 Incoherent processing  
+
+Even block scales cannot fully eliminate bias introduced by extremely large entries spreading across many blocks. To “even out” these outliers before quantization we premultiply both $\mathbf Q$ and $\mathbf K$ by an orthogonal matrix $\mathbf M$:
+
+\[
+\widetilde{\mathbf Q}= \mathbf Q \,\mathbf M,
+\qquad
+\widetilde{\mathbf K}= \mathbf K \,\mathbf M,
+\qquad
+\widetilde{\mathbf Q}\,\widetilde{\mathbf K}^{\!\top}= \mathbf Q\,\mathbf K^{\!\top}.
+\]
+
+Since $\mathbf M$ is orthogonal ($\mathbf M\,\mathbf M^{\!\top}=I$), the dot product—and thus all attention scores—stay unchanged mathematically. In implementation we use a product of random sign diagonal matrices and a Hadamard matrix, which can be applied in $O(d \log d)$ time per block and fused with other linear operations such as rotary embeddings at zero extra cost.
+
+The net effect is that each entry of $\widetilde{\mathbf Q}$ or $\widetilde{\mathbf K}$ becomes a random linear combination of many original entries, dispersing any rare spikes across all dimensions. When subsequently quantized with block scales, this “incoherence” yields markedly smaller absolute errors than directly quantizing raw tensors.
+
+---
+
+## 4. Putting it together – FlashAttention‑3’s fp8 pipeline  
+
+FlashAttention‑3 retains the producer–consumer warp specialization introduced in FlashAttention‑2:
+
+- A *producer* warpgroup asynchronously loads blocks of $\mathbf K$/$\mathbf V$ from global memory using Tensor Memory Accelerator (TMA).
+- A *consumer* warpgroup runs two `WGMMA` calls per iteration:
+  1. Compute $\mathbf S = \frac{1}{\sqrt d}\,\widetilde{\mathbf Q}\,\widetilde{\mathbf K}^{\!\top}$.
+  2. After softmax operations generate $\widetilde{\mathbf P}$, compute $\widetilde{\mathbf O}= \widetilde{\mathbf P}\,\widetilde{\mathbf V}$.
+
+Because `WGMMA` is asynchronous on Hopper, the kernel pipelines these two GEMMs across iterations (`pingpong` schedule). Meanwhile softmax’s exponential and reduction—a comparatively slow operation—runs while another warpgroup performs its GEMMs, fully hiding non‐matmul latency.
+
+Crucially, **block quantization** fits seamlessly: each tile’s scale is known before it reaches shared memory so loading can be performed already in fp8 form; likewise incoherent processing can be folded into the same launch that applies rotary embeddings or any other pre‐attention linear transform—all without additional memory traffic or kernel launches.
+
+The overall effect is an *exact* attention implementation (softmax still computed in fp32 accumulation) that enjoys:
+
+- **~2× higher raw FLOP throughput**, measured at ≈ 1.2 PFLOPs /s on an H100 SXM5 when running in fp8.
+- **~75 % utilisation** of Hopper’s theoretical tensor core peak (~740 TFLOPs /s for fp16), showing that asynchrony fully saturates compute units.
+- **Significant accuracy improvement**, achieving **2.6× lower RMSE** compared with a baseline fp8 kernel that uses only per‐tensor scaling—a result validated on synthetic data containing heavy-tailed outliers typical for large language models.
+
+---
+
+## 5. Why this matters  
+
+### Faster inference for long contexts  
+Long‐sequence tasks (e.g., document retrieval over > 10k tokens or codebase navigation) are limited by quadratic attention cost. Doubling matmul throughput directly translates into lower latency for these workloads without sacrificing model quality because numerical error stays within twice–fp16 precision bounds.
+
+### Power efficiency  
+FP8 halves both arithmetic intensity and memory bandwidth per element compared with fp16 while delivering roughly double performance—meaning more FLOPs per watt. For data centre deployments where power budget dominates TCO, this improvement carries tangible economic benefits.
+
+### Compatibility with existing software stacks  
+FlashAttention‑3 is released under an permissive license and already integrates with PyTorch/HuggingFace via an easy drop-in call (`flash_attn`). Users can continue training or serving models written for standard FlashAttention without code changes—only an optional flag selects fp8 mode together with block quantization turned on automatically when appropriate precision hardware is detected.
+
+---
+
+## 6. Takeaways  
+
+| Aspect | Traditional FlashAttention (​FP16​) | FlashAttention‑3 (​FP8​) |
+|-------|------------------------------------|--------------------------|
+| Compute throughput | ≈ 740 TFLOPs /s (~75 % peak) | ≈ 1.2 PFLOPs /s (~80–85 % peak) |
+| Memory traffic | One pass per tile | Same single pass – no extra transposes |
+| Layout handling | Simple mn/k–major flexibility | In‐kernel transpose + register permute |
+| Quantization error | N/A (full precision) | 2.6× lower RMSE vs baseline fp8 |
+| Complexity | Unified kernel | Additional pre/post processing fused into existing pipeline |
+
+The key message: **Hardware aware kernel design plus modest algorithmic tricks can unlock native FP8 speed without compromising numerical stability**, making low precision an attractive default for future Transformer workloads on Hopper—and likely on any accelerator that provides asynchronous matmul units plus fast low‐precision support.
+
+---
+
+## 7. Looking forward  
+
+FlashAttention‑3 demonstrates how much room remains in well‐studied primitives when we let software follow hardware evolution closely:
+
+- Future work may bring persistent kernels for fp8 as well as deeper pipelining stages beyond two.
+- Extending incoherent processing to training pipelines could further shrink rounding errors during backpropagation.
+- Similar ideas should translate to other GPUs (e.g., Blackwell with FP4 support) or even specialized AI accelerators where asynchronous compute paths exist.
+
+For now, developers eager to squeeze more performance out of their H100 nodes can try FlashAttention‑3 directly from its GitHub repo (`https://github.com/Dao-AILab/flash-attention`) and enjoy near‐optimal utilization whether they run decoder-only LLMs or encoder models handling multi–modal long streams.
+
+---
+
+*FlashAttention‑3 shows that precision loss need not be synonymous with accuracy loss—a well–engineered pipeline can give you both speed and confidence.*
+
+
+
+# What 1.2 PFLOPs on an H100 Means for Real‑World AI  
+
+*Translating the raw FLOP numbers from FlashAttention‑3 into concrete benefits for LLM inference, training, and long‑context applications.*
+
+---
+
+## Introduction  
+
+The Transformer’s self‑attention layer is the classic “quadratic bottleneck”: computing the $N\times N$ score matrix costs $O(N^2)$ operations even when all other parts of a model scale linearly. When $N$ reaches a few thousand tokens—common in code completion, multi‑document QA, or video understanding—the raw number of floating‑point operations becomes the dominant factor in latency and energy consumption.
+
+FlashAttention (2022) showed that much of this cost is wasted on moving intermediate results between global memory and registers. By fusing all attention steps—matmul, softmax, and the final multiplication—into a single kernel it eliminated those extra reads/writes and delivered a sizable speedup on older GPUs.  
+
+FlashAttention‑2 extended the idea to parallelize over the sequence dimension but still left plenty of hardware idle on NVIDIA’s Hopper H100: measured utilization was only ~35 % compared with ~80–90 % that optimized GEMM kernels achieve.  
+
+Enter **FlashAttention‑3**—a redesign that exploits *asynchrony* and *low‑precision* units native to Hopper. The result? Up to **740 TFLOPs / s** in FP16 (75 % of H100’s peak) and **≈1.2 PFLOPs / s** in FP8, together with a **1.5–2×** speedup over FlashAttention‑2 on both forward and backward passes.
+
+Below we unpack why those raw FLOP numbers matter and how they translate into tangible gains for today’s AI workloads.
+
+---
+
+## FLOPs as a performance yardstick  
+
+A FLOP (floating‑point operation) count tells us how much arithmetic a kernel performs; *TFLOPs/s* (teraflops per second) or *PFLOPs/s* (petaflops per second) measure how fast those operations are executed on a given device. In practice:
+
+| Metric | What it reflects |
+|--------|------------------|
+| **Utilization** | Ratio of achieved FLOPs to the theoretical peak of the GPU (e.g., H100 peaks at ≈990 TFLOPs / s in FP16). Higher utilization means fewer idle cycles. |
+| **Throughput → Tokens/sec** | Attention FLOP count ≈ $4\cdot \text{seqLen}^2\cdot d_{\text{head}}\cdot n_{\text{heads}}$ (forward pass). Dividing measured TFLOPs/s by this expression gives the number of tokens a single GPU can process per second at a given sequence length and model size. |
+| **Energy efficiency** | More FLOPs per watt → lower electricity bill per token processed—a non‑trivial factor when running large LLM clusters round‑the‑clock. |
+
+Thus moving from 35 % → 75 % utilization is not just an engineering vanity metric—it directly halves the wall‑clock time needed for any attention‑heavy workload at unchanged power draw.
+
+---
+
+## FlashAttention‑3: Squeezing more out of Hopper  
+
+FlashAttention‑3 builds on three hardware‑aware ideas that together push utilization far higher:
+
+1. **Producer–consumer asynchrony via warp specialization**  
+   - A CTA’s warps are split into **producers** (only issue tensor memory accelerator—TMA—loads) and **consumers** (only issue Tensor Core matrix multiplications).  
+   - Because TMA transfers are *asynchronous*, producers can keep feeding new blocks while consumers are crunching previous ones, effectively hiding memory latency behind compute.
+
+2. **Ping‑pong scheduling – overlapping softmax with GEMM**  
+   - Softmax involves exponentials and reductions that run at only a few TFLOPs/s on Hopper’s special‐function units—orders of magnitude slower than Tensor Core matmuls (~990 TFLOPs/s).  
+   - By pipelining two warp groups (“ping” does GEMM while “pong” does softmax on the previous block) they occupy both units simultaneously, raising overall occupancy from ~570 TFLOPs/s up to ~620–640 TFLOPs/s even before applying low precision.
+
+3. **Hardware‑accelerated FP8 GEMM + accuracy tricks**  
+   - Hopper’s Tensor Cores support an FP8 data path that doubles matmul throughput relative to FP16/BF16.  
+   - Using **block quantization** (a scale per tile rather than one per whole tensor) reduces quantization error locally.  
+   - **Incoherent processing** multiplies Q and K by a random orthogonal matrix before quantization, spreading out outliers so they don’t dominate a single tile’s scaling factor.  
+   - Together these yield an **FP8 implementation that is 2.6× more accurate** than naïve per‑tensor scaling while enjoying nearly double raw FLOP rates.
+
+The net effect is a *single* attention kernel that runs at roughly three quarters of H100’s peak performance in FP16 and surpasses one petaflop in FP8—a first for exact attention kernels.
+
+---
+
+## FP16 at ~740 TFLOPs/s – what “twice as fast” looks like  
+
+### Inference latency  
+
+Consider an LLM with hidden size $2048$, $12$ heads each $d_{\text{head}}=128$, generating text at context length $N=4096$. The forward attention FLOP count is:
+
+\[
+\text{FLOPs}_{\text{fwd}} = 
+4 \times N^2 \times d_{\text{head}} \times n_{\text{heads}}
+      = 4 \times 4096^2 \times 128 \times 12 
+      \approx 25\,\text{TF} .
+\]
+
+At FlashAttention‑3’s $740\,\text{TF}/\text{s}$ this block finishes in roughly:
+
+\[
+\frac{25\,\text{TF}}{740\,\text{TF}/\text{s}} \approx 34\,\text{ms}.
+\]
+
+FlashAttention‑2 running at half that throughput would take ≈68 ms—a perceivable latency gap in interactive chat settings where sub‑50 ms responses feel “instant”.
+
+### Throughput & batch size  
+
+If you double batch size while keeping latency constant you roughly double overall token throughput—useful for serving multiple users from a single GPU or accelerating beam search where each step processes many hypotheses simultaneously.
+
+### Training speed  
+
+Training requires both forward and backward passes; FlashAttention‑3 delivers **1.5–1.75×** speedup in the backward pass too because the same producer–consumer pipeline applies after recomputing intermediate gradients. For a typical pretraining run costing $10^5$ GPU hours, cutting time by even one third translates into millions of dollars saved in cloud compute budgets.
+
+### Energy savings  
+
+Since power draw stays roughly constant across kernels (the Tensor Cores stay busy either way), halving wall–clock time cuts energy consumption per token by almost half—critical when scaling up LLM training clusters into megawatt territories.
+
+---
+
+## Going FP8 – ≈1.2 PFLOPs/s opens new horizons  
+
+### Doubling matmul throughput  
+
+FP8 halves operand width relative to FP16 while retaining essentially the same exponent range through e4m3 format (+/- 448). Hopper’s Tensor Cores therefore execute two FP8 matmuls in parallel where one FP16 matmul would run—a *theoretical* $2\times$ speedup which FlashAttention‑3 realizes empirically (~1.0–1.25 PFLOPs/s).
+
+### Longer contexts without extra hardware  
+
+Because attention cost scales quadratically with sequence length ($N^2$), extending context windows dramatically amplifies required FLOPs:
+
+| Context length | Forward FLOPs @ dₕₑₐd=128,nₕ=12 | Time @ 740 TF/s (FP16) | Time @ ≈1 PF / s (FP8) |
+|----------------|------------------------------|------------------------|----------------------|
+| 4K | ~25 TF | ~34 ms | ~25 ms |
+| 8K | ~100 TF | ~135 ms | ~~100 ms |
+| 16K | ~400 TF | ~~540 ms | ~~400 ms |
+
+With an FP8 implementation you can process twice as many tokens within the same budgeted latency budget—a decisive advantage for applications like *retrieval‑augmented generation* where you need to attend over several documents simultaneously or *video transformers* where each frame becomes another token slice.
+
+### Quality stays realistic  
+
+Low precision often scares practitioners because errors could cascade through deep networks. FlashAttention‑3 mitigates this by:
+
+* Quantizing each tile independently (**block quantization**) so large outliers don’t dominate an entire matrix scale.
+* Randomly rotating Q/K before quantization (**incoherent processing**) which “spreads” out extreme values.
+  
+Empirically this yields **2.6× lower RMSE** compared with baseline FP8 attention that uses only per‐tensor scaling—making it viable for most downstream tasks where small numerical drift is tolerable after fine‐tuning or post‐hoc calibration.
+
+---
+
+## Real‑world scenario digest  
+
+Below are concrete ways these numbers impact everyday AI workloads:
+
+| Scenario | Benefit from ~740 TF/s (FP16) | Benefit from ~1.2 PF/s (FP8) |
+|----------|------------------------------|------------------------------|
+| **Chatbot with persistent memory** – store prior turns up to tens of thousands tokens | Latency drops from >70 ms → <40 ms when serving multiple concurrent conversations on a single H100 | Same latency achievable even when extending memory window from 4K → 12K tokens without adding hardware |
+| **Retrieval‐augmented generation** – attend over top‐k retrieved passages (~10k tokens total) | Ability to batch more queries per GPU → higher QPS / lower cost | Double QPS while keeping retrieval set size unchanged |
+| **Large codebase navigation** – indexing entire repo (~20k lines) during inference | Faster compilation‐time suggestions → smoother IDE experience | Allows full repo indexing without splitting files across GPUs |
+| **Video understanding** – frame‐level attention across hundreds of frames (each frame ≈768 tokens after patch embedding) | Process longer clips within real-time constraints (<30 fps) using fewer GPUs | Cut required GPUs by half for high‐resolution video streams |
+| **Training huge LLMs** – billions of parameters across multi‐node clusters | Reduce epoch time by ∼30–40 % → lower cloud spend | Potentially halve training wall‐time if fp8 mixed precision pipelines are adopted end-to-end |
+
+In short: **more FLOP capacity translates directly into either lower latency for fixed workloads or higher throughput when scaling out**, while energy costs stay roughly stable thanks to higher unit utilization.
+
+---
+
+## Accuracy under the hood  
+
+FlashAttention‑3 keeps *softmax intermediate results* in FP32 even when Q/K/V themselves are stored in lower precision—this mirrors what FlashAttention‑2 did for FP16 but extends nicely into fp8 territory thanks to blockwise scaling tricks. Consequently:
+
+* In FP16 both FlashAttention versions achieve about *1½× lower RMSE* versus vanilla PyTorch attention.
+* In fp8 the baseline “per-tensor scaling” version suffers noticeable drift due to outliers; adding block quantization + incoherent processing improves RMSE by **≈2.6×**, making fp8 practical even for models known to have heavy-tailed activation distributions (e.g., GPT‑style LLMs).
+
+Thus you get raw speed without sacrificing model quality beyond what downstream fine-tuning can absorb.
+
+---
+
+## Limitations & what’s next  
+
+FlashAttention‑3 already shines on Hopper GPUs, yet some aspects remain work in progress:
+
+* The current fp8 kernel does not yet use a *persistent kernel* design—so very short sequences or aggressive causal masking see modest gains compared with cuDNN’s hand‑tuned kernels.
+* Scaling beyond single H100 cards will require careful load balancing across multiple SM clusters—a challenge already tackled partially by FlashAttention‑3’s warp specialization but still open for future research.
+* Full mixed‑precision training pipelines (`fp8` forward + `fp32` backward accumulator) need further validation at multi‐node scale before being adopted industry-wide.
+
+The authors plan integration with PyTorch/Hugging Face so developers can drop‐in replace `torch.nn.functional.scaled_dot_product_attention` with FlashAttention‑3 without rewriting models—a critical step toward broader adoption.
+
+---
+
+## Conclusion  
+
+Hitting **≈1 PFLOP/s** on an exact-attention kernel is more than an impressive benchmark headline—it reshapes realistic expectations around what can be done on a single H100 today:
+
+* **Inference:** Substantial latency reductions open doors for truly conversational agents with long memories.
+* **Training:** Faster forward/backward passes cut expensive GPU hours dramatically.
+* **Long Context:** Quadratic cost no longer forces engineers to truncate inputs arbitrarily; sequences twice as long become tractable under identical hardware budgets.
+* **Energy:** Higher utilization equals better performance-per-watt—an increasingly important metric as AI workloads dominate data center power envelopes.
+
+With FlashAttention‑3 turning those theoretical petaflops into everyday productivity gains, we’re witnessing a decisive step toward making ever larger context windows—and consequently richer AI capabilities—available at scale today rather than tomorrow.
+
+
+
+# A Beginner’s Guide to Building Faster Transformers with FlashAttention‑3  
+
+*Quickly get your PyTorch or Hugging Face models running on NVIDIA Hopper GPUs with the new FlashAttention‑3 kernel.*
+
+---
+
+## Why FlashAttention‑3?
+
+Self‑attention is the heavy‑weight operation in every Transformer model:
+
+\[
+S = \alpha\, QK^\top,\qquad 
+P = \operatorname{softmax}(S),\qquad 
+O = PV,
+\]
+
+with $\alpha=1/\sqrt{d}$ (the head dimension).  
+For a sequence of length $N$, the quadratic cost of $QK^\top$ dominates both training and inference—especially when $N$ reaches several thousand tokens.
+
+FlashAttention‑2 already eliminated most global‑memory traffic by fusing the three steps into a single kernel.  
+FlashAttention‑3 goes further by exploiting **Hopper‑specific hardware features**:
+
+| Feature | What it does | Benefit |
+|---|---|---|
+| **Producer–consumer asynchrony + warp specialization** | Separate warps handle data movement (TMA) and matrix multiplication (WGMMA) so that memory loads never stall compute | ≥ 75 % TFLOP utilization on H100 |
+| **GEMM–softmax pipelining (“ping‑pong”)** | While one warpgroup computes a block of $QK^\top$, another warpgroup simultaneously runs the softmax of the previous block | 1.5–2× speed‑up over FlashAttention‑2 |
+| **Hardware‑accelerated FP8 + block quantization + incoherent processing** | Uses FP8 Tensor Cores (≈ 2× higher matmul throughput) together with per‑tile scaling and a random orthogonal “mixing” matrix to keep quantisation error low | Up to **1.2 PFLOP/s** compute and **2.6×** lower numerical error than naïve FP8 |
+
+In practice you get:
+
+* **FP16**: up to **740 TFLOP/s** (≈ 75 % of H100 peak) → 1.5–2× faster than FlashAttention‑2.
+* **FP8**: close to **1.2 PFLOP/s** → roughly double the raw matmul throughput while staying accurate thanks to block quantisation.
+* Same exact‐attention results as the full‐precision baseline because intermediate softmax values are kept in FP32 internally.
+
+All of this lives in an easy‑to‑install Python library that plugs directly into PyTorch or Hugging Face Transformers.
+
+
+---
+
+## 1️⃣ Hardware you need
+
+FlashAttention‑3 is built around two Hopper primitives:
+
+* **Tensor Memory Accelerator (TMA)** – asynchronous HBM→SMEM copies.
+* **Warp‑group wide Matrix Multiply‑Accumulate (WGMMA)** – asynchronous Tensor Core GEMM that works on shared memory directly (including an FP8 mode).
+
+Therefore you need an NVIDIA GPU that implements Hopper’s SM architecture (**SM90**) – e.g.:
+
+| GPU | Compute capability | Peak FP16 / FP8 TFLOP |
+|---|---|---|
+| H100 SXM5 / PCIe 80 GB | sm_90 | ≈ 989 TFLOP/s (FP16) / ≈ 1.98 PFLOP/s (FP8) |
+
+Older GPUs still run the library but will fall back to the slower Ampere‐style kernels and won’t see the full speed gains.
+
+
+---
+
+## 2️⃣ Installing FlashAttention‑3
+
+The authors ship FlashAttention‑3 under the same repository used for earlier versions:
+
+```bash
+# 1️⃣ Clone the repo
+git clone https://github.com/Dao-AILab/flash-attention.git
+cd flash-attention
+
+# 2️⃣ Make sure you have CUDA ≥12.0 (required for TMA / WGMMA)
+#    Verify with `nvcc --version`.
+
+# 3️⃣ Build for Hopper (sm_90). Setting TORCH_CUDA_ARCH_LIST forces compilation against Hopper ISA.
+export TORCH_CUDA_ARCH_LIST="90"
+
+# 4️⃣ Install – this compiles a custom Torch extension.
+pip install -e .   # editable install; replace with `pip install .` for a regular install
+```
+
+If you just want a binary wheel and are already on a Hopper system:
+
+```bash
+pip install flash-attn   # picks up the prebuilt sm_90 wheels when they exist
+```
+
+> **Tip:** The build will automatically enable *fp8* support when it detects SM90 hardware. No extra flags are needed.
+
+
+---
+
+## 3️⃣ Using FlashAttention‑3 in pure PyTorch
+
+### 3.1 The low‑level API (`flash_attn_func`)
+
+FlashAttention‑3 ships a thin wrapper around the kernel:
+
+```python
+from flash_attn import flash_attn_func
+
+# Q,K,V shapes expected by the kernel:
+#   [batch * nheads , seqlen , head_dim]   -> float16 or float8_e4m3fn
+def fast_attention(Q, K, V, causal=False):
+    """
+    Returns O ∈ ℝ^{B·H × T × d} where B=batch size,
+    H=num heads, T=seq_len, d=head_dim.
+    """
+    return flash_attn_func(Q,
+                           K,
+                           V,
+                           dropout_p=0.0,
+                           softmax_scale=None,
+                           causal=causal)
+```
+
+The function does exactly what you wrote out above (`QKᵀ → softmax → PV`) **without ever materialising** the $N\times N$ score matrix in global memory.
+
+
+### 3.2 A drop‑in multi‑head attention module
+
+Below is a minimal MHA implementation that swaps out the naïve matmul–softmax sequence for `flash_attn_func`. The code works both in FP16 and FP8 – just change the dtype of your inputs.
+
+```python
+import torch
+import torch.nn as nn
+from flash_attn import flash_attn_func
+
+class FlashMHA(nn.Module):
+    """
+    Multi‑head attention based on FlashAttention‑3.
+    """
+    def __init__(self,
+                 embed_dim: int,
+                 num_heads: int,
+                 dropout: float = 0.,
+                 dtype=torch.float16):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim   = embed_dim // num_heads
+        self.dtype     = dtype
+
+        # QKV projection + output projection – bias omitted for simplicity.
+        self.qkv_proj = nn.Linear(embed_dim,
+                                  embed_dim * 3,
+                                  bias=False,
+                                  dtype=dtype)
+        self.out_proj = nn.Linear(embed_dim,
+                                  embed_dim,
+                                  bias=False,
+                                  dtype=dtype)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self,
+                x: torch.Tensor,
+                causal: bool = False,
+                attn_mask: torch.Tensor | None = None):
+        """
+        x : [batch , seq_len , embed_dim]
+        attn_mask : optional boolean mask broadcastable to [batch , seq_len , seq_len]
+                    – e.g., padding mask.
+        """
+        B, T, _ = x.shape
+
+        # ---- Project ----
+        qkv = self.qkv_proj(x)                       # [B , T , 3·C]
+        qkv = qkv.view(B, T, 3, self.num_heads,
+                       self.head_dim).permute(2, 0, 3, 1,
+                                             4)      # [3 , B , H , T , d]
+
+        Q, K, V = qkv[0], qkv[1], qkv[2]             # each [B , H , T , d]
+
+        # ---- Collapse batch & heads -------------------------------------------------
+        # This matches {@code flash_attn_func}'s expected layout.
+        Q = Q.reshape(B * self.num_heads, T, self.head_dim)
+        K = K.reshape(B * self.num_heads, T, self.head_dim)
+        V = V.reshape(B * self.num_heads, T, self.head_dim)
+
+        # ---- Call kernel ------------------------------------------------------------
+        O = flash_attn_func(Q,
+                            K,
+                            V,
+                            dropout_p=self.dropout.p,
+                            causal=causal)
+
+        # ---- Restore original shape -------------------------------------------------
+        O = O.view(B, self.num_heads, T,
+                   self.head_dim).transpose(1, 2).contiguous()
+                     # → [B , T , H , d]
+        O = O.reshape(B, T, self.embed_dim)
+
+        return self.out_proj(O)
+```
+
+#### Using FP8  
+
+If your hardware supports fp8 Tensor Cores you can simply cast your inputs:
+
+```python
+# Cast model parameters once at start-up:
+model.to(torch.float8_e4m3fn)
+
+# Or work in mixed precision:
+with torch.autocast(device_type='cuda', dtype=torch.float16):
+    out = model(input_ids)
+```
+
+Internally FlashAttention‑3 will detect fp8 tensors and automatically switch to the **block‐quantised**, **incoherently processed** kernels described in the paper—no extra code changes are required.
+
+
+---
+
+## 4️⃣ Hooking FlashAttention‑3 into Hugging Face Transformers  
+
+Most transformer models inside 🤗 Transformers define their own MHA subclass (`BertSelfAttention`, `GPTNeoXSelfAttention`, …). Replacing these classes with our `FlashMHA` yields immediate speedups without altering training loops or tokenizers.
+
+### Example: Speeding up GPT‑NeoX
+
+```python
+from transformers import GPTNeoXForCausalLM
+import torch.nn as nn
+
+# Load pretrained model (weights stay in fp16/float32 as usual).
+model_fp32 = GPTNeoXForCausalLM.from_pretrained(
+    "EleutherAI/gpt-neox-20b",
+    torch_dtype=torch.float16   # use fp16 weights if you have enough GPU memory
+)
+
+# Replace its internal Self-Attention module:
+for layer in model_fp32.gpt_neox.layers:
+    hidden_sz   = layer.self_attn.embed_dim      # typically ≈2048
+    nheads      = layer.self_attn.num_attention_heads
+
+    layer.self_attn.__class__      = type("FlashSelfAttn", (), {})
+    layer.self_attn.forward         = FlashMHA(embed_dim=hidden_sz,
+                                              num_heads=nheads,
+                                              dropout=layer.self_attn.attention_dropout,
+                                              dtype=torch.float16).forward.__get__(layer.self_attn)
+
+# Move everything onto an H100:
+model_fp32.to("cuda")
+model_fp32.eval()
+
+# Inference example:
+input_ids = torch.randint(0, model_fp32.config.vocab_size,
+                          (1, 2048), device="cuda")
+with torch.no_grad():
+    logits = model_fp32(input_ids).logits   # now runs via FlashAttention‑3!
+```
+
+#### Optional: Swapping only at runtime  
+
+If you prefer not to modify model source files you can monkeypatch on import:
+
+```python
+from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXLayer
+
+def patched_forward(self, hidden_states):
+    return FlashMHA(self.attention.embed_dim,
+                    self.attention.num_attention_heads)(hidden_states)
+
+GPTNeoXLayer.forward.__code__ = patched_forward.__code__
+```
+
+(For production workloads you’d usually fork the model class instead of monkeypatching.)
+
+---
+
+## 5️⃣ Choosing Between FP16 and FP8  
+
+| Aspect | FP16 (native half) | FP8 (e4m3fn) |
+|---|---|---|
+| Throughput on H100 | ≈ 740 TFLOP/s ≤ 75 % utilization | ≈ 1.2 PFLOP/s ≈ 100 % Tensor Core utilization |
+| Memory footprint per tensor | ×2 reduction vs fp32 | ×4 reduction vs fp16 |
+| Numerical error on outlier‐heavy data | Same as FlashAttention‑2 (softmax kept in FP32) | ≈ 2.6× lower error than naïve per‐tensor fp8 quantisation thanks to block quantisation + incoherent processing |
+| When to use | Most LLM fine‐tuning / inference where memory is not limiting | Very long sequences (>4k tokens), inference at massive scale or when GPU memory is at premium |
+
+In practice try both modes on a small validation set—if your downstream quality metrics stay within tolerance you’ll enjoy roughly double throughput with fp8.
+
+
+---
+
+## 6️⃣ Performance Tips & Gotchas  
+
+* **Batch & head tiling** – The kernel internally chooses tile sizes (`B_r`, `B_c`) that balance shared memory usage versus register pressure. If you see low utilization on very short sequences (<1024 tokens), consider increasing batch size so total token count stays around ~16k per kernel launch—the sweet spot used in the paper’s benchmarks.
+* **Causal masking** – Set `causal=True` when generating autoregressive text; this disables half of the score matrix which slightly reduces TFLOPs but still gives > 60 % utilization.
+* **Mixed precision training** – Use PyTorch’s native AMP (`torch.autocast`) together with `torch.compile` if you’re on PyTorch ≥ 2.x – both compile time optimisations stack nicely on top of our kernel.
+* **Persistent kernels** – The current open source build contains a persistent kernel for FP16 paths which further reduces launch overhead on long sequences (>4k). For now the FP8 path uses a non‑persistent design—future releases will close this gap.
+* **Profiling** – Use `torch.profiler` or Nsight Systems to confirm that most time is spent inside `flash_attn_cuda_kernel`. If you see heavy time spent in data loading (`copy_kernel`), double check that your tensors are already resident on HBM (i.e., avoid `.cpu()` → `.cuda()` copies inside training loops).
+
+---
+
+## 7️⃣ Wrapping up  
+
+FlashAttention‑3 shows that modern GPUs aren’t just “faster GPUs”—they expose *new execution primitives* that software can exploit today:
+
+* Asynchronous memory movement + Tensor Core compute enables true producer–consumer pipelines.
+* Overlapping softmax with GEMM hides low-throughput special functions behind high-throughput matrix ops.
+* Leveraging FPGA-like low‐precision arithmetic while keeping exact results through smart quantisation tricks gives us TFLOP/ PFLOP speeds without sacrificing quality.
+
+All of this comes bundled in an easy-to-install Python package that plugs directly into PyTorch and Hugging Face pipelines—providing up to *twice* faster inference or training on an H100 while staying numerically robust even when working in aggressively low precision like FP8.
+
+Give it a spin:
+
+```bash
+pip install flash-attn                # get latest wheels
+python -c "import torch; print(torch.cuda.get_device_name())"
+# → Should print something like “NVIDIA H100”
+```
+
+Then replace your MHA layers with `FlashMHA` and watch those long-context tasks become *real time*. Happy coding! 🚀

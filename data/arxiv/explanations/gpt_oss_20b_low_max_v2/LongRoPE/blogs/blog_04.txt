@@ -1,0 +1,217 @@
+\title{Blogs about the Paper: "LongRoPE: Extending LLM Context Window Beyond 2 Million Tokens"}
+
+# How to Keep Short Context Magic Intact After A 512× Window Upscale  
+
+Large‑language‑models (LLMs) are now ready to handle “mega‑documents” that span millions of tokens.  
+With **LongRoPE** a pre‑trained model can be pushed from the 4 k limits of LLaMA 2 and Mistral to an astonishing **2 048 k** context window, all while spending only ~1 k fine‑tuning steps on a 256 k corpus.  
+The cost of such an extension is a subtle one: the model’s performance on the *short* inputs it was originally designed for can drop, sometimes quite noticeably.  
+
+This post explains why enlarging the window hurts short‑length performance and walks through the short‑window recovery trick introduced in LongRoPE—searching for new RoPE (rotary positional embedding) scales that work only for the first few kilobytes, while keeping the huge, 512× extension untouched. We’ll also show how you can add this trick to any extended‑context LLM.
+
+---
+
+## 1. Why does an “off‑the‑bat” positional interpolation hurt short inputs?
+
+### 1.1 Rotary Position Encoding (RoPE) in a nutshell  
+RoPE injects absolute position information into the Q/K attention heads by rotating each embedding dimension by an angle proportional to the token index:
+
+```latex
+\left[
+\cos(n\theta_0), \sin(n\theta_0),
+\cos(n\theta_1), \sin(n\theta_1), …
+\right]
+```
+
+where  
+\(n\) = token index,  
+\(\theta_i = \theta^{-2i/d}\) – a frequency that decreases as dimension \(i\) grows (\(d\) = embedding size).  
+The base value \(\theta = 10\,000\) is fixed during pre‑training.
+
+### 1.2 Extending the window by interpolating rotation angles  
+A simple way to extend a model beyond its training length is **down‑scale** every rotation angle by a factor \(\lambda = s\), where \(s = L^\prime/L\) is the extension ratio. This keeps all angles inside the pre‑trained range but forces *all* positions to live in a compressed angular space:
+
+- **Pros**: No extra training required.
+- **Cons**: Positions become “crowded” – differences between nearby indices blur, making it hard for attention to discriminate.
+
+LongRoPE improves on this by letting each RoPE dimension have a *different* scaling factor and additionally *preserving* the first few token positions completely (no scaling at all).  
+
+### 1.3 The crowding problem at high ratios  
+When you push \(s\) from 4 k → 2048 k (a factor of 512), every higher dimension’s angles are compressed by up to \(512^\times\). Even if you spread interpolation unevenly across dimensions (as LongRoPE does), you still reshape the entire angular geometry seen *inside* that original 4 k range.
+
+Intuitively:  
+
+| Window | Input length | Effective angle span inside original RoPE |
+|--------|--------------|------------------------------------------|
+| 4 k    | 4 k          | Full span (pre‑trained)                  |
+| 8 k    | 8 k          | Half the span per dimension              |
+| …      | …            | …                                        |
+| 2048 k.| 2048 k       | Much less than full span per dimension   |
+
+Thus, as soon as you ask the model to predict tokens that correspond to indices larger than what it has seen during training, it must interpret them through a vastly tighter angular lens—making probability distributions noisier and hurting perplexity.
+
+---
+
+## 2. What LongRoPE does instead
+
+LongRoPE tackles this issue on two fronts:
+
+1. **Non‑uniform scaling across dimensions** – lower dimensions (high frequency) get little change; higher dims (low frequency) can afford larger scaling.
+2. **Guarding the first \(\hat{n}\) tokens** – those tokens usually carry most of the attention mass; they keep their original angles unaffected.
+
+Both mechanisms preserve position fidelity where it matters most, but they’re *global*: at inference time every token uses whatever scale was found during search.
+
+To restore short‑length performance we add a *second* set of scales that applies *only* when we feed sequences shorter than about 8 k tokens.
+
+---
+
+## 3. Short‑Window Recovery – The recipe
+
+### Step 0 – Set up your extended LLM
+
+Assume you’ve already:
+
+- Ran the LongRoPE evolutionary search and fine‑tuned on a `256 k` corpus.  
+- Got `model_long_rope_2048k`.
+
+You now own an LLM with two important attributes:
+
+- `rope_scales`: a vector of length `d/2` that tells how much each rotary pair should be scaled when using the *long* context.
+- `rope_start_cutoff`: scalar (`hat{n}`) telling how many starting positions are untouched in long mode.
+
+Both these quantities are frozen during inference on long inputs.
+
+### Step 1 – Run another evolutionary search *only* for short lengths
+
+The goal: find a new set of scales (`short_rope_scales`) that works best when seq‐len ≤ `short_cutoff` (e.g., `8 k`).  
+
+**Search space**
+
+| Symbol | Meaning |
+|--------|---------|
+| `λ_i` | Scaling factor for RoPE dimension `i`<sup>¹</sup> |
+| `s_short` | target ratio (`<= short_cutoff / current_pretrain_length`) |
+| `λ_min = s_short`, `λ_max = s_short × 1.25` | Allowed range per dimension |
+
+<sup>¹</sup> In practice we control λ via its reciprocal \(α_i=1/λ_i\).
+
+We keep *exactly* the same evolutionary framework that LongRoPE used:
+
+- Start with three seed entries: PI, NTK, YaRN scales.
+- Mutate/crossover around them under a monotonicity constraint (`λ_0 ≤ λ_1 ≤ …`).
+- Evaluate candidate scale sets by computing perplexity on a small validation set (say five PG19 or Book3 samples padded or padded back up to your long context size but then truncated early).
+
+The only difference is that we **restart** with fresh populations because we’re searching for an *alternative* scaling set.
+
+The output is one entry—or perhaps you keep several and pick one with consistency across lengths—that gives noticeably lower perplexity at say `[512 k] → [4 k]` and `[4 k]`.
+
+### Step 2 – Keep both scale sets inside your code
+
+When serving your model, insert logic like:
+
+```python
+def get_rope_params(seq_len):
+    if seq_len <= SHORT_CUTOFF:
+        return short_rope_scales
+    else:
+        return rope_scales
+```
+
+That’s all—no modification to architecture, no extra GCs or distress calls. Below is a quick sketch in PyTorch style:
+
+```python
+class ReversibleRotaryEmbedding(torch.nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.d_model = d_model
+        # pre-computed base angles
+        beta = torch.pow(10000., torch.arange(d_model//2)/((d_model//2)))
+        self.register_buffer('beta', beta)
+
+    def forward(self, x, seq_len):
+        # pivot between short / long modes
+        if seq_len <= SHORT_CUTOFF:
+            scales = self.short_scales      # found via optimization
+            start_cutoff = self.short_cutoff
+        else:
+            scales = self.long_scales       # found via optimization
+            start_cutoff = self.long_cutoff
+
+        # compute rotated vectors
+        n_ids = torch.arange(seq_len).type_as(x).reshape(-1, 1)
+        freqs = n_ids / scales.view(1,-1)
+        cos_warmup = torch.cos(freqs)
+        sin_warmup = torch.sin(freqs)
+        return combine_cyclic(cos_warmup, sin_warmup)
+```
+
+Where `self.short_scales` and `self.long_scales` are just arrays of scalars applied per rotary pair.
+
+### Step 3 – Optional fine-tuning with mixed windows
+
+If you want even more polish, you might run a tiny fine‑tuning loop mixing short & long sequences; treat it as standard supervised language modelling but use both scale sets at each step (depending on sequence length). Because only rotational scaling changes—a simple linear transform—the relevant parameters are tiny; training converges in milliseconds per GPU.
+
+---
+
+## 4. Why this trick actually helps
+
+Let’s dissect what happens when we keep two distinct scaling regimes:
+
+| Scenario | Aperture inside original RoPE | Distress on shortened sequences |
+|----------|---------------------------------|---------------------------------|
+| Single large scale (`lambda_long`) | Too tight → poor granularity ↑ | Model misinterprets dynamics; perplexity rises |
+| Small-scale (`lambda_short`) applied globally | Unnecessary softness → less compression for ≥8 k sequences → information loss ↑ | Model behaves OK for large windows but now has extra redundancy; memory overhead ↑ |
+
+By tailoring each regime to an explicit regime of sequence lengths we let the truncated input use exactly the “resolution” it expects: same angles it was trained on just before padding starts. The abrupt shift at \(~8\,k\) tokens stops crowding gradually propagating back through all layers; instead it stays strictly within its own zone.
+
+Empirically across LLaMA‑2 & Mistral–7B LongRoPE models:
+
+- **Perplexity at \(4\,k\)** drops from ~28 → ~10 upon adding recovery scales.
+- **Passkey retrieval accuracy** goes from ~20% ➜ ~80% at \(64\,k\).
+- Zero-shot benchmark scores on legacy tasks stay unchanged compared to vanilla pre‑trained models.
+
+So you almost regain “short window magic” without sacrificing your dramatic long context reach.
+
+---
+
+## 5. Getting started with your own recovered short window
+
+Below is high‑level pseudo code you can adapt into any toolkit (🤗Transformers, JAX/Flax…):
+
+```python
+# STEP A: Load extended weights
+model   = load_extended_long_rope("llama2_7b_long_rope_2048k")
+tokenizer = AutoTokenizer.from_pretrained("llama2")
+
+# STEP B: Run evolution search again specifically for <8K sequence
+short_target_ratio   = SHORT_CUTOFF / PRETRAINED_LEN      # e.g., CODE(8192/4096)=2
+best_short_scales    = evolve_search_scaling(
+                       model=model,
+                       ratio=short_target_ratio,
+                       pop_size=64,
+                       iter=30,
+                       criterion="perplexity",
+                       validation_set="PG19_val"
+                    )
+
+# STEP C: Plug into model forward pass
+model.rope.set_short_params(best_short_scales,
+                            cutoff=SHORT_CUTOFF)
+
+# STEP D: Serve or finetune further if desired  
+```
+
+If you already ran LongRoPE’s first pass (to get ∼2048 k), you can reuse those weights directly—only extra optimization for short lengths is required.
+
+---
+
+## 6. Takeaways & best practices
+
+- **Preserve what matters:** The first few tokens hold key cues; protecting them from interpolation gives immediate gains.
+- **Separate regimes:** Treat short & long input domains as distinct; one cannot be served perfectly with another.
+- **Keep it lightweight:** Only two vectors of scalars + cutoff threshold—no extra weights or huge code changes.
+- **Validate early:** Plug realistic benchmarks of various lengths right after evolution; look for consistent improvements across all downstream tasks.
+- **Portability:** The method works irrespective of machine learning framework because RoPE exists everywhere; just adjust where rotations are computed.
+
+With this trick in hand you can now deploy fully extended models—say in chatbots loading entire legal documents or assistants generating complex reports—while still handling conventional chat queries flawlessly.
+
+Happy extending! 🚀

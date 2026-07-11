@@ -1,0 +1,186 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 3: 4. Standard Attention vs. FlashAttention Fundamentals
+
+In the Transformer, the attention layer is the computational fulcrum:
+it multiplies the query matrix $\mathbf{Q}$ with the key matrix $\mathbf{K}^\top$, applies a softmax row‑wise, and finally multiplies the result with the value matrix $\mathbf{V}$. The classical implementation materializes both intermediate products $\mathbf{S}= \mathbf{Q}\mathbf{K}^\top$ and $\mathbf{P}=\mathrm{softmax}(\mathbf{S})$ in global memory before forming the output $\mathbf{O}=\mathbf{P}\mathbf{V}$. This section contrasts that naïve approach with FlashAttention’s tile‑based, on‑chip reduction strategy that fuses all attention operations into a single GPU kernel.
+
+## From intermediate $S$ & $P$ matrices to on‑chip reductions
+
+In standard attention on a GPU, the three core stages are carried out in sequence:
+
+1. **Score matrix**  
+   \[
+   \mathbf{S}= \alpha\,\mathbf{Q}\,\mathbf{K}^{\top},
+   \]
+   where $\alpha = 1/\sqrt{d}$ scales the dot products to control variance. The product is typically computed via a batched general matrix multiply (GEMM) that produces an $N\times N$ matrix $\mathbf{S}$ in global memory.
+
+2. **Row‑wise softmax**  
+   A second pass over $\mathbf{S}$ computes
+   \[
+   \mathbf{P}_{ij}= \frac{\exp(\mathbf{S}_{ij}-\max_k \mathbf{S}_{ik})}
+                      {\sum_{k}\exp(\mathbf{S}_{ik}-\max_k \mathbf{S}_{ik})},
+   \]
+   so that each row sums to one. In practice, a separate GPU kernel loads each row of $\mathbf{S}$ back into registers or shared memory, performs a reduction to compute the row maximum, exponentiates the centered scores, and then performs a second reduction to compute the row sum before forming $p_{ij}$.
+
+3. **Value aggregation**  
+   Finally,
+   \[
+   \mathbf{O}= \mathbf{P}\,\mathbf{V},
+   \]
+   is again evaluated as a GEMM. Because $\mathbf{P}$ is dense and must be available in global memory, this step incurs another large global memory traffic.
+
+The expensive component in this pipeline is the **intermediate materialization** of both $\mathbf{S}$ and $\mathrm{\!softmax}( \! S )$. For a sequence length of $N$, materializing an $N\times N$ dense matrix incurs $O(N^2)$ reads and writes from high‑latency global memory (HBM), dominating the overall runtime for large $N$. Moreover, each of the two GEMM operations calls for loading two full matrices from global memory into SM register files and shared memory, further stressing bandwidth.
+
+Performing these operations in separate kernels forces each stage to wait for all data movement from GMEM to SMEM or RMEM before it can proceed. Even if each stage proceeds concurrently on different threadblocks, stalls arise whenever a warp has to load data that another warp has not yet finished releasing, yielding an upper bound on utilization well below theoretical peak.
+
+FlashAttention was introduced to break this bottleneck by **keeping all required data within fast memory throughout the attention computation** and fusing GEMM and softmax operations into a single launch. This reduces global traffic from \(O(N^2)\) to only $O(Nd)$ per tile, as we now detail.
+
+### Tiling strategy
+
+FlashAttention partitions the query matrix $\mathbf{Q}$ into horizontal strips or blocks:
+\[
+\{\; \mathbbmssymb Q_0,\; Q_1,\; \dots,\; Q_{T-1}\;\},
+\]
+where $\mathbbmssymb Q_i \in \mathbb R^{B_r\times d}$ denotes a block of size $B_r$ (rows), with $T=\lceil N/B_r\rceil$. Similarly, it tiles key and value matrices vertically:
+\[
+\{\; K_0,\; K_1,\; \dots,\; K_{C-1}\;\}, 
+\qquad
+\{\; V_0,\; V_1,\; \dots,\; V_{C-1}\;\},
+\]
+where each block has shape $B_c\times d$, with $C = \lceil N/B_c\rceil$.
+
+Each CUDA threadblock is assigned one query block $Q_i$. Inside that block it iterates over all key/value blocks (the inner loop). During iteration $j$, two small sub‑matrices are kept resident in shared memory:
+
+* score tile \( S^{(j)} = Q_i\, K_j^\top\)  – an \(B_r\times B_c\) matrix,
+* value tile \( V_j\) – an \(B_c\times d\) matrix.
+
+The *score tile* fits comfortably into SM shared memory (typically 48 KB per SM on Hopper). The *value tile* also fits once we choose sensible block sizes (e.g., \(B_c=64\) when \(d=128\)).
+
+By streaming these tiles across GPU registers and using **Tensor Cores** for accelerated mixed‑precision GEMMs, FlashAttention keeps most of the data on chip: only one key/value tile needs to be streamed from global memory per inner loop iteration once at the beginning of that iteration. The score tile is produced by a Tensor Core *stacked* GEMM – a 2D multiplication performed entirely within SM registers – so no intermediate $\mathbbit S$ is written back out to GMEM.
+
+The final step – multiplication by $\mathbbit V$ – also happens entirely within SM registers: Once a score tile has been produced and reduced for softmax locally (see next subsection), it is multiplied by its corresponding value tile using another Tensor Core operation before accumulating into an “output accumulator” for this query block.
+
+By ensuring that **every input operand chain stays within SMEM/RMEM**, FlashAttention eliminates all off‑chip traffic associated with storing or reading intermediate results past their use which reduces latency dramatically and frees up bandwidth for other work such as communication or pipeline prefetching.
+
+## Local softmax derivation and rescaling
+
+A key insight enabling FlashAttention’s reduction of global traffic lies in performing *row‑wise softmax locally*, i.e., entirely inside shared memory or registers without materializing full rows of \( P = \mathrm{\!softmax}( S )\).
+
+Consider one query block \( Q_i(x)\) interacting with one key piece \( K_j(y)\). The score tile
+\( S^{(j)}_{x,y} = Q_i(x)\cdot K_j(y)^\top / \sqrt d \).
+Row \(x\) of this score tile contains contributions from every key column inside block \(K_j\).
+The standard softmax algorithm would apply:
+
+1. Compute row maximum: \( m_{i,x} = \max_y S^{(j)}_{x,y} + m^{(old)}_{i,x}\),
+2. Subtract it: \( s'_{x,y}= S^{(j)}_{x,y} - m_{i,x}\),
+3. Exponentiate: \( e'_{x,y}= e^{s'_{x,y}}\),
+4. Sum exponentials per row: \( l_{i,x}= l^{(old)}_{i,x} + \sum_y e'_{x,y}\).
+
+Because we handle only partial rows (the keys local to block \(K_j)\), we need to maintain running maxima (\(m_i^{old}\)) and running sums (\(\ell_i^{old}\)) across iterations over all key blocks:
+
+* **Running maximum**: After processing each key block we update
+  *\( m_i = {\rm max}( m_i , {\rm max}_y(S^{(j)}_{\cdot ,y}))\).
+* **Running sum**: We also accumulate
+  *\( \ell_i = e^{m_i^{old}-m_i}\,\ell_i + {\rm sum}_y(e^{S^{(j)}_{\cdot ,y}-m_i})\).
+
+After processing all key blocks,
+the true local max per query row will be stored in vector \(m_i\); 
+the accumulated sum vector is stored in
+\(l_i = e^{m_{\textbf last}-m_{\textbf final}}\ell_{\textbf final}
+     + e^{-m_{\textbf last}}\,l_{\textbf last}\)
+which leads directly to correct normalisation factors once all contributions have been summed.
+In practice this means we delay division until after all key blocks have been processed:
+
+```text
+// After finishing inner loop:
+O_i = diag(l_i^{-1}) * O_accum;
+```
+
+Here `O_accum` denotes the unscaled weighted sum produced by successive 
+tensor core multiplies `tildeP * V`. `diag(l_i^{-1})` performs an element-wise 
+division of every row of `O_accum` by its corresponding normalization factor `l_i`. 
+This rescaling step also has a simple fusible form because it acts only across rows,
+hence no additional communication beyond an atomic traverse over rows is required.
+
+Thus FlashAttention’s local softmax algorithm follows precisely three fused
+steps per inner loop iteration:
+
+1. **Score GEMM** (`Q x K^T`) producing `tildeS`,
+2. **Softmax reduction** updating `m` and `l`,
+3. **Value GEMM** (`tildeP x V`) updating cumulative output accumulator `O`.
+
+All three steps use Tensor Core accelerated operations where possible.
+This fused pipeline produces exactly what would be obtained by first calculating
+full matrices `S` & `P`, then writing them back out and reloading them –
+but without ever touching global memory except during streamloads at block boundaries.
+Therefore global I/O becomes proportional to the number of tiles (`T·C`) rather than scaling as \(O(N^2)\).
+
+### Quantitative effect on latency
+
+Let us compare latencies qualitatively:
+
+| Operation | Classic implementation | FlashAttention |
+|-----------|------------------------|----------------|
+| Load `$Q$, `$K`, `$V$` | Full matrices loaded per GEMM | Small tiles loaded once per inner loop |
+| Middle GEMM (`QK⊤`) | Two reads each O($N^2$) | Tiles reused across inner loops |
+| Softmax | Row reductions over full rows | Row reductions over small score tiles |
+| Final GEMM (`PV`) | Large dense GEMM over full `$P$` | Small tiled GEMM reused tiles |
+| Global writes | Two dense outputs back out | One small output per query block |
+
+Hence overall bandwidth consumption drops drastically: Non‑essential reads/writes segment that would otherwise saturate HBM bandwidth are largely eliminated, allowing Tesla H100 GPU's tensor cores to work at higher utilization (upward of 70 % vs <40 % for earlier FlashAttention versions). The quadratic dependency on sequence length thus becomes linearish once tiled reduction dominates compute cost.
+
+
+
+## Tensor Core usage in FlashAttention‑1
+
+Prior work—FlashAttention‑1—already demonstrated how tiled attention could improve performance on older GPUs by employing Tensor Core accelerated *mini*-GEMMs for both the score computation `(QS)` and value accumulation `(PV)` when working with half-precision operands ($FP16$). In particular:
+
+* Each score tile `S` is calculated via stacked GEMMs where multiple warps jointly compute separate sub-blocks using WGMMA instructions.
+* The value accumulation uses two-pass reduce–multiply patterns: first produce partial weighted sums on-chip followed by a final compromise across warps via atomic additions or shared-memory reductions.
+* Because System‐Level parallelism was limited—the entire kernel was blocked under threadblock scheduling—FlashAttention‑1 had modest overall occupancy due largely to tensor core underutilisation when facing highly sparse causal masks or short sequences.
+
+Nonetheless, FlashAttention‑1 introduced critical ideas that survive into version 3:
+
+1. **Blocking along sequence dimension**: Operate on matmul tiles stored in shared memory.
+2. **Local reductions**: Perform partial softmax calculations purely in registers/SHMEM.
+3. **Fusion of kernels**: Keep all intermediate state local so GPUs can pipeline across warps efficiently.
+
+These ideas now get refined further in FP8 Falcon Attention through specialized asynchrony designs as described earlier.
+
+
+
+## Impact on memory traffic and latency
+
+A direct measurement of how much GPU traffic changes between classic attention and FlashAttention can be traced through its profile pipelines:
+
+*The classic pipeline*: For sequence length $N$, head dimension $d$, this requires roughly$
+   
+    \(6\,N^2\,d\,4\,{\rm bytes}  + 2\,N^2\,d\,8\,{\rm bytes}\)
+
+because both Score (`$(X,Y)$` pairings) and Value multiplication produce outputs twice as large due to storing at higher precision internally (FP32 intermediate even if inputs are FP16).
+
+*The tiled pipeline*: For each query block size $B_r$ you load
+    $(B_r+B_c)d\times 4 + B_cd\times4 =$ approx $8*(B_r+B_c)d$ bytes from GMEM.
+    This load occurs once per outer loop iteration ($T*C$ times), drastically reducing overhead.
+    Once loaded, subsequent computations use only register/SMEM accesses which are essentially free compared
+    with off-chip HBM reads/writes (100× lower latency). 
+
+Moreover, tokenisation strategies such as _warp-specialization_ enable multiple warps inside one CTA either “producing” data (prefetching new tiles) or “consuming” it (computing kernels). Using NVIDIA Hopper’s **Tensor Memory Accelerator (TMA)** readers together with asynchronous Tensor Cores fully amortises DRAM latencies because loads can overlap with math without stalling fast execution lanes.
+
+In practice this translates into ~35 % utilisation gains over multifaceted naive launches observed on Hopper GPUs – precisely because fewer LIC tunnel buckets saturate HBM bandwidth while tensor cores remain productively busy awaiting their inputs.
+
+
+
+## Summary
+
+* Classical attention isolates three distinct kernel launches causing massive global–memory pressure scaling quadratically with sequence length.
+* FlashAttention collapses these stages into a single CUDA launch that tiles queries versus keys/values.
+* All intermediate results stay resident in fast-shared registers/shared-memory thanks to fitting tiling dimensions ($B_r,B_c,d$).
+* Local softmax/pooling eliminates write/read cycles while preserving exact behaviour through incremental maxima/sums.
+* On Hopper GPUs fusion together Warp-group specialised TMA loads + asynchronous WGMMAs further accelerates throughput up through roughly 70–80 % VFU utilisation – far surpassing earlier variants baked for Ampere hardware.
+* These design principles set up FLASHATTENTION‑3’s subsequent extensions such as asynchronous producer-consumer pipelines,
+  FP8 low-precision arithmetic support,
+  and interlock-free GRE algorithms built atop Hopper’s TMA/TAC capabilities,
+
+opening doors towards provably efficient long-context attentions without sacrificing precision or accuracy.*

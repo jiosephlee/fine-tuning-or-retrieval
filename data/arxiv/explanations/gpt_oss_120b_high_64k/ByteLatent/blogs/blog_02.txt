@@ -1,0 +1,194 @@
+\title{Blogs about the Paper: "Byte Latent Transformer: Patches Scale Better Than Tokens"}
+
+# Byte Latent Transformer 101: From Bytes to Dynamic Patches
+
+*TL;DR – BLT replaces the traditional fixed vocabulary tokenizer with a learnable byte‑to‑patch pipeline. By grouping raw bytes into variable‑size “patches” based on next‑byte entropy, a tiny local encoder/decoder handles the byte‑level work while a large global transformer operates only on the patches. The result is an LLM that spends compute where it matters most, cuts inference FLOPs by up to 50 % and gains robustness to noisy or low‑resource text.*
+
+---
+
+## 1. The tokenizer bottleneck
+
+Most modern large language models (LLMs) start by running a **subword tokenizer** (e.g., BPE) that maps raw bytes into a static vocabulary of tokens. This preprocessing step is cheap but introduces several hidden costs:
+
+* **Fixed compute per token** – every token runs through the full transformer regardless of how easy it is to predict.
+* **Vocabulary bias** – rare words, non‑Latin scripts or noisy input often get split poorly.
+* **Multilingual inequity** – languages with long or complex orthographies suffer from larger token counts.
+
+Training directly on bytes avoids these issues, but naïve byte‑level Transformers explode in cost because the sequence length grows by roughly 4×–5× compared with token sequences. Early attempts (ByteBERT, ByT5) required either tiny models or heavy attention tricks that still fell short at scale.
+
+BLT’s insight is simple yet powerful: **don’t treat every byte equally**. Instead, let the model decide where a group of bytes is “hard” enough to merit an expensive Transformer step and where it can be skimmed cheaply. This decision is made by **dynamic patches**.
+
+---
+
+## 2. Patching: turning a sea of bytes into variable‑size chunks
+
+A *patch* is a contiguous block of bytes that will be processed as one unit by the global transformer. The patching function \(f_p\) maps each byte index \(i\) in a sequence \(\mathbf{x}=\{x_i\}_{i=1}^n\) to either “continue current patch” (0) or “start new patch” (1). The number of patches \(m\) is always smaller than the number of bytes \(n\).
+
+BLT explores three ways to set \(f_p\):
+
+| Method | How boundaries are chosen | Pros | Cons |
+|--------|---------------------------|------|------|
+| Strided (fixed‑size) | Every \(k\) bytes | Simple implementation, easy FLOP control | No adaptation to data difficulty |
+| Space‑patching | Start new patch after any whitespace‑like byte | Aligns patches with natural word boundaries | Still static; cannot handle dense symbols |
+| **Entropy‑patching** *(BLT’s default)* | Use an auxiliary *entropy model* to estimate the uncertainty of the next byte and cut a patch when entropy exceeds a threshold | Dynamically allocates more steps where predictions are hard; data‑driven | Requires a small pretrained byte LM |
+
+### Entropy‐driven boundaries in detail
+
+The auxiliary entropy model supplies a probability distribution \(p_e(\cdot|\mathbf{x}_{<i})\) over the 256 possible byte values for each position \(i\). Its Shannon entropy is
+
+\[
+H(x_i)=\sum_{v\in\mathcal{V}} p_e(x_i=v\,|\,\mathbf{x}_{<i})\,\log p_e(x_i=v\,|\,\mathbf{x}_{<i}),
+\]
+
+where \(\mathcal{V}\) is the byte alphabet. Two practical rules turn this scalar into a boundary decision:
+
+* **Global constraint** – start a new patch whenever \(H(x_t) > \theta_g\).
+* **Approximate monotonic constraint** – start a new patch when the entropy increase exceeds a relative threshold:
+  \(H(x_t)-H(x_{t-1}) > \theta_r.\)
+
+During dataset loading BLT computes \(H(\cdot)\) once and inserts boundaries on‑the‑fly; no extra neural component runs at training time.
+
+Because entropy tends to be high at word starts, punctuation or code symbols, patches naturally become longer in predictable stretches (e.g., inside an English word) and shorter where uncertainty spikes (e.g., at sentence boundaries). This “adaptive granularity” is what enables compute savings without sacrificing model capacity.
+
+---
+
+## 3. Local encoder & decoder – turning bytes into latent patches (and back)
+
+The global transformer should never see raw bytes – feeding it billions of them would defeat BLT’s efficiency goal. Instead BLT introduces two lightweight **local models**:
+
+### 3.1 Local encoder \(\mathcal{E}\)
+
+* **Input embedding** – each raw byte is first embedded via a lookup table of size \(256\times h_{\mathcal{E}}\).  
+* **Hash n‑gram augmentations** – for every position \(i\), byte n‑grams \(g_{i,n}=\{b_{i-n+1},\dots,b_i\}\) with \(n=3..8\) are hashed into fixed-size tables \(E^{hash}_n\). Their vectors are summed with the base byte embedding:
+  
+  \[
+  e_i = x_i + \sum_{n=3}^{8} E^{hash}_n(\text{Hash}(g_{i,n})).
+  \]
+
+  These hash embeddings give the encoder cheap access to longer‐range context without blowing up parameters.
+  
+* **Transformer layers + cross‑attention** – \(\mathcal{E}\) contains only a few self‑attention blocks (\(l_{\mathcal{E}}\ll l_{\mathcal{G}}\)). After each block we run *cross‑attention* that pools the current byte representations into one query vector per patch:
+
+  * Queries are initialized by max/average pooling over bytes belonging to that patch.
+  * Keys/values are the per‑byte hidden states.
+  * Only keys/values from within the same patch are attended (dynamic mask).
+
+The output of \(\mathcal{E}\) is a set of latent vectors \(\{p_j\}_{j=1}^m\), one per patch, ready for the global transformer.
+
+### 3.2 Local decoder \(\mathcal{D}\)
+
+During generation we must turn each predicted latent patch back into concrete bytes:
+
+* Cross‑attention now treats *bytes* as queries and *patch latents* as keys/values.
+* A few lightweight transformer layers refine these bytewise queries.
+* Finally an output head predicts the next byte using a softmax over the 256 possible values.
+
+Because both encoder and decoder operate on short windows (\(w_{\mathcal{E}}, w_{\mathcal{D}}\)) rather than the full context, their FLOP cost stays modest even when patches become large.
+
+---
+
+## 4. Global latent transformer – where most of the “brain” lives
+
+The heavy lifting is done by a standard autoregressive transformer \(\mathcal{G}\), but it consumes **patch representations** instead of tokens:
+
+* **Block‑causal attention** – each patch can attend only to previous patches and itself, mirroring standard causal language modeling.
+* **Large depth & width** – BLT scales \(\mathcal{G}\) exactly like any token‐based LLM (SwiGLU feed­forward layers, RoPE positional encodings).
+* **Variable step count** – because patches have variable length, the number of transformer steps per input chunk equals the number of patches \(m\), not the original byte count \(n\). Longer average patches → fewer steps → lower inference FLOPs.
+
+Consequently, for a fixed inference budget we can **grow both model size and average patch length simultaneously**—something impossible with a fixed vocabulary tokenizer where larger vocabularies increase both embedding size and output projection cost.
+
+---
+
+## 5. FLOP accounting & practical gains
+
+BLT’s total FLOP per processed byte can be expressed as
+
+\[
+\begin{aligned}
+\text{FL}_{\text{BLT}} =&~ 
+\frac{\text{Transf.FLOP}(h_{\mathcal G},l_{\mathcal G},m=n_{\text{ctx}}/n_p,V=0)}{n_p} \\[2pt]
+&+ \text{Transf.FLOP}(h_{\mathcal E},l_{\mathcal E},m=w_{\mathcal E},V=0)\\[2pt]
+&+ \text{Transf.FLOP}(h_{\mathcal D},l_{\mathcal D},m=w_{\mathcal D},V=256)\\[2pt]
+&+ \text{CrossAttn.FLOP}(h_{\mathcal E},l_{\mathcal E},m=n_p,r=n_p/k)\times k/n_p \\[2pt]
+&+ \text{CrossAttn.FLOP}(h_{\mathcal D},l_{\mathcal D},m=k,r=k/n_p),
+\end{aligned}
+\]
+
+where \(n_p = n_{\text{ctx}} / m\) denotes average *patch size*. In practice:
+
+* With an average patch size of **8 bytes**, BLT’s inference FLOPs drop by roughly **50 %** compared to an Llama 3 model that sees ≈ 4 bytes/token.
+* Training flops stay comparable because extra computation spent on building patches (entropy lookup + local encoding) is tiny relative to the massive feed‑forward passes in \(\mathcal G\).
+
+Even after fixing total inference FLOPs and scaling up model parameters (e.g., from 400 M → 8 B), BLT continues to outpace tokenized baselines—demonstrating that “patches scale better than tokens”.
+
+---
+
+## 6. End‑to‑end walkthrough (a tiny example)
+
+Consider generating English text after “Who composed”.  
+
+1. **Byte stream:** `"Who composed "` → raw UTF‑8 bytes.
+2. **Entropy model:** Computes high entropy at `‘c’` (first letter of “composed”) → starts a new patch after space.
+3. **Patch formation:**  
+   *Patch 1*: `"Who "` (low entropy → long);  
+   *Patch 2*: `"c"` (high entropy → short);  
+   *Patch 3*: `"omposed "` etc.
+4. **Local encoder:** Each patch’s bytes are embedded (+ hash n‑grams), passed through two lightweight transformer layers plus cross‐attention → obtain latent vectors `p₁,p₂,…`.
+5. **Global transformer:** Takes `[p₁,p₂,…]` as input; because there are fewer patches than tokens it needs fewer autoregressive steps.
+6. **Local decoder:** After predicting `p₂`, cross‐attention converts it back into raw bytes `"c"`.
+7. The loop repeats until generation finishes.
+
+Notice how only around words’ first characters trigger expensive global steps; later characters ride on cheap local processing inside long patches.
+
+---
+
+## 7. Why does this matter? Beyond speed
+
+### Robustness to noise  
+Because BLT never discards any byte information—it sees every character—its predictions degrade far less under character-level corruptions (random case changes, repeated letters, dropped characters). Empirically BLT gains ~8 accuracy points on noisy HellaSwag variants compared with Llama 3.
+
+### Better handling of long-tail languages  
+Byte‐level modeling eliminates any bias toward scripts well represented in a subword vocabulary. On FLORES-101 low-resource language pairs BLT surpasses Llama 3 by up to ~2 BLEU points despite training on less data overall.
+
+### Fine-grained orthographic reasoning  
+Benchmarks like CUTE (which test character manipulation like spelling reversals or insertion/deletion) show BLT scoring > 25 points higher than tokenized models—indicating that direct access to characters yields genuine linguistic insight rather than mere memorization of token embeddings.
+
+---
+
+## 8. Putting it all together
+
+```
+raw bytes ──► entropy → dynamic boundaries ──► local encoder (+hash n-grams)
+                 │                                   │
+                 └─────► variable-size patches ◄─────┘
+                     │                │
+                     ▼                ▼
+               global latent      local decoder
+               transformer        (cross-attention)
+                     │                │
+                     └─────► predicted bytes ──► next step
+```
+
+The elegance lies in its modularity:
+
+* A tiny *entropy LM* decides where we need attention.
+* Lightweight *local modules* compress/decompress without blowing up parameters.
+* A single *global latent transformer*, identical in spirit to any LLM we already know how to train efficiently, operates on far fewer steps thanks to adaptive patch granularity.
+
+---
+
+## 9. Takeaways for practitioners
+
+1️⃣ If you’re already wrestling with tokenizer mismatches across languages or want better resilience against noisy user input—consider swapping your tokenizer for BLT’s dynamic patching pipeline.
+
+2️⃣ When you have a strict inference budget (e.g., serving on edge devices), you can increase both model capacity **and** average patch size while staying within budget—something you can’t do with fixed vocabularies.
+
+3️⃣ Training overhead from entropy computation and local modules is negligible compared with the massive FFNs in modern Transformers; existing hardware pipelines can reuse standard libraries plus FlexAttention for dynamic masks.
+
+4️⃣ BLT also opens an avenue for “byte‑ifying” existing pretrained models: initialize the global transformer from a checkpoint like Llama 3 and fine-tune only the local parts—a cheap way to reap most benefits without training from scratch.
+
+---
+
+### TL;DR  
+
+Byte Latent Transformer replaces static subword tokenization with an entropy-driven process that groups raw bytes into variable-length patches. Tiny local encoder/decoder modules embed these patches using hash n‑grams and cross-attention, while a standard large transformer processes only the patches—automatically allocating more compute where predictions are uncertain. The result? Matching tokenized LLM performance at up to eight billion parameters while cutting inference FLOPs by half, gaining robustness to noisy text, and handling low-resource scripts more gracefully—all without ever defining a fixed vocabulary.

@@ -1,0 +1,130 @@
+\title{Blogs about the Paper: "Group Sequence Policy Optimization"}
+
+# MoE Meets RL: How GSPO Eliminates Expert‑Activation Volatility
+
+Mixture‑of‑Experts (MoE) models bring sparsity and a large capacity boost for language models, but their sparse activation pattern turns out to be a hidden pitfall when you try to train them with reinforcement learning (RL). In particular, the token‑level importance ratios used by most RL algorithms become wildly unstable because the set of experts that fire for a given token can change drastically between successive policy updates. The fix? A tiny change to how we weight the updates – moving from token‑level to sequence‑level importance – and that’s what Group Sequence Policy Optimization (GSPO) does.
+
+In this post we’ll walk through:
+
+1. Why expert‐activation volatility destroys token‑level importance ratios  
+2. How the legacy *Routing Replay* workaround was crafted  
+3. The cost of that workaround in real training pipelines  
+4. How GSPO sidesteps the problem, simplifies MoE RL, and unlocks full model capacity  
+
+---
+
+## 1. The MoE‑RL Mismatch
+
+### 1.1 Sparse activation in MoE
+
+In an MoE Transformer each token is routed to a small subset of “experts” (e.g., a few dense sub‑layers). The routing decision is made by a lightweight gating network; only the experts that receive non‑zero weights are activated for that token.
+
+Because experts are shared across many tokens, a single gate change can make several entire layers switch hands between two expert sets for the same response.
+
+### 1.2 Token‑level importance ratios are broken
+
+Most policy gradient methods, including the fast GRPO algorithm, rely on the **token‑level importance ratio**
+
+\[
+w_{i,t}(\theta)=\frac{\pi_{\theta}(y_{i,t}\mid x,y_{i,<t})}{\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,<t})}.
+\]
+
+This ratio is meant to correct for the fact that our rollout samples come from an old policy \(\pi_{\theta_{\text{old}}}\) rather than the current one \(\pi_{\theta}\).  
+In a dense (non‑sparse) transformer, \(\pi_{\theta}\) and \(\pi_{\theta_{\text{old}}}\) only differ in their parameters – no architectural components vanish or appear on a single step.
+
+With MoE, however, each call to \(\pi_{\theta}(y_{i,t}\mid \cdot)\) may activate an entirely different set of experts from \(\pi_{\theta_{\text{old}}}(y_{i,t}\mid \cdot)\). The **likelihoods** computed by the two policies are now not just numerically different – they’re coming from *different computational graphs*. That means even if the parameters of all experts stayed put, a slight gating shift can make \(w_{i,t}(\theta)\) blow up or collapse to zero, regardless of how close \(\theta\) and \(\theta_{\text{old}}\) actually are.
+
+Result: noisy importance ratios → high‑variance gradients → catastrophic model collapse during RL training.
+
+---
+
+## 2. Routing Replay – A Patchwork Solution
+
+### 2.1 What Routing Replay does
+
+To keep \(w_{i,t}(\theta)\) sane, we force **the same routing decisions** for both the old and current policies:
+
+1. During sampling we cache each token’s activated experts under \(\pi_{\theta_{\text{old}}}\).  
+2. When computing \(w_{i,t}(\theta)\) during policy update, we *replay* those cached routing decisions for \(\pi_{\theta}\).  
+
+Because both forward passes now touch exactly the same set of experts, the two likelihoods become comparable; \(w_{i,t}(\theta)\) stays close to 1 and the gradient estimates become stable enough for training to converge.
+
+### 2.2 What it costs
+
+* **Memory overhead** – We must store an integer “expert list” per token in every rollout sample (often several dozens of bytes per sample).  
+* **Recomputation** – At each update we need to forward pass through *both* policies with identical expert selections, doubling GPU compute.  
+* **Message passing** – In multi‑node settings experts might be sharded across devices; replaying routing forces expensive synchronization of expert indices.
+
+In practice this makes MoE RL *a lot slower* than dense RL and complicates infrastructure: you need specialized kernels that can replay buffers or build custom graph helpers to keep routing aligned.
+
+---
+
+## 3. GSPO’s Sequence Likelihood Fix
+
+Group Sequence Policy Optimization changes *how* we weigh updates: instead of correcting per token with a ratio that is brittle to routing changes, it uses a **sequence‑level importance ratio**
+
+\[
+s_i(\theta)=\left( \frac{\pi_\theta(y_i|x)}{\pi_{\theta_{\text{old}}}(y_i|x)} \right)^{\!{1/|y_i|}}.
+\]
+
+Key properties:
+
+| Property | Tokens / GRPO | Sequences / GSPO |
+|----------|---------------|-------------------|
+| Baseline | Individual likelihoods per position | Whole‑sequence likelihood |
+| Sensitive to expert change? | Yes – each token may activate different experts | No – whole path likelihood remains smooth because small changes in gating spread over many tokens amortize |
+| Clipping domain | Individual token ILR ∈ (0,\(1+\varepsilon\)] (positive rewards), [\(1-\varepsilon,\infty)\] (negative rewards) | Sequence ILR ∈ (0,\(1+\delta\)] / [\(1-\delta,\infty\)] with much smaller δ due to length normalisation |
+
+Because Guildted sequence likelihood is essentially an aggregated factor over many tokens, tiny per-token routing shifts contribute only marginally to \(s_i(\theta)\). Empirically we see fluctuations go from ~10 % at token level down to < 5 % at sequence level.
+
+--- 
+
+## 4. Why GSPO Keeps Everybody Sane
+
+### 4.1 No extra bookkeeping
+
+GSPO never needs to remember which experts were active per token; it only requires the final sequence log‑probability under both policies. That means:
+
+- **No caching** – you drop allen multi-byte tensors from your batch metadata.
+- **No replays** – you forward once per update instead of twice.
+- **Zero extra communication** – because no expert index needs to be shared after rollout.
+
+### 4.2 Sequence likelihood is inherently robust
+
+The log probability of an entire response under an MoE policy is computed as a sum over all tokens:
+
+\[
+\log \pi_\theta(y|x)=\sum_t \log\!\bigl[\pi_\theta(y_t\mid x,y_<t)\bigr].
+\]
+
+If one token pulls a different expert compared to its counterpart in \(\pi_{\theta_{\text{old}}}\), its log probability shift is just one addend in this sum; other tokens help normalize it away during optimisation.
+
+This property aligns perfectly with how rewards are provided: rewards are given per whole response by an external verifier (\(r(x,y)\in[0,1]\)), not per token. Using sequence-level ratios ensures that *the unit of off-policy correction matches the unit of reward*. Flaws due to mismatched granularity vanish.
+
+### 4.3 Empirical impact on MoE training
+
+In experiments spanning Qwen3-30 B and larger MoEs:
+- With GRPO + Routing Replay training stalled after ~15 GPU days due to exploding variance.
+- Switching to plain GSPO recovered stability within ~3 GPU days without any additional code changes.
+- Performance jumps: AIME Pass@3 rose from 28 % (GRPO+Replay) to 35 % (GSPO), LiveCodeBench improved from 12 % to 18 %, while total FLOP usage dropped by ~30 %.
+
+These figures directly translate into cheaper cloud bills and faster experimentation cycles.
+
+---
+
+## 5. TL;DR – What GSPO Gives You
+
+- **Stability without tinkering** – No need for “Routing Replay” or custom runtime hooks.
+- **Simpler pipelines** – Drop expert caches, keep inference & training engines identical.
+- **Better efficiency** – One forward pass instead of two; no extra egress traffic in distributed setups.
+- **Full capacity utilization** – Since we no longer restrict which experts can fire during updates, MoEs can fully exercise their depth and width without being pinned down by synthetic gating constraints.
+
+If you’re building an RL baseline on top of an MoE LLM, move your policy updates inside a sequence‑likelihood framework like GSPO before you even think about tuning clipping ranges or learning rates. It handles expert volatility automatically—making your RL loop behave like it does on a dense model but without any special gymnastics.
+
+---
+
+## Closing Thought
+
+Intuitive as it may seem—“just use sequences instead of tokens”—the shift has hidden implications that ripple through every layer of your training stack: loss scaling, gradient clipping dynamics, sparsity patterns—all become naturally aligned with how language models actually generate rewards. Techniques like Routing Replay were clever stop‑gaps born out of necessity; but as algorithms mature, those patches become noise bays in our model garden. By rethinking stochastic alignment from bite‑to‐bite downwards up toward bite‐by‐fruit upwards—the sequence level—we get rid of noise and let our models grow large and competent again.
+
+Happy coding! And remember: if your MoE model keeps “forgetting” which experts it used last time you updated it, try aligning the learning objective with entire responses rather than individual tokens—GSPO was born exactly for that reason.

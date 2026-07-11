@@ -1,0 +1,140 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# Asynchrony on Hopper GPUs: Turning Latency Into Speed  
+
+*How the Tensor Memory Accelerator (TMA) and asynchronous Tensor Cores let FlashAttention‑3 hide memory and compute latencies using a producer‑consumer warp model.*
+
+---
+
+## The latency problem in exact attention  
+
+When a Transformer computes self‑attention it must form the score matrix  
+
+\[
+\mathbf{S}= \frac{1}{\sqrt{d}}\;\mathbf{Q}\mathbf{K}^{\top},
+\qquad
+\mathbf{P}= \operatorname{softmax}(\mathbf{S}),\qquad
+\mathbf{O}= \mathbf{P}\mathbf{V},
+\]
+
+with $\mathbf{Q},\mathbf{K},\mathbf{V}\in\mathbb{R}^{N\times d}$.  
+Even though the matrix‑multiplications are “just” GEMMs, the quadratic $N^2$ term makes attention dominate both runtime and memory traffic. 
+
+**FlashAttention‑2** tackled this by fusing the three ops into a single kernel so that intermediate matrices never touch global memory. The trick worked well on older GPUs but only achieved about **35 %** compute utilization on NVIDIA’s Hopper H100—far below the ~80 % hit rate of a handcrafted GEMM kernel.  
+
+Why? Two things changed on Hopper:
+
+1. **Tensor Memory Accelerator (TMA)** – a dedicated unit that moves data between HBM (global memory) and shared memory *asynchronously*.
+2. **Asynchronous Tensor Core WMMA** – the new `WGMMA` instruction can start a matrix multiply while still fetching its operands from shared memory; it does not stall the rest of the warp.
+
+If we can schedule data movement **and** computation so they overlap, those hidden latencies disappear and the kernel finally runs at its theoretical speed.
+
+---
+
+## Hopper’s async building blocks  
+
+| Component | What it does | Why it helps |
+|-----------|--------------|--------------|
+| **TMA**   | Issues non‑blocking loads/stores between global memory (HBM) and shared memory (SMEM). | The GPU can keep doing work while a block of $\mathbf{K}$ or $\mathbf{V}$ streams in. |
+| **Tensor Core (`WGMMA`)** | Performs a GEMM directly from SMEM operands without waiting for previous instructions. | Matrix multiply becomes a fire‑and‑forget operation that can run in parallel with other arithmetic such as exponentials. |
+| **Warp groups** | A CTA is split into several *warp‑groups* (typically 4 warps each). | By dedicating some warps solely to loading (`producer`) and others solely to computing (`consumer`), each group can stay busy without stepping on each other’s toes. |
+| **`setmaxnreg`** | Dynamically re‑allocates registers between warp‑groups at launch time. | Consumer warps get extra registers for larger GEMM tiles; producer warps keep only what they need for TMA calls. |
+
+These concepts are already present in Hopper’s programming guide—they just weren’t exploited by earlier FlashAttention kernels.
+
+---
+
+## Producer–consumer warp specialization  
+
+The core idea of FlashAttention‑3 is a **circular SMEM buffer** managed by two kinds of warp‑groups:
+
+1. **Producer warps** – issue TMA loads for $\mathbf{Q}$, $\mathbf{K}$ and $\mathbf{V}$ into SMEM slots.
+2. **Consumer warps** – read already‑loaded tiles from SMEM and run `WGMMA` to form partial scores $\mathbf{S}^{(j)}$ and partial outputs $\mathbf{O}^{(j)}$.
+
+A simplified sketch (inspired by Algorithm 1 of the paper) looks like this:
+
+```text
+# Producer side
+for each tile j of K/V:
+    TMA_load(K_j)                     // async, no stall
+    TMA_load(V_j)
+    signal_consumer(j)               // notify that slot j is ready
+
+# Consumer side
+for each tile j:
+    wait_for_producer(j)             // barrier until slot j filled
+    S_cur = WGMMA(Q_i, K_j^T)         // async GEMM
+    softmax_update(S_cur)            // exp, row‐max etc.
+    O_i += WGMMA(P_cur, V_j)          // second async GEMM
+    release_slot(j)                  // let producer reuse it
+```
+
+Key points:
+
+* The producers *never* wait for any GEMM result—they merely stream data into SMEM.
+* Consumers *never* touch global memory—they only read from the already resident SMEM tiles.
+* A lightweight barrier (`signal_consumer` / `wait_for_producer`) synchronizes just enough to preserve data correctness while letting the hardware pipeline run continuously.
+* `setmaxnreg` gives consumer warps more registers so they can hold intermediate results (`S_cur`, `P_cur`) without spilling, while producers shrink their register footprint because they only need a handful of registers for a TMA launch.
+
+Because TMA is truly asynchronous, the first *s* stages of the circular buffer fill up without any stalls; only when the buffer wraps around does a producer have to pause until its earlier slot is reclaimed by a consumer. In practice this yields near‑perfect overlap between data movement and computation.
+
+---
+
+## Hiding softmax under asynchronous GEMMs  
+
+Even after we overlap loads with matrix multiplies, there remains an obvious sequential dependency: **softmax needs the scores** $\mathbf{S}^{(j)}$, while the second GEMM needs *post‑softmax* probabilities $\widetilde{\mathbf{P}}^{(j)}$. On Hopper those two steps have wildly different throughputs:
+
+* FP16 matmul throughput ≈ 989 TFLOPs/s  
+* Exponential / special‑function throughput ≈ 3.9 TFLOPs/s
+
+In other words, while Tensor Cores are churning through billions of FLOPs per cycle, the scalar “exp” pipeline sits idle most of the time.
+
+FlashAttention‑3 solves this with **ping‑pong scheduling** across two consumer warp‑groups:
+
+1️⃣ Warp group A finishes its `WGMMA(Q·Kᵀ)` for tile *j*, then immediately starts computing `exp` on those scores (the softmax part).  
+2️⃣ While group A works on `exp`, warp group B launches its own `WGMMA(Q·Kᵀ)` for tile *j+1*.  
+3️⃣ When group A finishes `exp`, it proceeds to its second GEMM (`P·V`) using results from tile *j*, while group B now moves onto its own softmax stage.
+
+The two groups exchange roles each iteration—hence “ping‑pong”. By inserting explicit CUDA barriers (`bar.sync`) we enforce that *all* `WGMMA`s belonging to one group are issued before any softmax instructions from the other group execute. The net effect is that **every cycle contains both a high‑throughput matmul and a low‑throughput exponential**, eliminating idle time for either unit.
+
+Real measurements confirm this intuition: flashing from 570 TFLOPs/s (no overlap) up to 620–640 TFLOPs/s for FP16 forward passes at head dimension 128 and sequence length 8192—roughly an extra 10 % boost just from intra‑warpgroup pipelining.
+
+---
+
+## From 35 % to 75 % utilization  
+
+Putting producer–consumer specialization together with ping‑pong softmax yields surprising speedups:
+
+| Precision | Peak TFLOPs/s (H100 SXM5) | Observed Utilization | Speedup vs FlashAttention‑2 |
+|-----------|--------------------------|----------------------|-----------------------------|
+| FP16      | ~990 TFLOPs              | ~75 % (≈740 TFLOPs/s) | 1.5–2×                      |
+| FP8       | ~1.2 PFLOPs              | comparable           | ≈1× (but doubles raw throughput because FP8 Tensor Cores are twice as fast) |
+
+FlashAttention‑2 topped out at roughly 35 % because its kernels were built around synchronous “load → compute → write” steps that left both TMA units and Tensor Cores underutilized most of the time. By redesigning the algorithm around Hopper’s asynchronous execution model we finally achieve hardware utilisation comparable to hand‑tuned GEMM kernels—without sacrificing exactness (the algorithm still computes true softmax).
+
+A few practical notes from our implementation:
+
+* **Register pressure:** The two‑stage pipeline needs an extra copy of $\mathbf{S}_{\text{next}}$ kept in registers, which pushes occupancy limits at very large block sizes.
+* **Compiler reordering:** NVCC sometimes shuffles instructions; we verified through SASS inspection that our barriers indeed enforce the intended order.
+* **Scalability:** The approach works for any sequence length where we can tile Q/K/V into blocks $B_r$/$B_c$; larger blocks give higher arithmetic intensity but also raise register usage—so profiling remains essential.
+
+---
+
+## Key takeaways  
+
+- **Asynchrony is free if you schedule it right** – Hopper’s TMA lets you pull data into shared memory while Tensor Cores are already busy on previous tiles.
+- **Separate roles = higher occupancy** – dedicating some warps just to loading frees up registers for the compute warps, letting them use larger GEMM tiles without spilling.
+- **Overlap cheap ops with expensive ops** – ping‑pong scheduling hides softmax’s low‐throughput exponentials behind high‐throughput matrix multiplies.
+- **Result:** FlashAttention‑3 reaches up to 75 % device utilisation on H100s, delivering 1½–2× faster exact attention than FlashAttention‑2 while keeping numerical error identical (FP16) or even improving it dramatically when combined with FP8 block quantization techniques.
+
+---
+
+## Looking ahead  
+
+The producer–consumer pattern isn’t limited to attention—it can accelerate any kernel where large tensor loads precede heavy compute (e.g., convolutional backbones or vision transformers). Moreover, while our experiments focused on NVIDIA’s Hopper architecture, any accelerator offering separate data‐movement units and compute units could benefit from a similar software pipeline.
+
+FlashAttention‑3 is open source (`github.com/Dao-AILab/flash-attention`) and will soon be integrated into PyTorch/Hugging Face pipelines, so developers can plug in these speedups without rewriting models. As GPUs continue adding more specialized async engines (e.g., tensor‐core versions for FP4/FP6), refining producer–consumer pipelines will remain a key strategy for squeezing every ounce of performance out of modern hardware—turning latency into speed rather than a bottleneck you have to live with.
+
+--- 
+
+*Happy hacking!*

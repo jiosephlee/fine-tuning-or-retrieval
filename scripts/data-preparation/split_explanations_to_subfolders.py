@@ -38,7 +38,13 @@ def load_outline_titles(explanations_dir, outline_filename, key, title_key):
         outline_data = json.load(f)
     if isinstance(outline_data, dict):
         outline_data = outline_data.get(key, [])
-    return [item.get(title_key) for item in outline_data if item.get(title_key)]
+    # Some generated outlines contain stray non-dict items (generation artifacts);
+    # only dict entries can carry a usable title.
+    return [
+        item.get(title_key)
+        for item in outline_data
+        if isinstance(item, dict) and item.get(title_key)
+    ]
 
 
 def split_by_outline_titles(content, titles, min_prefix_chars=200):
@@ -89,11 +95,13 @@ def split_textbook(explanations_dir):
     if not chapter_titles:
         chapter_titles = load_outline_titles(explanations_dir, "textbook_outline.json", "sections", "section_title")
 
-    if chapter_titles:
-        chapter_contents = split_by_outline_titles(content, chapter_titles)
-    else:
-        print(f"  No outline found, skipping textbook split")
-        return
+    chapter_contents = split_by_outline_titles(content, chapter_titles) if chapter_titles else []
+    if not chapter_contents:
+        # Fallback for corpora whose generator wrote its own chapter headings
+        # (outline titles absent from the text): split on markdown h1 headers,
+        # mirroring the blogs fallback.
+        h1_parts = re.split(r'\n(?=# )', content)
+        chapter_contents = [p.strip() for p in h1_parts if p.strip().startswith("# ")]
 
     if not chapter_contents:
         print(f"  Could not find chapter boundaries, skipping")
@@ -176,13 +184,20 @@ def split_stackexchange(explanations_dir):
     lines = content.split("\n")
     title_line = lines[0] if (lines[0].startswith("\\title{") or lines[0].startswith("Title:")) else ""
 
-    # Q&A blocks start with "### Question Title"
+    # Q&A blocks start with "### Question Title". Some corpora (e.g. gpt_oss) also
+    # use "### " for section headers inside answers; a real Q&A block is identified
+    # by containing a top-level "Question:" line, and header-only blocks are folded
+    # back into the preceding Q&A.
     parts = re.split(r'\n(?=### )', content)
     qas = []
     for part in parts:
         part = part.strip()
-        if part.startswith("### "):
+        if not part.startswith("### "):
+            continue
+        if re.search(r'(?m)^Question:', part) or not qas:
             qas.append(part)
+        else:
+            qas[-1] = qas[-1] + "\n\n" + part
 
     if not qas:
         print(f"  No Q&A blocks found in stackexchange.txt, skipping")

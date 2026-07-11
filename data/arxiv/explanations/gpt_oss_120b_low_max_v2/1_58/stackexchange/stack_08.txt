@@ -1,0 +1,136 @@
+\title{Stack Exchange of the Paper: "The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits"}
+
+### How would a 1‑bit Mixture‑of‑Experts (MoE) model be built on top of BitNet b1.58?
+Question:
+The authors briefly propose 1‑bit MoE LLMs but give no architectural details. Would each expert use its own ternary weight matrix and share the same routing network? How does quantization affect the routing logits, and what changes would be needed in load balancing or expert capacity calculations?
+Answer:
+**Answer**
+
+The paper only sketches the idea of a *1‑bit Mixture‑of‑Experts* (MoE) model and does not give an explicit architecture, but the design can be inferred from the way **BitNet b1.58** is built.  
+In a standard MoE layer the computation is
+
+$$
+y=\sum_{k=1}^{E} g_k(x)\;\; \operatorname{Expert}_k\bigl(R_k(x)\bigr),
+$$
+
+where  
+
+* $E$ is the number of experts,  
+* $g_k(x)\in\{0,1\}$ are the routing masks (often sparse – e.g. top‑2),  
+* $R_k(\cdot)$ extracts the slice of the hidden state that is sent to expert $k$, and  
+* each expert is a feed‑forward sub‑network (normally a pair of `nn.Linear` layers with a non‑linearity).
+
+**BitNet b1.58** replaces every `nn.Linear` with a **BitLinear** whose weights are ternary $\{-1,0,+1\}$ and whose activations are 8‑bit integers. The same substitution can be applied inside every expert: each expert becomes a *ternary* feed‑forward network built from `BitLinear` modules, while all other components of the Transformer (RMSNorm, SwiGLU, rotary embeddings) stay unchanged.
+
+Below is a concise description of how a 1‑bit MoE on top of BitNet b1.58 would look, together with the consequences for routing, load‑balancing and capacity calculations.
+
+---
+
+### 1. Expert weight matrices
+
+* **Separate ternary matrices** – each expert keeps its own set of `BitLinear` weights that are quantised by the *abs‑mean* function described in the paper:
+
+  $$
+  \widetilde{W}= \operatorname{RoundClip}\!\Bigl(\frac{W}{\gamma+\epsilon},-1,1\Bigr),\qquad
+  \gamma=\frac{1}{nm}\sum_{i,j}|W_{ij}|.
+  $$
+
+  This quantisation is performed **independently for every expert**, exactly as for the base model. Because each expert’s parameters are stored in ternary form, the memory required for an MoE with $E$ experts grows only linearly in $E$ but with a factor of ~$\tfrac{1}{16}$ compared with FP16 experts.
+
+* **Shared non‑linearities and normalisation** – the SwiGLU activation and RMSNorm that sit around the experts are not quantised; they remain in full precision (or at most 8‑bit activation as in BitNet). This matches the implementation of BitNet where only the linear kernels are ternarised.
+
+---
+
+### 2. Routing network
+
+The router itself is *not* ternarised. The paper mentions that 1‑bit MoE “reduces the memory footprint … and eliminates most inter‑chip traffic”, but it does **not** say that the router logits are also 1‑bit. In practice:
+
+* **Routing logits are kept in floating point (FP16/BF16)** because they must discriminate among many experts; a tiny quantisation error would cause large changes in which experts are selected.
+* After computing logits $z = xW_{\text{router}} + b_{\text{router}}$, a softmax (or a sparsified variant such as *top‑k* softmax) yields probabilities; then hard gating ($g_k = 1$ for the top‑k experts, else 0) produces the binary mask.
+* Since the router parameters are a tiny fraction of the total MoE parameters (typically one linear layer per MoE block), keeping them in full precision adds negligible memory overhead.
+
+Thus **each token still sees only a few experts**, and because activations travelling to an expert are already 8‑bit integers they can be transmitted across chips much cheaper than full‑precision activations.
+
+---
+
+### 3. Effect on load balancing
+
+BitNet b1.58 already uses *load‑balancing loss* (the auxiliary loss encouraging each expert to receive roughly equal traffic). That loss does not depend on weight precision; it only uses the router’s gating probabilities. Consequently:
+
+* No change is required to the formulation of the loss term.
+* The only practical difference is that, because experts now occupy far less memory, we can afford to **increase the number of experts** for a given hardware budget while keeping the same batch size and sequence length. This automatically improves load balance because more experts dilute traffic spikes.
+
+If one wishes to be extra careful about overflow when aggregating many integer activations inside an expert, a small *bias term* (kept in higher precision) can be added before applying SwiGLU; however this does not affect routing.
+
+---
+
+### 4. Expert capacity calculation
+
+In conventional MoE implementations capacity per expert is often set as
+
+$$
+C = \left\lceil \frac{\alpha\, B\, L}{E} \right\rceil,
+$$
+
+where $B$ is batch size, $L$ sequence length, $E$ number of experts and $\alpha>1$ a safety factor (e.g., $\alpha=1.2$).  
+
+Because **the per‑token representation inside an expert is now 8 bits instead of 16 bits**, the *memory footprint* of stored intermediate activations is halved. Therefore we can either:
+
+1. **Keep $C$ unchanged**, which simply reduces overall memory usage; or  
+2. **Increase $C$** (e.g., double it) to allow each expert to hold more tokens without hitting memory limits – this can improve throughput when traffic is highly skewed.
+
+The paper’s “energy” discussion indicates that additions dominate cost; integer additions are cheap, so expanding capacity does not noticeably increase energy consumption.
+
+---
+
+### 5. Putting it together
+
+A practical implementation would look like this:
+
+```python
+class BitMoELayer(nn.Module):
+    def __init__(self, dim, hidden_dim, num_experts, top_k=2):
+        super().__init__()
+        # router stays FP16
+        self.router = nn.Linear(dim, num_experts, bias=False)
+        # each expert: two BitLinear + SwiGLU
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                BitLinear(dim, hidden_dim),
+                SwiGLU(),
+                BitLinear(hidden_dim, dim)
+            ) for _ in range(num_experts)
+        ])
+        self.top_k = top_k
+        self.capacity_factor = 1.25   # same as dense MoE
+
+    def forward(self, x):
+        # x : [B*L , dim]   int8 activations after embedding
+        logits = self.router(x.float())          # keep FP16 for routing
+        scores = F.softmax(logits, dim=-1)
+        topk_vals, topk_idx = scores.topk(self.top_k, dim=-1)
+
+        # create binary mask g (B*L , num_experts)
+        mask = torch.zeros_like(scores)
+        mask.scatter_(1, topk_idx, 1.)
+
+        # send tokens to selected experts (int8 paths)
+        out = torch.zeros_like(x)
+        for i, expert in enumerate(self.experts):
+            sel = mask[:, i].bool()
+            if sel.any():
+                out[sel] += expert(x[sel])       # all ops inside are INT8+INT32 acc.
+        return out
+```
+
+All linear layers inside `expert` are `BitLinear`, thus using ternary weights and INT8 activations; only the router operates in floating point.
+
+---
+
+### Summary
+
+* **Each expert keeps its own ternary (`{-1,0,+1}`) weight matrices**, exactly as in ordinary BitNet b1.58.
+* The **router remains in full precision**, because quantising logits would damage gating decisions.
+* **Load‑balancing loss and capacity formulas stay unchanged**, but thanks to half‑size activations we can either cut memory usage or raise per‑expert capacity without extra cost.
+* The overall architecture is therefore just a standard MoE layer where every feed‑forward sub‑network has been swapped for `BitLinear`.  
+  This gives exactly the advantages advertised in Section “1‑bit Mixture‑of‑Experts”: dramatically lower weight memory, smaller activation traffic across chips, and almost no multiplication—only integer additions—while preserving the routing behaviour of ordinary MoE LLMs.

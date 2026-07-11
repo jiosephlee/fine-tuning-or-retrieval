@@ -1,0 +1,108 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### "Why must FP8 WGMMA operands satisfy a k-major layout while FP16 allows both mn-major and k-major layouts?
+Question:
+"Section 2.2 mentions that WGMMA for fp8 only accepts operands whose inner dimension $k$ is contiguous.
+Could you explain why this requirement exists at >hardware> or PTX>level and what would go wrong if I attempted an mn-major operand with fp8 tensors?
+Answer:
+**Short answer**
+
+The “inner‑dimension‑contiguous” rule for FP8 WGMMA comes from how Hopper’s Tensor-Core fabric was built.  
+The low‑precision accelerator uses *DP4-A* units that read a 4×4 tile of the first operand at a time, and those tiles are laid out in registers exactly according to a **k-major** (inner-dimension-contiguous) fragment.  
+When the stride isn’t along k, the needed stretches of memory would be non-contiguous across warp threads; such scatters are not supported by those HW blocks, so an assembler error is produced or the load becomes a slow generic gather that defeats all of the acceleration advantage we want.  
+With FP16/WP it is still possible because two extra “transpose” stages are available in hardware: an extra “mn-major” path can be fed through an internal buffer that swaps axis roles before feeding it back out again. FP8 HW has no equivalent magic path, so it accepts only the natural **k-major** mapping.
+
+Below is a more detailed walk-through.
+
+
+
+---
+
+### What does “mn-major” vs “k-major” mean?
+
+For a matrix product \(C = A B^T\) with \(A \in \mathbb{R}^{M\times K}\), \(B \in \mathbb{R}^{N\times K}\):
+
+* **mn-major** – columns of each operand are stored contiguously (`row-major` order when `K` changes slowly). An example memory layout for \(A\) looks like  
+\[
+[A_{0,\ast}, A_{1,\ast}, \dotsc , A_{M-1,\ast}]
+\]
+* **k-major** – rows are laid out sectionally (`K` runs fastest):  
+\[
+[A_{0,0}, A_{0,1}, \dotsc , A_{0,K-1}, A_{1,0},\dotsc]
+\]
+
+In a TMA load from global↦shared memory you cannot change these strides – they’re set by how you originally packed your tensors or how you transpose them before loading.
+
+
+
+---
+
+### How TPUs/Hopper’s Tensor Cores consume these fragments
+
+The Hopper *WGMMA* instruction operates on “fragments”: small blocks of registers that hold pieces of \(A\), \(B\) and optionally an accumulator for its result (FP32).  
+For **FP16**, two kinds of fragments are accepted:
+
+| variant | source (registries / shared) | required ordering |
+|---------|-------------------------------|-------------------|
+| mn_major | can come from shared memory      | **any**            |
+| k_major | shared **or** register           | any                |
+
+Because FPGA firmware contains two separate pipelines inside each Tensor-Core tile – one driven by a gromline engine that can perform an implicit 4×4 transpose – an all–mn product can be fed directly into WMMA after an internal rearrange operation inside SMEM.
+
+
+
+For **FP8**, Sam requires a stricter setup:
+
+* The first operand’s fragment must already be laid out *exactly* as produced by reading consecutive `uint64` values (i.e., “packed” along k).
+* That’s exactly what a k-major TMA produced looks like after loading into SMEM with `ldmatrix`/`stmatrix`.
+* There is no internal transpose path available for FP8 because the DP4-A MPAC units were designed without a lane shuffler large enough to handle full transposes on their own – simply because 256 1-byte elements don’t fit into a single 128-byte blade when stored row–by–row without contiguity along *k*.
+
+
+
+Consequently, when you try to give an *mn*-layout fragment on FP8:
+
+
+
+1. **Assembler / PTX Validation** – The PTX assembler sees that fields `C_k` (kernel-mode flag) ≠ `C_mn`, etc., triggers a fatal error (“illegal combination of ordering flags”).  
+
+2. **Hardware Path** – If somehow bypassed (e.g., by hand-writing SASS), each thread group would load non-contiguous words from SMEM using gathers (`ldmatrix / stmatrix` do not support arbitrary strides), causing uncoalesced traffic → massive slowdowns and wrong numeric results since every gather fetch mixes bytes from neighboring columns incorrectly.
+
+
+
+3. **Operand–Accumulator Mismatch** – When chaining two GEMMs back-to-back—necessary for our fused softmax pipeline—the first GEMM produces an **FP32 accumulator whose register order depends on how we read *A*. Subsequent WGMMAs expect that order again. If we had used an mn packet at some stage, we’d have had to permute bytes differently each time—something not tunable by current HW features—so either we’d get garbage values or we'd have to fall back on slower scalar kernels.
+
+
+
+In short— the hardware simply does ​not​ know how to turn an arbitrary mn ordering from stream into its internal DP4-A tile budget when operating in eight-bit mode; only pure kj streams line up with its fixed read pattern.
+
+
+
+---
+
+### What happens if you still try it?
+
+* At compile time most runtimes will catch it immediately: PTX assembly will emit something like  
+
+```text
+error : target segment ignored
+error : WGMMA invalid order...
+```
+
+
+
+* If you circumvent PTX and hand–produce SASS (extremely rare) you’ll end up with either
+
+    * Extremely poor performance because every `ldmatrix` uses generic loads instead of `STSM/STSM_PACKED`; EM reports many warps stalled waiting for memory.
+    * Or worse → numerical corruption because each symbol representing one ‘row’ actually picks up bytes from two adjacent rows (“row mosaic”), altering every dot product completely.
+
+
+
+---
+
+
+
+### Bottom line
+
+The special-case design decision was taken at silicon time: implement fast DP4-A units accepting prepacked 4×4 tiles; allow semantic flexibility only where the firmware already contains an implicit transpose path (FP16/BF16). Introducing another path would stretch silicon resources and diminish lifetime — thus Hopper reserves only k-major support for the cheapest precision levels (FP8/FpSupplement).
+
+So when writing FlashAttention — or any working tensor kernel targeting Hopper GPU — always make sure FB64 operands for second GEMM’re placed contiguously along k (or explicitly transpose them before loading). Once they’re in place your fused softmax pipeline will run at full throughput without any compiler warnings or hidden errors.)

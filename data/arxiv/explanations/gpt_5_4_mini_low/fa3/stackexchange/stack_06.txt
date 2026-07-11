@@ -1,0 +1,37 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### How can softmax be overlapped with GEMM if softmax depends on the GEMM output?
+Question:
+The main technical claim I am struggling with is the 2-stage pipeline. The paper says it overlaps non-GEMM softmax work with asynchronous GEMMs, even though softmax depends on $\mathbf{S}_{\mathrm{next}} = \mathbf{Q}_i \mathbf{K}_j^\top$ and the second GEMM depends on $\widetilde{\mathbf{P}}_{\mathrm{cur}}$.
+
+I can follow the pseudocode line by line, but I do not have an intuitive mental model of why this is legal. Is the idea simply to pipeline across iterations so that during iteration $j$ you are:
+
+- computing $\mathbf{S}_{\mathrm{next}}$ for block $j$,
+- computing $\mathbf{O}_i += \widetilde{\mathbf{P}}_{\mathrm{cur}}\mathbf{V}_{j-1}$ for block $j-1$,
+- and doing softmax for the score block that has just become available?
+
+If so, could someone restate the dependency graph carefully? Right now I keep thinking there is still a sequential chain that would prevent overlap.
+Answer:
+Yes — the key is that the overlap is *across iterations*, not within a single iteration’s true data dependence chain. The paper is explicit that “within one warpgroup, we can overlap some instructions in the softmax with some instructions in the GEMMs,” but only after “pipelining across iterations through additional buffers in registers.” In other words, they do **not** claim that softmax magically runs before the score block exists; they restructure the loop so that, while the current block is being softmaxed, the Tensor Cores are already computing the *next* score block and/or the previous value-product block.
+
+The dependency graph is easiest to see if you separate the two GEMMs and the softmax state by iteration. For block $j$, the mathematical flow is still
+
+$$
+\mathbf{S}^{(j)} = \mathbf{Q}_i \mathbf{K}_j^\top,\qquad
+\widetilde{\mathbf{P}}^{(j)} = \mathrm{softmax\_local}(\mathbf{S}^{(j)}, m,\ell),\qquad
+\mathbf{O} \mathrel{+}= \widetilde{\mathbf{P}}^{(j)} \mathbf{V}_j.
+$$
+
+So within a single block, yes, $\widetilde{\mathbf{P}}^{(j)}$ depends on $\mathbf{S}^{(j)}$, and the output update depends on $\widetilde{\mathbf{P}}^{(j)}$. That sequential dependence is real and cannot be removed. What FlashAttention-3 changes is the *schedule* of these operations across blocks. Because the first GEMM for block $j+1$ only needs $\mathbf{Q}_i$ and $\mathbf{K}_{j+1}$, it does **not** depend on the softmax of block $j$. Meanwhile, the second GEMM for block $j$ only needs the already-computed $\widetilde{\mathbf{P}}^{(j)}$ and $\mathbf{V}_j$. These are independent enough that, once $\widetilde{\mathbf{P}}^{(j)}$ has been formed, the Tensor Cores can start the $\widetilde{\mathbf{P}}^{(j)}\mathbf{V}_j$ update while the CUDA cores are doing the softmax work for block $j+1$.
+
+That is exactly what the pseudocode is arranging. In the main loop, line $\ref{code:first_wgmma}$ launches the next score GEMM, line $\ref{code:second_wgmma}$ launches the previous value GEMM, and line $\ref{code:softmax}$ computes the softmax for the newly available score block. Because WGMMA is asynchronous, “commit but do not wait” means the Tensor Core work can be in flight while the regular FP/exp instructions run. The crucial point is that the two WGMMA calls and the softmax are not three independent computations of the *same* block; they belong to *different* blocks in a staggered pipeline.
+
+Your mental model is therefore basically right, but with one small correction: in iteration $j$, the kernel is not simultaneously computing $\mathbf{S}_{\mathrm{next}}$ and the softmax for the same block. Rather, it is computing $\mathbf{S}_{j+1}$, using $\widetilde{\mathbf{P}}_j$ to update $\mathbf{O}$, and then softmaxing $\mathbf{S}_{j+1}$. The “next” score block becomes the “current” one in the following step, which is why the code copies $\mathbf{S}_{\mathrm{next}}$ to $\mathbf{S}_{\mathrm{cur}}$ at the end of the loop. The extra register buffer is what breaks the apparent serialization: one buffer holds the block whose softmax is currently being computed, while another buffer stores the next score block being produced by WGMMA.
+
+So there is still a sequential chain, but it is only local to each block. Across blocks, the chain is rearranged into a pipeline:
+
+$$
+\text{GEMM}(j+1)\ \parallel\ \text{softmax}(j)\ \parallel\ \text{GEMM}(j)
+$$
+
+subject to the fact that each block’s softmax must still wait for its own score matrix, and each block’s value update must still wait for its own softmax probabilities. The overlap works because those two dependencies are on *different* blocks once the loop is shifted by one iteration. That is the legal trick FlashAttention-3 is exploiting.

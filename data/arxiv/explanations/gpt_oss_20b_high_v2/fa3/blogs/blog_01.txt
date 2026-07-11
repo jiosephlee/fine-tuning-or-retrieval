@@ -1,0 +1,117 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# Warp Specialisation – Turning GPU Latency Into Lightning Attention  
+
+Modern Transformer models spend most of their time computing scaled dot‑product attention:
+$$\mathbf{S}= \alpha\,\mathbf{Q}\mathbf{K}^{\mathsf{T}},\qquad  
+\mathbf{P}=\text{softmax}(\mathbf{S}),\qquad  
+\mathbf{O}= \mathbf{P}\,\mathbf{V},$$
+where $\alpha = d^{-1/2}$ and all matrices have shape $(N\times d)$ per head ($N$ = sequence length). On today’s GPUs this operation is usually dominated by fast Matrix‑Multiply Accumulators (Tensor Cores) together with relatively slow global‑memory traffic and low‑throughput `exp()` instructions needed for softmax. When the implementation forces every step to complete sequentially — first load everything into shared memory, then run one dot product per block — a significant fraction of compute power sits idle waiting for data or waiting operators that have been stalled behind the latest memory transfer or exponential evaluation.  
+
+FlashAttention‑3 tackles this bottleneck head‑on by **warp‑specialising** inside every cooperative thread array (CTA). In a nutshell we separate each CTA into two logical groups:
+
+| Group | Role | Typical PTX commands |
+|-------|------|---------------------|
+| **Producer** | Load query/key/value tiles with Tungten Memory Accelerator (`TMA`) | `tma_async_load` |
+| **Consumer** | Drive Tensor Core GEMMs (`WGMMA`) and execute rowwise softmax | `wmma_sync`, scalar arithmetic |
+
+Separating these roles lets each group execute its “best” instruction set concurrently while still sharing a shared-memory buffer that horizontally streams tiles through the GPU pipeline.
+
+
+---
+
+## 1\. Why split a CTA into producer & consumer warps?
+
+In Hopper GPUs both **TMA** (`tma_async_load`) and **WGMMA** (`wmma_sync`) are *asynchronous*. They start their work immediately once issued, then hand control back so other streams can start without blocking I/O or compute units:
+
+```text
+producer : tma_async_load(Q); tma_async_load(Kj,Vj);
+          notify_consumer();
+consumer : wait_for(Kj,Vj);
+          s_ij ← Q * Kjᵀ ;          // WGMMA
+          p_ij ← exp(s_ij – mᵢ);
+          Oᵢ ← Oᵢ + p_ij * Vj     // second WGMMA
+```
+
+Had we kept all threads together, every iteration would have carried three barriers:
+1️⃣ wait until MMAs finished  
+2️⃣ wait until exponentials were ready  
+3️⃣ wait until registers were flushed back into global memory  
+
+This serial chaining leaves Tensor Cores idle half the time because they’re blocked waiting either for data (`tma`) or an unready exponential lane (`exp`). By letting half the warps perform pure data movement while the other half sink real computation into Tensor Cores, most cycles now spend doing something useful.
+
+
+---
+
+## 2\. The circular shared‑memory buffer 
+
+A single CTA processes several blocks ($B_c$) of keys & values ($K_j$, $V_j$). Between two successive “consumer” iterations there are only two states inside shared memory:
+
+| state | contents             |
+|-------|----------------------|
+| Stage *s* | current pair $(K_w,V_w)$ |
+| Stage *(s+1)%S* | next pair $(K_{w+1},V_{w+1})$ |
+
+With this circular buffer there is always one stage ready when a consumer finishes its second GEMM while another stage is being filled by producers overnight “ping‑ponging” through stages $0…S−1$. With $\verb|maxNRegs$ you simply dictate how many registers each group claims—consumers need more because they own GEMM operands plus partial sum accumulators (`Oᵢ`, `$mᵢ$`, `$ℓᵢ$`), whereas producers keep their footprint tiny (just one sign bit per resource).
+
+
+---
+
+## 3\. Ping‑Pong scheduling across trigonometric functions
+
+Softmax’s exponential operation is performed on a separate ASIC that provides only ∼4 TFLOPS even on Hopper’s top fanout board — far below what Tensor Cores deliver (~1 TFLOP per half-cycle). Rather than idle those units behind slow matmul spikes, FlashAttention‑3 lets one vibrational group finish an exponential sweep “on top” while its neighbour simultaneously drives another GEMM forward:
+
+```
+Stage j         |      Stage j+1
+producing K_{j+1}/V_{j+1}
+-----------→-----
+compute S_{j+1} = Q • K_{j+1}ᵀ            // async WGMMA wakes immediately
+softmax(...)             // pipelined against next GEMM
+compute O_{i} += P_{j}•V_{j}
+```
+
+In effect we double–use every clock cycle such that Tensor Core throughput becomes almost fully saturated while special-function pipes throttle along side them.
+
+
+---
+
+## 4\. Low‐precision acceleration (FP8)
+
+Once the producer–consumer separation worked out cleanly we can harness Hopper’s newest FP8 Tensor Cores by satisfying their stricter layouts:
+* V tiles must be **k‑major** in SMB/loading strides,
+* Intermediate accumulators must be laid out `(0–9)` versus `(0–9)` distinct shuffle order,
+so before launching any PP stream we perform an *in–kernel transpose*. This relies purely on LDSM/STSM instructions that collapse eight-by-eight blocks directly into registers without explicit shuffling — effectively turning each twice as many primed occupants into efficient accumulators without paying an extra synchronization penalty.
+
+
+---
+
+## 5\. Results at a glance  
+
+| precision | core FLOP delivery | estimated theoretical max | utilisation |
+|----------|--------------------|---------------------------|-------------|
+| FP16 | ≈740 TFLOP/s | 985 TFLOP/s | ≈75 % |
+| FP8 | ≈1.2 PFLOP/s | >2× FP16 | ≈90 % |
+
+Compared with FlashAttention‑2:
+* forward pass improves by *~1½×–2×*,
+* backward pass improves by *~1½×–①¾×* — net model training time falls proportionally,
+* at long contexts (>8k tokens) flash-\*3 even beats cuDNN’s vendor‐optimized kernels on H100.
+
+
+Large models often suffer numerical instability because quantization pushes values towards extreme outliers — our small extra quantisation per‑block plus random orthogonal mixing (“incoherent processing”) cuts RMSE relative base peri-g attention from \$=$'' m=2..4 alliances?.
+
+(For this layer only FlashAttention 3’s algorithms attain roughly equivalent accuracy as standard double‐precision yet run at one-third longer real latency.)
+
+---
+
+## Bottom line  
+
+On modern NVIDIA H100 spin‐ether boards you’re mainly wasting capacity because you hand every thread duplication values back unit-by-unit without exploiting concurrency cupped inside each multiprocessor slot. Separating my CTAs into producer & consumer warps converts most idle persistent stalls into productive Tensor Core execution—thereby turning raw latency budgets into thrustful throughput gains that approach physical limitality!
+
+If your pool already relies on cutting‐edge transformer inference you’ll find the migration painless—a single drop-in call (`flash_attn.autocast()` from Dao AILab’s open source repo) pulls these optimisations under hood automatically.
+
+
+
+--- 
+
+The full source life cycle written as open source lock at <https://github.com/Dao-AILab/flash-attention>. It already champions PyTorch/Hugging Face pipelines so developers who hunt longer contexts will notice symmetries right away without reimplementing runtime logic themselves – just plug-and-play fast exact attention wherever you need lightning-speed scaling today​.

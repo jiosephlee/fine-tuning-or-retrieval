@@ -1,0 +1,272 @@
+\title{A Textbook about the Paper: "Byte Latent Transformer: Patches Scale Better Than Tokens"}
+
+Chapter 2: Training Procedure and Data Handling  
+
+In this chapter we describe in depth how the **Byte Latent Transformer (BLT)** is pretrained.  We focus on the concrete choices that make it possible to compare BLT fairly with token‑based baselines while keeping the total floating‑point‑operation (FLOP) budget under control.  The discussion follows the terminology and methodology introduced in the original paper, and every component is explained from first principles so that a newcomer can understand how to reproduce the experiments or adapt them to new settings.
+
+---
+
+## Pretraining Corpora: Llama‑2 Mix vs BLT‑1T  
+
+### Llama‑2 Mix  
+
+The first corpus used for scaling‑law experiments mirrors the data employed to train the Llama 2 family of models.  It consists of roughly **2 trillion tokens** drawn from a heterogeneous collection of web pages, books, code repositories, and scientific articles.  The raw text is first **tokenized with the Llama 3 BPE tokenizer** (vocabulary size 128 K) so that it can be compared directly against BPE baselines, but for BLT the same raw bytes are retained; tokenization is only used to define a reference training schedule.
+
+Before pretraining, each document undergoes a standard cleaning pipeline:
+
+1. **HTML stripping** – all markup tags are removed while preserving visible text.
+2. **Language detection** – documents identified as non‑Latin scripts are retained, but low‑quality language‐identification failures are filtered out.
+3. **Deduplication** – exact and near‑duplicate lines are eliminated using a MinHash fingerprint with a Jaccard threshold of 0.8.
+4. **Safety filtering** – any content matching a list of prohibited patterns (e.g., personal data, hate speech) is discarded.
+
+After cleaning, each document is represented as a **byte sequence** \(\mathbf{x} = \{x_{1},\dots ,x_{n}\}\), where each \(x_{i}\) is an integer in \([0,255]\).  No further preprocessing (e.g., lowercasing) is performed because BLT aims to preserve all sub‑byte information.
+
+### BLT‑1T Dataset  
+
+For the large‑scale “beyond compute‑optimal” experiments a second corpus called **BLT‑1T** is assembled.  It contains roughly **1 trillion tokens** (≈ 4 trillion bytes) drawn from:
+
+- A subset of the publicly released *Datacomp‑LM* data,
+- Large web crawls filtered analogously to the Llama 2 mix,
+- Additional multilingual sources to ensure broad script coverage.
+
+The same cleaning steps described above are applied, yielding a high‑quality byte stream that matches the distribution used for BLT’s entropy model (see next section).  Importantly, all data remain **tokenizer‑free** throughout training; the only grouping operation performed later is dynamic patching.
+
+Both corpora are stored in sharded binary files where each record contains a length field followed by the raw byte payload.  This format enables fast streaming reads during data loading and simplifies on‑the‑fly patch segmentation.
+
+---
+
+## Entropy Model Specifics  
+
+Dynamic patching hinges on an auxiliary **byte‑level language model** that predicts the entropy of the next byte given its left context.  The entropy model is trained **once** on the same pretraining distribution as BLT and then frozen; its predictions are used only during dataset preprocessing to decide where patch boundaries should lie.
+
+### Architecture  
+
+The entropy model follows a standard transformer decoder layout with:
+
+- **Parameter count:** \(100\text{ M}\) (≈ 14 layers),
+- **Hidden dimension:** \(h_{\mathcal{E}} = 512\),
+- **Feed‑forward dimension:** \(4h_{\mathcal{E}} = 2048\),
+- **Number of attention heads:** 8,
+- **Windowed self‑attention:** each token attends to at most the preceding \(w = 512\) bytes.
+
+All layers employ **SwiGLU** activations, RMSNorm normalization, and rotary positional embeddings (RoPE) with \(\theta = 500{,}000\).  Because the model processes bytes directly, its input embedding matrix has shape \(\mathbb{R}^{256 \times h_{\mathcal{E}}}\).  No additional hash‑n‑gram embeddings are used for this model; they would increase FLOPs without improving entropy estimation significantly.
+
+### Sliding Window & Lookup Table Approximation  
+
+When the attention window is small (\(w \leq 256\)), the entropy model’s forward pass can be compiled into a compact lookup table: for each possible context hash we store the distribution over the next byte.  This reduces inference during patching to an essentially O(1) operation per byte, which is crucial because patch boundaries must be identified for millions of sequences in each training epoch.
+
+In practice we train three variants of the entropy model (window sizes 64, 256, and 512) and find that increasing window size beyond 256 yields diminishing returns on boundary quality while increasing memory consumption.  The final experiments adopt \(w = 512\) with a straightforward forward pass rather than a lookup table because GPU memory is abundant during preprocessing.
+
+### Training Procedure  
+
+The entropy model minimizes standard causal cross‑entropy loss:
+
+\[
+\mathcal{L}_{\text{CE}}(\mathbf{x}) = -\sum_{i=1}^{n}\log p_{e}(x_{i}=v_{i}\mid \mathbf{x}_{<i}),
+\]
+
+where \(p_{e}\) denotes the softmax output of the model at position \(i\).  
+Optimization uses AdamW with \(\beta_{1}=0.9\), \(\beta_{2}=0.95\), \(\epsilon=10^{-8}\), a learning rate of \(5\times10^{-4}\), weight decay \(0.1\), and cosine decay after linear warmup for \(2{,}000\) steps.  
+Training proceeds for enough steps to achieve convergence on a held‑out validation split (typically ≈ 200 B tokens).  
+Once trained, checkpoints are frozen; at runtime only the forward pass (or table lookup) is needed.
+
+---
+
+## Determining Entropy Thresholds for Target Patch Size  
+
+A deterministic *patching function* \(f_{p}\) maps each byte position to either “continue current patch” or “start new patch”.  For entropy‑based patching we compute a scalar **entropy estimate**
+
+\[
+H(x_{t}) = -\sum_{v\in \mathcal{V}} p_{e}(x_{t}=v \mid \mathbf{x}_{<t})\,\log p_{e}(x_{t}=v \mid \mathbf{x}_{<t}),
+\]
+
+where \(\mathcal{V}\) is the set of 256 possible byte values.
+
+Two simple decision rules are explored:
+
+| Rule | Condition |
+|------|-----------|
+| Global threshold | \(H(x_{t}) > \theta_{g}\) |
+| Approximate monotonicity | \(H(x_{t}) - H(x_{t-1}) > \theta_{r}\) |
+
+The thresholds \(\theta_{g}\) and \(\theta_{r}\) are not arbitrary; they are calibrated so that the *expected* average patch size equals a target value (e.g., \(4.5\) bytes).  The calibration proceeds as follows:
+
+1. Run the entropy model on a large random sample of training bytes (≈ 10 M bytes).
+2. For each candidate threshold compute the resulting number of patches \(m\).
+3. Derive average patch length \( \overline{s}= n_{\text{bytes}}/m\).
+4. Choose thresholds yielding \(\overline{s}\) closest to desired size while keeping variance modest.
+
+Because BLT must operate **incrementally** at inference time—i.e., it cannot look ahead—the thresholds are applied online as each byte arrives; no future context is consulted beyond what has already been processed by the entropy model.
+
+When training on BLT‑1T we observed “entropy drift” in very long repetitive documents (e.g., multiple choice questions). To mitigate this effect we *reset* the entropy context at each newline character before recomputing entropies for the subsequent line; this keeps local entropy estimates stable across document boundaries.
+
+---
+
+## Batch Composition Under Variable Patch Counts  
+
+Dynamic patching means that two training examples containing exactly the same number of bytes may produce different numbers of patches after segmentation.  Since BLT’s expensive component—the global latent transformer—operates on patches rather than bytes, it is essential to keep the number of patches per minibatch roughly constant to avoid load imbalance and excessive padding.
+
+### Packing Strategy  
+
+During data loading we perform **patch packing**:
+
+1. Sample a batch of raw byte sequences until their *total byte* count exceeds a target budget (e.g., \(16\,\text{MiB}\)).
+2. Apply `f_p` to each sequence independently, yielding variable numbers of patches.
+3. Concatenate all patches from all sequences into a *single* packed tensor `[total_patches]`.
+4. Record an index map so that later stages can reconstruct per‑example boundaries if needed (e.g., for loss masking).
+
+Because patches belong to a single contiguous tensor, padding occurs only once at the end of each packed batch rather than per example.   The total number of patches per batch therefore stays within a narrow band around `target_patches = target_bytes / expected_patch_size`. 
+
+### Padding & Truncation  
+
+To guard against pathological outliers—documents that produce extremely long patches—we enforce:
+
+- A maximum allowed patch length `max_patch_len = 32` bytes.
+- If a patch exceeds this length we split it greedily at its midpoint; this maintains monotonicity without altering overall FLOP counts substantially.
+- Byte sequences longer than `max_seq_len` (12 kB for Llama 2 mix; 24 kB for BLT‑1T) are truncated after tokenizing or patching respectively.
+- Shorter sequences are padded with a special *null byte* (`0x00`) after they have been patched; padding tokens do not affect loss calculation because their cross‑entropy contribution is masked out.
+
+These safeguards keep GPU memory usage predictable while preserving statistical fidelity across batches.
+
+---
+
+## Maintaining Constant Byte Context Length Across Models  
+
+When comparing BLT against BPE baselines we must ensure that any performance differences stem from architectural innovations rather than merely longer effective contexts.  The paper therefore holds **average byte context length constant in expectation**, even though patch sizes differ.
+
+### Procedure  
+
+- For BPE models we use an established context window measured in *tokens*, e.g., `ctx_tokens = 8192`.  
+- Translating this into bytes gives an expected number of bytes `E[n_{\text{bytes}}] = ctx_tokens × \overline{\text{token size}}`.  
+- For BLT we fix `ctx_bytes` directly: `8 kB` when training on Llama 2 mix and `16 kB` when training on BLT‑1T.
+- If after patching our sequence contains fewer patches than required for `ctx_bytes`, we pad additional “dummy” patches whose representations are zeroed out; conversely if more patches appear we simply truncate at `ctx_bytes`.
+
+Because FLOP cost scales inversely with average patch size (`flops ∝ #patches`), fixing `ctx_bytes` ensures that any reduction in FLOPs truly reflects more efficient computation per step rather than simply processing fewer bytes overall.
+
+---
+
+## Optimizer Settings, Learning Rate Schedule, Weight Decay & Gradient Clipping  
+
+All experiments share an identical optimization configuration so that FLOP budgets can be compared directly between architectures.
+
+| Hyperparameter | Value |
+|----------------|-------|
+| Optimizer | AdamW |
+| β₁ | 0.9 |
+| β₂ | 0.95 |
+| ε | \(10^{-8}\) |
+| Base learning rate | \(4\times10^{-4}\) |
+| Warmup steps | 2 000 |
+| Learning rate schedule | Cosine decay from peak LR down to zero at end of pretraining |
+| Weight decay | 0.1 |
+| Gradient clipping norm | 1.0 (global norm across all parameters) |
+| Batch size (in bytes) | Fixed per experiment (see Section “Batch composition”) |
+
+The base learning rate was chosen after sweeping logarithmically between \(1\times10^{-3}\) and \(1\times10^{-4}\) on both a $400$ M and $1$ B parameter configuration; both scales exhibited optimal validation loss around \(4\times10^{-4}\). Importantly this LR is applied uniformly across all three modules (\(\mathcal{E}, \mathcal{G}, \mathcal{D}\)).  
+During “distillation” experiments where BLT’s global transformer is initialized from Llama 3 weights we reduce its LR by an order of magnitude (\(4\times10^{-5}\)) while keeping encoder/decoder LR unchanged; this prevents catastrophic forgetting in already‐trained high‑capacity weights while still allowing fine‐tuning needed for byte-level tasks.
+
+---
+
+## FLOP Accounting Methodology  
+
+Accurate FLOP accounting enables us to claim *flop‑controlled parity* with tokenizers such as Llama 3. The paper follows Chinchilla’s formulation but adapts it to three interacting modules plus cross‑attention steps.
+
+### Forward vs Backward Passes  
+
+For any transformer layer with hidden size \(h\), depth \(l\), sequence length \(m\), and vocabulary size \(V\), Chinchilla approximates forward FLOPs as
+
+\[
+\operatorname{FL}_{\text{FFN}} = m\,l\,[\,8h^{2} +
+    4h\,d_{\text{ff}}\,],
+\]
+where `d_ff` denotes FFN inner dimension (typically $4h$).  
+Self–attention contributes
+
+\[
+\operatorname{FL}_{\text{SA}}= m\,l\, [\,4hd_{\!k}+4hd_{\!v}+2mh^{2}+2h^{2}].
+\]
+
+Because BLT’s embedding lookup is an index operation rather than matrix multiplication its cost is considered zero FLOPs.
+
+A backward pass roughly doubles these counts (the paper assumes *twice* forward FLOPs), so total training FLOPs per iteration equal
+
+\[
+\operatorname{FL}_{\text{train}} = 
+    (\operatorname{FL}_{\text{forward}}+\operatorname{FL}_{\text{backward}})
+    =3\times \operatorname{FL}_{\text{forward}}.
+\]
+
+### Module-Level Breakdown  
+
+Let:
+
+- \(n_{\text{ctx}}\): total number of bytes fed to one forward pass,
+- \(n_{\text{p}}\): resulting number of patches,
+- \(h_{\mathcal G}, l_{\mathcal G}\): hidden size / depth of global latent transformer,
+- \(h_{\mathcal E}, l_{\mathcal E}, w_{\mathcal E}\): hidden size / depth / attention window for encoder,
+- Similar symbols with subscript \(\mathcal D\) for decoder,
+- \(k = h_{\mathcal G}/h_{\mathcal E}\): ratio between global and local hidden dimensions,
+- \(V=256\): byte vocabulary used only by decoder’s final linear projection.
+
+The total FLOPs per *byte* processed by BLT are then
+
+\[
+\begin{aligned}
+    {\rm FL}_{\rm BLT}
+    &= 
+        \underbrace{\frac{\operatorname{Transf.\!FL}(h_{\mathcal G}, l_{\mathcal G},
+                m=n_{\text{ctx}}/n_{\text p}, V=0)} {n_{\text p}}}_{%
+                \text{global latent transformer per patch}}
+      + 
+        \underbrace{\operatorname{Transf.\!FL}(h_{\mathcal E}, l_{\mathcal E},
+                m=w_{\mathcal E}, V=0)}_%
+                {\text{local encoder}}
+      + 
+        \underbrace{\operatorname{Transf.\!FL}(h_{\mathcal D}, l_{\mathcal D},
+                m=w_{\mathcal D}, V=256)}_%
+                {\text{local decoder}}\\[4pt]
+      &+ 
+        \underbrace{\operatorname{CrossAttn.\!FL}(h_{\mathcal E},
+                l_{\mathcal E}, m=n_{\text p},
+                r=n_{\text p}/k)\times
+                k/n_{\text p}}_
+                {\text{encoder cross‐attention}}
+      + 
+        \underbrace{\operatorname {CrossAttn.\!FL}(
+                h_{\mathcal D},l_{\mathcal D},
+                m=k,\ r=k/n_{\text p}) }_
+                {\text{decoder cross‐attention}} .
+\end{aligned}
+\]
+
+Each term represents either an attention block or an FFN block evaluated according to Chinchilla’s formulas; ``CrossAttn`` uses analogous expressions but replaces self–attention’s quadratic term with factor \(r=\frac{\#queries}{\#keys} = k/n_p.\)
+
+The dominant term in most configurations is the global latent transformer because it processes every *patch*. By increasing average patch size—via higher entropy thresholds—the factor `\(m=n_\mathrm {ctx}/ n_\mathrm p)\)` shrinks, yielding fewer global steps and consequently fewer FLOPs per byte during both training and inference.
+
+### Inference FLOP Control  
+
+For inference experiments we fix an upper bound on total FLOPs per generated token by holding `average_patch_size` constant within each budget class (e.g., “low inference flop” vs “high inference flop”). Because every generated byte either belongs to an existing patch or triggers a new latent transformer step depending on whether its position marks a boundary, inference cost becomes
+
+\[
+{\rm FL}_{true}
+   = ({\rm steps~per~patch})\,\, {\rm FL}_{{}^{}}\!\!( {\rm Global})
+   + ({%no~global~step})\,\, {\rm FL}_{{}^{}}\!\!( {\rm Encoder/Decoder}),
+\]
+
+allowing clean comparisons against tokenizers that always invoke their full transformer at every token step.
+
+---
+
+## Summary  
+
+Training BLT requires careful orchestration across several moving parts:
+
+1. High‑quality raw-byte corpora (Llama 2 mix or BLT‑1T), cleaned but otherwise untouched.
+2. A dedicated entropy estimator—a modest transformer—trained once and kept frozen.
+3  A dynamic threshold calibration system guaranteeing target average patch sizes.
+4  Batch packing strategies that normalize “patch count” rather than “byte count”.
+5  Explicit control over byte context lengths so that baselines receive identical amounts of information.
+6  Uniform optimizer hyperparameters ensuring comparable convergence dynamics.
+7  A meticulous FLOP accounting pipeline derived from Chinchilla’s formulas extended to cross-attention modules.
+
+Together these design choices enable **flop‐controlled parity** with state-of-the-art tokenization based models such as Llama 3 while simultaneously delivering up to fifty percent savings at inference time—a central claim explored throughout the rest of this work.
