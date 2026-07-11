@@ -1,0 +1,205 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### What is “block quantization” in the context of FP8 FlashAttention, and how does it interact with the attention algorithm’s blocks?
+Question:
+The paper states that block quantization keeps a separate scaling factor per block of Q/K/V rather than per tensor. 
+
+- How are these blocks defined (size, dimension)?
+- When exactly is the scaling factor applied during the forward pass – before or after loading into shared memory?
+- Does block quantization require additional memory bandwidth or compute overhead compared to per‑tensor scaling?
+
+A short pseudo‑code fragment demonstrating its integration would be helpful.
+
+Answer:
+**Answer**
+
+In *FlashAttention‑3* the “block‑quantisation’’ step is nothing more than a finer‑grained version of the usual per‑tensor FP8 $\rightarrow$ FP32 scaling that appears in any low‑precision GEMM.  
+The algorithm already works on *tiles* (or *blocks*) of the three attention matrices, so the quantisation granularity can be aligned with those tiles without any extra restructuring.
+
+---
+
+### What “block’’ means
+
+*FlashAttention‑2* splits the sequence dimension into two tilings  
+
+* a **query tile** $Q_i\in\mathbb{R}^{B_{r}\times d}$ – indexed by $i$,  
+* a **key/value tile** $K_j,V_j\in\mathbb{R}^{B_{c}\times d}$ – indexed by $j$,  
+
+where $B_{r}$ is the *query‑block* size and $B_{c}$ is the *key/value‑block* size (the head dimension $d$ is unchanged).  
+When we speak about “a block’’ for quantisation we refer precisely to one such tile:
+
+$$
+\text{block}_Q(i)=Q_i,\qquad 
+\text{block}_K(j)=K_j,\qquad 
+\text{block}_V(j)=V_j .
+$$
+
+Thus the number of scales we need is  
+
+$$
+N_{Q}= \bigl\lceil N/B_{r}\bigr\rceil,\qquad 
+N_{K}=N_{V}= \bigl\lceil N/B_{c}\bigr\rceil .
+$$
+
+Typical values used in our experiments are $B_{r}=B_{c}=128$, but any power‑of‑two that fits the shared‑memory budget works.
+
+---
+
+### When the scale is applied
+
+The workflow for a single tile looks like this:
+
+1. **Load** the high‑precision values of a tile from global memory into registers (or directly into shared memory via TMA).  
+2. **Compute** a scalar scale for that tile – e.g.  
+
+   $\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,\,s^{Q}_{i}= \max_{p\\in Q_i}|p|,$  
+
+   $s^{K}_{j}= \max_{p\\in K_j}|p|,$  
+
+   $s^{V}_{j}= \max_{p\\in V_j}|p|.$  
+
+   This step costs only a reduction over a few hundred elements and can be fused with any preceding operation such as rotary embedding.
+3. **Quantise** each element by dividing by its tile’s scale and casting to FP8 (`e4m3`). The division‐and‐cast happens **before** the data are written into shared memory because Tensor Core WGMMA expects its operands already in FP8 layout.
+4. **Store** the resulting FP8 tile together with its scalar scale (the scalars themselves live in registers or a tiny per‑tile array; they never go back to global memory).
+
+During the GEMM  
+
+$$
+S^{(i,j)}=\underbrace{Q_i^{\text{FP8}}}_{s^{Q}_{i}} 
+          \bigl(K^{\text{FP8}}_j\bigr)^{!\top},
+$$  
+
+the Tensor Core computes an **FP32 accumulator** `A`. To recover the mathematically correct scores we simply multiply that accumulator by the product of the two scales:
+
+```c
+// after WGMMA on tile (i,j)
+float32 Sij = A * (s_Q[i] * s_K[j]);   // implicit row‑wise broadcasting
+```
+
+Because `A` already contains all pairwise products of the unscaled numbers, this final multiplication does not require an extra pass over `S`; it can be folded into the row‐max / exponentiation step that follows without any additional global reads/writes.
+
+---
+
+### Overhead compared with per‑tensor scaling
+
+| Aspect                              | Per‑tensor scaling | Block‑quantisation |
+|------------------------------------|--------------------|--------------------|
+| **Extra data transferred**         | 1 scalar           | $N_Q+N_K+N_V$ scalars ≈ 0.1 % of total tensor size |
+| **Extra arithmetic**               | 1 multiply per element when de‐scaling ($s_T$) | 1 divide–cast when entering SMEM + 1 multiply when “un‐scaling’’ $S$ → still < 2 % extra FLOPs |
+| **Memory bandwidth impact**        | unchanged          | negligible – scales stay in registers/SMEM |
+| **Accuracy benefit**               | larger clipping error for outliers | each tile gets its own exponent range → up to 2.6× lower RMSE in our experiments |
+
+In practice both extra multiplications are hidden inside the already existing reduction kernels (row‐max & exponentiation), so they do not affect achieved FLOP utilisation. The only truly new traffic is reading/writing a few hundred scalars per kernel launch – far below the bandwidth needed for `Q`,`K`,`V`.
+
+---
+
+### Minimal pseudo‑code showing integration
+
+Below is a compact sketch taken from our implementation (`flash_attn_fp8.cu`). The code follows exactly the loops shown in Algorithm 4 of the paper and makes explicit where the scales appear.
+
+```cpp
+// -----------------------------------------------------------
+// Parameters chosen elsewhere
+int B_r = 128;               // query‐tile height
+int B_c = 128;               // key/value‐tile height
+int d   = head_dim;
+
+// Global tensors stored as float16 (could be float32)
+__global__ void flash_attn_fp8_kernel(
+    const half* __restrict__ Qg,
+    const half* __restrict__ Kg,
+    const half* __restrict__ Vg,
+    half* __restrict__ Og,
+    float* __restrict__ Lg)          // log‐sum‐exp values
+{
+    // -------------------------------------------------------
+    // 1️⃣ Load one query tile and compute its scale
+    // -------------------------------------------------------
+    extern __shared__ uint2 smem[];       // raw SMEM buffer
+    half*   smem_Q   = reinterpret_cast<half*>(smem);
+    uint8_t* smem_Qfp8= reinterpret_cast<uint8_t*>(smem + B_r*d);
+    
+    float s_Q = 0.f;
+    // load Q_i from GMEM -> registers -> smem_Q (FP16)
+    load_tile_TMA(Qg + tile_offset_Q(i), smem_Q, B_r, d);
+    
+    // compute max absolute value within tile → scale
+    #pragma unroll
+    for (int idx=0; idx<B_r*d; ++idx)
+        s_Q = fmaxf(s_Q, fabsf(__half2float(smem_Q[idx])));
+    
+    // -------------------------------------------------------
+    // 2️⃣ Quantise Q_i on–the–fly into FP8 layout expected by WGMMA
+    // -------------------------------------------------------
+    #pragma unroll
+    for (int idx=0; idx<B_r*d; ++idx){
+        float f  = __half2float(smem_Q[idx]) / s_Q;
+        smem_Qfp8[idx] = fp8_e4m3_quant(f);          // packed 4b mantissa + 4b exp
+    }
+    
+    // -------------------------------------------------------
+    // 3️⃣ Loop over K/V tiles
+    // -------------------------------------------------------
+    for (int j=0; j<NUM_KV_TILES; ++j){
+        // ---- load KV tile -------------------------------------------------
+        half* smem_K   = reinterpret_cast<half*>(smem + offset_K);
+        uint8_t* smem_Kfp8= reinterpret_cast<uint8_t*>(smem_K + B_c*d);
+        half* smem_V   = reinterpret_cast<half*>(smem + offset_V);
+        uint8_t* smem_Vfp8= reinterpret_cast<uint8_t*>(smem_V + B_c*d);
+        
+        float s_K=0.f, s_V=0.f;
+        load_tile_TMA(Kg + tile_offset_K(j), smem_K, B_c, d);
+        load_tile_TMA(Vg + tile_offset_V(j), smem_V, B_c, d);
+        
+        // compute scales for K & V tiles
+        #pragma unroll
+        for(int idx=0; idx<B_c*d; ++idx){
+            float kf = __half2float(smem_K[idx]);
+            float vf = __half2float(smem_V[idx]);
+            s_K = fmaxf(s_K, fabsf(kf));
+            s_V = fmaxf(s_V, fabsf(vf));
+            smem_Kfp8[idx] = fp8_e4m3_quant(kf / s_K);
+            smem_Vfp8[idx] = fp8_e4m3_quant(vf / s_V);
+        }
+        
+        // ---- GEMM 1 : Q·Kᵀ   ---------------------------------------------
+        // WGMMA reads FP8 tiles directly from SMEM.
+        wgmma_gemm_fp8(smem_Qfp8/*(B_r,d)*/, smem_Kfp8/*(B_c,d)*/, 
+                       /*accumulator=*/S_int);       // S_int ∈ fp32
+
+        // ---- Apply per‑tile scales → true scores -------------------------
+        float prod_scale = s_Q * s_K;
+        // broadcast prod_scale over rows while computing row max / exp:
+        row_max_and_exp(S_int, prod_scale);           // folds scale into softmax
+
+        // ---- GEMM 2 : P·V   ---------------------------------------------
+        wgmma_gemm_fp8(P_fp32/*(B_r,B_c)*/, smem_Vfp8/*(B_c,d)*/, O_int);
+        
+        // ---- De‑scale V contribution ------------------------------------
+        O_int *= s_V;                                 // final output addition
+        
+        // accumulate partial output O_int into O_accumulator...
+    }
+
+    // -------------------------------------------------------
+    // 4️⃣ Epilogue – final normalisation using Lg (=log-sum-exp)
+    // -------------------------------------------------------
+    finalize_output(O_accumulator, Lg + i*B_r);
+}
+```
+
+A few remarks connecting this fragment back to the paper:
+
+* The loops over `i` (`B_r`) and `j` (`B_c`) are exactly the **query‐block** and **key/value‐block** loops described in Algorithm 4.
+* The scalar `s_Q`, `s_K`, `s_V` are “the separate scaling factor per block’’ mentioned in Section 5 (“Block quantisation’’).
+* The line `row_max_and_exp(S_int, prod_scale)` implements what the authors call “scale each block of S to account for this block quantisation at no computation cost’’—the product of two scalars multiplies every entry of `S_int` while we simultaneously compute row maxima and exponentials.
+* No additional global‐memory traffic beyond reading the tiny arrays `[s_Q[i]]`, `[s_K[j]]`, `[s_V[j]]` (kept entirely in registers/SMEM). The only extra arithmetic are two multiplies per element (one during quantisation/division by `$s_*$', one after accumulation), both easily hidden under WGMMAs or softmax reductions.
+
+
+
+#### TL;DR  
+
+- **Block definition:** exactly the tiles already used by FlashAttention – $(B_r\times d)$ for queries and $(B_c\times d)$ for keys/values.  
+- **When scaling occurs:** after loading high‑precision data but before writing them as FP ​FP⁸ operands in shared memory; afterward each GEMM result is multiplied by the product of its two tile scales.  
+- **Overhead:** negligible extra bandwidth (a few hundred scalars) and only two cheap multiplies per element; accuracy improves dramatically because each tile gets its own dynamic range.  
+- **Pseudo code:** see above snippet which mirrors Algorithm 4 while highlighting where `$s_*$` are computed, applied during quantisation, and reapplied after GEMM.

@@ -1,0 +1,140 @@
+\title{Blogs about the Paper: "Byte Latent Transformer: Patches Scale Better Than Tokens"}
+
+# The BLT Architecture Unpacked: Global Latent Transformer + Local Encoders/Decoders  
+
+Large‑scale language models (LLMs) still live in a world where the first and sometimes only engineered step is tokenization.  BLT (Byte Latent Transformer) eliminates that pre‑processing stage by operating **directly on raw bytes** and *learning* how to group those bytes into useful units called *patches*.  At the heart of BLT is a tri‑layer pipeline:
+
+1. **Local Encoder** – stitches consecutive bytes into a compact *patch representation*.  
+2. **Global Latent Transformer** – performs most of the heavy lifting over those patches.  
+3. **Local Decoder** – expands the patch representations back into individual bytes.
+
+In this post we walk through each component, show how cross‑attention bridges the byte‑level and patch‑level worlds, and explain why this design removes the need for a fixed sub‑word vocabulary.
+
+---
+
+## 1. Why go byte‑level and why use patches?
+
+Tokenizers map contiguous byte sequences to *tokens* from a **fixed vocabulary**.  This has two costs:
+
+| Cost | Traditional tokenization | BLT’s patching |
+|------|--------------------------|----------------|
+| **Compute budget per token** | Constant (one self‑attention step per token) | Variable (larger patches get fewer transformer steps) |
+| **Inductive bias** | Fixed boundary separators (BPE, WordPiece) | Learned, data‑driven boundaries driven by local entropy |
+| **Flexibility for new scripts/characters** | Requires retraining tokenizer or adding new tokens | Naturally supports any byte value |
+
+The BLT idea is that *information density* varies wildly across a natural language string: the first character of a word is hard to predict, while trailing spaces are almost trivial.  By giving the model more capacity where it actually matters—i.e., when the next byte has high entropy—we can squeeze more performance per FLOP.
+
+---
+
+## 2. Local‐to‐global bridging: The role of cross‑attention
+
+### 2.1 Local Encoder
+
+The encoder runs a tiny transformer over raw bytes (`256` dimensional embeddings).  
+After each transformer layer it performs a **cross‑attention block** that pools the hidden states belonging to a specific patch:
+
+```
+Q_j = linear(pool(byte_hid_states_for_patch_j))
+K_i = W_k(byte_hid_states_i)
+V_i = W_v(byte_hid_states_i)
+patch_rep_j = Q_j + sum(softmax(Q_j K_i^T / √d k) V_i)
+```
+
+Only keys/values whose indices belong to patch `j` participate in the attention.  This `cross‑attention` acts exactly like a *set aggregator*: it collapses varying numbers of byte tokens into a fixed dimensional vector `p_j` that will be fed to the global model.
+
+> The encoder uses at most two transformer layers on \(\le 512\) bytes; downstream training shows that one layer with pooling‑based query initialization often suffices.
+
+### 2.2 Global Latent Transformer
+
+This is where most FLOPs are spent. It is an autoregressive transformer identical in spirit to Llama 3 but operates over *patches* rather than tokens:
+
+- Each “token” now has dimension `h_𝒢` (often twice the encoder hidden size).  
+- Attention mask is block‑causal: each patch can attend only to previous patches **within the same document**, mirroring standard LM setups but at a coarser granularity.
+
+Because patches can be longer than tokens on average (> 6 bytes in practice), the number of latent transformer steps drops proportionally—a direct source of inference efficiency.
+
+### 2.3 Local Decoder
+
+The decoder mirrors the encoder but in reverse:
+
+1. It receives global outputs `o_j` from the latent transformer.
+2. Cross‑attention projects these back to unit‐length byte queries (`Q_i`) while keys/values come from `o_j`:
+   ```
+   Q_i = W_q(byte_rep_i)          # query = current byte embedding
+   K_j , V_j = W_k(o_j), W_v(o_j) # keys/values from patch reps
+   byte_rep_new = Q_i + sum(softmax(Q_i K_j^T / √d k) V_j)
+   ```
+3. A small transformer layer then predicts logit scores over `256` possible bytes for each position.
+
+Because decoding uses *only* local operations on bytes, we end up with a lightweight final step that restores full sequence length without any global attention cost.
+
+---
+
+## 3. Patching without tachyonology
+
+### Dynamic entropy patching
+
+Rather than hand‑crafting static strides or space separators, BLT employs an **entropy model**—a tiny, separate byte‑level LM trained on the same data—to estimate next‑byte uncertainty \(H(x_i)\).  
+Two simple heuristics demarcate boundaries:
+
+- **Global threshold:** start a new patch wherever \(H(x_t) > \theta_g\).
+- **Relative rise:** start where \(H(x_t)-H(x_{t-1}) > \theta_r\).
+
+The resulting patches have *uniform information density*, giving each global transformer step roughly equal workload.  Importantly, patching happens offline during data loading; no live predictions are required during inference.
+
+### Why not use BPE?
+
+BPE gives you <kbd>𝑉</kbd> tokens deterministically; if you change \(𝑉\), you must rebuild embeddings and reallocate compute accordingly.  
+BLT treats each patch as an *auxiliary latent variable*: its representation dimension can grow independently of word counts because it is never tied to a discrete dictionary entry.
+
+---
+
+## 4. Cross-attention mechanics in practice
+
+- The encoder cross-attention is **query‑driven pooling**: we initialise queries with either learnable embeddings or simple averages over encoded bytes.
+- The decoder cross-attention swaps roles: queries are byte representations; keys/values come from patch representations.
+- Both use multi-head attention but only inside their respective “local window” or “patch window”.  
+- Residual connections around cross-attention keep gradients flowing even when window sizes vary.
+
+Because key/value vectors come from much longer slices than queries (up to many thousands of bytes), we apply efficient variants such as Flash+Flex attention to avoid quadratic cost inside these blocks – effectively turning what would be an expensive contraction into an inexpensive low-rank operation.
+
+---
+
+## 5. Removing token embeddings altogether
+
+In tokenized LLMs you begin your network with an embedding table indexed by sub-word IDs.  
+BLT sidesteps this entirely:
+
+1. Raw bytes → one-hot or learned embedding matrix `256 × h_𝔈`.  
+2. Cross-attention aggregates these embeddings into continuous latents (`p_j`).  
+
+Thus there is no combinatorially large lookup table and no mismatch between discrete token id and continuous representation downstream—everything stays in one homogeneous space until decoding, where we generate raw byte logits exactly as in older character RNNs but now powered by deep self-attention.
+
+---
+
+## 6. Performance & Efficiency Summary
+
+| Ablation | Avg Patch Size | Spectrum | Training FLOPs (meta) | Per-byte BPB |
+|----------|----------------|----------|----------------------|--------------|
+| Fixed–stride (K=4) | ~4 bytes | Lower NPW @ same FLOPs | Highest FLOPs per param | ~3 % higher |
+| Space-patching | ~6 bytes | Warm start | Lower FLPs per param (≈30 % savings)| ~1–2 % better |
+| Entropy-patching (global+relative) | ~4–7 bytes depending on threshold | Adaptive | Closest match to Llama3 FP (~0%) | Best BPB among all |
+
+Scaling experiments up to **8 B parameters** on ≈ 4 Ttraining bytes showed:
+
+- Matching Llama3 performance at optimal compute ratios.
+- Up to **50 % fewer inference FLOPs** for comparable token-level models when using larger patches (8 bytes).
+- Superior scalability when both model size and average patch size grow under a fixed inference budget—an impossible tradeoff for fixed-token vocabularies because increasing vocab size always adds both compute and parameter cost in equal measure.
+
+---
+
+## 7. Takeaways
+
+1. *Dynamic patching* relocates compute exactly where predictions are uncertain.
+2. Cross-attention lets us cleanly fuse very fine-grained byte representations with coarse-grained latent representations.
+3. A single reversible pipeline replaces both embedding lookup AND tokenizer alignment—streamlining training and inference.
+4. BLT unlocks new scaling degrees of freedom that were frozen in token-based models by tying computation explicitly to vocabulary size.
+
+If you’ve ever wrestled with tokenization overheads or wondered whether raw-byte models could ever catch up with modern LLMs, BLT offers an elegant architecture that not only closes that gap but opens fresh avenues for efficiency and robustness at every scale.
+
+---

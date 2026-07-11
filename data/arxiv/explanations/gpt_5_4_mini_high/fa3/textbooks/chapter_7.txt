@@ -1,0 +1,107 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 7: Overlapping Softmax and GEMM: Pingpong Scheduling and Intra-Warpgroup Pipelines
+
+# Why Sequential Dependencies Normally Serialize $\mathbf{Q}\mathbf{K}^\top$, Softmax, and $\mathbf{P}\mathbf{V}$
+
+The second FlashAttention-3 idea starts from a simple observation: even though attention is built from matrix multiplications, not all of its work is equally fast on modern GPUs. The two GEMMs, $\mathbf{Q}\mathbf{K}^\top$ and $\mathbf{P}\mathbf{V}$, are exactly the kind of operations Tensor Cores are built to accelerate. By contrast, softmax involves reductions, subtraction of a running maximum, exponentials, and normalization, all of which run on lower-throughput hardware. On Hopper, the paper emphasizes that FP16 matmul throughput is vastly higher than the throughput of special functions such as exponential, so softmax can become a visible bottleneck even when the matmuls are highly optimized.
+
+What makes this a scheduling problem is that attention is not just a bag of independent operations. For a block of keys and values, the kernel must first compute a score block such as $\mathbf{S}_i^{(j)} = \mathbf{Q}_i \mathbf{K}_j^\top$, then apply the local softmax update, and only then can it form the contribution $\widetilde{\mathbf{P}}_i^{(j)} \mathbf{V}_j$. The output probabilities do not exist until the scores are available, and the value multiplication does not exist until the probabilities have been normalized. In a straightforward implementation, these dependencies force a strict sequence: GEMM, then softmax, then GEMM again. Even though the GPU is highly parallel, this logical dependence chain serializes the work inside each block.
+
+FlashAttention’s key insight is that softmax can be computed block by block without materializing the full $N \times N$ matrix, but that does not remove the dependencies. It only changes them into running state. The running maximum $m_i$ and running sum $\ell_i$ must be updated as each new score block arrives, and earlier output contributions must be rescaled when the maximum changes. That is what gives the algorithm its numerical stability and memory efficiency, but it also means that the next step in the computation depends on what the previous step produced. FlashAttention-3 takes this same dependency structure and tries to hide it behind asynchronous hardware execution.
+
+# The Intuition Behind Hiding Softmax Under Asynchronous WGMMA Execution
+
+The paper’s intuition is that if one part of the machine is much slower than another, the slow work should happen while the fast work is already in flight. On Hopper, the Tensor Core GEMM instruction exposed as WGMMA is asynchronous, and TMA can move data from global memory to shared memory asynchronously as well. That means a kernel does not need to stop and wait after launching a matmul. It can issue the operation, move on to other useful work, and only synchronize later when the result is actually needed.
+
+This is exactly the right setting for softmax overlap. Softmax is comparatively low-throughput, but it is not dependent on the next matmul launch in the same way that the matmul output depends on its operands. So the desired schedule is to issue a WGMMA, let it run on the Tensor Cores, and use the intervening time to perform the softmax bookkeeping on the scores from a neighboring block. In other words, the kernel tries to keep the Tensor Cores busy with GEMMs while the multi-function unit handles the exponentials and related scalar work.
+
+The paper also notes a useful asymmetry: the matmul pipeline gets faster on Hopper, but the exponential throughput does not improve in the same way. That makes the imbalance larger, not smaller. So the more the kernel can treat softmax as background work, the better its overall utilization becomes. FlashAttention-3 does this in two ways: across warpgroups, by pingpong scheduling, and within a warpgroup, by a two-stage pipeline that overlaps the second GEMM with the next softmax.
+
+# Pingpong Scheduling Across Two Consumer Warpgroups
+
+Pingpong scheduling is the cross-warpgroup version of this idea. The kernel is warp-specialized, so some warps act as producers that bring data into shared memory, while consumer warpgroups carry out the attention computation. The paper’s pingpong scheme arranges two consumer warpgroups so that one is doing GEMMs while the other is doing softmax. Then they swap roles, like two players passing the ball back and forth, which is where the “pingpong” name comes from.
+
+The point is not simply to run two warpgroups at once. The point is to bias the execution so that their expensive operations complement one another. The softmax work of one warpgroup can be issued while the other warpgroup is occupying the Tensor Cores with its GEMMs. Because the lower-throughput softmax uses different execution resources from matmul, the two can coexist more effectively than if each warpgroup tried to complete its entire block in isolation. The result is a more balanced use of the hardware pipeline.
+
+The paper reports that this is not merely a theoretical idea. In one example, the authors say that pingpong scheduling improves performance from about 570 TFLOPS to roughly 620--640 TFLOPS for FP16 forward attention with head dimension 128 and sequence length 8192. They also caution that the execution is not as clean in practice as the idealized picture, but it still helps. The important lesson is that scheduling across warpgroups can be used deliberately to align the slow softmax phase of one group with the fast GEMM phase of another.
+
+# Using \texttt{bar.sync} to Influence Execution Order Across Warpgroups
+
+To make pingpong scheduling happen, the kernel needs some way to shape the order in which the GPU issues work. The paper uses synchronization barriers, specifically \texttt{bar.sync} instructions, to influence this order. The goal is to force the GEMMs of one warpgroup to be scheduled before the GEMMs of the other warpgroup. Once that ordering is established, the first warpgroup can move into its softmax phase while the second warpgroup is still performing GEMMs.
+
+This use of barriers is subtle. The barrier is not there because the math requires global synchronization after every block. Instead, it is there because scheduling on a GPU is a hardware-managed process, and the programmer can sometimes guide that process by creating precise points where one group must wait for another. In the paper’s description, this makes warpgroup 1 finish its GEMM phases first, then spend time on softmax while warpgroup 2 occupies the Tensor Cores. After that, the roles reverse. The barrier creates the alternation that pingpong scheduling depends on.
+
+The important intuition is that the barrier is being used as a performance tool, not just a correctness tool. It helps construct a useful temporal arrangement of work, where one warpgroup’s non-matmul instructions are displaced into the time window created by another warpgroup’s matmuls. That is how the paper turns a synchronization primitive into an opportunity for overlap.
+
+# Scheduling One Warpgroup’s Softmax While Another Warpgroup’s GEMMs Run
+
+Once the warpgroups are arranged in this alternating pattern, the overlap becomes easy to describe. Suppose warpgroup 1 has just launched a GEMM and is waiting for the corresponding score block to become available. At that moment, warpgroup 2 can be using the Tensor Cores for its own GEMMs. The softmax computation for warpgroup 1, which is slower but does not need the Tensor Cores, can run while warpgroup 2 is keeping those Tensor Cores occupied.
+
+This is why the paper emphasizes the difference between the hardware units. The Tensor Cores are excellent at matmul, but the softmax-related exponential and reduction work is handled elsewhere. If both warpgroups tried to do the same type of work at the same time, some hardware would sit idle. By contrast, if one warpgroup is doing softmax while the other is doing GEMM, the two phases can coexist more productively. The overlap is not perfect, but it is enough to raise utilization.
+
+The word “while” matters here. The kernel is not changing the math of attention; it is changing when the various pieces of the math happen. That is the core software-pipelining idea in FlashAttention-3. Softmax is not eliminated, and the GEMMs are not fused away. They are simply scheduled so that the low-throughput phase occupies time that would otherwise be lost to waiting.
+
+# The Two-Stage Pipeline with $\mathbf{S}_{\mathrm{cur}}$ and $\mathbf{S}_{\mathrm{next}}$
+
+The intra-warpgroup pipeline refines the same idea inside a single consumer warpgroup. The paper presents it as a two-stage algorithm built around two score buffers, $\mathbf{S}_{\mathrm{cur}}$ and $\mathbf{S}_{\mathrm{next}}$. At the start, the kernel computes $\mathbf{S}_{\mathrm{cur}} = \mathbf{Q}_i \mathbf{K}_0^\top$ and then uses that block to initialize the running softmax state. After that, each loop iteration computes the next score block and keeps it available for the following iteration.
+
+The reason for having both $\mathbf{S}_{\mathrm{cur}}$ and $\mathbf{S}_{\mathrm{next}}$ is that the current block still needs to be consumed by softmax and value multiplication while the next block is already being prepared. The kernel computes $\mathbf{S}_{\mathrm{next}} = \mathbf{Q}_i \mathbf{K}_j^\top$ using WGMMA, but it does not immediately force that result to be used. Instead, it stores the result in registers and only later waits for the relevant WGMMA when the pipeline reaches the softmax stage. This is the essence of the two-stage design: one block is being consumed while the next is being produced.
+
+The paper notes that the number of overlap stages is bounded by, but does not have to equal, the number of stages in the circular shared-memory buffer. That means the shared-memory ring buffer and the register-level software pipeline are related but distinct. The shared-memory buffer feeds data to the consumer warps, while the register buffer lets the kernel hold onto an intermediate score block long enough to overlap it with later work.
+
+# Overlapping the $\mathbf{P}\mathbf{V}$ GEMM from One Iteration with Softmax from the Next Iteration
+
+The key overlap inside the two-stage pipeline is between the second GEMM of one iteration and the softmax work for the next score block. In the paper’s pseudocode, the kernel launches the WGMMA that computes $\mathbf{S}_{\mathrm{next}} = \mathbf{Q}_i \mathbf{K}_j^\top$, then launches the WGMMA that computes $\mathbf{O}_i \leftarrow \mathbf{O}_i + \widetilde{\mathbf{P}}_{\mathrm{cur}} \mathbf{V}_{j-1}$, and only then waits for the score GEMM to finish so that it can run the softmax update. This means that while one WGMMA is still in flight, the kernel can be doing the reduction and exponential work on the previously completed block.
+
+This is the heart of the overlap. The second GEMM, which uses the current probabilities and the value block, is asynchronous, so the kernel does not have to sit idle while it executes. During that time, the softmax for the next block can be computed, as long as the next score block has already been launched and is ready when needed. In the paper’s description, the second WGMMA of iteration $j$ is overlapped with the softmax operations from iteration $j+1$. That is a classic software pipeline: the machine works on two adjacent iterations at once, with one stage computing while another stage prepares the next input.
+
+The practical benefit is that the low-throughput softmax work is no longer isolated as a pure stall between GEMMs. Instead, it is hidden in the shadow of a second GEMM. Because the Tensor Cores are asynchronous, the kernel can keep them busy without waiting for the softmax to finish, and because the softmax does not need the Tensor Cores, it can run alongside the ongoing matmul. The result is a better balanced inner loop.
+
+# Loop-Carried Dependencies and How Register Buffering Breaks Them
+
+At first glance, the pipeline seems impossible because the operations are still logically dependent. The softmax for a block needs the score matrix from the previous GEMM, and the second GEMM needs the probabilities from softmax. So how can one iteration overlap with the next? The answer is that the algorithm does not remove the dependencies; it moves them across iteration boundaries and stores the intermediate result in registers.
+
+This is why the buffer names matter. When the kernel computes $\mathbf{S}_{\mathrm{next}}$, it does not immediately discard it. Instead, it keeps that block in registers while it finishes the softmax and value update for the current block. Then, at the end of the iteration, it copies $\mathbf{S}_{\mathrm{next}}$ into $\mathbf{S}_{\mathrm{cur}}$ so the next iteration can begin from a score block that is already available. The loop-carried dependency is therefore turned into a pipeline register: a saved intermediate that lets one stage start before the previous stage has completely finished everything else.
+
+This is exactly the kind of dependence breaking that software pipelining is designed for. The original chain was “compute scores, wait, compute softmax, wait, compute output.” The pipelined chain becomes “launch the next scores, work on the current softmax and output, then later consume the next scores.” The algorithm is still correct because the mathematical order is preserved, but the hardware sees more overlap and less waiting.
+
+# The Epilogue: Final Rescaling and Writing $\mathbf{O}$ and Log-Sum-Exp State
+
+After all the key and value blocks have been processed, the kernel still has one final job: it must normalize the accumulated output and store the summary statistics that describe the row-wise softmax. The paper’s epilogue computes
+\[
+\mathbf{O}_i = \mathrm{diag}(\ell_i)^{-1} \mathbf{O}_i
+\]
+and
+\[
+L_i = m_i + \log(\ell_i),
+\]
+and then writes $\mathbf{O}_i$ and $L_i$ back to high-bandwidth memory as the $i$-th block of the output and log-sum-exp state.
+
+This epilogue is the final step that turns the running, blockwise accumulation into the actual attention output. During the loop, the kernel has been maintaining output contributions in a form that can be rescaled whenever the running maximum changes. That is why the final normalization must happen only after all blocks have been seen. Once the loop is done, the accumulated value in $\mathbf{O}_i$ can be divided by the final row sums in $\ell_i$, and the blockwise log-sum-exp quantity $L_i$ can be formed from the final maximum and sum.
+
+For a student reading the paper, the important point is that the epilogue is not a leftover detail. It is the mathematical closure of the entire blockwise softmax procedure. The overlap tricks speed up the inner loop, but the algorithm still has to end by producing the correctly normalized output and the corresponding summary state.
+
+# Compiler Reordering and the Need to Verify Actual SASS Output
+
+The paper is careful to point out that pseudocode is not the same as machine code. Even if the algorithm is written in a particular order, the compiler may reorder instructions for its own optimization goals. That is especially important here, because the whole performance trick depends on a carefully arranged sequence of asynchronous WGMMA launches, waits, and softmax instructions. If the compiler moves instructions around too aggressively, the intended overlap can be weakened or lost.
+
+For that reason, the authors do not rely on the high-level pseudocode alone. They inspect the generated SASS, the actual machine-level instruction stream, to check that the overlap appears as intended. This is an important lesson for anyone studying GPU kernels: when performance depends on precise interleaving, the source code is only a proposal. The real question is what the compiler emitted and whether the hardware is actually seeing the schedule the programmer expected.
+
+The chapter’s broader message is that modern GPU optimization is partly a scheduling problem and partly a compilation problem. The algorithm must be designed to admit overlap, but the implementation must also preserve that overlap after compilation. FlashAttention-3 explicitly acknowledges that requirement.
+
+# Register Pressure, Tile-Size Trade-Offs, and Spill Avoidance
+
+The two-stage pipeline buys overlap, but it is not free. The paper explains that the additional score buffer $\mathbf{S}_{\mathrm{next}}$ must live in registers, which increases register usage by roughly $B_r \times B_c \times \mathrm{sizeof}(\mathrm{float})$ per threadblock. That is a substantial cost, especially when the kernel is already trying to use large tiles to improve arithmetic intensity and occupancy. The same registers that would help with larger tiles are now also needed to hold the pipelined intermediate.
+
+This creates a real trade-off. Larger tiles can improve GEMM efficiency, but they consume more registers. Deeper pipelining can hide more softmax work, but it also consumes more registers. If the register demand becomes too large, the compiler may spill values, which means writing them to slower memory and losing the performance that the pipeline was meant to gain. So the practical question is not whether more overlap is always better, but how much overlap can be supported before register pressure becomes harmful.
+
+The paper’s advice is to profile and balance these factors rather than assume a single universally best configuration. The point of the pipelining design is to expose an opportunity for higher utilization; the final kernel configuration still has to fit within the hardware’s register budget. That is why spill avoidance is central to the implementation discussion.
+
+# The Optional Three-Stage Pipeline and Why It Is Harder to Balance
+
+The paper also mentions a possible three-stage variant. Conceptually, this would extend the two-stage scheme by adding another layer of overlap, allowing even more of the softmax work to be hidden behind asynchronous WGMMA execution. The appeal is straightforward: if two stages can overlap a GEMM with softmax, perhaps a third stage can smooth the pipeline further and improve Tensor Core utilization again.
+
+But the cost grows quickly. An extra stage means more state must be kept alive at once, which means even more registers. That makes the trade-off between tile size and pipeline depth harder to balance. The kernel must now decide not only how large its blocks should be, but also how many partially completed iterations it can hold in flight without exceeding the register budget or causing spills. The paper therefore treats the three-stage version as an interesting extension rather than the main design point.
+
+The lesson is a familiar one in GPU programming: deeper pipelines can improve throughput, but only if the hardware can afford to carry the additional state. FlashAttention-3’s two-stage pipeline is the practical middle ground emphasized in the paper, while the three-stage version illustrates how far the same idea might be pushed if the register budget allowed it.

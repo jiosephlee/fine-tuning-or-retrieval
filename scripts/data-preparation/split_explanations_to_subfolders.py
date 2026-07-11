@@ -41,17 +41,29 @@ def load_outline_titles(explanations_dir, outline_filename, key, title_key):
     return [item.get(title_key) for item in outline_data if item.get(title_key)]
 
 
-def split_by_outline_titles(content, titles):
+def split_by_outline_titles(content, titles, min_prefix_chars=200):
     boundaries = []
     for title in titles:
         pattern = r'\n(?:#{1,6}\s+)?' + title_pattern(title) + r'\s*\n'
         match = re.search(pattern, content, flags=re.IGNORECASE)
         if match:
             boundaries.append(match.start() + 1)
+    boundaries.sort()
     chunks = []
     for i, start in enumerate(boundaries):
         end = boundaries[i + 1] if i + 1 < len(boundaries) else len(content)
         chunks.append(content[start:end].strip())
+    # If the first outline title never matched (e.g. the generator wrote its own
+    # headings), the content before the first matched boundary would be silently
+    # dropped. Recover it as a leading chunk when it is substantial.
+    if boundaries:
+        prefix = content[:boundaries[0]]
+        prefix_lines = prefix.split("\n")
+        if prefix_lines and (prefix_lines[0].startswith("\\title{") or prefix_lines[0].startswith("Title:")):
+            prefix = "\n".join(prefix_lines[1:])
+        prefix = prefix.strip()
+        if len(prefix) >= min_prefix_chars:
+            chunks.insert(0, prefix)
     return chunks
 
 
@@ -93,6 +105,9 @@ def split_textbook(explanations_dir):
     os.makedirs(out_dir, exist_ok=True)
     for i, ch in enumerate(chapter_contents):
         ch = ch.strip()
+        # Some corpora (e.g. glm) format chapter titles as markdown headings;
+        # drop the leading hashes so files read "Chapter N: Title" like the rest.
+        ch = re.sub(r"^#{1,6}\s+", "", ch)
         if title_line:
             chapter_text = f"{title_line}\n\nChapter {i+1}: {ch}"
         else:

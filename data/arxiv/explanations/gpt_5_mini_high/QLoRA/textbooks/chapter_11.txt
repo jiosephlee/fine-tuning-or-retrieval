@@ -1,0 +1,178 @@
+\title{A Textbook about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+Chapter 11: Practical Guide: Reproducing and Deploying QLoRA
+
+# Environment setup for bitsandbytes and transformers
+
+Before attempting to reproduce QLoRA experiments or to deploy QLoRA-finetuned models, prepare an environment with three kinds of capabilities that the paper relies on: (1) a recent PyTorch + CUDA stack able to run the released CUDA kernels for 4-bit operations, (2) the bitsandbytes 4-bit support and the QLoRA codebase (the authors released both: https://github.com/artidoro/qlora and https://github.com/TimDettmers/bitsandbytes), and (3) hardware that matches the compute precision choices used in the paper.
+
+The paper makes two important, hardware-relevant choices. First, the QLoRA storage data type for pretrained model weights is a 4-bit data type (NF4), while the computation data type used for forward and backward passes is a 16-bit floating type (the paper uses BrainFloat / BFloat16). Second, paged optimizers use NVIDIA unified memory to allow optimizer state paging between GPU and CPU. Concretely, to reproduce results you will need a GPU with enough device memory for the target model (e.g., consumer 24 GB class GPUs are sufficient for 33B QLoRA finetuning in <12 hours; a 48 GB professional-class GPU was used to finetune 65B in ~24 hours in the paper). You also need a CUDA driver and a PyTorch build compatible with the authors' CUDA kernels and with BFloat16 support on your hardware.
+
+The authors integrated their kernels and codebase into the Hugging Face transformers stack. Practically that means you should use the released QLoRA / bitsandbytes code and the HF integration supplied by the authors rather than attempting to re-implement the low-level 4-bit kernels yourself. The repositories linked in the paper contain the CUDA kernels and examples (see the two repository links above).
+
+# Enabling NF4 and Double Quantization in code
+
+Two of QLoRA's core technical ingredients are the NF4 (4-bit NormalFloat) datatype and Double Quantization (DQ). Implementing them requires (a) using a quantization scheme derived from a theoretical normal distribution, and (b) quantizing not only the original weights but also the quantization constants to reduce memory overhead.
+
+NF4 — concept and steps. NFk is built by taking the quantiles of a standard normal distribution and using these values as the representable codebook for a k-bit type that is information-theoretically optimal for zero-centered normal data. The paper defines the representative code values (for a k-bit NF) as, for each bin index $i$:
+
+\[
+q_i = \frac{1}{2}\left( Q_{N(0,1)}\!\left(\frac{i}{2^k+1}\right) + Q_{N(0,1)}\!\left(\frac{i+1}{2^k+1}\right)\right),
+\]
+
+where $Q_{N(0,1)}$ is the quantile function of the standard normal. To turn this into a practical quantization for a particular weight block you (1) normalize the block so its elements are rescaled into the target range (the paper uses $[-1,1]$), and (2) map each rescaled weight to the nearest NFk code $q_i$. Because many pretrained neural network weight tensors are approximately zero-centered and Gaussian-like, this design avoids expensive case-by-case quantile estimation and yields better quantization fidelity than uniform FP4 or Int4 schemes in the experiments reported.
+
+A practical detail used in the paper is that exact zero is important: to represent zero exactly while still using all $2^k$ codes, the NFk construction is made asymmetric in the positive/negative partition so that one discrete zero codepoint is available.
+
+Double Quantization (DQ) — concept and memory math. A realistic blockwise k-bit quantization scheme stores, for each block, a quantization constant (scale) $c$ in high precision. For small block sizes this scale storage can be non-negligible: with 32-bit constants and a blocksize of 64, the constants add, on average, $32/64 = 0.5$ bits per parameter. Double Quantization reduces this overhead by treating the per-block quantization constants themselves as an array to be quantized a second time. The paper implements the second-stage quantization of the per-block constants using an 8-bit float representation (FP8) with a larger blocksize (the paper used blocksize 256 for the constants). To make symmetric quantization effective for the positive constants, the mean of the per-block constants is subtracted before the second-stage quantization.
+
+The memory arithmetic for the example block sizes used in the paper is:
+
+- original constants cost: $32/64 = 0.5$ bits per parameter;
+- after DQ (FP8 for $c_2$, blocksize 256 for that quantization): $8/64 + 32/(64\cdot 256) = 0.127$ bits per parameter;
+
+so DQ reduces the quant-constant overhead by about $0.373$ bits per parameter (roughly ~3 GB for a 65B parameter model in the paper's accounting).
+
+Double dequantization (runtime). At runtime, dequantization is performed in two steps to turn the stored k-bit NF4 tensor back into the computation data type (BFloat16). For a single linear layer the paper expresses the forward computation as:
+
+\[
+\mathbf{Y}^{\text{BF16}} = \mathbf{X}^{\text{BF16}} \;\text{doubleDequant}(c_1^{\text{FP32}}, c_2^{\text{k-bit}}, \mathbf{W}^{\text{NF4}}) + \mathbf{X}^{\text{BF16}}\mathbf{L}_1^{\text{BF16}}\mathbf{L}_2^{\text{BF16}},
+\]
+
+with
+
+\[
+\text{doubleDequant}(c_1^{\text{FP32}}, c_2^{\text{k-bit}}, \mathbf{W}^{\text{k-bit}}) = \text{dequant}\big(\text{dequant}(c_1^{\text{FP32}}, c_2^{\text{k-bit}}), \mathbf{W}^{\text{4bit}}\big) = \mathbf{W}^{\text{BF16}}.
+\]
+
+Implementation guidance distilled from the paper: when you enable NF4 in your stack you must (a) store base model weights in NF4, (b) store first-stage block quant scales (and then DQ the constants into FP8 to save memory), and (c) dequantize to BFloat16 before every matmul. The authors' released kernels and HF integration perform these steps; rely on those implementations to avoid subtle errors.
+
+# Choosing target modules and adapter configs for common LLMs
+
+A core empirical finding in the paper is that where and how many LoRA adapters are placed matters more than making the adapter rank overly large. The LoRA parameterization used in the paper augments a linear projection $\mathbf{X}\mathbf{W} = \mathbf{Y}$ with a low-rank additive term:
+
+\[
+\mathbf{Y} = \mathbf{X}\mathbf{W} + s\,\mathbf{X}\mathbf{L}_1\mathbf{L}_2,
+\]
+
+where $\mathbf{L}_1 \in \mathbb{R}^{h\times r}, \mathbf{L}_2 \in \mathbb{R}^{r\times o}$ and $s$ is a scalar. Two practical consequences follow directly from the paper's experiments.
+
+First — LoRA placement: applying LoRA only to attention query and value projections (the common default in some prior work) was insufficient to reproduce full fine-tuning performance for large base models in the authors' experiments. The authors found that placing LoRA adapters on all linear layers within each transformer block recovers full finetuning performance (this means attention projections and the MLP/projection layers inside each block). The intuition the paper gives is memory: LoRA parameters themselves are very small compared to activation gradient memory, so adding more LoRA adapters (more placement points) is cheap in memory but powerful in capacity.
+
+Second — adapter dimensionality: the projection rank $r$ (the internal LoRA dimension) showed little sensitivity in the authors' ablations. In practice the main lever for performance was how many adapters were used (i.e., placement across layers) rather than making $r$ large. This enables practitioners to use relatively small $r$ while applying LoRA widely.
+
+Recommendations for common architectures (as supported by the experiments in the paper):
+
+- LLaMA (decoder-only): apply LoRA to all linear projection layers inside each transformer block (attention and MLP projections). The paper's best results use adapters at every layer rather than only q/v.
+- Encoder-only models (e.g., RoBERTa): apply LoRA to the core linear projections used in attention and feedforward sublayers across the encoder stack.
+- Encoder-decoder models (e.g., T5): apply adapters across encoder and decoder linear layers; QLoRA experiments compared to 16-bit adapter finetuning for T5 showed 4-bit LoRA can match 16-bit performance.
+
+Because adapters are so compact, the paper emphasizes that you can afford to put LoRA at many more points in the network than typical defaults without a major memory penalty; this is important to fully recover full-finetuning performance.
+
+# Using paged optimizers and caveats in PyTorch
+
+Paged Optimizers are the QLoRA mechanism to cope with occasional GPU memory spikes (for example when a single mini-batch includes very long sequences) without crashing to out-of-memory. The idea used in the paper is to use NVIDIA unified memory so that large optimizer states (which would otherwise have to live in GPU memory) can be allocated in pageable memory and automatically evicted to CPU RAM when the device runs low. At the optimizer update step the needed pages are pulled back into GPU memory.
+
+Key points and caveats from the paper:
+
+- Paged Optimizers let you finetune models (the authors successfully ran 33B on a single consumer GPU and 65B on a 48 GB professional GPU) that would otherwise OOM due to infrequent spikes. They used UNIX/NVIDIA unified memory to automatically page optimizer states.
+- Because paging is not free, it can introduce runtime overhead when pages are moved. The paper did not present a comprehensive benchmark of paging overhead because the paging events are rare (they only occur for certain batches with long sequences). In their experiments for a 65B model on a 48 GB GPU with batch size 16 they observed the paged optimizer gave the same training speed as a non-paged optimizer. Still, be mindful: if your workload frequently triggers paging, training can slow down.
+- Paged optimizers are a complement to gradient checkpointing and proper batch sizing; they do not replace careful planning of activation memory.
+
+In practice (per the conceptual description in the paper) you should allocate optimizer state tensors in a pageable space that the CUDA unified memory system can manage and let the runtime page them in and out. The authors integrated these behaviors into their release; use the authors' code to avoid low-level errors.
+
+# Memory planning, mixed precision, and micro-batching tips
+
+QLoRA achieves dramatic memory reductions by combining 4-bit storage (NF4) with 16-bit computation (BFloat16) and parameter-efficient finetuning (LoRA), plus the DQ and paged optimizers described above. Use the paper's reported memory numbers to plan resources.
+
+Representative numbers reported in the paper:
+
+- Full 16-bit finetuning of a LLaMA 65B model requires more than 780 GB of GPU memory.
+- QLoRA reduces average memory usage enough to finetune a 65B model on a single 48 GB GPU (the paper reports "< 48 GB").
+- For a 7B LLaMA model with LoRA (with batch size 1 on FLAN v2 in the authors' accounting): LoRA input gradients consumed ~567 MB, LoRA parameters only 26 MB, and the 4-bit base model consumed ~5048 MB. With gradient checkpointing the input gradient requirement dropped to an average of 18 MB per sequence.
+
+Use these principles when planning:
+
+- Storage vs computation dtypes. Store the pretrained base model in NF4 with Double Quantization. On every forward/backward, dequantize the base weights to BFloat16 so matmuls are done in 16-bit; keep adapter parameters and optimizer states in 16-bit (the paper used BF16 for LoRA weights). This combination preserves the precision needed for finetuning while keeping storage tiny.
+- Blocksize choices (affecting quantization precision and constant overhead). The paper used blocksize 64 for base weight quantization (for higher precision) and blocksize 256 for second-stage quantization of constants. These choices balance quantization error and constant overhead; the paper reports these as effective defaults.
+- Batch size and scaling. The paper reports that hyperparameters found at 7B generalize to 13B, but for 33B and 65B they halved the learning rate and doubled the batch size. Use that rule-of-thumb when scaling experiments up. (When in doubt, run a small lr and batch-size sweep — the paper did a search across learning rates from $1\!\times\!10^{-6}$ to $5\!\times\!10^{-5}$ and batch sizes 8 to 128 to find robust baselines for smaller sizes.)
+- Activation memory: activation gradients dominate training memory consumption. Use gradient checkpointing aggressively; in the paper checkpointing reduced LoRA input gradient footprints dramatically (from hundreds of MB to tens of MB per sequence).
+- If a single GPU is still not enough and you see OOMs only for rare, long sequences, use paged optimizers rather than permanently reducing batch size for all iterations; this lets common-mini-batch steps run at full speed while avoiding crashes for occasional spikes.
+
+The practical upshot: plan for NF4 storage + BF16 compute + LoRA parameters + checkpointing + paged optimizer states. Use the paper's reported memory points for sanity checks (e.g., if a 65B attempt claims to need 200 GB on a 48 GB GPU then something is misconfigured).
+
+# A minimal robust training recipe for instruction tuning
+
+The paper provides an empirically validated minimal recipe you can follow to reproduce the main results (finetuning a large base model to an instruction-following chat assistant):
+
+1. Data selection and preprocessing. Choose a high-quality instruction dataset first; the paper shows that data quality matters far more than raw size for chatbot performance. In particular, the Open Assistant (OASST1) dataset (a relatively small, high-quality crowd-sourced collection) produced the best chatbot performance in the paper, outperforming much larger aggregated datasets when the objective is a chat assistant. Where a dataset distinguishes clearly between instruction and response, the authors finetuned on the response only; when a dataset contains multi-turn dialog, they selected the top responses through the conversation and finetuned on the full selected conversation.
+
+2. Model and storage precision. Quantize the pretrained base model weights to NF4 with blocksize 64 and apply Double Quantization to the per-block scales (the second stage uses FP8 with blocksize 256). Keep adapter parameters (LoRA) and optimizer states in BF16.
+
+3. Adapter configuration. Add LoRA adapters at every linear layer in each transformer block (attention q/k/v/projection and MLP projections). Use small adapter ranks (the paper reports that rank is not the critical knob), but make sure the adapters are applied broadly across the model.
+
+4. Training objective and loss. Use standard supervised cross-entropy training (no RLHF is required in the experiments that produced Guanaco). The paper explicitly highlights that their state-of-the-art Guanaco models were trained only with cross-entropy.
+
+5. Optimizer, paged states, and checkpointing. Use a paged optimizer to allow optimizer state paging to CPU RAM when occasional spikes would otherwise OOM. Use gradient checkpointing to reduce activation memory use; this is especially effective for large transformer models.
+
+6. Hyperparameters and scaling heuristics. For small models do a lightweight search across learning rates $[1\times 10^{-6}, 5\times 10^{-5}]$ and batch sizes from 8 to 128 to find baselines. The paper found that hyperparameters found at 7B transfer to larger models except for learning rate and batch size: when going to 33B and 65B, halve the learning rate and double the batch size relative to the 7B-friendly settings.
+
+7. Generation settings for evaluation. When evaluating chat behavior use nucleus sampling with $p=0.9$ and temperature $0.7$ (the paper used these settings for consistent evaluation).
+
+8. Training runtime expectations. With the QLoRA stack and a single appropriate GPU: a 33B model was finetuned in less than 12 hours on a 24 GB consumer GPU in the authors' runs; the best 65B finetuning run (Guanaco 65B) used a single 48 GB professional GPU for ~24 hours to reach near-ChatGPT performance on Vicuna.
+
+If you follow these steps using the authors' released code and kernels (the two GitHub links above), you will be following the configuration choices that produced the reported results in the paper.
+
+# Saving, loading, and merging LoRA adapters for inference
+
+The paper emphasizes that LoRA adapters are compact and that the authors released a collection of adapter files for multiple model sizes and datasets. Operationally there are two common ways to use adapters at inference time; both are consistent with the LoRA parameterization the paper uses.
+
+1. Runtime application (adapter-on-the-fly). At inference, keep the base weights stored in NF4. For each forward pass dequantize the base layer weights to BF16 and compute the base output $\mathbf{X}\mathbf{W}^{\text{BF16}}$. Compute the adapter contribution $\mathbf{X}\,s\,\mathbf{L}_1\mathbf{L}_2$ (in BF16) and add it to the base output. This approach keeps the base model quantized on disk and in storage, and only requires transient dequantization at run time.
+
+2. Merging adapters into base weights. Because the LoRA term is additive, algebraically
+
+\[
+\mathbf{Y} = \mathbf{X}\mathbf{W} + s\,\mathbf{X}\mathbf{L}_1\mathbf{L}_2 = \mathbf{X}\big(\mathbf{W} + s\,\mathbf{L}_1\mathbf{L}_2\big).
+\]
+
+Thus it is possible to form merged weights $\mathbf{W}' = \mathbf{W} + s\,\mathbf{L}_1\mathbf{L}_2$ and then use $\mathbf{W}'$ alone at inference. That merged weight can be stored and re-quantized if you want to return to a quantized representation for storage efficiency. Conceptually this gives you a tradeoff: merging yields a single weight tensor per layer (simpler runtime computation) but requires creating and possibly storing a merged copy of the base weights (which may raise storage and memory requirements unless you re-quantize carefully).
+
+Which option to pick depends on your deployment constraints. The paper reports that their deployed smallest Guanaco 7B fits in ~5 GB at runtime (implying use of quantized base + small adapter footprint). If you need the minimal working memory, keep the base model on-disk in NF4 and keep adapters small and applied on the fly. If you prefer slightly simpler runtime behavior and have room to store merged weights, do the merge step once after finetuning.
+
+# Troubleshooting OOMs, instability, and evaluation pitfalls
+
+This section condenses the paper's troubleshooting lessons and evaluation cautions into a practical checklist.
+
+OOMs and memory spikes:
+- If you get OOMs only on a few batches (long sequences), enable paged optimizers so optimizer state pages to CPU rather than crashing. Pair paged optimizers with gradient checkpointing to reduce activation gradients.
+- Re-check your blocksize settings: smaller block sizes for NF4 improve quantization fidelity but increase quantization-constant overhead. Double Quantization reduces that overhead substantially (see the arithmetic in the Double Quantization section).
+- If you must reduce memory usage, first reduce batch size or sequence length; the paper shows that for larger models adjusting batch size and learning rate helps (they halved LR and doubled batch size when scaling up).
+
+Training instability and accuracy drops:
+- If finetuning performance lags full fine-tuning, verify LoRA placement. The paper's ablations showed that LoRA limited to q and v was not enough; placing adapters on all linear layers was the fix that recovered full finetuning performance.
+- If 4-bit variants differ in quality, prefer NF4 + Double Quantization as reported in the paper. The authors observed that NF4 improves over FP4/Int4, and that Double Quantization reduces memory without degrading accuracy.
+- Check computation dtype: ensure dequantization to BF16 before matmuls and keep LoRA parameters in BF16. Mismatched dtypes can cause numerical instabilities.
+
+Evaluation pitfalls:
+- The paper reports two important evaluation caveats. First, automatic evaluator models (GPT-4 in the paper) can have biases — e.g., a strong ordering effect where responses earlier in the prompt receive higher scores. The authors therefore recommend averaging results across prompt orderings or using pairwise comparisons that randomize ordering.
+- Second, human agreement on nuanced preference judgments is only moderate. The authors found moderate system-level agreement between GPT-4 and human annotators (Kendall Tau $\tau=0.43$ at the system level; sample-level agreement lower). To get robust rankings, use pairwise tournaments and Elo aggregation rather than absolute scoring when possible. The authors used Elo with $K=32$, starting Elo = 1000, and repeated the aggregation with multiple random seeds (10,000) to control ordering effects.
+- For generation recipes during evaluation the paper used nucleus sampling with $p=0.9$ and temperature $0.7$ uniformly across systems to ensure comparable response diversity.
+
+If you encounter unexpected behavior, first re-check: (a) that the base model weights are actually stored in NF4 and that the quantization constants are DQ'ed as intended, (b) that the forward/backward dequantize into BF16 before matmuls, and (c) that LoRA adapters are present at the expected layers and in BF16. Many observed issues in reproducing results stem from a single mis-typed dtype or a missed dequantization step.
+
+# Compact checklist (recommended settings used in the paper)
+
+- Repositories: QLoRA repo and bitsandbytes (authors' GitHub links).
+- Storage dtype: NF4 (4-bit NormalFloat) for base weights, blocksize 64.
+- Double Quantization: quantize per-block scales to FP8 with blocksize 256; subtract mean before second-stage quantization.
+- Compute dtype: BFloat16 for matmuls and LoRA parameters.
+- LoRA placement: adapters on all linear layers inside each transformer block (attention + MLP projections).
+- LoRA parameter rank: small; focus on placement rather than enlarging $r$.
+- Optimizer: paged optimizer (NVIDIA unified memory) + gradient checkpointing.
+- Training objective: supervised cross-entropy (no RLHF necessary to reproduce Guanaco results).
+- Evaluation sampling: nucleus sampling $p=0.9$, temperature $0.7$.
+- Evaluation aggregation: pairwise judgments + Elo (start 1000, $K=32$); average over ordering permutations to mitigate GPT-4 ordering bias.
+- Scaling rule of thumb: hyperparameters from 7B generalize; for 33B and 65B halve learning rate and double batch size relative to 7B-tuned settings.
+- Expected runtime: 33B in <12 hours on a 24 GB consumer GPU (per paper); 65B in ~24 hours on a single 48 GB professional GPU (best reported run).
+
+Closing note: the QLoRA paper's primary contribution is a practical recipe that combines NF4, Double Quantization, paged optimizers, and widespread LoRA adapters to recover full 16-bit finetuning performance while operating within the memory of single-GPU machines for very large models. To reproduce their results faithfully, rely on the released implementations (the repositories above), follow the dtype and blocksize conventions they report, apply LoRA broadly across layers, and prioritize data quality in your instruction-tuning dataset.

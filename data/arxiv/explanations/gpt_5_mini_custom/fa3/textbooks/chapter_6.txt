@@ -1,0 +1,102 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 6: FlashAttention-3, Part II: Overlapping GEMMs and Softmax
+
+# Why overlap matters: MFU throughput vs Tensor Core throughput; exp as a bottleneck
+
+The motivation for overlapping softmax work with GEMM work in FlashAttention-3 comes directly from a mismatch between where the arithmetic throughput is concentrated on modern GPUs and where the non-GEMM costs arise. On Hopper-like GPUs, the Tensor Cores (accessed through WGMMA) deliver extremely high matrix-multiply throughput. For example, an H100 SXM5 can provide on the order of 989 TFLOPS for FP16 matmul, while the hardware unit that computes special functions (the multi-function unit; MFU) provides only a few TFLOPS for operations like exponential. The paper quotes roughly 3.9 TFLOPS for these special functions on the same device. 
+
+Attention's inner loop is dominated by two kinds of work: matrix multiplications (the two GEMMs per block: one to produce \mathbf{S} = \mathbf{Q}_i \mathbf{K}_j^\top and one to multiply the (local) probabilities by \mathbf{V}_j) and the softmax-related scalar/vector operations (row-wise max, exponentials, row sums, and rescaling). While the GEMMs exercise Tensor Cores and therefore can be executed at high utilization, the softmax work uses MFU and scalar units that have far less throughput. In a simplistic counting example from the paper, for head dimension 128 the number of matmul FLOPs can be 512× that of exponentials, and exponentials have roughly 256× lower throughput than matmul on the device; consequently the exponential operations can occupy a nontrivial fraction (about 50% in that example) of the total cycles if they are serialized with GEMMs.
+
+The key insight is that these two categories of work use largely disjoint hardware: Tensor Cores for GEMMs and the MFU / scalar units for exponentials and reductions. If we can schedule them so that the MFU is busy while the Tensor Cores are busy with GEMMs, both units can be utilized concurrently and overall throughput increases. That is the rationale for the overlapping strategies developed in FlashAttention-3: hide softmax under asynchronous GEMMs so neither the Tensor Cores nor the MFU are idle waiting for the other.
+
+# Ping-pong scheduling across warpgroups: forcing GEMM order with bar.sync; softmax in one warpgroup while GEMMs execute in another
+
+Warp-specialization is the software pattern exploited by FlashAttention-3: partition the warps in a CTA into groups that specialize as producers (issuing TMAs, doing layout work) or consumers (issuing WGMMA GEMMs and softmax logic). With TMA and WGMMA both being asynchronous on Hopper, it becomes possible to schedule distinct warpgroups so that when one warpgroup is performing its softmax work, another warpgroup is performing GEMMs. The paper calls this "ping-pong" scheduling because the warpgroups swap roles across iterations.
+
+Mechanically, ping-pong scheduling enforces an ordering of GEMM issuance across the warpgroups using synchronization barriers (CUDA's bar.sync). The objective is to ensure that the pair of GEMMs of warpgroup A (GEMM that computes the next S block and GEMM that updates O using the previous P̃ and V) are scheduled before the corresponding GEMMs of warpgroup B. When A's GEMMs are scheduled on the Tensor Cores, the compiler and hardware can schedule the non-GEMM softmax work of A to execute concurrently while the Tensor Cores are running B's GEMMs. Then in the next phase the warpgroups swap: B's softmax runs while A's GEMMs execute. By alternating (ping-ponging) which warpgroup performs GEMMs, the softmax of one group is overlapped with the Tensor Core work of the other, increasing aggregate utilization.
+
+This style of scheduling is not a naive parallelization of independent work: it deliberately introduces cross-warpgroup ordering constraints (via bar.sync) so that the hardware's asynchronous engines are kept busy. In practice the paper reports concrete gains from using ping-pong scheduling — for instance an FP16 forward run with head dimension 128 and sequence length 8192 improved from about 570 TFLOPS to roughly 620–640 TFLOPS after enabling this inter-warpgroup overlap.
+
+# Two-stage intra-warpgroup pipeline: S_cur, \tilde{P}_{cur}, O update for j-1 while S_{next} is computed for j
+
+Beyond overlapping across warpgroups, FlashAttention-3 also creates overlap inside a single warpgroup. The standard inner loop of attention for a query tile \mathbf{Q}_i iterates over key/value blocks j and, per iteration, computes a GEMM to produce a score block \mathbf{S}_i^{(j)}, runs the softmax reductions on that block to produce a scaled block of probabilities \tilde{\mathbf{P}}_i^{(j)}, and then performs a second GEMM to multiply \tilde{\mathbf{P}}_i^{(j)} by \mathbf{V}_j to accumulate into the output tile \mathbf{O}_i. Naively these steps are serialized inside each iteration, which prevents the MFU and Tensor Cores from overlapping their work within the warpgroup.
+
+The two-stage intra-warpgroup pipeline breaks that serialization by plumbing one iteration's second GEMM against the next iteration's first GEMM. Concretely, FlashAttention-3 keeps a register-resident copy of the "current" score tile S_{cur} and the associated scaled probability tile \tilde{\mathbf{P}}_{cur} (and the running maxima m_i and normalizers \ell_i). The main loop proceeds roughly as follows:
+
+1. Before entering the loop, compute S_{cur} = \mathbf{Q}_i \mathbf{K}_0^\top with an asynchronous WGMMA and then compute m_i, \tilde{\mathbf{P}}_{cur}, update \ell_i and rescale \mathbf{O}_i accordingly.
+
+2. For each subsequent j in 1..T_c-2:
+   - Issue (but do not wait for) an asynchronous WGMMA to compute S_{next} = \mathbf{Q}_i \mathbf{K}_j^\top. This is the "first" GEMM of iteration j.
+   - Issue (but do not wait for) a WGMMA to compute the second GEMM of the previous iteration: \mathbf{O}_i += \tilde{\mathbf{P}}_{cur} \mathbf{V}_{j-1}. This uses the \tilde{\mathbf{P}} that was produced from S_{cur} and the V tile previously loaded.
+   - Wait on the completion of the S_{next} WGMMA and then run softmax-style reductions on S_{next} to get \tilde{\mathbf{P}}_{next}, update m_i and \ell_i, and perform any rescaling of \mathbf{O}_i that depends on the updated m_i.
+   - Wait for the completion of the previous iteration's second WGMMA (if necessary), finishing the accumulation into \mathbf{O}_i.
+   - Move S_{next} into S_{cur} and P̃_{next} into P̃_{cur} (register copies) and continue.
+
+3. Handle the tail iteration to ensure the final \tilde{\mathbf{P}} multiplies the last V tile and then execute the epilogue: scale \mathbf{O}_i by the final normalizer and compute the log normalizer L_i = m_i + \log(\ell_i).
+
+This arrangement ensures that when the warpgroup issues the WGMMA to compute S_{next}, the GPU can immediately start running the WGMMA for \tilde{\mathbf{P}}_{cur}\mathbf{V}_{j-1} (or vice versa), so GEMM work for one iteration is concurrent with GEMM work for the other and MFU-based softmax work of one iteration is overlapped with Tensor Core work of another. The paper calls these WGMMA operations "commit but do not wait" to emphasize asynchronous issuance.
+
+# Breaking dependencies with buffering and waits: commit-but-don’t-wait WGMMA; sequencing waits for S_{next} and PV updates
+
+The two-stage pipeline depends on carefully breaking the strict dependencies that would otherwise force serial execution. The mechanism is a combination of small register buffers and precise synchronization (waits) placed only where necessary.
+
+Two ideas are central here:
+
+- Commit-but-don't-wait WGMMA. When a WGMMA (asynchronous GEMM) is issued, the kernel code "commits" the instruction to start but does not immediately stall the issuing threadgroup to wait for completion. This allows the warpgroup to continue issuing other work that does not depend on the results of that WGMMA. For example, while the WGMMA computing S_{next} executes, the warpgroup can issue the WGMMA that multiplies \tilde{\mathbf{P}}_{cur} by \mathbf{V}_{j-1} or start the softmax reductions on S_{cur}.
+
+- Selective waits and ordering. The code only waits when the result of a previously issued asynchronous operation is actually needed. In the two-stage loop, after issuing S_{next} we later wait for it before performing the softmax reductions that produce \tilde{\mathbf{P}}_{next}. Similarly, we only wait for the previous iteration's PV-update WGMMA when we must finalize updates to \mathbf{O}_i that depend on its completion. This selective waiting phrases the dependencies as: issue S_{next} (async), issue PV-update of previous tile (async), wait for S_{next} to complete and do softmax, then wait for PV-update to complete and rescale O as required.
+
+To support this pattern without losing correctness, FlashAttention-3 maintains per-query-block running maxima m_i and normalizers \ell_i which are updated in the softmax stage. The accumulation into \mathbf{O}_i is done in a numerically stable, incremental fashion: whenever the running maximum m_i increases, the previously accumulated \mathbf{O}_i is rescaled appropriately (using a diagonal scaling by \exp(m_i^{old}-m_i)). This same numerical bookkeeping that keeps the fused softmax numerically stable also enables the pipelining: the RS-GEMM that consumes \tilde{\mathbf{P}}_{cur} can be postponed or overlapped with the next SS-GEMM that produces S_{next}, as the rescaling operations and incremental accumulations preserve mathematical correctness across the reordering.
+
+Because these asynchronous GEMM instructions and waits are explicitly managed, compute and memory movement can be effectively overlapped. The producer warps can continue TMA loads and in-kernel transposes while consumer warps do asynchronous GEMMs and softmax work, and within the consumers the two-stage pipeline overlaps MFU and Tensor Core usage.
+
+# Epilogue rescaling: final O and L computations after pipelined loop
+
+At the end of the pipelined main loop, FlashAttention-3 needs to compute the final output block \mathbf{O}_i and the log normalizer matrix block L_i in a way that is numerically correct and consistent with the fused local-softmax procedure. Throughout the main loop we maintain:
+
+- \mathbf{O}_i: accumulated, partially rescaled output for the query block, stored on-chip.
+- m_i: running per-row maximum of the scores seen so far, stored on-chip.
+- \ell_i: running per-row sum of exponentials normalized with respect to the current maximum; specifically \ell_i is updated incrementally when new blocks' exponentials are computed.
+
+The final epilogue performs two tasks. First, it finishes any outstanding \tilde{\mathbf{P}} \mathbf{V} accumulations for the last key/value block(s), waiting on any outstanding WGMMA instructions if needed. Second, it applies the final normalization and computes the log-normalizer. Algebraically, the final output for the tile is obtained by
+
+\[
+\mathbf{O}_i \leftarrow \mathrm{diag}(\ell_i)^{-1} \mathbf{O}_i,
+\]
+
+and the log normalizer is
+
+\[
+L_i = m_i + \log(\ell_i).
+\]
+
+Here the diagonal scaling by \ell_i^{-1} converts the accumulated, scaled sums back to true expectation values under the softmax. Because the pipeline incrementally updated m_i and \ell_i in a way that mirrors row-wise stable softmax, this epilogue yields the exact same result as the non-pipelined, fused softmax algorithm. Finally, \mathbf{O}_i and L_i are written back to global memory (HBM) as the output for that query tile.
+
+# Trade-offs: compiler reordering (NVCC/SASS), register pressure (extra S_next), tile size vs pipeline depth
+
+While the two-stage and inter-warpgroup ping-pong schemes provide substantive performance gains, they require careful engineering and present trade-offs that must be balanced in implementation.
+
+Compiler reordering. The pseudocode shows an intended ordering of asynchronous WGMMA issues and non-WGMMA softmax code. However, the compiler (NVCC) and the lower-level assembly generator can rearrange instructions for optimization. Such reordering can disrupt the intended asynchrony pattern: for example, the compiler might move a wait earlier or reorder scalar instructions relative to WGMMA issues in ways that reduce overlap. The authors note that a SASS-level analysis must confirm that the compiled code preserves the desired overlapped pattern. In practice, one must inspect generated SASS and potentially use pragmas, inline assembly, or other control-flow constructs to prevent harmful reordering.
+
+Register pressure. The two-stage pipeline requires keeping additional intermediate tiles in registers: at minimum a register-resident copy of S_{next} that is produced by the first WGMMA and later used to compute \tilde{\mathbf{P}}_{next}. If the chosen block sizes are large (large B_r and B_c), the per-thread register requirement grows since each thread is responsible for a portion of the tile. Excessive register usage can cause register spilling to local memory, which severely degrades performance. Therefore there is a trade-off between (a) larger tiles (which improve GEMM efficiency per WGMMA call) and (b) the number of pipeline stages kept in flight (which increases register footprint). FlashAttention-3 chooses a two-stage pipeline as a pragmatic middle ground: it gets much of the overlap benefit while keeping register usage manageable.
+
+Tile size vs pipeline depth. Extending the pipeline to more stages (see the next section) can increase Tensor Core utilization further by overlapping a greater portion of softmax work with GEMMs. However, each extra stage requires additional register buffering (additional S_{next}, possibly additional \tilde{\mathbf{P}} buffers) and more complex dependency management, exacerbating register pressure and control complexity. Consequently, there is a practical limit to pipeline depth set by the register budget and the desire to avoid spill. The overall optimization problem is therefore to choose block sizes B_r and B_c and pipeline depth that maximize throughput without triggering register spills or creating excessive synchronization overhead.
+
+# Three-stage variant (concept): more overlap, more registers; when to consider it
+
+The two-stage pipeline is not the only possible intra-warpgroup overlapping strategy. A conceptual three-stage pipeline extends the same idea by keeping one more iteration's S tile in-flight and therefore overlapping the softmax and PV-update work of multiple iterations with the GEMMs of several subsequent iterations. In a three-stage pipeline one might:
+
+1. Issue WGMMA to compute S_{next2} (for iteration j+1) while
+2. Compute the PV-update for iteration j-1 and
+3. Execute the softmax for iteration j.
+
+This increases the window of asynchrony: while softmax for iteration j uses the MFU, two GEMMs for j+1 and j (or j and j-1) can be in flight on Tensor Cores. If enough independent GEMMs are available and the register budget permits it, this can further increase Tensor Core utilization and thus end-to-end throughput.
+
+However, the three-stage variant requires yet more register storage (for S_{next2}, potentially \tilde{\mathbf{P}}_{next} buffers, etc.), more elaborate ordering logic for waits and commits, and greater sensitivity to compiler reordering. The paper therefore treats three-stage pipelining as a possible extension but cautions that its practical benefit is workload- and hardware-dependent: it is worthwhile to consider only when the target platform has sufficient register resources per CTA and when profiling shows that two-stage pipelining still leaves significant unused Tensor Core cycles that a deeper pipeline could fill.
+
+In summary, the choice between two-stage and three-stage (or deeper) pipelines is a balance between achievable overlap (hence higher MFU + Tensor Core concurrency) and resource constraints (registers, shared memory, compiler behavior). Profiling and SASS-level inspection are essential to make the right choice for a particular hardware/software configuration.
+
+# Summary
+
+Overlapping softmax with GEMMs in FlashAttention-3 leverages two complementary dimensions of asynchrony: cross-warpgroup ping-pong scheduling and intra-warpgroup pipelining. Ping-pong scheduling forces an inter-warp ordering so that softmax work in one warpgroup is executed while GEMMs run in another. The two-stage intra-warpgroup pipeline breaks per-iteration serial dependencies by issuing WGMMA instructions asynchronously, buffering a next score tile in registers, and waiting only when results are needed. These mechanisms collectively increase Tensor Core and MFU concurrency, improving throughput in practice (the paper reports substantial TFLOPS improvements in FP16 experiments). The practical success of these techniques depends on controlling compiler reordering, keeping register pressure within limits, and choosing tile sizes and pipeline depth that suit the hardware's resource profile.

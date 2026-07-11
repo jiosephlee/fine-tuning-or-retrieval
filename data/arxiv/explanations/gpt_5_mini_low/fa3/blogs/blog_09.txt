@@ -1,0 +1,60 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# Inside the Backward Pass: Keeping Gradients Fast With Asynchrony
+
+The backward pass of attention is more matmul-heavy than the forward pass. That makes it a natural place to reap the benefits of the same low-level techniques that sped up FlashAttention-3's forward pass: tiling, warp-specialization to exploit asynchrony, and careful overlap of GEMMs with the non-GEMM softmax work. This post explains how those ideas are adapted for the backward computation, why they matter, and what they mean in practice for end-to-end training.
+
+## Why the backward pass matters (and why it’s different)
+
+For a single head with queries Q, keys K and values V, the forward pass computes
+S = α Q K^T, P = softmax(S) and O = P V.
+The backward pass computes gradients via a chain of GEMMs and a softmax Jacobian: given dO, we form
+dV = P^T dO,
+dP = dO V^T,
+dS = dsoftmax(dP),
+dQ = α dS K,
+dK = α dS^T Q.
+
+Compared to the forward pass, the backward involves more matmuls (the paper counts five matmuls in the backward vs two in the forward, which motivates their FLOP model where backward FLOPs ≈ 2.5 × forward FLOPs). That imbalance makes it both an opportunity and a challenge: matmuls are the parts the Tensor Cores are great at, but the attention backward also contains softmax-related reductions and elementwise operations that can become bottlenecks if scheduled poorly.
+
+FlashAttention-3 applies the same principles that helped forward attention to the backward pass, yielding measured speedups of about 1.5–1.75× over FlashAttention-2 for typical H100 runs.
+
+## The core techniques carried into the backward pass
+
+Three algorithmic/hardware-aware ideas are responsible for the gains, and they map over naturally to the backward computation.
+
+1. Warp-specialization and producer/consumer pipelining
+   - The kernel splits warps into producer roles (moving tiles Q, K, V from global memory into shared memory using TMA) and consumer roles (issuing the heavy WGMMA GEMMs on those tiles). Because both TMA (asynchronous tile loads) and the Hopper WGMMA instruction are asynchronous, this separation lets data movement and computation proceed concurrently with fine-grained synchronization.
+   - In the backward pass, the producers stream the tiles that feed the sequence of GEMMs (for example, tiles used to compute dP = dO V^T and dV = P^T dO), while consumer warps immediately launch WGMMA work on previously loaded tiles. This hides global memory latency and keeps Tensor Cores fed across the many matmuls in the backward.
+
+2. Overlapping GEMMs with the softmax Jacobian and other non-GEMM work
+   - The backward contains softmax-related computations (the dsoftmax reduction) and other elementwise ops that cannot be executed on Tensor Cores. FlashAttention-3 uses a pipelined schedule that interleaves GEMMs from one iteration with the softmax processing of an adjacent iteration (the same two-stage or multi-stage pipeline used in forward).
+   - The idea is the same: schedule the low-throughput scalar/special-function work (exponentials, reductions) to run while the Tensor Cores are busy on another GEMM. By doing so the small amount of special-function throughput no longer sits on the critical path, and GEMM utilization increases across the backward’s multiple matmuls.
+
+3. Keeping intermediates in higher precision where it matters; exploiting low-precision for matmuls
+   - FlashAttention-3 preserves numerically sensitive intermediate steps (e.g., softmax rescaling) in FP32 even when using FP16 for most work. That reduces backward numerical error relative to naive low-precision implementations.
+   - Where FP8 is used to accelerate GEMMs, the same FP8-aware layout and quantization strategies (block quantization, incoherent random mixing) can be applied to the backward matmuls. Because the backward has more GEMMs, it benefits even more from Tensor Core throughput wins when FP8 is safe and accuracy controls are in place.
+
+## Practical points in the backward implementation
+
+- Work decomposition: the backward is still embarrassingly parallel across batch, heads and query blocks, so the CTA-level tiling and circular shared-memory buffers used in the forward are reused. Tiles of K and V are streamed, and multiple backward GEMMs are scheduled to maximize overlap.
+- Register and shared-memory trade-offs: the backward’s need to keep multiple temporaries (partial accumulators for multiple matmuls, rowwise sums for dsoftmax, etc.) increases register pressure. In practice FlashAttention-3 balances tile sizes, pipeline depth (two-stage vs three-stage), and register allocation so that asynchronous scheduling improves throughput without causing excessive spilling.
+- Synchronization points: the algorithm uses lightweight barriers and producer-consumer commits to guarantee correctness while allowing WGMMA and TMA to proceed asynchronously. This lets GEMMs for different backward steps be ordered to maximize overlap with softmax reduction on other tiles.
+- FLOP accounting and speed: because backward FLOPs are ~2.5× forward FLOPs (5 matmuls vs 2 in the forward, as used in the paper’s benchmarking), improvements in GEMM utilization translate into larger absolute time savings for end-to-end training than comparable gains in the forward pass.
+
+## Measured outcome: 1.5–1.75× speedup over FlashAttention-2
+
+The paper reports that FlashAttention-3 achieves roughly 1.5–1.75× speedup in the backward pass compared to FlashAttention-2 on H100 for typical attention configurations. This comes from the combination of higher Tensor Core utilization (thanks to asynchrony and GEMM-softmax overlap), better scheduling across the many backward GEMMs, and, where applicable, use of FP8 matmul acceleration with mitigations for quantization error.
+
+Because the backward is more matmul-dominated, improvements in GEMM throughput yield disproportionately large reductions in total backward runtime. In turn, that reduces per-step training time and shortens wall-clock time for end-to-end training runs, assuming the rest of the model and data pipeline are not dominant bottlenecks.
+
+## Practical implications for training
+
+- Lower per-step cost: a 1.5× reduction in backward time directly shrinks the dominant contributor to many training steps, so end-to-end epoch time can meaningfully improve.
+- Better scaling to long contexts: the backward benefits from the same tiling and memory-avoiding strategies that let FlashAttention-3 handle long sequences efficiently in the forward; training with long contexts becomes more tractable time-wise.
+- FP8 opportunity with care: where FP8 is acceptable (and with block quantization + incoherent processing applied), the backward has many matmuls that can use FP8 Tensor Cores, yielding even larger throughput. But quantization safeguards must be used to avoid degrading gradients—FlashAttention-3 keeps sensitive reductions at higher precision and uses block-level and randomized transforms to reduce FP8 error.
+- Integration considerations: reducing backward latency helps training throughput, but overall benefit depends on the whole pipeline. For example, if other layers, optimizer state updates, or I/O dominate, the relative win will be smaller. The paper’s results are most impactful when attention is a bottleneck (large models, many attention heads, long sequences).
+
+## Summary
+
+FlashAttention-3 takes the forward-pass ideas—tiling to avoid global reads/writes, warp-specialized producer/consumer pipelining to exploit asynchronous TMA and WGMMA, and overlapping GEMMs with softmax work—and applies them to the backward pass. Because the backward contains more GEMMs, the same techniques give measurable speedups (about 1.5–1.75× over FlashAttention-2) and translate directly into faster training iterations for attention-heavy models. Where FP8 is used, the backward has even more to gain from FP8 Tensor Core throughput, provided block quantization and incoherent processing are used to keep gradient accuracy acceptable.

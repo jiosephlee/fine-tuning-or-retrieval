@@ -1,0 +1,304 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### Why is attention still bottlenecked by softmax if the paper says matrix multiplication has much higher throughput?
+Question:
+In FlashAttention-3, the authors say that on H100 the FP16 matmul throughput is extremely high, while special functions like exponentials have much lower throughput. They even estimate that for attention with head dimension 128, the exponential part of softmax can take about 50% of the cycles relative to matmul. I am confused because I thought attention was dominated by the two GEMMs, namely $\mathbf{Q}\mathbf{K}^\top$ and $\mathbf{P}\mathbf{V}$. If GEMMs are so much more expensive in FLOPs, why does softmax become such a serious bottleneck? Is the point that wall-clock time is determined by hardware throughput rather than just operation count?
+Answer:
+Yes — the key point is that attention runtime is determined by hardware throughput and overlap, not by raw operation count alone.
+
+In the paper’s setting, the two GEMMs in attention, $\mathbf{Q}\mathbf{K}^\top$ and $\mathbf{P}\mathbf{V}$, are executed on Tensor Cores, which on H100 have extremely high throughput. By contrast, the softmax uses operations like rowwise max, subtraction, exponentials, and reductions, and the exponential in particular runs on the GPU’s special-function machinery, which is much slower. The paper gives the relevant comparison explicitly: on H100, FP16 matmul is about $989\,\mathrm{TFLOPs/s}$, while special functions such as $\exp$ are only about $3.9\,\mathrm{TFLOPs/s}$. So even if softmax involves far fewer arithmetic operations than the GEMMs, each of those operations is much more expensive in wall-clock terms.
+
+That is why the “GEMMs dominate FLOPs” intuition is misleading here. FLOPs count the number of mathematical operations, but they do not tell you how fast the hardware can actually execute those operations. A good mental model is to think in terms of time $\approx \text{work}/\text{throughput}$, not just work. In the paper’s example for head dimension $128$, there are about $512\times$ more matmul FLOPs than exponential FLOPs, but the exponential throughput is about $256\times$ lower than matmul throughput, so the softmax part can still consume roughly half as many cycles as the matmul part. In other words, the much smaller amount of softmax work is being done on a far slower execution unit.
+
+This is exactly why FlashAttention-3 tries to hide softmax under GEMM rather than pretending softmax is negligible. The paper’s main idea is to overlap the low-throughput non-matmul work with asynchronous Tensor Core matmul, so that the expensive softmax operations are “free” as much as possible from the user’s perspective. So yes, your last sentence is right: wall-clock time is determined by hardware throughput and scheduling, not by FLOP count alone.
+
+### What exactly is the 'local softmax' trick that lets FlashAttention avoid materializing $\mathbf{S}$ and $\mathbf{P}$?
+Question:
+I understand standard attention as computing $\mathbf{S} = \alpha \mathbf{Q}\mathbf{K}^\top$, then $\mathbf{P} = \mathrm{softmax}(\mathbf{S})$, then $\mathbf{O} = \mathbf{P}\mathbf{V}$. The paper says FlashAttention uses a blockwise or local softmax reduction so that $\mathbf{S}$ and $\mathbf{P}$ do not need to be written to HBM. But in the pseudocode, it keeps running values $m_i$, $\ell_i$, and rescales $\mathbf{O}_i$ each iteration. I do not see why this gives the same result as full row-wise softmax over the entire sequence. Could someone explain the algebra behind how the running row max and running normalization recover the exact attention output?
+Answer:
+The “local softmax” in FlashAttention is really an online, blockwise implementation of the same row-wise softmax, not a different function. The key idea is to keep the softmax in a shifted form using the running row maximum, exactly as in the usual numerically stable softmax, but to update that shift incrementally as more key blocks arrive.
+
+For one query row, let the raw attention scores be $s_1,\dots,s_N$ and the corresponding value vectors be $v_1,\dots,v_N$. The exact attention output is
+
+$$
+o \;=\; \frac{\sum_{j=1}^N e^{s_j} v_j}{\sum_{j=1}^N e^{s_j}}.
+$$
+
+Now split the keys/values into blocks. After processing the first few blocks, FlashAttention maintains two things for that row: a running maximum $m$ and a running normalization $\ell$, together with an unnormalized output accumulator $\mathbf{O}$. The invariant is that, after some set of blocks has been processed,
+
+$$
+\ell \;=\; \sum_{\text{seen } j} e^{s_j - m}, \qquad
+\mathbf{O} \;=\; \sum_{\text{seen } j} e^{s_j - m} v_j.
+$$
+
+This is just the softmax numerator and denominator, but written in coordinates shifted by the current maximum $m$. Since softmax is invariant to adding or subtracting the same constant from every score in a row, this shift does not change the final result.
+
+The only subtlety is what happens when a new block contains a score larger than the previous maximum. Suppose the old max was $m_{\text{old}}$ and the new max becomes
+
+$$
+m_{\text{new}} = \max\!\bigl(m_{\text{old}}, \max(\text{new block scores})\bigr).
+$$
+
+Then every previously accumulated term must be re-expressed with the new shift. But that is easy:
+
+$$
+e^{s_j - m_{\text{new}}}
+=
+e^{m_{\text{old}} - m_{\text{new}}} e^{s_j - m_{\text{old}}}.
+$$
+
+So the old numerator and denominator are simply multiplied by $e^{m_{\text{old}} - m_{\text{new}}}$, and then the new block’s contributions are added in the new coordinates. In other words, the updates in the pseudocode are exactly
+
+$$
+\ell_{\text{new}} = e^{m_{\text{old}} - m_{\text{new}}}\ell_{\text{old}} + \sum_{j\in \text{new block}} e^{s_j - m_{\text{new}}},
+$$
+
+$$
+\mathbf{O}_{\text{new}} = e^{m_{\text{old}} - m_{\text{new}}}\mathbf{O}_{\text{old}} + \sum_{j\in \text{new block}} e^{s_j - m_{\text{new}}} v_j.
+$$
+
+That is exactly what the paper’s $\ell_i$, $m_i$, and rescaling of $\mathbf{O}_i$ are doing. After the last block, you divide once:
+
+$$
+o = \frac{\mathbf{O}}{\ell}.
+$$
+
+Because both $\mathbf{O}$ and $\ell$ are being kept in the same shifted basis, the factor $e^{-m}$ cancels, and you recover the exact full-row softmax result:
+
+$$
+\frac{\sum_j e^{s_j - m} v_j}{\sum_j e^{s_j - m}}
+=
+\frac{\sum_j e^{s_j} v_j}{\sum_j e^{s_j}}.
+$$
+
+So the trick is not an approximation at all. It is the standard stable-softmax identity applied incrementally over blocks, which is why FlashAttention can avoid materializing $\mathbf{S}$ and $\mathbf{P}$ in HBM while still computing exact attention.
+
+### Why does FlashAttention-3 split warps into producer and consumer roles instead of letting every warp do both loading and compute?
+Question:
+The paper emphasizes 'warp-specialization' where some warps only issue TMA loads and others only issue WGMMA and softmax-related computation. I am confused why this is better than a more symmetric design where each warp loads its own data and computes on it. Is the main benefit reduced instruction scheduling complexity, better overlap of asynchronous units, better register allocation through `setmaxnreg`, or something else? I am trying to understand what problem warp-specialization solves that FlashAttention-2 could not.
+Answer:
+The short answer is that warp-specialization is mainly about **hiding latency by overlapping two different kinds of work that Hopper can execute asynchronously**: data movement through TMA and matrix multiplies through WGMMA. The register reallocation with `setmaxnreg` is a very important bonus, but it is not the primary point.
+
+What FlashAttention-3 is exploiting is that Hopper has separate hardware paths for loading and compute. The paper explicitly says that warp-specialized kernels are useful because they “extend the algorithm’s ability to hide memory and instruction issue latencies,” and because `setmaxnreg` lets the warps doing the heavy WGMMA work borrow registers from the warps that are mostly just issuing TMA loads. In other words, the producer warps are there to keep the shared-memory pipeline full, while the consumer warps stay busy on Tensor Cores and softmax. That is exactly the kind of producer-consumer overlap that a symmetric “every warp does both” design tends to lose.
+
+If every warp both loaded and computed its own tile, each warp would still have to alternate between waiting for data and using it. You would get much less clean overlap between the load path and the compute path, and the compiler would have a harder time scheduling the instructions in a way that keeps the asynchronous units busy. With warp-specialization, the roles are separated, so one set of warps can run ahead on TMA while another set is already consuming previous tiles. That is why the paper describes it as a software pipelining scheme.
+
+The register story is real too, but it is best thought of as enabling the overlap rather than replacing it. The compute warps need a lot more register file space because they hold partial results, softmax state, and WGMMA fragments. The producer warps, by contrast, need very little state. Hopper’s dynamic register reallocation means the consumer warps can get a larger share of registers, which helps avoid spilling and supports larger tiles. That is especially valuable in a kernel like attention, where register pressure is already high.
+
+So the clean way to think about it is: the main benefit is **better overlap of asynchronous data movement and compute**, while **simpler scheduling** and **better register allocation** are the practical mechanisms that make that overlap efficient. FlashAttention-2 did not get this because it was still structured around a more synchronous execution model and did not explicitly exploit Hopper’s TMA/WGMMA asynchrony in this producer-consumer way.
+
+### How can softmax be overlapped with GEMM if softmax depends on the output of $\mathbf{Q}\mathbf{K}^\top$?
+Question:
+The paper says one of the main ideas is to 'hide softmax under asynchronous block-wise GEMMs'. But softmax on block $j$ needs the scores $\mathbf{S}_i^{(j)} = \mathbf{Q}_i\mathbf{K}_j^\top$, so I would think the first GEMM must fully finish before softmax can even start. Then the second GEMM $\widetilde{\mathbf{P}}_i^{(j)}\mathbf{V}_j$ must wait for softmax. So this looks sequential to me. In Algorithm 2, they seem to break the dependency by pipelining across iterations using $\mathbf{S}_{\mathrm{cur}}$ and $\mathbf{S}_{\mathrm{next}}$. Could someone explain carefully which dependencies remain and which ones are avoided by the 2-stage pipeline?
+Answer:
+The key point is that the paper is not claiming that softmax no longer depends on $\mathbf{Q}\mathbf{K}^\top$. That dependency is still there and cannot be removed. What changes is *which block* of the computation is waiting on which other block.
+
+For a single block $j$, the dataflow is still
+$$
+\mathbf{S}^{(j)} = \mathbf{Q}_i \mathbf{K}_j^\top \;\rightarrow\; \widetilde{\mathbf{P}}^{(j)} = \exp(\mathbf{S}^{(j)} - m)\;\rightarrow\; \widetilde{\mathbf{P}}^{(j)} \mathbf{V}_j.
+$$
+So, yes, the softmax for block $j$ cannot start until the first GEMM for block $j$ has produced $\mathbf{S}^{(j)}$, and the second GEMM for block $j$ cannot start until softmax has produced $\widetilde{\mathbf{P}}^{(j)}$.
+
+The trick in FlashAttention-3 is that the kernel does not process one block to completion before moving on. It keeps two score buffers, $\mathbf{S}_{\mathrm{cur}}$ and $\mathbf{S}_{\mathrm{next}}$, and it uses WGMMA’s asynchrony to *launch* a GEMM and then do other work while that GEMM is still in flight. In the 2-stage pipeline, the useful overlap is across adjacent blocks: while WGMMA is computing $\mathbf{S}_{\mathrm{next}} = \mathbf{Q}_i\mathbf{K}_j^\top$, the warpgroup is simultaneously doing the softmax work for the previous block and/or launching the second GEMM for the previous block, $\widetilde{\mathbf{P}}_{\mathrm{cur}}\mathbf{V}_{j-1}$. Since $\widetilde{\mathbf{P}}_{\mathrm{cur}}$ already exists from the prior iteration, that second GEMM does not depend on the current softmax at all.
+
+So the dependency structure becomes:
+
+- $\mathbf{S}_j \rightarrow \mathrm{softmax}(\mathbf{S}_j)$ remains;
+- $\widetilde{\mathbf{P}}_j \rightarrow \widetilde{\mathbf{P}}_j \mathbf{V}_j$ remains;
+- but the kernel avoids the *idle wait* between them by moving the waits later and using the gap to run independent work from neighboring blocks.
+
+This is exactly why the pseudocode uses “commit but do not wait” for WGMMA. The launch of the GEMM is separated from the point where its result is actually needed. In other words, the pipeline does not violate the true data dependencies; it hides them by interleaving different blocks so that the Tensor Cores can be busy on one block while the scalar/special-function hardware is handling softmax for another. That is the same idea as classic software pipelining, just applied to attention blocks.
+
+So your intuition is right for a *single block*: softmax cannot start before $\mathbf{Q}\mathbf{K}^\top$ finishes. The overlap appears only after you unroll over blocks and realize that block $j$’s softmax can run while block $j{+}1$’s first GEMM is already executing asynchronously, and block $j{-}1$’s second GEMM can also be in flight.
+
+### What does 'commit but do not wait' mean for WGMMA, and why is that useful here?
+Question:
+In the consumer algorithm, the paper repeatedly says to issue a WGMMA, then 'commit but do not wait'. Later it explicitly waits for the result before using it. I think the idea is that WGMMA is asynchronous on Hopper, but I am not sure what state the computation is in after 'commit'. Does this mean the instruction has been launched to Tensor Cores but the CUDA cores can continue executing unrelated instructions? If so, what kinds of operations are actually safe to overlap before the later wait, and how does the kernel avoid reading incomplete accumulator values?
+Answer:
+On Hopper, “commit but do not wait” means “the WGMMA has been issued into the GPU’s asynchronous Tensor Core pipeline, and we have recorded it as an outstanding operation, but we are not stalling the warpgroup for it to finish.” So yes, conceptually the matmul is now in flight on the Tensor Cores, and the consumer warps can keep executing other instructions while that result is still being produced.
+
+The important subtlety is that “commit” does **not** mean “the accumulator is now ready.” It only means the operation has been launched and grouped for later synchronization. The values written by that WGMMA are still incomplete until the corresponding `wait` occurs, so they must not be read, reused, or overwritten before then. In the paper’s algorithm, that is handled by double buffering: the next score tile is computed into a separate register fragment, $\mathbf{S}_{\mathrm{next}}$, while the current tile $\mathbf{S}_{\mathrm{cur}}$ is the one already safe to feed into softmax. The code explicitly waits only at the point where the new tile is about to be consumed, so incomplete accumulator values are never used.
+
+What can be overlapped safely is any work that does not depend on the pending WGMMA result. In this paper, that is exactly the point of the 2-stage pipeline: while one WGMMA is running, the kernel does the softmax work for the previous tile, which is made up of comparatively low-throughput floating-point operations like max, exp, and reductions. The paper notes that these non-matmul operations run on different hardware units and are much slower in throughput than matmul, so hiding them under WGMMA improves utilization. In other words, the Tensor Cores are busy on one tile while the CUDA-side arithmetic and control flow are busy on another tile.
+
+So the answer to “how does the kernel avoid reading incomplete accumulator values?” is: by explicit synchronization and staging. The kernel never reads a WGMMA output until after the `wait`, and it keeps the in-flight output in a separate register buffer from the already-completed one. That is why the pseudocode has “commit but do not wait” followed later by a wait right before the result is actually used.
+
+### Why does pingpong scheduling need two warpgroups and explicit barriers if the hardware is already asynchronous?
+Question:
+The paper describes 'pingpong scheduling' where warpgroup 1 performs GEMMs while warpgroup 2 performs softmax, then they swap roles. I am confused why this requires carefully ordered barriers such as `bar.sync`. If WGMMA and TMA are already asynchronous, shouldn't the hardware naturally overlap whatever is ready? Is the point that without barriers, the compiler or scheduler might issue both warpgroups' GEMMs first and postpone the non-GEMM softmax work, which would underutilize special-function units? I would like to understand what is enforced by pingpong scheduling that would not happen automatically.
+Answer:
+The short answer is that Hopper’s asynchrony is a necessary enabler, but it does not by itself create the schedule that FlashAttention-3 wants. In the paper’s terms, WGMMA and TMA can run asynchronously, but the GPU will not “figure out” on its own that it should deliberately alternate two warpgroups so that one is doing GEMMs while the other is doing softmax. The `bar.sync` is there to enforce that higher-level phase ordering.
+
+There are really two different kinds of dependence here. First, within a single warpgroup, softmax depends on the result of $QK^\top$, and the second GEMM depends on the softmax output. So one warpgroup cannot simply overlap its own GEMM and softmax arbitrarily; the data flow is inherently sequential. Second, across warpgroups, the paper wants to use one warpgroup’s “waiting time” to hide the other warpgroup’s low-throughput softmax work. That is what pingpong scheduling adds: while warpgroup 1 is in softmax, warpgroup 2 is already issuing the next GEMMs, and then they swap roles.
+
+The explicit barriers are what make that alternation happen reliably. Without them, both warpgroups would just execute the same loop structure and the compiler/scheduler could keep them in roughly the same phase. In practice, that means both could rush through GEMM-heavy parts as soon as operands are ready, and the softmax work would be left to run when there is no GEMM left to hide it under. The paper even notes that NVCC may reorder instructions, so the authors use synchronization barriers to preserve the intended pipeline.
+
+So the point of pingpong scheduling is not “make the hardware asynchronous”; the hardware already is. The point is to impose a software schedule on top of that asynchrony so that the Tensor Cores stay busy with one warpgroup’s GEMM while the other warpgroup spends that time on the much slower special-function softmax operations. In other words, asynchrony gives you the possibility of overlap, but the barriers are what turn that possibility into the specific overlap pattern FlashAttention-3 needs.
+
+### Why are the buffer stages for $\mathbf{K}$ and $\mathbf{V}$ released at different times in the pipelined algorithm?
+Question:
+In the simpler algorithm, each iteration loads $\mathbf{K}_j$ and $\mathbf{V}_j$ into the same circular shared-memory pipeline stage and later releases that stage. But in the 2-stage algorithm, the code releases the stage for $\mathbf{K}_j$ and the stage for $\mathbf{V}_{j-1}$ separately. I am getting lost in the lifetime of each tile. Is this because $\mathbf{K}_j$ is only needed for the first GEMM of iteration $j$, while $\mathbf{V}_{j-1}$ is still needed later for the second GEMM? A timeline-style explanation of when each tile can be safely overwritten would help.
+Answer:
+Yes — that is exactly the reason, and the key is that the $2$-stage pipeline deliberately gives the $K$ tile and the previous $V$ tile different live ranges.
+
+In the simpler, non-overlapped algorithm, $\mathbf{K}_j$ and $\mathbf{V}_j$ are consumed in the same iteration back-to-back, so one shared-memory stage cannot be reused until both GEMMs have finished. In the $2$-stage algorithm, the first GEMM of iteration $j$ is $\mathbf{Q}_i \mathbf{K}_j^\top$, while the second GEMM is $\widetilde{\mathbf{P}}_{\mathrm{cur}} \mathbf{V}_{j-1}$. That means the current key tile $\mathbf{K}_j$ is needed only until the first GEMM for that iteration has produced $\mathbf{S}_{\mathrm{next}}$, whereas the value tile $\mathbf{V}_{j-1}$ remains needed later, until the second GEMM finishes. The whole point of the pipeline is to overlap those two phases: while the Tensor Cores are computing $\mathbf{Q}_i \mathbf{K}_j^\top$, the softmax work for the previous score tile and the GEMM with $\mathbf{V}_{j-1}$ can be in flight.
+
+A good way to think about iteration $j$ is this: at the start of the iteration, stage $j \bmod s$ holds $\mathbf{K}_j$ and stage $(j-1) \bmod s$ holds $\mathbf{V}_{j-1}$. The kernel launches the first WGMMA for $\mathbf{Q}_i \mathbf{K}_j^\top$, then launches the second WGMMA for $\widetilde{\mathbf{P}}_{\mathrm{cur}} \mathbf{V}_{j-1}$. Once the first WGMMA has completed and $\mathbf{S}_{\mathrm{next}}$ has been converted into $m_i$, $\widetilde{\mathbf{P}}_{\mathrm{next}}$, and $\ell_i$, the $\mathbf{K}_j$ tile has no further use. Once the second WGMMA has completed, the $\mathbf{V}_{j-1}$ tile is also dead. So conceptually, $\mathbf{K}_j$ could be released as soon as its score tile is no longer needed, and $\mathbf{V}_{j-1}$ only after the output update is done. The paper’s pseudocode releases both at the end of the iteration, but they are released separately because they correspond to different tiles with different last-use times.
+
+So the short answer is: yes, $\mathbf{K}_j$ dies after the first GEMM/softmax path, while $\mathbf{V}_{j-1}$ dies after the second GEMM path. That staggered lifetime is exactly what makes the overlap possible.
+
+### Why does the 2-stage pipeline increase register pressure by roughly one extra $\mathbf{S}$ tile?
+Question:
+The paper says the extra buffering required by the 2-stage pipeline means keeping an additional score tile like $\mathbf{S}_{\mathrm{next}}$ in registers, with extra storage on the order of $B_r \times B_c \times \mathrm{sizeof}(\mathrm{float})$ per threadblock. I do not fully understand where this quantity comes from. Is it because while softmax is consuming the current scores, the next scores from $\mathbf{Q}_i\mathbf{K}_j^\top$ have already been produced and must remain live until the wait finishes? Also, are these accumulators really all stored in registers rather than shared memory?
+Answer:
+Yes — that is essentially the reason. The “extra $\mathbf{S}$ tile” is not an extra global-memory or shared-memory buffer; it is extra *live state* in the consumer warps’ registers caused by software pipelining.
+
+In the 2-stage loop, the kernel issues the WGMMA for the next score block, $\mathbf{S}_{\mathrm{next}}=\mathbf{Q}_i \mathbf{K}_j^\top$, and does **not** wait for it immediately. Instead, it uses that time to run the second GEMM for the previous block, $\widetilde{\mathbf{P}}_{\mathrm{cur}} \mathbf{V}_{j-1}$, and only then waits before softmaxing $\mathbf{S}_{\mathrm{next}}$. So for part of the iteration both tiles must coexist: $\mathbf{S}_{\mathrm{cur}}$ is still needed for the current softmax/epilogue work, while $\mathbf{S}_{\mathrm{next}}$ has already been produced by the asynchronous WGMMA and must stay live until the `wait` completes and softmax can consume it. That is exactly the same logic as double-buffering: overlap two stages, and you need two buffers.
+
+The paper’s estimate $B_r \times B_c \times \mathrm{sizeof}(\mathrm{float})$ comes from the size of one score tile itself. A score tile has shape $B_r \times B_c$, and on Hopper the WGMMA score accumulator is in FP32, so one tile occupies about $B_r B_c$ floats, i.e. $4 B_r B_c$ bytes, spread across the threads of the warpgroup. The paper says “per threadblock” because that is the total CTA-wide register footprint, not because one thread stores the whole tile. In practice, the tile is partitioned into per-thread accumulator fragments, but the total live register demand is still roughly that of one extra $\mathbf{S}$ tile.
+
+So, to your second question: yes, these accumulators are kept in registers rather than shared memory in this design. That is precisely why the paper flags register pressure as the trade-off. If $\mathbf{S}_{\mathrm{next}}$ were spilled to shared memory, you would reduce register usage, but you would also lose the point of the overlap and add extra memory traffic/latency. The 2-stage pipeline works because the next score tile stays resident in registers long enough for the softmax stage to pick it up.
+
+### Why does FP8 WGMMA only supporting k-major operands create a special problem for attention?
+Question:
+The paper states that for FP16 WGMMA, both mn-major and k-major shared-memory layouts are allowed, but for FP8 WGMMA only k-major is supported. I am struggling to connect this hardware detail to the attention algorithm. In particular, the authors say this causes trouble for the second GEMM involving $\widetilde{\mathbf{P}}\mathbf{V}$. Is the issue that $\mathbf{V}$ is normally stored contiguous in the head-dimension direction, while the FP8 Tensor Core expects the shared-memory tile in the opposite contiguity? If so, why does this matter specifically when trying to fuse the two GEMMs in one kernel?
+Answer:
+Yes — that is essentially the issue, and the reason it becomes painful in FlashAttention is that the two GEMMs share data *on chip*.
+
+In the forward pass, the first GEMM is $\mathbf{Q}_i \mathbf{K}_j^\top$, and there the natural layout of $\mathbf{K}_j$ already works: $\mathbf{K}$ is stored with the head dimension $d$ contiguous, and for this GEMM the contracted dimension is exactly $d$. So for FP8 WGMMA, that operand can be used in the required k-major form without much drama.
+
+The second GEMM is different: it is $\widetilde{\mathbf{P}}_i^{(j)} \mathbf{V}_j$. Here the contracted dimension is the block length $B_c$, not $d$. But $\mathbf{V}$ is normally stored as sequence-length by head-dimension, so its natural contiguous direction is still the head dimension. For FP8 WGMMA, however, the paper says only k-major operands are supported, which means the tile of $\mathbf{V}$ in shared memory has to be contiguous along the contracted $B_c$ dimension, i.e. effectively transposed relative to the usual layout. So your intuition is right: the hardware wants the opposite contiguity from the one $\mathbf{V}$ naturally has.
+
+This matters specifically for fusion because FlashAttention is trying to do both GEMMs, plus the softmax in between, inside one kernel without ever writing the intermediate $\mathbf{P}$ to HBM. That means the output of the first GEMM lives in registers/accumulators, and the $\mathbf{V}$ tile lives in shared memory, and the second GEMM must consume both immediately. If FP8 WGMMA only accepts k-major, you cannot just “feed” the raw $\mathbf{V}$ tile into the second GEMM the way you can for FP16, because the layout is wrong. You either have to transpose $\mathbf{V}$ somewhere or store it globally in a transposed format.
+
+The paper’s key point is that TMA load itself cannot change the contiguity, so the transpose has to happen either as a preprocessing step in global memory or on chip after loading into shared memory. A preprocessing transpose would add extra memory traffic and defeat some of the point of fusing the kernel. That is why this is a special problem for the fused attention kernel: the second GEMM is *dependent* on the first, so the layout conversion has to happen inside the same pipeline, not as a separate easy-to-schedule GEMM call.
+
+So the short version is: FP8 WGMMA’s k-major restriction turns the usual $\mathbf{V}$ layout into a mismatch for $\widetilde{\mathbf{P}}\mathbf{V}$, and because FlashAttention wants to keep everything in one kernel, that mismatch becomes an on-chip layout-conversion problem rather than something you can hide with an extra kernel or a round trip through memory.
+
+### Why does FlashAttention-3 transpose $\mathbf{V}$ tiles inside the kernel instead of transposing $\mathbf{V}$ once in global memory?
+Question:
+For the FP8 path, the paper says there are two options: transpose $\mathbf{V}$ in global memory before attention, or load a tile and transpose it inside the kernel using LDSM and STSM. They choose the in-kernel transpose. I understand that a separate preprocessing transpose kernel would add bandwidth cost, but I am still unsure why that cost is large enough to dominate, especially if the transpose could be reused across multiple heads or layers. Is the main reason that attention during inference is memory-bound, so an extra read/write of all of $\mathbf{V}$ is too expensive compared to doing a tile-local shared-memory transpose on the fly?
+Answer:
+Yes — the paper’s main reason is exactly that a separate global-memory transpose would add an extra full pass over $\mathbf{V}$, and attention is already dominated by HBM traffic. In the FP8 path, Hopper’s WGMMA requires the $\mathbf{V}$ tiles to be in the k-major layout, but the usual layout of $\mathbf{V}$ is contiguous in the head dimension. Since TMA cannot change the contiguous dimension, the paper says you either transpose $\mathbf{V}$ in global memory first or transpose each tile after loading it into shared memory. They reject the standalone transpose kernel because even an optimized transpose still has to read and write all of $\mathbf{V}$ once before attention ever starts, and that is “too wasteful in a memory-bound situation such as inference.” That is very much in the spirit of FlashAttention: its whole purpose is to minimize global-memory reads/writes, so paying an extra global read + write of a large tensor is exactly the kind of overhead it tries to avoid.
+
+The in-kernel transpose is cheaper because it is tile-local and happens on-chip. The paper uses LDSM/STSM to transpose the loaded tile in shared memory/registers, and notes that after the first iteration this transpose can be hidden under the two WGMMAs of the neighboring steps. So the cost is not just smaller; much of it is overlapped with work you already have to do. By contrast, a preprocessing transpose cannot be overlapped away in the same way, and it would also require changing the storage format of $\mathbf{V}$ in a way that is awkward to integrate into a standard library. In short, the choice is not about transpose arithmetic cost but about memory traffic: on a memory-bound kernel, an extra global pass over $\mathbf{V}$ is expensive enough to matter, whereas a tile-local transpose inside the kernel is effectively “free enough” to be worth it.
+
+### How does the register-byte permutation after the first FP8 WGMMA still produce the correct $\widetilde{\mathbf{P}}\mathbf{V}$ result?
+Question:
+One of the most confusing parts for me is the FP8 layout fix. The paper says the FP32 accumulator layout produced by the first FP8 WGMMA does not match the layout expected for operand A of the second FP8 WGMMA, so they use byte-permute instructions to reorder the accumulator entries. They then say this logically permutes columns of the $\mathbf{P}$ tile, and they compensate by writing out a matching row permutation of the $\mathbf{V}$ tile during the in-kernel transpose. I think this means they are effectively multiplying $(\mathbf{P} \Pi)(\Pi^\top \mathbf{V})$ for some permutation matrix $\Pi$, which equals $\mathbf{P}\mathbf{V}$. Is that the right interpretation, or am I misunderstanding what is being permuted?
+Answer:
+Yes — that is essentially the right way to think about it.
+
+What the paper is doing is not changing the mathematics of attention, but changing the *internal indexing convention* used by the Hopper FP8 WGMMA instructions. The first FP8 WGMMA leaves the softmax tile $\widetilde{\mathbf{P}}$ in an FP32 accumulator layout that is inconvenient for the next WGMMA. The byte-permute reorders the accumulator entries so that, when interpreted as a matrix tile, it is as if the columns of $\widetilde{\mathbf{P}}$ had been permuted by some permutation matrix $\Pi$.
+
+Once you do that, you must feed the second WGMMA a $\mathbf{V}$ tile whose rows are permuted in the matching way, because the second GEMM contracts over the same inner dimension. In matrix form, that means the kernel is effectively computing
+$$
+(\widetilde{\mathbf{P}}\Pi)(\Pi^\top \mathbf{V}),
+$$
+which is exactly
+$$
+\widetilde{\mathbf{P}}\Pi\Pi^\top \mathbf{V}
+= \widetilde{\mathbf{P}}\mathbf{V}.
+$$
+So your interpretation is correct up to the usual convention issue: “matching row permutation” on $\mathbf{V}$ means the inverse permutation on the linear-algebra side, i.e. $\Pi^\top$, because permutation matrices satisfy $\Pi^{-1}=\Pi^\top$.
+
+The important subtlety is that the permute instruction is acting on the *register layout*, not on the abstract attention formula. The paper’s point is that the hardware wants the accumulator fragment and the operand-$A$ fragment in different byte orders, and by making the transpose of $\mathbf{V}$ produce the correspondingly reordered rows, the kernel preserves the exact product while avoiding extra shuffle instructions.
+
+So in short: yes, it is a compensated permutation of the shared inner dimension, and that is why the final $\widetilde{\mathbf{P}}\mathbf{V}$ result is still correct.
+
+### Why does multiplying both $\mathbf{Q}$ and $\mathbf{K}$ by an orthogonal matrix not change attention, and why is $\mathbf{V}$ left alone?
+Question:
+The paper uses 'incoherent processing' by multiplying $\mathbf{Q}$ and $\mathbf{K}$ with a random orthogonal matrix $\mathbf{M}$ before FP8 quantization, arguing that this spreads out outliers and reduces quantization error. They state that $(\mathbf{Q}\mathbf{M})(\mathbf{K}\mathbf{M})^\top = \mathbf{Q}\mathbf{K}^\top$ because $\mathbf{M}\mathbf{M}^\top = I$. I follow that algebra, but I am not sure how this interacts with the scaling factor and the later multiplication by $\mathbf{V}$. Why is it enough to transform only $\mathbf{Q}$ and $\mathbf{K}$, and not $\mathbf{V}$ as well? Also, does this preserve attention exactly before quantization and only change the quantization error profile?
+Answer:
+Yes: in the paper, the orthogonal mixing is meant to be an exact symmetry of the *score* computation, and only the quantization step makes it approximate.
+
+The key point is that attention depends on $\mathbf{Q}$ and $\mathbf{K}$ only through the dot-product matrix
+$$
+\mathbf{S}=\alpha \mathbf{Q}\mathbf{K}^\top,
+$$
+with $\alpha = 1/\sqrt{d}$. If you replace $\mathbf{Q}$ and $\mathbf{K}$ by $\mathbf{Q}\mathbf{M}$ and $\mathbf{K}\mathbf{M}$, where $\mathbf{M}$ is orthogonal, then
+$$
+\alpha(\mathbf{Q}\mathbf{M})(\mathbf{K}\mathbf{M})^\top
+= \alpha \mathbf{Q}\mathbf{M}\mathbf{M}^\top \mathbf{K}^\top
+= \alpha \mathbf{Q}\mathbf{K}^\top.
+$$
+The scaling factor does not change anything here because it is just a scalar multiplier outside the product. So the score matrix $\mathbf{S}$ is exactly unchanged, and therefore the row-wise softmax is unchanged as well:
+$$
+\mathrm{softmax}(\alpha \mathbf{Q}\mathbf{K}^\top)
+=
+\mathrm{softmax}(\alpha (\mathbf{Q}\mathbf{M})(\mathbf{K}\mathbf{M})^\top).
+$$
+Since $\mathbf{P}$ is the same, the final output
+$$
+\mathbf{O}=\mathbf{P}\mathbf{V}
+$$
+is also exactly the same if $\mathbf{V}$ is left alone. This is why no transformation of $\mathbf{V}$ is needed for correctness.
+
+By contrast, $\mathbf{V}$ does not enjoy the same cancellation property. If you transformed it as $\mathbf{V}\mapsto \mathbf{V}\mathbf{M}$, then you would get
+$$
+\mathbf{P}(\mathbf{V}\mathbf{M})=(\mathbf{P}\mathbf{V})\mathbf{M},
+$$
+which is a rotated output, not the original attention output. To preserve the exact output you would have to undo that rotation afterward, which the paper does not want to do. So there is a symmetry for $\mathbf{Q}$ and $\mathbf{K}$ because they appear in a bilinear form with a transpose on one side, but no analogous symmetry for $\mathbf{V}$ because it is multiplied only once, on the right, after the softmax.
+
+Intuitively, this “incoherent processing” is just a change of basis in the query/key feature space. Orthogonal matrices preserve inner products, so the attention scores are invariant, but they mix coordinates so that large outliers in a few dimensions get spread across many dimensions. That is exactly what helps FP8: the quantizer sees more balanced per-coordinate magnitudes, so it suffers less from saturation and rounding error. In other words, the *exact* attention computation is unchanged before quantization, and the only thing that changes is the quantization error profile.
+
+So the short answer is: yes, mathematically the attention is preserved exactly by applying the same orthogonal transform to $\mathbf{Q}$ and $\mathbf{K}$, including the usual scaling factor, and $\mathbf{V}$ is left untouched because there is no corresponding invariance there. The benefit is purely to make the low-precision representation of $\mathbf{Q}$ and $\mathbf{K}$ easier.
+
+### Why does block quantization have 'no computation cost' in this algorithm?
+Question:
+The FP8 section says block quantization can be fused with an operation before attention, and that FlashAttention-3 can 'scale each block of $\mathbf{S}$ to account for this block quantization at no computation cost'. I do not see why the cost is effectively zero. If each block of $\mathbf{Q}$ and $\mathbf{K}$ has its own scale, shouldn't the score block $\mathbf{S}_{ij}$ need to be multiplied by a corresponding factor such as $s_{Q,i} s_{K,j}$ before softmax? Is the claim simply that these multiplications are negligible compared to GEMMs, or is the scaling folded into existing instructions so no extra instructions are needed?
+Answer:
+Yes, mathematically you are right: if a query block $Q_i$ is quantized with scale $s_{Q,i}$ and a key block $K_j$ with scale $s_{K,j}$, then the corresponding score tile should be
+
+$$
+S_{ij} = \alpha\, Q_i K_j^\top \approx \alpha\, s_{Q,i}s_{K,j}\, \hat Q_i \hat K_j^\top,
+$$
+
+so there is indeed a block-specific scalar factor to apply before softmax.
+
+What the paper means by “at no computation cost” is not that the multiply magically disappears, but that it does not require any extra standalone pass, kernel, or global-memory traffic. FlashAttention already processes one score block at a time and keeps that block on-chip while it computes the row max, the exponentials, and the running normalization. So the factor $s_{Q,i}s_{K,j}$ can simply be folded into that existing on-chip block processing, exactly when the score tile is already being used for softmax. In other words, the tile can be rescaled in place before the softmax sees it.
+
+So the intended claim is more like “free in the performance sense,” not “zero FLOPs in a literal sense.” There is still a tiny amount of extra arithmetic, but it is negligible compared with the GEMM and the softmax work, and crucially it does not add memory bandwidth pressure. That is why the authors say block quantization can be fused and why the blockwise structure of FlashAttention-3 makes the scaling of $S$ easy to absorb.
+
+### Why is the backward-pass FLOP count estimated as $2.5$ times the forward-pass FLOPs?
+Question:
+In the benchmarking section, the paper says forward FLOPs are computed as $4 \cdot \mathrm{seqlen}^2 \cdot \mathrm{head\ dimension} \cdot \mathrm{number\ of\ heads}$, and the backward pass is estimated as $2.5$ times the forward pass because there are 5 matmuls in backward versus 2 in forward due to recomputation. I can see from the equations that backward uses $\mathbf{P}^\top \mathbf{dO}$, $\mathbf{dO}\mathbf{V}^\top$, $\mathbf{dS}\mathbf{K}$, and $\mathbf{dS}^\top\mathbf{Q}$, but that is only 4 matmuls unless I am missing one. Which operation is being counted as the fifth matmul, and how exactly does recomputation enter this accounting?
+Answer:
+The missing fifth matmul is the recomputation of the forward score matrix, $S = QK^\top$, inside the backward pass.
+
+If you look only at the gradient formulas you wrote, then yes, there are four matmuls there:
+$$
+dV = P^\top dO,\qquad dP = dO\,V^\top,\qquad dQ = dS\,K,\qquad dK = dS^\top Q.
+$$
+But FlashAttention-style backward does not assume that the intermediate attention probabilities $P$ (or even $S$) were stored from the forward pass. That is the whole point of the method: it saves memory bandwidth by recomputing what it needs. So before those four gradient matmuls can even be carried out, the backward kernel first recomputes
+$$
+S = QK^\top
+$$
+and then applies the row-wise softmax machinery to recover the needed probabilities. That recomputed $QK^\top$ is the fifth matmul the paper is counting.
+
+So the paper’s rough FLOP accounting is:
+
+forward: two matmuls, $QK^\top$ and $PV$;
+
+backward with recomputation: one recomputed $QK^\top$, plus the four gradient matmuls above.
+
+That gives $5$ matmuls in backward versus $2$ in forward, hence the factor of $2.5$.
+
+The softmax and its derivative are not counted as matmuls; they are elementwise/reduction operations. The benchmark section is using a simple GEMM-based estimate, not an exact instruction-level FLOP count, so the $2.5\times$ is really a convenient accounting rule reflecting “extra compute in exchange for not storing intermediates.”
+
+### Why can FP8 FlashAttention-3 be slower than FP16 in some cases even though FP8 Tensor Cores have higher peak throughput?
+Question:
+The paper reports nearly double measured throughput with FP8 WGMMA, but also says that for some settings, especially small sequence length or causal masking, FP8 FlashAttention-3 is only competitive with cuDNN and may lag behind. I am confused because I expected FP8 to be strictly faster than FP16 if the Tensor Core throughput is higher. Is the bottleneck shifting away from GEMM to softmax, transposes, layout conversions, or load balancing overhead? The discussion also mentions that the FP8 kernel does not yet use a persistent kernel design. I would appreciate a clearer explanation of why higher arithmetic peak does not automatically translate into end-to-end attention speedup.
+Answer:
+The key point is that the FP8 result in the paper is a speedup for the **GEMM part** of attention, not a guarantee that the whole attention kernel becomes proportionally faster.
+
+FlashAttention-3 is not just matrix multiplication. Even in the forward pass, it still has to do the online softmax update, exponentials, rescaling, synchronization, and data movement through shared memory. The paper explicitly notes that Hopper’s FP8 WGMMA gives about $2\times$ the Tensor Core throughput of FP16/BF16, but the throughput of the non-matmul pieces, especially the special-function units used for $\exp$, does **not** increase. In fact, the paper emphasizes that when matmul gets faster, the softmax becomes relatively more expensive: for FP16 the exponential already takes a substantial fraction of the cycle, and in FP8 the situation is worse because the matmul side speeds up while the exponential side stays the same. So the bottleneck shifts away from GEMM toward the softmax and related overheads.
+
+There is also extra FP8-specific work that FP16 does not need. The paper says FP8 WGMMA has stricter layout requirements: for the second GEMM, the $\mathbf{V}$ tile must be in $k$-major form, so FlashAttention-3 performs an in-kernel transpose, and it also has to permute the FP32 accumulator layout so it matches the operand layout expected by the next WGMMA. Those transformations are not “free”; they are partly hidden, but they still add overhead and can matter when the sequence length is small.
+
+That is why higher peak arithmetic throughput does not automatically translate into a larger end-to-end speedup. Attention is a pipeline, and the overall time is governed by the slowest stage that cannot be hidden. If the GEMM stage becomes very fast, the fixed-cost parts like softmax, transposes, synchronization, and load balancing become a larger fraction of runtime. This is just Amdahl’s law in GPU clothing.
+
+The paper’s own limitation section makes the small-sequence and causal cases especially clear: the FP16 version of FlashAttention-3 already uses a persistent-kernel design and load balancing, but the FP8 version does not yet have that. The authors say this partly explains why FP8 FlashAttention-3 is not as strong for small sequence length and causal masking as the FP8 cuDNN kernels. With small sequences, there is less work to amortize the pipeline setup and fewer opportunities to hide latency; with causal masking, the available work is also less regular and less balanced across CTAs.
+
+So the short answer is: FP8 makes the **Tensor Core portion** faster, but the **kernel as a whole** is often limited by things that FP8 does not accelerate, and in FP8 those non-matmul costs can become the dominant bottleneck.
+

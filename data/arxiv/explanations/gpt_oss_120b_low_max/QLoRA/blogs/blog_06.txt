@@ -1,0 +1,257 @@
+\title{Blogs about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+# Practical Guide: Fine‑tuning Your Own Instruction‑Tuned LLM with QLoRA  
+
+Fine‑tuning a large language model (LLM) used to be a luxury reserved for teams with dozens of high‑memory GPUs. The recent **QLoRA** paper shattered that myth by showing how a 65 B‑parameter model can be adapted on a single 48 GB GPU while keeping the same performance as full 16‑bit finetuning. In this post we walk through a concrete, end‑to‑end workflow that follows the same steps the authors used to create the **Guanaco** family of chatbots:
+
+1. **Clone the QLoRA codebase** (includes custom CUDA kernels).  
+2. **Quantize a pretrained model to 4‑bit NormalFloat (NF4)** – the data type that is information‑theoretically optimal for normally distributed weights.  
+3. **Add LoRA adapters** at every transformer layer (the same “full‑layer” LoRA recipe that recovered full‑precision performance).  
+4. **Run a quick finetune** on an open‑source instruction dataset (e.g., OASST1 or Alpaca).  
+5. **Deploy** the resulting model on a consumer GPU or, with a few extra tricks, on a mobile device.
+
+Everything below assumes a Linux workstation with an NVIDIA GPU (CUDA 12+) and Python 3.9+.  
+
+---  
+
+## 1. Set Up the Environment  
+
+```bash
+# Clone the repo – it ships the QLoRA utilities and the 4‑bit kernels
+git clone https://github.com/artidoro/qlora.git
+cd qlora
+
+# Recommended: create a fresh virtual environment
+python -m venv .env
+source .env/bin/activate
+
+# Install dependencies (transformers ≥ 4.30, bitsandbytes, torch)
+pip install -r requirements.txt
+# Install the custom 4‑bit kernels (takes a minute)
+python setup.py install
+```
+
+If you hit any compilation errors, make sure your `nvcc` version matches your driver and that you have at least CUDA 11.8. The repository also provides pre‑compiled wheels for common GPU architectures.
+
+---  
+
+## 2. Choose and Quantize a Base Model  
+
+The QLoRA method works with any transformer checkpoint that can be loaded by 🤗 Transformers. Here we use LLaMA‑13B as an example, but the same steps apply to 7 B, 33 B, or even 65 B models.
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import bitsandbytes as bnb
+
+model_name = "meta-llama/Llama-2-13b-hf"   # replace with your path or HF repo
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+# Load the model in bfloat16 (the compute dtype)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.bfloat16,
+    device_map="auto"
+)
+
+# Quantize to NF4 (4-bit NormalFloat) with blocksize=64 as in the paper
+nf4_config = bnb.nn.Params4bit(
+    load_in_4bit=True,
+    quant_type="nf4",          # <– key innovation of QLoRA
+    blocksize=64,
+    compress_statistics=False   # keep per‑block scales for double quantization
+)
+
+model = bnb.nn.quantization.quantize_model(model, nf4_config)
+```
+
+Under the hood this does two things:
+
+* **NF4** packs each weight into 4 bits using the *NormalFloat* codebook derived from the quantiles of a standard normal distribution—exactly what the authors called “information theoretically optimal for normally distributed data.”  
+* **Double Quantization** compresses the per‑block scaling constants themselves into 8‑bit floats, shaving roughly 0.37 bits per parameter (≈ 3 GB for 65 B).  
+
+The resulting model occupies less than half the memory of a full 16‑bit checkpoint while still being able to backpropagate through it.
+
+---  
+
+## 3. Add LoRA Adapters  
+
+QLoRA fine‑tunes only low‑rank adapters; all original weights stay frozen. The authors found that **adding adapters to *every* linear layer** was crucial to recover full‑precision performance.
+
+```python
+from peft import LoraConfig, get_peft_model
+
+lora_cfg = LoraConfig(
+    r=64,                     # rank – 64 works well across scales
+    lora_alpha=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "down_proj", "up_proj"],   # every linear proj
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+
+model = get_peft_model(model, lora_cfg)
+model.print_trainable_parameters()   # should be ≈0.2% of total params
+```
+
+Because adapters are tiny (≈ 26 MB for LLaMA‑13B), most of the GPU memory is still taken up by activations and optimizer states—not by the trainable parameters themselves.
+
+---  
+
+## 4. Prepare an Instruction Dataset  
+
+QLoRA was evaluated on eight public instruction collections; any of them can be used directly via 🤗 Datasets. Here we illustrate with **OASST1**, which gave Guanaco its best Vicuna scores.
+
+```python
+from datasets import load_dataset
+
+raw = load_dataset("OpenAssistant/oasst1")
+# Keep only the top turn in each conversation (as done in the paper)
+def extract_pair(example):
+    # example["messages"] is list of dicts: {"role":..., "content":...}
+    user_msg = next(m["content"] for m in example["messages"] if m["role"]=="prompter")
+    assistant_msg = next(m["content"] for m in example["messages"] if m["role"]=="assistant")
+    return {"input": user_msg, "output": assistant_msg}
+
+train_data = raw["train"].map(extract_pair, remove_columns=["messages"])
+```
+
+You can also mix multiple datasets (Alpaca + FLAN v2) if you prefer a broader instruction mix; just concatenate them before tokenization.
+
+---  
+
+## 5. Tokenize & Create Dataloaders  
+
+```python
+def tokenize(example):
+    prompt = f"[INST] {example['input']} [/INST] {example['output']}"
+    tokenized = tokenizer(prompt, truncation=True,
+                          max_length=1024, padding="max_length")
+    tokenized["labels"] = tokenized["input_ids"].copy()
+    return tokenized
+
+train_dataset = train_data.map(tokenize, batched=True, remove_columns=train_data.column_names)
+
+import torch
+train_loader = torch.utils.data.DataLoader(
+    train_dataset,
+    batch_size=2,               # QLoRA works with tiny batches; adjust to fit VRAM
+    shuffle=True,
+    collate_fn=default_data_collator
+)
+```
+
+The paper used *gradient checkpointing* plus their **Paged Optimizers** to keep memory spikes low when processing long sequences. The `bitsandbytes` optimizer automatically activates paged memory when you pass `optim="paged_adamw_8bit"`.
+
+---  
+
+## 6. Fine‑tune with QLoRA  
+
+```python
+from transformers import Trainer, TrainingArguments
+
+training_args = TrainingArguments(
+    output_dir="./guanaco-13b-oasst1",
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=8,      # effective batch ≈16
+    num_train_epochs=3,
+    learning_rate=5e-5,
+    fp16=False,
+    bf16=True,                          # run in bfloat16 (same as compute dtype)
+    optim="paged_adamw_8bit",           # paged optimizer from bitsandbytes
+    logging_steps=50,
+    save_steps=500,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+)
+
+trainer.train()
+```
+
+A single epoch over ~9k OASST1 examples finishes in under an hour on an RTX 4090 (24 GB). The authors reported that a **65 B** model reaches ChatGPT‐level Vicuna scores after ~24 h on a single A100 48 GB; our 13 B run should finish much faster.
+
+---  
+
+## 7. Save & Merge Adapters (Optional)  
+
+If you want a single checkpoint that can be loaded without PEFT tooling:
+
+```python
+model.save_pretrained("./guanaco-13b-oasst1")
+tokenizer.save_pretrained("./guanaco-13b-oasst1")
+# Merge adapters into base weights if you intend to serve without LoRA logic:
+merged_model = model.merge_and_unload()
+merged_model.save_pretrained("./guanaco-13b-merged")
+```
+
+The merged checkpoint will still be stored in NF4 + FP8 double‐quantized format, so inference will remain low‑memory.
+
+---  
+
+## 8. Inference on a Consumer GPU  
+
+```python
+from transformers import pipeline
+
+pipe = pipeline(
+    "text-generation",
+    model="./guanaco-13b-merged",
+    tokenizer=tokenizer,
+    torch_dtype=torch.bfloat16,
+    device_map="auto"
+)
+
+prompt = "[INST] Explain why whales are mammals [/INST]"
+print(pipe(prompt, max_new_tokens=128, do_sample=True, temperature=0.7)[0]["generated_text"])
+```
+
+On an RTX 3060 with only **5 GB** of VRAM you can run the **7 B** version of Guanaco comfortably after quantization; even the 13 B model fits inside a consumer RTX 4090 when using NF4 weights and paged optimizer states.
+
+---  
+
+## 9. Deploying to Mobile (iOS/Android)  
+
+The paper mentions that a quantized 7 B model occupies ~5 GB – small enough for modern smartphones when using ONNX Runtime or Meta’s *llama.cpp* backend:
+
+1️⃣ Export the merged checkpoint to GGUF (the binary format used by llama.cpp):  
+
+```bash
+python convert_hf_to_gguf.py \
+   --model_path ./guanaco-7b-merged \
+   --output_path ./guanaco-7b.gguf \
+   --quant nf4 \
+   --allow-reorder True
+```
+
+2️⃣ Build `llama.cpp` with `GGML_TYPE_NF4` support and copy the `.gguf` file onto your device.
+
+3️⃣ Use the provided Android/iOS wrapper libraries to run inference locally—no server roundtrip required. On an iPhone 12 Pro you can process ~3 M tokens overnight while charging, which is enough for daily personal assistants or on‑device summarisation.
+
+---  
+
+## 10. Tips & Gotchas from the QLoRA Paper  
+
+| Issue | What the authors observed | Practical fix |
+|------|----------------------------|---------------|
+| **Outliers in weight distribution** | NF4 expects near‑normal weight statistics; extreme outliers hurt quantization quality. | Keep default blocksize = 64; avoid aggressive pruning before quantization. |
+| **Memory spikes during long sequences** | Gradient checkpointing can exceed VRAM even with LoRA adapters. | Enable `paged_adamw_8bit` and set `torch.backends.cuda.enable_mem_efficient_sdp(True)`. |
+| **Adapter placement** | Only adding LoRA to Q/K/V layers lost ≈ 2% accuracy on Vicuna benchmark. | Follow “full‐layer LoRA” configuration: adapt *every* linear projection (`target_modules` list above). |
+| **Learning rate scaling for larger models** | For 33 B / 65 B they halved LR and doubled batch size compared to 7 B/13 B runs. | Use `lr=2e-5` for >30 B models and increase `gradient_accumulation_steps` accordingly.|
+
+---  
+
+## 11. Wrap‑up  
+
+With just a few commands you can:
+
+* Quantize any publicly available LLM to **NF4 + double quantization**, slashing memory by > 90%.  
+* Insert lightweight LoRA adapters into *every* layer and recover full‑precision finetuning quality—exactly what made Guanaco achieve **99.3%** of ChatGPT’s Vicuna score while training on a single GPU.  
+* Deploy the resulting chatbot on desktop GPUs or even on smartphones without sacrificing speed.
+
+QLoRA democratizes instruction tuning: you no longer need multi‑GPU clusters to experiment with instruction following or RLHF pipelines; a modest consumer machine is enough to produce state‑of‑the‑art chatbots like Guanaco.
+
+Happy fine‑tuning! If you run into bugs or have interesting results to share (e.g., new instruction datasets), drop them in the GitHub issues of `artidoro/qlora`—the community is growing fast around this breakthrough technique.

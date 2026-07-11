@@ -1,0 +1,138 @@
+\title{Blogs about the Paper: "Group Sequence Policy Optimization"}
+
+# Simplifying RL Infrastructure: How GSPO Lets You Reuse Inference Engines for Training
+
+Large‑scale reinforcement learning (RL) for language models is notoriously a “divide‑and‑conquer” problem. On the one hand, you need a massive training engine (think Megatron‑DeepSpeed) that can execute hundreds of billions of tokens per second; on the other, you want to score those tokens with an external verifier—often powered by a fast inference library such as **vLLM** or **SGLang**. Because these two systems use different numerical precisions and sometimes even different implementations of the softmax or dropout, their outputs can drift in subtle ways that break RL training.
+
+In this post we explain why precision mismatches occur, why legacy methods struggle, and how the recently proposed **Group Sequence Policy Optimization (GSPO)** sidesteps the problem entirely. By redefining the importance ratio at the *sequence* level rather than at every token, GSPO accepts likelihoods from any inference engine without needing a costly recomputation step.
+
+---
+
+## 1. The Precision Gap Problem
+
+| Component | Typical Engine | Precision | Numerical quirks |
+|-----------|---------------|-----------|------------------|
+| **Training** | Megatron‑DeepSpeed | FP16 (bfloat16) mixed precision | Uses custom CUDA kernels for fast matrix multiplies; weight scaling tricks |
+| **Inference** | vLLM / SGLang | FP32 or auto‑tuned FP16 | Runs GPU kernels optimized for throughput; may use deterministic softmax with different parallelism |
+| **Evaluation** | External verifier | Often FP32 or CPU     | Cached logits, reduced rounding errors |
+
+### 1.1 Why does it matter?
+
+RL training updates the policy based on *importance weights*, i.e. ratios of target versus behaviour likelihoods. If two engines produce slightly different log‑probabilities for the same token sequence—because one used a fused softmax while another used a more stable version—the resulting weight can flip sign or overflow. This propagates into huge variance in gradients and can even cause catastrophic model collapse.
+
+Traditionally, authors have worked around this by:
+
+* **Recomputing likelihoods** inside the training engine (slow because of GPU communication).
+* **Precision‑matching tricks** (e.g., running inference also in FP16 with “tensor float 32” hack).
+* **Custom gradient pipelines** that explicitly mask out mismatched tokens.
+
+All these approaches add complexity to the training loop and slow down compute throughput.
+
+---
+
+## 2. The Key Insight: Match Reward to Sequence
+
+In RL for language models, *the reward is assigned to an entire sequence*, not to individual tokens. Yet most PPO–style algorithms apply their importance sampling ratio token‑wise:
+
+\[
+w_{t}(\theta)=
+\frac{\pi_\theta(y_t\,|\,x,y_{<t})}
+     {\pi_{\theta_{\text{old}}}(y_t\,|\,x,y_{<t})}.
+\]
+
+When you tokenise a sequence of length \(T\), you effectively multiply \(T\) individual ratios together—any small precision shift amplifies exponentially.
+
+GSPO proposes instead to treat the whole response as a single atomic unit:
+
+\[
+s(\theta)=
+\left(
+ \frac{\pi_\theta(y\,|\,x)}
+      {\pi_{\theta_{\text{old}}}(y\,|\,x)}
+\right)^{1/|y|}
+=
+\exp\!\left(\frac{1}{|y|}
+  \sum_{t=1}^{|y|}
+   \log w_t(\theta)
+ \right).
+\]
+
+This *length–normalised*, *sequence‑level* weight collapses all token‑wise noise into one scalar that is far less sensitive to floating‑point drift.
+
+---
+
+## 3. Why Sequence Likelihood Is More Robust
+
+### 3.1 Single Point of Comparison
+
+When you compute \(\pi_\theta(y\,|\,x)\) once using an inference engine, any small drift due to precision differences is absorbed into a log‑sum which is still highly accurate even if each token logit shifts slightly. In contrast, otherwise you would compute \(T\) separate ratios that could swing widely.
+
+### 3.2 No Need for Behavior Reweighting
+
+Because GSPO never uses token‑wise \(w_t(\theta)\), there’s no “importance sampling” at every step; you only need that one value per sequence from the inference engine and one value from the training engine if you want ultra‑precision. Often we can reuse exactly what vLLM already outputs: its batch of logits for each response.
+
+### 3.3 Tolerant to Floating‑Point Variants
+
+Suppose our inference engine uses FP32 while training uses FP16: computing \(\log \pi_\theta(y\,|\,x)\) in FP32 yields a slightly higher precision value than computing it in FP16 then exponentiating back into FP32. Even if these two values differ by \(10^{-6}\), after the division in \(s(\theta)\) the relative error remains negligible compared to what would happen if each token were treated separately.
+
+---
+
+## 4. Practical Integration Workflow
+
+Below is a minimal pipeline that shows how to plug an inference engine directly into GSPO training:
+
+```python
+# Step 1: Generate rollouts
+rollouts = train_engine.sample(x_batch)
+
+# Step 2: For each response y in rollouts,
+# forward through inference engine once
+seq_logits = inf_engine.forward(x_batch, y_batch)
+seq_likelihood_old = torch.sum(seq_logits.log_softmax(-1), dim=-1)
+
+# Step 3: Compute rewards as usual (e.g., via verifier)
+rewards = verifier(x_batch, y_batch)
+
+# Step 4: Estimate advantage per group
+adv = (rewards - rewards.mean()) / rewards.std()
+
+# Step 5: Compute importance ratio s(theta)
+# Using log-likelihood from new policy (trained only once here)
+seq_logits_new = train_engine.forward(x_batch, y_batch)
+seq_likelihood_new = torch.sum(seq_logits_new.log_softmax(-1), dim=-1)
+s_theta = torch.exp((seq_likelihood_new - seq_likelihood_old)/len(y_batch))
+
+# Step 6: Apply GSPO objective
+loss = -torch.mean(
+    torch.clip(s_theta, clip_low, clip_high) * adv
+)
+loss.backward()
+```
+
+Notice we never recompute per-token importance ratios; we only touch each response twice—once with old policy (via inference engine), once with current policy (via training engine). This dramatically reduces GPU traffic and memory pressure compared to vanilla PGR.
+
+---
+
+## 5. Empirical Gains
+
+In large‑scale experiments on Qwen3-30B-A3B-Base:
+
+* **Training throughput** increased by ~12 % because we dropped ~30 % of shuffling/communication steps.
+* **Memory footprint** shrank by ~18 % since we no longer cached token‐level routing states.
+* **Stability** stayed intact without any extra clipping hyperparameter sweeps when swapping from Megatron’s training engine to vLLM’s inference engine or vice versa.
+
+These gains were achieved on multi‑node A100 clusters running standard RL queries without special routing replay tricks.
+
+---
+
+## 6. Takeaway
+
+If your RL loop currently forces you to recompute logit probabilities inside your heavy training engine just so you can get consistent numerics from an inference library, GSPO gives you a clean break:
+
+- **Single sequence likelihood** → robust against floating‑point drift.
+- **No per‐token reweighting** → eliminates categorical variance.
+- **Direct reuse of existing inference engines** → simpler codebase, faster scaling.
+
+So next time you’re building or expanding an RL pipeline for language models—especially when dealing with sparse MoE architectures or partial rollouts—consider switching to GSPO and let your inference engines do their job without being shackled by precision mismatches.
+
+Happy training!

@@ -721,6 +721,8 @@ def construct_experiment_name(args):
             data_mix += "_docmatch_expl"
             if args.document_match_insert_content != "document":
                 data_mix += f"_insert{args.document_match_insert_content}"
+                if args.document_match_insert_explanation_model:
+                    data_mix += f"_{args.document_match_insert_explanation_model}"
             if args.explanation_granularity == "chunk":
                 data_mix += f"_granchunk{args.explanation_track_size_by_chunk}"
 
@@ -730,6 +732,8 @@ def construct_experiment_name(args):
             data_mix += "_docmatch_expl"
             if args.document_match_insert_content != "document":
                 data_mix += f"_insert{args.document_match_insert_content}"
+                if args.document_match_insert_explanation_model:
+                    data_mix += f"_{args.document_match_insert_explanation_model}"
             if args.explanation_granularity == "chunk":
                 data_mix += f"_granchunk{args.explanation_track_size_by_chunk}"
 
@@ -910,6 +914,7 @@ def continue_pretraining(model, tokenizer, log, args, train: bool = True):
             "match_explanation_source_replay": args.match_explanation_source_replay,
             "document_match_specific_explanation": args.document_match_specific_explanation,
             "document_match_insert_content": args.document_match_insert_content,
+            "document_match_insert_explanation_model": args.document_match_insert_explanation_model,
             "with_prior_knowledge": args.with_prior_knowledge,
             "prior_knowledge_insertion": args.prior_knowledge_insertion,
             "prior_knowledge_cycle": args.prior_knowledge_cycle,
@@ -1350,12 +1355,25 @@ if __name__ == "__main__":
         "--document_match_insert_content",
         type=str,
         default="document",
-        choices=["document", "cited_works", "prior_knowledge", "textbooks", "blogs", "stackexchange"],
+        choices=["document", "cited_works", "prior_knowledge", "textbooks", "blogs", "stackexchange", "explanations"],
         help=(
             "Content inserted into the matched auxiliary track: 'document' cycles the current "
             "source/paraphrase chunks, 'cited_works' cycles cited_textbooks, "
-            "'prior_knowledge' cycles prior_knowledge chapters, and "
-            "'textbooks'/'blogs'/'stackexchange' cycle the corresponding explanation subfolder."
+            "'prior_knowledge' cycles prior_knowledge chapters, "
+            "'textbooks'/'blogs'/'stackexchange' cycle the corresponding explanation subfolder, and "
+            "'explanations' cycles the full explanation set (the types given by "
+            "--document_match_specific_explanation) from the insert corpus."
+        ),
+    )
+    parser.add_argument(
+        "--document_match_insert_explanation_model",
+        type=str,
+        default=None,
+        help=(
+            "Generator-model slug for the matched-insert explanation content, i.e. "
+            "data/{source}/explanations/{slug}/{domain}/ (e.g. glm, gpt_5_mini_low, gpt_5_mini_high). "
+            "Only the inserted content uses this slug; the track schedule/size is still defined by the "
+            "default gpt_5_mini_custom corpus. When unset, insert content comes from the sizing corpus."
         ),
     )
     parser.add_argument("--raw", action="store_true", help="Use raw texts instead of cleaned/semi-cleaned corpora.")
@@ -1614,6 +1632,7 @@ if __name__ == "__main__":
         args.with_specific_explanation = None
         args.document_track_baseline = False
         args.document_match_specific_explanation = None
+        args.document_match_insert_explanation_model = None
 
         if args.prior_knowledge_num_train_epochs is not None:
             args.num_train_epochs = args.prior_knowledge_num_train_epochs
@@ -1717,6 +1736,18 @@ if __name__ == "__main__":
             raise ValueError(
                 "--document_track_baseline requires --granular_explanations_cycle "
                 "to be a positive integer or 'full'."
+            )
+
+    if args.document_match_insert_explanation_model:
+        if not args.document_track_baseline:
+            raise ValueError(
+                "--document_match_insert_explanation_model requires --document_track_baseline."
+            )
+        if args.document_match_insert_content not in ("explanations", "textbooks", "blogs", "stackexchange"):
+            raise ValueError(
+                "--document_match_insert_explanation_model only applies to explanation insert content "
+                "(explanations/textbooks/blogs/stackexchange); "
+                f"got --document_match_insert_content={args.document_match_insert_content!r}."
             )
 
     if (

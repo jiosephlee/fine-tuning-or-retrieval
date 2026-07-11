@@ -1,0 +1,70 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# Hiding Softmax Latency: The Overlap That Makes FlashAttention-3 Fly
+
+## Motivation — why softmax kills utilization
+
+Attention is dominated by matrix multiplies, but it also needs softmax: compute
+S = α Q K^\top, P = softmax(S), O = P V. On modern GPUs these two pieces live on very different execution units. Tensor Cores (via WGMMA) chew through the dense GEMMs at extremely high throughput, while softmax needs exponentials and reductions executed on the GPU's multi-function / special-function units, which are orders of magnitude slower.
+
+On the H100 the paper cites roughly 989 TFLOPs of FP16 matmul vs. only about 3.9 TFLOPs available for special functions like exp. For a typical head size (headdim = 128) the math ends up with far more matmul FLOPs than exponentials, yet the exponential units are so slow that softmax can take a surprisingly large fraction of the wall‑clock time if scheduled sequentially. The upshot: if you run GEMMs then softmax then another GEMM, a cheap-but-slow softmax step can leave Tensor Cores idle and overall utilization low.
+
+FlashAttention-3 fixes this by exploiting asynchrony in the hardware to schedule work so the slow softmax runs “in the gaps” while Tensor Cores are busy.
+
+## The key idea — a two-stage overlapping pipeline
+
+FlashAttention-3 tiles attention over blocks of keys/values and works block-by-block. For a fixed query block Q_i and key/value blocks K_j,V_j, the classic tight loop looks like:
+
+1. compute S^{(j)} = Q_i K_j^\top (GEMM on Tensor Cores)
+2. softmax over the S block to produce a block of P
+3. compute O_i += P^{(j)} V_j (another GEMM)
+
+Those three steps are logically dependent and typically executed serially. The two-stage pipeline breaks that strict ordering by pipelining across iterations: while the Tensor Cores compute the next QK^\top, the special-function units compute softmax for the previous or current block, and another GEMM that consumes the already-computed P runs concurrently as well. Concretely, each consumer warpgroup runs roughly the following pattern (described at a high level):
+
+- Prime: compute S_cur = Q_i K_0^\top (WGMMA).
+- Compute its softmax block and apply it to O_i (initial rescale).
+- For each subsequent block j:
+  - Issue an asynchronous WGMMA for S_next = Q_i K_j^\top (commit but do not wait).
+  - Issue an asynchronous WGMMA for O_i += \tilde P_cur V_{j-1} (commit but do not wait).
+  - Wait for the S_next WGMMA to finish; compute softmax on S_next (this uses the special‑function units).
+  - Wait for the O-update WGMMA to finish; rescale/accumulate O_i.
+  - Roll S_next → S_cur and continue.
+
+Two things make this possible: (1) the WGMMA instruction is asynchronous on Hopper and can be issued and left running while the warp executes other work; (2) the softmax-heavy work (exp + reductions) executes on different functional units than the Tensor Cores. By carefully issuing the next QK^\top and the current P V GEMMs without blocking, the kernel keeps Tensor Cores busy while the softmax runs on the slow functional units — instead of leaving the Tensor Cores idle.
+
+The algorithm also relies on the FlashAttention idea of local (blockwise) softmax — keeping running normalization variables so we never materialize full S or P matrices to global memory. That lets softmax be computed incrementally and interleaved with GEMMs.
+
+## Why overlapping helps (numbers make it convincing)
+
+This is not just clever scheduling — it matches hardware realities. The paper reports:
+
+- H100 FP16 matmul throughput ≈ 989 TFLOPs, while special-function throughput (exp/etc.) ≈ 3.9 TFLOPs.
+- For headdim = 128 the matmul FLOPs per block far exceed the exponentials needed, but the exp units are so slow that if softmax runs serially it can occupy ~50% of cycles versus the matmul. With FP8 (matmul throughput doubles) the imbalance gets worse.
+
+By overlapping, FlashAttention-3 reclaims cycles that would otherwise be wasted waiting for exp and reductions. In practice the authors report concrete gains: a ping-pong inter-warpgroup schedule (overlapping softmax across warpgroups) improved a 128‑headdim forward run from about 570 TFLOPs to roughly 620–640 TFLOPs, and the full 2-stage intra-warpgroup pipeline plus warp-specialization raised performance further (an ablation example goes from 570 to 661 TFLOPs). Overall, FlashAttention-3 reaches up to ≈740 TFLOPs/s in FP16 (about 75% utilization) and, with FP8, approaches ≈1.2 PFLOPs/s.
+
+## How warp-specialization and “ping‑pong” fit in
+
+There are two concurrency axes at play:
+
+- Asynchrony inside a warpgroup: WGMMA is asynchronous, so a warpgroup can issue it and go do softmax/other work. The two‑stage pipeline described above is intra-warpgroup.
+- Warpgroup-level ping‑pong: the CTA's warps are split into producer warpgroups (doing TMA loads, in-kernel transposes) and consumer warpgroups (doing WGMMA + softmax). Two consumer warpgroups can “ping‑pong”: while one is doing GEMMs, the other performs softmax, then they swap. The kernel uses barrier synchronizations to enforce an ordering that makes this inter-warpgroup overlap possible.
+
+Warp-specialization also enables register reallocation (via setmaxnreg) so the warps that do heavy Tensor Core work can get more registers, while the warps issuing TMA need far fewer registers. TMA (asynchronous memory copies) is used to hide loads of K and V tiles into shared memory, adding another layer of overlap.
+
+## Trade-offs and practical pitfalls
+
+The overlapping pipeline is powerful, but not free:
+
+- Register pressure. The 2-stage design requires keeping S_next (a block of scores) in registers while other work proceeds, which increases register usage. That limits how large block sizes can be and can force trade-offs between tile size and pipeline depth. Extending to a 3‑stage pipeline is possible but consumes even more registers.
+- Compiler reordering. The C++/PTX compiler may reorder instructions for optimization. The algorithm depends on issuing WGMMA and then doing softmax without accidental reordering; the authors analyze the generated SASS to ensure the intended overlapped ordering appears in practice.
+- Complexity for low-precision (FP8). Using FP8 Tensor Cores requires operand layouts to be k-major, so FlashAttention-3 adds in-kernel transposes (LDSM/STSM) and byte permutations to align accumulator and operand register layouts. Those details complicate the kernel but are handled in the implementation.
+- Varying benefit by shape. For small sequence lengths or very small tiles the overheads may dominate and the overlap yields smaller gains. FP8 also needs careful block quantization and incoherent processing to control numeric error.
+
+## Practical impact — what you get
+
+By using the two-stage pipeline plus warp-specialization and asynchronous loads, FlashAttention-3 turns softmax from a utilization sink into something that can be hidden under matmuls. The result is a sizable utilization win: 1.5–2.0× speedups over FlashAttention-2 on many workloads, forward-pass performance up to ~740 TFLOPs/s in FP16 on H100, and even higher peak with FP8 when accuracy tricks (block quantization + incoherent processing) are used to control numerical error.
+
+## Takeaway
+
+Softmax is slow, but it doesn’t have to be on the critical path. On hardware where GEMMs and special functions are implemented in separate asynchronous units, the right scheduling can keep Tensor Cores busy while the slow softmax runs elsewhere. FlashAttention-3 shows that a disciplined two-stage pipeline (issue next QK^\top early, issue PV early, do softmax in the gaps) plus warp‑specialization and careful register management produces large real-world speedups — at the cost of more complex kernels and tighter register/tile trade-offs. If you care about long‑context attention and real GPU throughput, overlapping softmax under GEMMs is the single implementation trick that unlocks a lot of value.

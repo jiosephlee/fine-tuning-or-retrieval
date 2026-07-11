@@ -1,0 +1,73 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# FP8 Without the Faceplants: Block Quantization and Incoherent Processing for Accurate Attention
+
+FP8 offers big throughput wins on modern GPUs, but naïvely quantizing attention to FP8 is risky: large outlier activations in LLMs can blow up quantization error and make attention numerically unstable. FlashAttention-3 shows a practical way to get the FP8 speedup without the “faceplants” by combining block-wise quantization with an inexpensive randomized orthogonal transform (a Hadamard + sign-flips trick). Together these two ideas reduce FP8 attention error by up to 2.6× versus a standard per-tensor FP8 baseline, while integrating cleanly into the block-based attention pipeline.
+
+This post walks through why FP8 is fragile for attention, what the two techniques do and why they help, and how they were validated.
+
+## Why FP8 can be fragile for attention
+
+FP8 (e4m3 on Hopper) is extremely compact: only 3 mantissa bits and 4 exponent bits. That compresses dynamic range and precision compared to FP16/BF16, so quantization error is larger in general. Attention is especially sensitive for two reasons:
+
+- Attention multiplies Q and K and then applies a softmax. Large absolute values (outliers) in Q or K produce large entries in the score matrix S = α Q Kᵀ. Those large entries dominate softmax and any small relative quantization error in S can propagate nonlinearly through the exponential and the normalization.
+- Typical FP8 quantization in practice uses a single scale per tensor (per-tensor scaling). If a few entries are much larger than the rest (outliers), the per-tensor scale must accommodate them, which forces most entries into a narrower effective dynamic range and increases relative rounding error everywhere else.
+
+Large language models (LLMs) often have these outlier entries in activations, so a straightforward per-tensor FP8 attention implementation noticeably worsens numerical error compared to higher precision or block-aware schemes.
+
+## Two simple, compatible fixes
+
+FlashAttention-3 adopts two complementary strategies that are natural in a block-based attention implementation: block quantization and incoherent processing. Both are lightweight to apply and can be fused into existing pre-attention computation (e.g., rotary embeddings), so they incur little or no extra memory-bandwidth cost.
+
+1) Block quantization (per-block scale)
+- Instead of using one FP8 scale for an entire tensor (e.g., the whole Q), split the tensor into blocks that match the attention tiling (for example Q blocks of size $B_r \times d$ and K/V blocks of size $B_c \times d$) and keep one FP8 scale per block.
+- Each block is scaled independently before quantization into FP8. This keeps the dynamic range tight within each block and prevents a few outliers in one block from forcing a tiny effective resolution across the entire tensor.
+- Because FlashAttention-style algorithms already process attention in blocks, the bookkeeping (one scale per block) is natural and cheap. The per-block scaling step can be fused with preceding operations that are already bandwidth-limited (e.g., rotary embedding application), so it typically does not add significant extra kernel cost.
+
+Why it helps: block-level scaling reduces the worst-case relative quantization noise by making each block choose a scale appropriate to its own statistics rather than a global worst-case scale.
+
+2) Incoherent processing: randomized orthogonal mixing
+- Before quantizing, multiply Q and K (separately) by the same orthogonal matrix $M$ and quantize the transformed tensors: quantize $Q M$ and $K M$ instead of $Q$ and $K$ directly.
+- Because $M$ is orthogonal, the attention score matrix is preserved:
+  $$(Q M) (K M)^\top = Q M M^\top K^\top = Q K^\top.$$
+- The choice of $M$ matters for cost. FlashAttention-3 uses a structured random orthogonal transform: a product of random sign-diagonal matrices and a Hadamard matrix. This achieves the mixing effect with $O(d \log d)$ work instead of $O(d^2)$, and it can be fused with existing transforms like rotary embeddings.
+
+Why it helps: the orthogonal mixing spreads any large outlier entries across many coordinates. That “incoheres” outliers so that they no longer concentrate in single components that force poor global scaling. After mixing, per-block quantization sees much milder per-coordinate dynamic range, reducing rounding error.
+
+Practical note: the structured random orthogonal transform used in the paper follows earlier work (e.g., QUIP-like transforms) where $M$ = Diag(±1) × Hadamard × Diag(±1) × ...; applying this costs about $O(d \log d)$ and is easily fused into pre-attention operations.
+
+## Putting the two together
+
+Block quantization addresses local scale mismatch, while incoherent processing prevents extreme entries from dominating a block’s scale. They are orthogonal techniques and combine naturally:
+
+- Apply the structured randomized orthogonal transform $M$ to Q and K (can be fused with other pre-attention ops).
+- Partition the transformed Q and K into the same blocks used by the attention kernel and compute one FP8 scale per block.
+- Quantize blocks into FP8 using those per-block scales and proceed with the FP8 GEMMs (and fused softmax) in FlashAttention-3.
+
+Because FlashAttention-3 already operates on blocks in shared memory and registers, this fits the execution model well and avoids extra global memory traffic.
+
+## Experimental validation (summary)
+
+To validate numerical behavior under outliers, the paper simulates realistic worst-case-ish activations by sampling entries of Q, K, V from
+$$\mathcal{N}(0,1) + \mathcal{N}(0,100)\cdot\mathrm{Bernoulli}(0.001),$$
+i.e., each element is standard normal but with 0.1% of entries augmented by an extra large normal term (std 10). This models the sparse outliers seen in large models.
+
+Against a reference FP64 implementation, FlashAttention-3 measured root mean squared error (RMSE) of attention outputs. The main findings:
+
+- In FP16, FlashAttention-3 (which keeps intermediate softmax-related values in FP32) already reduces RMSE vs. a standard attention implementation.
+- For FP8, using standard per-tensor scaling leads to substantially larger error. Adding block quantization plus the incoherent randomized transform reduces FP8 RMSE by up to 2.6× compared to the per-tensor FP8 baseline used in the experiments.
+
+So the combination materially reduces FP8 numerical error in the kind of outlier regime that tends to break naïve FP8 attention.
+
+## Implementation considerations
+
+- Fusion: Both block scaling and the Hadamard-sign mixing can be fused into existing pre-attention operations (rotary embeddings, projections, etc.) so they do not add appreciable memory-bandwidth overhead.
+- Cost: The Hadamard-based mixing runs in $O(d \log d)$ per vector and is cheap relative to the GEMM-heavy attention inner loops. Block quantization is just a per-block max/scale plus quantize step, also cheap and naturally aligned with the attention block processing.
+- Precision of intermediates: FlashAttention-3 still keeps critical intermediates (for instance, softmax rescaling) in higher precision (FP32) where appropriate, which helps numerical stability.
+- Integration with FP8 Tensor Cores: The FlashAttention-3 paper also describes layout and accumulator format manipulations needed to call the FP8 WGMMA instructions on Hopper, but those details are orthogonal to the quantization/incoherence strategy described here.
+
+## Takeaway
+
+If you want the throughput benefits of FP8 for attention but are concerned about LLM-style outliers breaking your numerical behavior, use block quantization and randomized orthogonal mixing (Hadamard + sign flips) before quantization. These two lightweight techniques reduce FP8 attention error substantially (2.6× in the paper’s experiments) and slot naturally into block-based attention kernels like FlashAttention-3 with negligible extra bandwidth or compute cost compared to the attention GEMMs.
+
+The result: get most of the FP8 speedup without the faceplants.

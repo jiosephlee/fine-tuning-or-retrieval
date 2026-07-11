@@ -1,13 +1,22 @@
 import os
 import json
 import sys
-import shutil
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
-sys.path.append('../../')
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DATA_ROOT = PROJECT_ROOT / "data"
+LEGAL_CLEANED_DIR = DATA_ROOT / "legal" / "cleaned"
+sys.path.insert(0, str(PROJECT_ROOT))
 import utils.utils as utils
+from utils.granular_outputs import write_granular_files
 from importlib import reload
 reload(utils)
+
+# Per-generation output budget. Defaults to the historical 32k cap; override via
+# MULTIVIEW_MAX_TOKENS to request longer completions (clamped to fit the served
+# context window by utils._create_vllm_completion).
+MAX_TOKENS = int(os.environ.get("MULTIVIEW_MAX_TOKENS", "32768"))
 
 
 def extract_case_title(case_content, case_name):
@@ -18,29 +27,13 @@ def extract_case_title(case_content, case_name):
     return case_name.replace("_", " ")
 
 
-def reset_granular_dir(output_dir, subfolder):
-    granular_dir = os.path.join(output_dir, subfolder)
-    if os.path.isdir(granular_dir):
-        shutil.rmtree(granular_dir)
-    os.makedirs(granular_dir, exist_ok=True)
-    return granular_dir
-
-
-def write_granular_files(output_dir, subfolder, filename_template, texts):
-    granular_dir = reset_granular_dir(output_dir, subfolder)
-    for i, text in enumerate(texts, start=1):
-        path = os.path.join(granular_dir, filename_template.format(i=i))
-        with open(path, "w") as f:
-            f.write(text)
-    print(f"Saved {len(texts)} files to {granular_dir}/")
-
-
-def generate_legal_qa(case_name):
+def generate_legal_qa(case_name, model=None, slug="gpt_5_mini_custom", efforts=None, outline_model="gpt-5", writing_model="gpt-5-mini",
+                      provider="auto", base_url=None, max_workers=4):
     """Generate Law Stack Exchange style Q&A for a court opinion."""
     print(f"Processing {case_name} for legal Q&A...")
 
-    CASE_FILE_PATH = f'../../data/legal/cleaned/{case_name}.txt'
-    OUTPUT_DIR = f"../../data/legal/explanations/{case_name}/"
+    CASE_FILE_PATH = LEGAL_CLEANED_DIR / f"{case_name}.txt"
+    OUTPUT_DIR = utils.explanations_dir('legal', slug, case_name, root=str(DATA_ROOT))
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -78,11 +71,13 @@ Example:
 
     response_questions_str = utils.query_llm(
         prompt_questions,
-        model='gpt-5',
-        reasoning_effort="medium",
+        model=model or outline_model,
+        reasoning_effort=efforts["questions"],
         system_prompt_included=True,
         return_json=True,
-        max_tokens=10000
+        max_tokens=MAX_TOKENS,
+        provider=provider,
+        base_url=base_url,
     )
 
     outline_log_path = os.path.join(OUTPUT_DIR, "stack_exchange_outline.json")
@@ -90,8 +85,18 @@ Example:
         f.write(response_questions_str)
     print(f"Saved legal Q&A outline to {outline_log_path}")
 
+    if not (response_questions_str or "").strip():
+        print(f"WARNING: empty questions response for {case_name}; skipping legal Q&A view")
+        return
     questions_data = json.loads(response_questions_str)
-    questions = questions_data['questions']
+    # json_object mode guarantees valid JSON but not the requested schema; models
+    # occasionally omit the "questions" key or return the list at top level. Drop
+    # malformed entries so one bad response doesn't KeyError the whole run.
+    questions = utils.extract_dict_list(questions_data, preferred_key='questions')
+    questions = [q for q in questions if q.get('title') and q.get('question_body')]
+    if not questions:
+        print(f"WARNING: no valid legal questions for {case_name}; skipping legal Q&A view")
+        return
     print(f"Generated {len(questions)} questions")
 
     # --- 2. Generate answers ---
@@ -123,10 +128,12 @@ Format your response as a Stack Exchange answer.""",
 
         answer_text = utils.query_llm(
             prompt_answer,
-            model='gpt-5-mini',
-            reasoning_effort="medium",
+            model=model or writing_model,
+            reasoning_effort=efforts["answer"],
             system_prompt_included=True,
-            max_tokens=2000
+            max_tokens=MAX_TOKENS,
+            provider=provider,
+            base_url=base_url,
         )
 
         return {
@@ -135,14 +142,14 @@ Format your response as a Stack Exchange answer.""",
             'answer': answer_text
         }
 
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         qa_pairs = list(tqdm(executor.map(generate_answer, questions), total=len(questions), desc="Generating legal answers"))
 
     # --- 3. Create single file ---
     # Use stackexchange.txt filename for compatibility with data_preparation.py
     print("Creating legal Q&A file...")
 
-    content = f"Title: Stack Exchange about the opinion: {case_title}\n\n"
+    content = f"Title: Stack Exchange about the opinion: \"{case_title}\"\n\n"
     for qa in qa_pairs:
         content += f"### {qa['title']}\nQuestion:\n{qa['question']}\nAnswer:\n{qa['answer']}\n\n"
 
@@ -152,20 +159,23 @@ Format your response as a Stack Exchange answer.""",
 
     print(f"Saved legal Q&A to {output_file}")
 
-    title_line = f"Title: Stack Exchange about the opinion: {case_title}"
+    title_line = f"Title: Stack Exchange about the opinion: \"{case_title}\""
     granular_qas = [
         f"{title_line}\n\n### {qa['title']}\nQuestion:\n{qa['question']}\nAnswer:\n{qa['answer']}"
         for qa in qa_pairs
     ]
-    write_granular_files(OUTPUT_DIR, "stackexchange", "stack_{i:02d}.txt", granular_qas)
+    paths = write_granular_files(OUTPUT_DIR, "stackexchange", granular_qas)
+    print(f"Saved {len(paths)} files to {Path(OUTPUT_DIR) / 'stackexchange'}/")
 
 
-def generate_casebook_textbook(case_name, outline_model="gpt-5"):
+def generate_casebook_textbook(case_name, model=None, slug="gpt_5_mini_custom",
+                               outline_model="gpt-5", writing_model="gpt-5-mini", efforts=None,
+                               provider="auto", base_url=None, max_workers=4):
     """Generate a casebook/treatise-style textbook chapter that teaches the underlying law through a court opinion."""
     print(f"Processing {case_name} for casebook textbook...")
 
-    CASE_FILE_PATH = f'../../data/legal/cleaned/{case_name}.txt'
-    OUTPUT_DIR = f"../../data/legal/explanations/{case_name}/"
+    CASE_FILE_PATH = LEGAL_CLEANED_DIR / f"{case_name}.txt"
+    OUTPUT_DIR = utils.explanations_dir('legal', slug, case_name, root=str(DATA_ROOT))
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -203,10 +213,13 @@ Provide the output as a JSON object with a single key "outline", which is a list
 
     response_outline_str = utils.query_llm(
         prompt_outline,
-        model=outline_model,
+        model=model or outline_model,
+        reasoning_effort=efforts["outline"],
         system_prompt_included=True,
         return_json=True,
-        max_tokens=4000
+        max_tokens=MAX_TOKENS,
+        provider=provider,
+        base_url=base_url,
     )
 
     outline_log_path = os.path.join(OUTPUT_DIR, "textbook_outline.json")
@@ -214,8 +227,40 @@ Provide the output as a JSON object with a single key "outline", which is a list
         f.write(response_outline_str)
     print(f"Saved textbook outline to {outline_log_path}")
 
-    outline_data = json.loads(response_outline_str)
-    outline = outline_data['outline']
+    def _parse_outline(raw):
+        pairs = []
+        data = json.loads(raw, object_pairs_hook=lambda p: p)
+        if isinstance(data, list):
+            pairs = next((v for k, v in data if k == 'outline'), [])
+        elif isinstance(data, dict):
+            pairs = data.get('outline', [])
+        if isinstance(pairs, list) and len(pairs) == 1 and isinstance(pairs[0], list):
+            pairs = pairs[0]
+        if isinstance(pairs, list) and pairs and isinstance(pairs[0], tuple):
+            recovered = []
+            current = None
+            for key, value in pairs:
+                if key == 'chapter_title':
+                    if current: recovered.append(current)
+                    current = {'chapter_title': value}
+                elif current is not None:
+                    current[key] = value
+            if current: recovered.append(current)
+            if recovered: return {'outline': recovered}
+        return json.loads(raw)
+
+    if not (response_outline_str or "").strip():
+        print(f"WARNING: empty textbook outline for {case_name}; skipping textbook view")
+        return
+    outline_data = _parse_outline(response_outline_str)
+    # Tolerate schema drift: chapters may sit under "outline", at top level, or another
+    # key. Drop chapters missing a required field.
+    outline = utils.extract_dict_list(outline_data, preferred_key='outline')
+    outline = [c for c in outline if c.get('chapter_title')
+               and c.get('description') and isinstance(c.get('subtopics'), list)]
+    if not outline:
+        print(f"WARNING: no valid textbook chapters for {case_name}; skipping textbook view")
+        return
     print(f"Parsed outline with {len(outline)} chapters.")
 
     # --- 2. Write each chapter in parallel ---
@@ -259,21 +304,23 @@ Start with the chapter title as a header. Use '#' for the chapter title and '##'
 
         chapter_content = utils.query_llm(
             prompt_chapter,
-            model='gpt-5-mini',
-            reasoning_effort="medium",
+            model=model or writing_model,
+            reasoning_effort=efforts["chapter"],
             system_prompt_included=True,
-            max_tokens=4000
+            max_tokens=MAX_TOKENS,
+            provider=provider,
+            base_url=base_url,
         )
         return chapter_content
 
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         chapter_contents = list(tqdm(executor.map(write_chapter, outline), total=len(outline), desc="Writing textbook chapters"))
 
     # --- 3. Concatenate and save ---
     # Use textbook.txt filename for compatibility with data_preparation.py
     print("Assembling textbook...")
     full_content = "\n\n".join(chapter_contents)
-    full_textbook = f"Title: Casebook chapter about the opinion: {case_title}\n\n{full_content}"
+    full_textbook = f"Title: Casebook chapter about the opinion: \"{case_title}\"\n\n{full_content}"
 
     output_file = os.path.join(OUTPUT_DIR, "textbook.txt")
     with open(output_file, 'w') as f:
@@ -281,20 +328,22 @@ Start with the chapter title as a header. Use '#' for the chapter title and '##'
 
     print(f"Saved textbook to {output_file}")
 
-    title_line = f"Title: Casebook chapter about the opinion: {case_title}"
+    title_line = f"Title: Casebook chapter about the opinion: \"{case_title}\""
     granular_chapters = [
         f"{title_line}\n\nChapter {i}: {chapter.strip()}"
         for i, chapter in enumerate(chapter_contents, start=1)
     ]
-    write_granular_files(OUTPUT_DIR, "textbooks", "chapter_{i}.txt", granular_chapters)
+    paths = write_granular_files(OUTPUT_DIR, "textbook", granular_chapters)
+    print(f"Saved {len(paths)} files to {Path(OUTPUT_DIR) / 'textbooks'}/")
 
 
-def generate_legal_blog(case_name):
+def generate_legal_blog(case_name, model=None, slug="gpt_5_mini_custom", efforts=None, outline_model="gpt-5", writing_model="gpt-5-mini",
+                        provider="auto", base_url=None, max_workers=4):
     """Generate legal blog / commentary posts for a court opinion."""
     print(f"Processing {case_name} for legal blog...")
 
-    CASE_FILE_PATH = f'../../data/legal/cleaned/{case_name}.txt'
-    OUTPUT_DIR = f"../../data/legal/explanations/{case_name}/"
+    CASE_FILE_PATH = LEGAL_CLEANED_DIR / f"{case_name}.txt"
+    OUTPUT_DIR = utils.explanations_dir('legal', slug, case_name, root=str(DATA_ROOT))
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -325,11 +374,13 @@ Provide the output as a JSON object with a single key "blogs", which is a list o
 
     response_blog_ideas_str = utils.query_llm(
         prompt_blog_ideas,
-        model='gpt-5',
-        reasoning_effort="medium",
+        model=model or outline_model,
+        reasoning_effort=efforts["ideas"],
         system_prompt_included=True,
         return_json=True,
-        max_tokens=2000
+        max_tokens=MAX_TOKENS,
+        provider=provider,
+        base_url=base_url,
     )
 
     outline_log_path = os.path.join(OUTPUT_DIR, "blog_outline.json")
@@ -337,8 +388,16 @@ Provide the output as a JSON object with a single key "blogs", which is a list o
         f.write(response_blog_ideas_str)
     print(f"Saved blog outline to {outline_log_path}")
 
+    if not (response_blog_ideas_str or "").strip():
+        print(f"WARNING: empty blog ideas for {case_name}; skipping blog view")
+        return
     blogs_data = json.loads(response_blog_ideas_str)
-    blogs = blogs_data['blogs']
+    # Tolerate schema drift: list may sit under "blogs", at top level, or another key.
+    blogs = utils.extract_dict_list(blogs_data, preferred_key='blogs')
+    blogs = [b for b in blogs if b.get('title') and b.get('description')]
+    if not blogs:
+        print(f"WARNING: no valid blog ideas for {case_name}; skipping blog view")
+        return
     print(f"Parsed {len(blogs)} blog post ideas.")
 
     # --- 2. Write each blog post in parallel ---
@@ -371,21 +430,23 @@ Description: {description}"""
 
         blog_content = utils.query_llm(
             prompt_blog_content,
-            model='gpt-5-mini',
-            reasoning_effort="medium",
+            model=model or writing_model,
+            reasoning_effort=efforts["post"],
             system_prompt_included=True,
-            max_tokens=4000
+            max_tokens=MAX_TOKENS,
+            provider=provider,
+            base_url=base_url,
         )
         return blog_content
 
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         blog_contents = list(tqdm(executor.map(write_blog, blogs), total=len(blogs), desc="Writing blog posts"))
 
     # --- 3. Concatenate and save ---
     # Use blogs.txt filename for compatibility with data_preparation.py
     print("Assembling blog posts...")
     full_blogs_content = "\n\n\n\n".join(blog_contents)
-    full_blogs_content = f"Title: Blog about the opinion: {case_title}\n\n{full_blogs_content}"
+    full_blogs_content = f"Title: Blog about the opinion: \"{case_title}\"\n\n{full_blogs_content}"
 
     output_file = os.path.join(OUTPUT_DIR, "blogs.txt")
     with open(output_file, 'w') as f:
@@ -393,12 +454,13 @@ Description: {description}"""
 
     print(f"Saved blog posts to {output_file}")
 
-    title_line = f"Title: Blog about the opinion: {case_title}"
+    title_line = f"Title: Blog about the opinion: \"{case_title}\""
     granular_blogs = [
         f"{title_line}\n\n{blog.strip()}"
         for blog in blog_contents
     ]
-    write_granular_files(OUTPUT_DIR, "blogs", "blog_{i:02d}.txt", granular_blogs)
+    paths = write_granular_files(OUTPUT_DIR, "blog", granular_blogs)
+    print(f"Saved {len(paths)} files to {Path(OUTPUT_DIR) / 'blogs'}/")
 
 
 PART_GENERATORS = {
@@ -415,18 +477,40 @@ def resolve_parts(parts):
     return parts
 
 
-def process_cases(case_names=None, parts=None, outline_model="gpt-5"):
+def process_cases(case_names=None, parts=None, outline_model="gpt-5", writing_model="gpt-5-mini",
+                  model=None, model_slug=None, reasoning_effort=None, provider="auto",
+                  base_url=None, max_workers=4):
     if case_names is None:
-        input_dir = "../../data/legal/cleaned/"
-        case_names = [os.path.splitext(f)[0] for f in os.listdir(input_dir) if f.endswith('.txt')]
+        case_names = [path.stem for path in LEGAL_CLEANED_DIR.glob("*.txt")]
+
+    # Per-step reasoning efforts: the 'custom' profile by default, or a uniform level.
+    efforts = utils.load_reasoning_efforts('legal', override=reasoning_effort)
+    mode = reasoning_effort or "custom"
+
+    # Folder name suffixed by the reasoning-effort mode. When --model is set it names both
+    # tiers; otherwise the slug is named after the writing-tier model (default gpt-5-mini
+    # -> 'gpt_5_mini'; gpt-5.4-mini -> 'gpt_5_4_mini'). Explicit --model_slug wins verbatim.
+    base = utils.model_slug(model) if model else utils.model_slug(writing_model)
+    slug = model_slug if model_slug else f"{base}_{mode}"
+    print(f"Writing explanations under slug='{slug}' "
+          f"(outline_model={model or outline_model}, writing_model={model or writing_model}, "
+          f"reasoning_effort mode={mode})")
 
     selected_parts = resolve_parts(parts)
     for case_name in case_names:
         for part in selected_parts:
             if part == "textbook":
-                generate_casebook_textbook(case_name, outline_model=outline_model)
+                generate_casebook_textbook(
+                    case_name, model=model, slug=slug, outline_model=outline_model,
+                    writing_model=writing_model, efforts=efforts[part], provider=provider,
+                    base_url=base_url, max_workers=max_workers,
+                )
             else:
-                PART_GENERATORS[part](case_name)
+                PART_GENERATORS[part](
+                    case_name, model=model, slug=slug, efforts=efforts[part],
+                    outline_model=outline_model, writing_model=writing_model,
+                    provider=provider, base_url=base_url, max_workers=max_workers,
+                )
 
 
 if __name__ == "__main__":
@@ -440,10 +524,22 @@ if __name__ == "__main__":
         default=['all'],
         help='Pipeline parts to run. Default: all.'
     )
-    parser.add_argument(
-        '--outline-model',
-        default='gpt-5',
-        help='Model to use for textbook outline generation. Default: gpt-5.'
-    )
+    parser.add_argument('--model', default=None, help='Override generator model for ALL steps (both tiers). If set, takes precedence over --outline_model/--writing_model.')
+    parser.add_argument('--outline_model', default='gpt-5', help='Model for outline-tier steps (questions/textbook-outline/blog-ideas). Default: gpt-5.')
+    parser.add_argument('--writing_model', default='gpt-5-mini', help='Model for writing-tier steps (answers/chapter/post). Also names the output slug. Default: gpt-5-mini.')
+    parser.add_argument('--model_slug', default=None, help='Override the output subfolder name verbatim (no reasoning-effort suffix). Defaults to <writing_model_slug>_<mode>, e.g. gpt_5_mini_custom.')
+    parser.add_argument('--provider', choices=sorted(utils.VALID_LLM_PROVIDERS), default='auto', help='LLM backend. Use vllm with --base_url for a self-hosted server.')
+    parser.add_argument('--base_url', default=None, help='OpenAI-compatible API base URL, including /v1. Falls back to VLLM_BASE_URL for provider=vllm.')
+    parser.add_argument('--max_workers', type=int, default=4, help='Maximum concurrent generation requests per view.')
+    parser.add_argument('--reasoning_effort', choices=['low', 'medium', 'high'], default=None,
+        help='Force a uniform reasoning effort for all outline+writing steps (slug suffix _low/_medium/_high). '
+             'Default (unset) uses the per-step "custom" profile from reasoning_effort.json (slug suffix _custom).')
     args = parser.parse_args()
-    process_cases(args.cases, args.parts, args.outline_model)
+    if args.max_workers < 1:
+        parser.error('--max_workers must be at least 1')
+    process_cases(
+        args.cases, args.parts, args.outline_model, args.writing_model, model=args.model,
+        model_slug=args.model_slug, reasoning_effort=args.reasoning_effort,
+        provider=args.provider, base_url=args.base_url,
+        max_workers=args.max_workers,
+    )

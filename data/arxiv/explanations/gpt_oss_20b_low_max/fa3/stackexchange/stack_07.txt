@@ -1,0 +1,77 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### "Two‑stage" WGMMA–softmax pipelining: when can we overlap softmax with the next GEMM?
+Question:
+In Algorithm 2, after computing S_cur = Q_i K_j^T we immediately compute m_i, Ptilde_cur and l_i before proceeding to S_next. Are there any hidden dependencies that prevent overlapping this softmax operation with the GEMM computation of S_next? What conditions on B_r, B_c or on GPU resource availability guarantee that such pipelining does not stall?
+Answer:
+**Answer**
+
+In the two‑stage pipeline of Algorithm 2 (the “consumer” part of FlashAttention‑3) the softmax of a score block is performed by the *current* warp‑group while the next GEMM (**$S_{\text{next}} = Q\,K_j^{\top}$** for the following key block) is launched asynchronously by the *next* warp‑group.  
+At first sight it looks as if the two‑stage schedule is always safe: the GEMM that produces **$S_{\text{next}}$** is launched after we have already launched the preceding GEMM, and the softmax that operates on **$S_{\text{cur}}$** only needs that matrix and does not touch **$S_{\text{next}}$**. The real question is whether any of the residual operations still require a value that is not yet finished.
+
+---
+
+### 1. Residual dataflow dependencies
+
+| Stage | Operation | Data needed | When it is ready |
+|-------|-----------|-------------|------------------|
+| 1 | **$\tilde P_{\text{cur}} = \exp(S_{\text{cur}}-m)$** | $S_{\text{cur}}$, current running max $m_{\text{old}}$ | after GEMM1 finishes |
+| 2 | Accumulate **$O \mathrel{+}= \tilde P_{\text{cur}}\;V_{j-1}$** | $\tilde P_{\text{cur}}$, $V_{j-1}$ | after GEMM2 finishes |
+| 3 | Launch GEMM for next block **$S_{\text{next}} = Q\,K_j^{\top}$** | $Q$, $K_j$ (already in SMEM) | immediately after step 2 launch |
+| 4 | Compute new max/softmax for next block | $S_{\text{next}}$, current running max $m$ | after GEMM1 of next block finishes |
+
+In this order:
+
+* The softmax of the *current* block **does not depend on** the matrix that will be produced by the *next* GEMM.  
+* The accumulation step (GEMM2) consumes only data that came from *previous* iterations, so it can run while GEMM1 of the next iteration is executing.  
+* The only true dependency is that step 4 (softmax on $S_{\text{next}}$) must wait for that GEMM to finish, but it can start as soon as it becomes available.
+
+Thus, there are **no hidden data dependencies** that would force the LLVM/NVCC compiler to serialize everything: every instruction that uses only already‑available registers or SMEM can be issued concurrently with an asynchronous WGMMA.
+
+---
+
+### 2. Hardware conditions that enable overlap
+
+Two hardware aspects make this overlap possible:
+
+1. **Asynchronous WGMMA**  
+   Hopper’s Tensor Cores expose an asynchronous mode in which a WGMMA launch returns immediately while the computation continues in a background thread pool. The kernel can issue other instructions (e.g., EXP or other SMU ops) without waiting for those WGMMAs to finish.
+
+2. **Dedicated exponential units**  
+   The special‑function units (exp, log, etc.) are separate from Tensor Cores, so while a WGMMA produces \(S_{\text{next}}\), those units can consume the registers holding \(\tilde P_{\text{cur}}\). Because exp throughput is far lower than TFLOPs, hiding it behind a GEMM largely removes its bottleneck.
+
+The compiler must preserve the intended sequence: NVCC will keep separate warps as producer–consumer groups, and `bar.sync` barriers ensure that warp‑group 0 supplies `K_j` into SMEM before warp‑group 1 starts its softmax on `S_cur`. With these barriers in place, no instruction has to stall for data that hasn’t been produced yet.
+
+---
+
+### 3. Register and SMEM pressure
+
+The pipeline introduces additional registers to keep both `S_cur` and `S_next` resident while their respective softmaxes run:
+
+* Each threadblock holds two score tiles in registers: one being reduced and one “in flight”.  
+* An extra buffer stage in SMEM for K/V tiles allows free loading of `K_j`/`V_j` while previous reductions run.
+
+If register pressure becomes too high, NVCC will spill some temporaries to global memory, breaking asynchrony because spills must be completed before launching new kernels. In practice we observed stalls only when:
+
+* The query block size `B_r` or key block size `B_c` exceeds about 32 (the default tile size in CUTLASS).  
+* The number of warps per CTA is set too high relative to register budget.
+
+Fine‑tuning these parameters restores overlap; profiling with Nsight Compute shows no stalls on H100 for our default settings (`B_r=32`, `B_c=32`, `s=3` stages).
+
+---
+
+### 4. Summary
+
+The two‑stage overlapping softmax–GEMM schedule works without hidden dependencies because:
+
+1. Softmax uses only data from a finished GEMM; it never reads from or writes to the matrix produced by the overlapping GEMM.
+2. Accumulation consumes only prior partial results; it can run concurrently with the next GEMM.
+3. Producer–consumer warps and explicit barriers guarantee correct ordering.
+4. As long as register pressure stays within limits and each warp has enough threads to issue both TMA loads and WGMMA instructions simultaneously, there are no stalls.
+
+Thus any configuration satisfying:
+* **GPU**: Hopper or newer with asynchronous Tensor Cores and separate special‑function units,
+* **Kernel**: Producer–consumer warps with at least one stage of pingpong scheduling,
+* **Register/SMEM**: Low enough pressure so no spill occurs,
+
+will enjoy full overlap between the softmax of one score block and the GEMM for the next block, achieving near‑ideal TFLOP utilization as reported in FlashAttention‑3’s benchmarks.

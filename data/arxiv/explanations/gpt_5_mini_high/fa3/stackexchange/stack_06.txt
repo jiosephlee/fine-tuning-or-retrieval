@@ -1,0 +1,29 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### How is causal masking integrated into the overlapped 2-stage pipeline without breaking the softmax rescaling invariants?
+Question:
+For causal attention, only entries with key position $\le$ query position are valid. In the FA-3 2-stage main loop, softmax of iteration $j+1$ overlaps with the second GEMM of iteration $j$. How are masked columns handled when updating $m_i$, $\ell_i$, and $\mathbf{O}_i$ at tile boundaries, especially when a query block $\mathbf{Q}_i$ spans multiple causal blocks? Do you zero out masked parts of $\mathbf{S}_i^{(j)}$ before the rowmax and rowsum updates, or apply an additive $-\infty$ mask inside the log-sum-exp update? Any special care needed at the first valid $\mathbf{K}_j$ for a given $\mathbf{Q}_i$?
+Answer:
+Short answer: you must apply the causal mask as an additive “$-\infty$” mask to the score tile immediately after the SS‑GEMM and before any reduction ($\mathrm{rowmax}/\mathrm{rowsum}$). Do not simply zero out masked entries of $\mathbf{S}$ (that would corrupt the row maxima). With a proper $-\infty$ mask the incremental log‑sum‑exp invariants used by FlashAttention‑3 remain valid even in the overlapped two‑stage pipeline; the first valid key block for a row is handled naturally by the math (because $e^{m^{\text{old}}-m}=0$ when $m^{\text{old}}=-\infty$), provided you implement the rescaling as multiplications by $e^{m^{\text{old}}-m}$ (not as a division by $0$).
+
+Why and how, in a bit more detail. FlashAttention‑3 updates each query‑row with the streaming log‑sum‑exp formulas; for one key tile the updates (after you have $\mathbf{S}_i^{(j)}=\mathbf{Q}_i \mathbf{K}_j^\top$) are, conceptually:
+
+1. apply the causal mask to $\mathbf{S}_i^{(j)}$ so that invalid positions become $-\infty$ (per row; a query block $\mathbf{Q}_i$ that spans many query positions needs a per‑row cutoff inside the same $\mathbf{K}_j$ tile),
+2. $m_i \leftarrow \max(m_i^{\mathrm{old}},\ \mathrm{rowmax}(\mathbf{S}_i^{(j)}_{\text{masked}}))$,
+3. $\widetilde{\mathbf{P}}_i^{(j)} \leftarrow \exp(\mathbf{S}_i^{(j)}_{\text{masked}} - m_i)$ (masked entries produce $0$ here),
+4. $\ell_i \leftarrow \exp(m_i^{\mathrm{old}}-m_i)\,\ell_i + \mathrm{rowsum}(\widetilde{\mathbf{P}}_i^{(j)})$,
+5. $\mathbf{O}_i \leftarrow \exp(m_i^{\mathrm{old}}-m_i)\,\mathbf{O}_i + \widetilde{\mathbf{P}}_i^{(j)} \mathbf{V}_j$.
+
+Two practical points that answer your explicit subquestions:
+
+- Do not zero masked parts of $\mathbf{S}$ before the $\mathrm{rowmax}/\mathrm{rowsum}$: zeroing changes the rowmax ($0$ values are legitimate finite values) and so breaks the log‑sum‑exp invariants. Instead set masked scores to $-\infty$ (or a sufficiently large negative FP32 constant) so they contribute nothing to max or sum; after the subtraction by $m_i$ their exponentials become (practically) $0$ and they do not contribute to $\ell_i$ or $\mathbf{O}_i$.
+
+- You can think of “additive $-\infty$ inside the log‑sum‑exp update” and “set masked $\mathbf{S}$ entries to $-\infty$ then run the same reductions” as the same thing; implementationally it’s simplest and fastest to apply the per‑element mask to the register/shared‑memory tile produced by WGMMA as the very next step, then run the $\mathrm{rowmax}/\exp/\mathrm{rowsum}$ on that masked tile.
+
+- First valid $\mathbf{K}_j$ for a given query row: if $m_i^{\mathrm{old}}=-\infty$ and $\ell_i=0$ then the formulas above reduce to $m_i=\mathrm{rowmax}(S_{\text{masked}})$, $\ell_i=\mathrm{rowsum}(\exp(S_{\text{masked}}-m_i))$, and $\mathbf{O}_i=\widetilde{\mathbf{P}}_i^{(j)}\mathbf{V}_j$. That is exactly what you want. In code you must avoid dividing by $0$ or computing inverses of $0$: compute the rescale as multiplication by the factor $f=\exp(m_i^{\mathrm{old}}-m_i)$ (which is $0$ when $m_i^{\mathrm{old}}=-\infty$) rather than trying to invert a diagonal with $0$ entries. If you prefer an explicit branch it is fine to branch on $\ell_i==0$ to do the first‑block initialization, but it isn’t necessary if you do the math via the multiplicative factor.
+
+How this fits the 2‑stage overlap in FA‑3. The overlap does not change correctness: S tiles are produced asynchronously (WGMMA) and one tile’s RS‑GEMM is overlapped with the softmax on the next tile, but the moment you consume a produced $\mathbf{S}_{\mathrm{next}}$ (i.e. wait for that WGMMA to finish) you must immediately apply the causal mask to that register‑resident tile and then run the $\mathrm{rowmax}/\mathrm{rowsum}/\exp$ updates. Masking must be done before the reductions for that tile, otherwise $m_i$ and $\ell_i$ would incorrectly reflect masked entries and break the streaming LSE invariant. In practice you implement the per‑row mask cheaply by computing a per‑row cutoff index for the key tile (clamp of $q_{\text{pos}}-k_{\text{start}}+1$ into $[0,B_c]$) and then applying that mask as the first operation after the SS‑GEMM returns.
+
+Small implementation tips that follow from the paper’s design choices: FlashAttention‑3 keeps softmax intermediate work in FP32, so use an FP32 $-\infty$ sentinel (or a very large negative float) for masking; when some rows of a key tile are completely invalid you can skip computing their exponentials or skip rows in the RS‑GEMM if that makes your kernel simpler/faster, but correctness is already guaranteed by the $-\infty$ mask and the multiplicative rescaling formula.
+
+In short: mask = $-\infty$ applied immediately after GEMM (per row inside a tile when needed) ; update $m_i,\ell_i,\mathbf{O}_i$ with the usual streaming log‑sum‑exp formulas using multiplication by $\exp(m^{\mathrm{old}}-m)$; first valid block is handled naturally (or you can branch for the first block to avoid special floating behaviour). This preserves the softmax rescaling invariants inside the overlapped 2‑stage pipeline used by FlashAttention‑3.

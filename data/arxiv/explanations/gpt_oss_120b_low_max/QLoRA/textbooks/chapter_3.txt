@@ -1,0 +1,262 @@
+\title{A Textbook about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+Chapter 3: # Design of QLoRA: Core Innovations  
+
+In this chapter we dissect the technical pillars that make **QLoRA**—a method for finetuning large language models (LLMs) with a 4‑bit quantized base—both memory‑efficient and performance‑preserving.  We begin by describing the novel 4‑bit NormalFloat (NF4) data type, then explain how *double quantization* shrinks the storage needed for the per‑block scaling factors.  Next we cover *paged optimizers*, which use NVIDIA unified memory to avoid out‑of‑memory spikes during gradient checkpointing.  Finally we tie these pieces together by detailing how storage and compute data types interact, and we walk through a full forward and backward pass through a quantized linear layer equipped with LoRA adapters.
+
+---
+
+## 4‑bit NormalFloat (NF4) data type – theory and construction  
+
+### 4.1 Motivation  
+
+Block‑wise quantization of LLM weights typically rescales each block by a *quantization constant* (or scale) so that the whole dynamic range of the low‑bit format is exploited.  Classical schemes such as Int8 or Float4 choose the scale by a simple max‑abs operation, but this is suboptimal when the underlying distribution is approximately Gaussian: a few outlier weights dominate the maximum, leaving most of the 2⁴=16 quantization bins under‑utilised.
+
+If we knew that every weight tensor follows a zero‑centered normal distribution **N(0,σ²)**, we could pick a quantizer whose bin boundaries are aligned with the *true* quantiles of that distribution.  In information theory this yields an *entropy‑optimal* discretisation: each bin receives the same expected probability mass, and the average distortion (measured e.g. by mean squared error) is minimized for that distribution.
+
+### 4.2 From quantile quantization to NormalFloat  
+
+Quantile quantization [Dettmers et al., 2022] constructs a data type by pre‑computing the quantiles of the empirical distribution of a tensor and then assigning each value to the nearest quantile.  Computing exact quantiles for each block at finetuning time would be prohibitively expensive, but because pretrained LLM weights are empirically close to **N(0,σ²)** (Appendix A of the QLoRA paper shows histograms and normality tests), we can *pre‑compute* quantiles once for the standard normal **N(0,1)** and reuse them for every block after an appropriate scaling.
+
+Concretely, let **k**=4 be the bit‑width.  We need **2ᵏ+1 = 17** quantile thresholds to define the twelve interior bin edges and two outer edges (−∞ and +∞).  For each integer i∈{0,…,2ᵏ} we compute
+
+\[
+q_i \;=\;\frac{1}{2}\Bigl(Q_{\mathcal N}\!\bigl(\tfrac{i}{2^{k}+1}\bigr)
+      \;+\;Q_{\mathcal N}\!\bigl(\tfrac{i+1}{2^{k}+1}\bigr)\Bigr),
+\tag{1}
+\]
+
+where \(Q_{\mathcal N}(\cdot)\) is the quantile function (inverse CDF) of a standard normal distribution.  
+Equation (1) yields **2ᵏ = 16** representative values \(\{q_i\}\) that are *symmetrically* placed around zero because \(Q_{\mathcal N}(p) = - Q_{\mathcal N}(1-p)\).
+
+A naive symmetric mapping would leave zero without an exact representation, which harms padding and other sparse patterns.  To guarantee a discrete zero point while preserving the equal‑probability property, QLoRA splits the positive and negative sides into \(2^{k-1}\) bins each, adds one extra bin on the positive side to host zero, merges both sides, and finally removes one duplicate zero entry.  The resulting set is called **k‑bit NormalFloat (NFₖ)**; in our work **NF₄** is used.
+
+The exact NF₄ codebook values are listed in Appendix B of the paper; they are fixed constants that can be stored once for all models.
+
+### 4.3 Quantizing a weight block  
+
+Given a weight block \(\mathbf W_b\in\mathbb R^{B}\) (B is typically 64 for high precision), we first compute its absolute maximum:
+
+\[
+c = \frac{ \operatorname{absmax}(\mathbf W_b)}{1},
+\tag{2}
+\]
+
+so that dividing by \(c\) rescales every entry into \([-1,1]\).  
+We then map each rescaled element \(w = \mathbf W_{b,i}/c\) to its nearest NF₄ codebook entry \(q_{i^\star}\).  
+The stored integer index \(i^\star\in\{0,\dots,15\}\) occupies exactly four bits per weight; together with the per‑block scale \(c\) we obtain a compact representation:
+
+\[
+\mathbf W_b^{\text{NF4}} = \bigl(\,\text{indices}_b,\; c_b \,\bigr).
+\tag{3}
+\]
+
+Because NF₄’s codebook aligns with normal quantiles, most weights fall into bins whose centers are close to their true values, yielding lower reconstruction error than naïve uniform or floating‑point 4‑bit schemes.
+
+---
+
+## Double Quantization of scale constants – algorithm and memory impact  
+
+### 5.1 The memory cost of per‑block scales  
+
+Each weight block needs its own scaling constant \(c_b\).   With blocksize = 64 and a model containing \(P\) parameters, we have \(P/64\) scales.  If each scale is stored in FP32 (32 bits), this adds
+
+\[
+\frac{32}{64}=0.5~\text{bits per parameter}
+\tag{4}
+\]
+
+to the overall memory budget—a non‑negligible overhead when targeting sub‑48 GB footprints for models with tens of billions of parameters.
+
+### 5.2 Quantizing scales themselves  
+
+**Double Quantization (DQ)** treats all scales as a secondary tensor that can itself be compressed without harming overall numerical fidelity. The procedure is:
+
+1. Collect all FP32 scales \(\{c_b\}\).  
+2. Subtract their mean \(\mu_c = \frac{1}{N}\sum_b c_b\) (centering makes them roughly symmetric around zero).  
+3. Quantize this centered vector using an **8‑bit floating point** format (FP8), again in blocks but now with a *larger* blocksize = 256 because FP8 is far less sensitive to small errors.  
+4. Store along with each FP8 block its own FP32 “meta–scale” that rescales the FP8 values back to near their original magnitude.
+
+Mathematically, let \(c'_b = c_b - \mu_c\). For each meta‑block \(M_j\) (256 scales), we compute:
+
+\[
+c'_{M_j}^{\,\text{FP8}} = \operatorname{quantize}_{8} \bigl( c'_{M_j} / s_j^{(FP32)} \bigr),
+\tag{5}
+\]
+
+where \(s_j^{(FP32)}=\operatorname{absmax}(c'_{M_j})/127\) is an FP32 scale for that meta‑block; dequantization later multiplies by both \(s_j^{(FP32)}\) and adds back \(\mu_c\).
+
+### 5.3 Memory savings  
+
+With blocksize = 64 for weights and meta‑blocksize = 256 for scales we obtain:
+
+- First level: original overhead = 0.5 bits/param (as in Eq 4).  
+- Second level: FP8 adds only \(8/64 = 0.125\) bits/param for storing quantized scales; additionally each meta‑block needs an FP32 scale (\(32/(64\times256)=0.00195\) bits/param).  
+
+Summing gives roughly **0.127 bits per parameter**, i.e., a reduction of **0.373 bits/param** compared with naïve FP32 scales—about **3 GB** saved on a 65 B model.
+
+Because DQ operates on values already small in magnitude after centering, its impact on downstream dequantized weights is negligible; empirical results in Section 6 confirm no degradation in downstream perplexity or downstream task accuracy.
+
+---
+
+## Paged Optimizers using NVIDIA unified memory – handling optimizer state spikes  
+
+### 6.1 Origin of optimizer memory spikes  
+
+When finetuning LLMs with gradient checkpointing, activations are recomputed on demand rather than stored continuously, dramatically shrinking activation memory usage. However, during backpropagation each layer’s gradient w.r.t. its **input activation** still needs temporary storage. For long sequence lengths or large batch sizes these *input gradients* can momentarily exceed the GPU’s static memory budget even though their *average* footprint stays low.
+
+Moreover, modern optimizers (AdamW, Lion, etc.) keep per‑parameter moment estimates (\(m_t,v_t\)). For a model with billions of parameters this *optimizer state* can be multiple times larger than the model itself if kept entirely on device.
+
+### 6.2 Unified memory paging  
+
+NVIDIA’s unified memory abstracts CPU RAM and GPU VRAM as a single address space: pages not currently needed on GPU are automatically swapped out to host RAM; when accessed again they are faulted back in asynchronously. QLoRA exploits this facility by allocating **optimizer states** (the moment vectors for AdamW or any other optimizer used in LoRA training) as *paged* allocations.
+
+The workflow:
+
+1. At initialization allocate optimizer tensors via `torch.cuda.memory_allocated(..., pin_memory=True)` combined with `torch.cuda.set_per_process_memory_fraction` so that they reside in unified memory.
+2. During forward/backward passes only a small subset of these tensors are accessed – chiefly those belonging to currently active LoRA adapters.
+3., The CUDA driver pages out inactive pages to host RAM automatically.
+4., When an optimization step occurs (`optimizer.step()`), only pages pertaining to active adapters are pulled back onto GPU; all other pages remain resident on CPU.
+
+Because LoRA adapters constitute only ~0.2% of total parameters (see Section 3), most optimizer state remains idle during any given update and therefore stays off‑GPU most of the time.
+
+### 6.3 Empirical impact  
+
+The authors report that paging introduces *no measurable slowdown* when training LLaMA 65B with batch size = 16 on a single 48 GB GPU; only rare “long‐sequence” batches trigger page faults but these are amortized across many steps and do not cause out‑of‑memory crashes even under aggressive checkpointing settings.
+
+Thus paged optimizers enable us to keep *all* required optimizer statistics at full precision while still fitting inside modest VRAM budgets.
+
+---
+
+## Interaction of storage vs. compute data types (NF4 ↔ BF16)
+
+QLoRA separates two concepts:
+
+| Component | Stored as | Used in computation |
+|-----------|-----------|---------------------|
+| Base model weights | NF4 (4‑bit integers indexing codebook + DQed scales) | Dequantized on‑the‑fly to BF16 |
+| LoRA adapters | BF16 parameters (learnable matrix factors L₁,L₂) | Directly multiplied in BF16 |
+| Optimizer states | BF16 or FP32 depending on optimizer | Operate on LoRA parameters only |
+
+During **forward inference**, a weight block is read from GPU memory as its compact NF4 representation (`indices` + `scale`). The dequantization kernel performs:
+
+```c
+float w_fp16 = dequantize_NF4(index[i], scale_block);
+```
+
+producing a BFloat16 value (`w_fp16`). This value participates in matrix multiplication together with BF16 activations (`X`). Because BF16 has identical exponent width as FP32 but reduced mantissa precision, it offers hardware acceleration on modern GPUs while preserving sufficient numeric range for deep transformer layers.
+
+During **backward propagation**, gradients w.r.t. LoRA matrices require two quantities:
+
+- The gradient w.r.t output (\(\partial E/\partial Y\)) – already in BF16.
+- The derivative of dequantized weights w.r.t their underlying NF4 indices/scales – needed only implicitly because we never update base weights.
+
+Thus QLoRA computes
+
+\[
+\frac{\partial E}{\partial L_1},\,\, \frac{\partial E}{\partial L_2}
+   = f_{\text{BF16}}\bigl( X^{\text{BF16}},\, W^{\text{BF16}}_{\text{deq}},\, 
+                         \partial E/\partial Y\bigr),
+\]
+
+while discarding any gradient w.r.t.\(\mathbf W^{NF4}\); those gradients are never materialized thanks to frozen base weights.
+
+In summary: **storage format optimizes memory**, **compute format optimizes speed**, and dequantization bridges them without any loss of information beyond what was already incurred by NF4 quantization.
+
+---
+
+## Full forward/backward pass through quantized weights  
+
+Consider a single transformer linear layer whose pretrained weight matrix \(\mathbf W \in \mathbb R^{h\times o}\) has been NF4‑quantized blockwise with double‐quantized scales as described above. Let \(\mathbf X \in \mathbb R^{b\times h}\) be the input activation batch (BF16), and let LoRA introduce low‑rank matrices \(\mathbf L_1 \in \mathbb R^{h\times r},\, \mathbf L_2 \in \mathbb R^{r\times o}\) with scaling factor \(s.\)
+
+### Forward pass  
+
+The output before activation is
+
+\[
+\boxed{
+    \mathbf Y
+    =
+    \underbrace{\mathbf X\, 
+        \operatorname{deq}_{BF16}\!\bigl(c_1,c_2,\mathbf W^{NF4}\bigr)
+    }_{\displaystyle
+        \text{Frozen base contribution}
+    }
+    + 
+    s\,\, 
+    \underbrace{\mathbf X\, \mathbf L_1\, \mathbf L_2}_{\displaystyle
+        \text{Learnable LoRA contribution}
+    } .
+}
+\tag{6}
+\]
+
+Operationally:
+
+1️⃣ For each block of columns of \(\mathbf W^{NF4}\): retrieve its four–bit indices and its double–quantized scale `c₂` → recover `c₁` via FP8→FP32 dequant → reconstruct full FP32 scaling factor for this block (`c`).  
+2️⃣ Convert each index into its NF4 codebook value `q` → multiply by `c` → cast to BF16 → feed into GEMM with `X`.  
+3️⃣ Compute LoRA GEMM `X L₁ L₂` entirely in BF16 (matrix multiplication kernels already exist).  
+4️⃣ Sum both contributions elementwise to obtain `Y`.
+
+All operations stay on GPU; step 1 involves lightweight elementwise kernels but does not materialize any intermediate full‐precision weight matrix beyond what fits inside registers/cache during GEMM.
+
+### Backward pass  
+
+Let loss be \(E(\mathbf Y)\). Gradient w.r.t.\(\mathbf Y` is denoted as
+\(G_Y = {\partial E}/{\partial \mathbf Y}\).
+
+Because base weights are frozen,
+
+- No gradient needs to be propagated into them:
+  \(\displaystyle
+   {\partial E}/{\partial \mathbf W}=0.
+   \)
+
+- However computing gradients w.r.t.\(\mathbf L_1,\mathbf L_2\) requires backpropagating through both branches:
+  
+  - **LoRA branch:** classic chain rule yields
+    \[
+      {\partial E}/{\partial (\!s\,L_1)} 
+        = G_Y^\top (\mathbf X\,L_2^\top),
+      \qquad
+      {\partial E}/{\partial (\!s\,L_2)}
+        = (\mathbf X^\top G_Y)\,
+          L_1 .
+    \tag{7}
+    \]
+    These products stay in BF16 precision.
+  
+  - **Base branch:** although we do not update base weights,
+    backpropagation still traverses them because downstream layers need gradients w.r.t.\ their inputs.
+    The derivative of dequantization relative to its input activations is simply:
+    \[
+      {\partial (\mathbf X\,W^{BF16})}/{\partial X}
+          = W^{BF16},
+    \]
+    where \(W^{BF16}= {\operatorname{deq}}_{BF16}(c_1,c_2,W^{NF4})\).
+    Hence,
+    \[
+       G_X := G_Y\,W^{BF16^\top},
+    \tag{8}
+    \]
+    which feeds further backward layers.
+    
+In practice deep learning frameworks fuse steps (6)-(8): after dequantizing once per forward pass they keep the resulting BF16 matrix cached (still consuming far less VRAM than full FP16 weights because it lives only transiently). The cached matrix is reused for both forward multiplication and backward gradient propagation without ever materializing or storing full‐precision gradients for frozen weights.
+
+Finally:
+- Optimizer updates apply only to LoRA matrices (`L₁`, `L₂`) using their stored BF16 copies and associated paged moment vectors.
+- All other tensors—original NF4 weights together with their double‐quantized scales—remain untouched throughout training.
+
+Thus QLoRA achieves **full backpropagation through a frozen quantized model**, while keeping memory consumption comparable to training a tiny adapter network alone.
+
+--- 
+
+### Summary  
+
+The three engineering contributions described above synergize to make QLoRA feasible:
+
+1️⃣ **NF4** aligns quantization bins with the natural Gaussian distribution of pretrained weights, delivering high fidelity at only four bits per parameter.  
+2️⃣ **Double Quantization** compresses the per‑block scaling constants themselves, shaving ~0.37 bits per parameter—a crucial saving at billions of parameters scale.  
+3️⃣ **Paged Optimizers** leverage NVIDIA unified memory so that massive optimizer states never force an out‑of‑memory failure during checkpointed training.
+
+Together they enable us to store an entire LLaMA 65B model in <48 GB GPU memory while still performing *exact* forward/backward passes through dequantized BF16 activations and updating only cheap LoRA adapters in full precision—a cornerstone enabling open‐source instruction tuning at previously unreachable model sizes.

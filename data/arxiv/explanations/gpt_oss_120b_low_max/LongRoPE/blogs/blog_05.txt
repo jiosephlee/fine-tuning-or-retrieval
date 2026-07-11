@@ -1,0 +1,208 @@
+\title{Blogs about the Paper: "LongRoPE: Extending LLM Context Window Beyond 2 Million Tokens"}
+
+# Practical Tips for Applying LongRoPE to Your Own Models  
+
+Extending a language model’s context window from a few thousand tokens to **millions** sounds like science‑fiction, but the recent *LongRoPE* paper shows it can be done with only a few thousand fine‑tuning steps and a clever evolutionary search over positional embeddings. In this post we walk through **how you can reproduce the results on your own RoPE‑based LLMs** (e.g., LLaMA 2, Mistral) without reinventing the wheel.  
+
+We’ll cover:  
+
+1. Preparing the model and data for a long‑context extension.  
+2. Setting up the evolutionary search for non‑uniform RoPE rescaling.  
+3. Hyper‑parameter choices that matter (population size, mutation rate, etc.).  
+4. Efficient fine‑tuning shortcuts (progressive extension).  
+5. Plug‑and‑play integration at inference time, including short‑window recovery.  
+
+Everything below follows the methodology described in the LongRoPE paper, so you can be sure that the numbers you obtain are grounded in their experiments.
+
+---
+
+## 1. Getting Started: Model + Dataset Prep  
+
+### 1.1 Choose a RoPE‑based LLM  
+LongRoPE works with any transformer that uses Rotary Position Embedding (RoPE). The authors tested LLaMA 2‑7B and Mistral‑7B; you can use either or any other open‑source model that follows the same embedding formula:
+
+\[
+\text{RoPE}(n,i)=\bigl[\cos\bigl(\tfrac{n}{\beta^{i}}\bigr),\;\sin\bigl(\tfrac{n}{\beta^{i}}\bigr)\bigr],
+\qquad 
+\beta=\theta^{2/d}.
+\]
+
+No architectural changes are required—only the **rotation angles** are re‑scaled.
+
+### 1.2 Collect Long Texts for Fine‑Tuning  
+LongRoPE needs a modest amount of data **longer than the target intermediate window** (e.g., 256 k tokens). Public corpora such as RedPajama, Together’s Long‑Data Collections, or even a curated dump of books work fine. You do **not** need 2 M‑token documents; those appear only during evaluation.
+
+*Tip:* Chunk each document into fixed‐length sequences (e.g., 128 k or 256 k) and prepend BOS / append EOS tokens as in the paper’s training pipeline.
+
+---
+
+## 2. Evolutionary Search for Non‑Uniform RoPE Rescaling  
+
+LongRoPE’s core is an **evolutionary algorithm** that discovers per‑dimension scaling factors \(\lambda_i\) and an optional “no‑interpolation prefix” length \(\hat n\). The search objective is simply **minimizing perplexity** on a handful of validation passages.
+
+### 2.1 Define the Search Space  
+
+| Variable | Range | Granularity |
+|----------|-------|-------------|
+| \(\lambda_i\) (per dimension) | \([1.0,\; s\times1.25]\) | step = 0.01 |
+| \(\hat n\) (prefix length) | \{0,1,2,4,8,12,16,20,24,28,32,64,128,256\} | – |
+
+Here \(s = L' / L\) is the extension ratio (e.g., \(s = 64\) for 256 k → 4 k). The lower bound \(1.0\) corresponds to *pure extrapolation* (no down‑scaling), while the upper bound allows slightly stronger interpolation than vanilla linear PI.
+
+### 2.2 Evolutionary Loop (Pseudo‑code)
+
+```python
+def longrope_search(model, samples, target_ratio,
+                    pop_size=64, mut_size=16, cross_size=16,
+                    max_iter=40, mutate_prob=0.3):
+    # 1️⃣ Initialise population
+    population = init_population(pop_size, target_ratio,
+                                 include_PI_NTK_YARN=True,
+                                 mutate_prob=mutate_prob)
+
+    topk = []   # keep best individuals
+    for it in range(max_iter):
+        # 2️⃣ Evaluate perplexity of each individual
+        scores = [perplexity(model, indiv, samples) for indiv in population]
+
+        # 3️⃣ Select top-k (e.g., k=32) as parents
+        parents = select_topk(population, scores, k=32)
+
+        # 4️⃣ Mutation + crossover respecting monotonicity λ_i ≤ λ_{i+1}
+        mutants   = mutate(parents, mut_size,
+                           prob=mutate_prob,
+                           monotonic=True)
+        crossovers = crossover(parents, cross_size,
+                               monotonic=True)
+
+        # 5️⃣ Form new generation
+        population = parents + mutants + crossovers
+
+    # Return best individual after final evaluation
+    best = min(population, key=lambda ind: perplexity(model, ind,
+                                                    samples))
+    return best
+```
+
+#### Key Implementation Details  
+
+* **Monotonic Constraint:** Enforce \(\lambda_i \le \lambda_{i+1}\). This dramatically cuts down meaningless candidates and aligns with NTK theory (high‑frequency dimensions need less interpolation).  
+* **Seed Individuals:** Include the three classic rescaling schemes—PI (\(\lambda_i=s\)), NTK (\(\lambda_i = s^{i/(d/2-1)}\)), and YaRN—so the algorithm starts from strong baselines rather than random noise.  
+* **Perplexity Evaluation:** Use **5 random PG19 validation samples**, each at least as long as the target length \(L'\). Computing perplexity over a short sliding window (e.g., stride = 256) keeps inference cheap.
+
+### 2.3 Practical Hyper‑Parameter Choices  
+
+| Parameter | Recommended Value | When to Adjust |
+|-----------|-------------------|----------------|
+| Population size \(P\) | 64 (halved to 32 for >512 k extensions) | Larger GPUs ⇒ increase for more thorough search |
+| Mutation/Crossover size (\(N_1,N_2\)) | 16 each | If search plateaus early → raise |
+| Iterations \(\mathcal{T}\) | 40 | More iterations improve quality but cost more GPU hours |
+| Mutation probability \(p\) | 0.3 | Higher values encourage exploration; lower values fine‑tune around good solutions |
+
+The authors report that even with these modest settings they locate a near‑optimal set of \(\lambda_i\) within **a few hours on 8 × A100 GPUs**.
+
+---
+
+## 3. Progressive Extension Strategy  
+
+Directly searching for a *512×* extension (4 k → 2048 k) is computationally infeasible because the search space explodes. LongRoPE sidesteps this by **progressively extending**:
+
+1. **Stage A – Search & Fine‑Tune to 256 k**  
+   * Search for \(\lambda_i^{(128k)}\) → fine‑tune ≈ 400 steps on 128 k data.  
+   * Swap in \(\lambda_i^{(256k)}\) → fine‑tune another ≈ 600 steps on 256 k data.
+
+2. **Stage B – Search from 256 k → 2048 k** (no extra fine‑tuning)  
+   * Run the evolutionary search again on the already fine‑tuned model but now targeting an extension ratio \(s = 8\) (256 k → 2048 k).  
+   * The second search yields a new set of scaling factors that give you a full **2048 k** context window essentially “for free”.
+
+This two‑stage recipe only needs **≈ 1 000 fine‑tuning steps total**, which is trivial compared to training from scratch or running hundreds of thousands of steps on ultra‑long sequences.
+
+### Tips for Fine‑Tuning  
+
+* Learning rate: \(2\times10^{-5}\) (LLaMA 2) or \(1\times10^{-6}\) (Mistral).  
+* Batch size: keep global batch ≈ 32–64; larger batches do not bring noticeable gains for such short fine‑tuning runs.  
+* Optimizer: standard AdamW with linear decay works well; no need for gradient checkpointing because sequence lengths are bounded at ≤ 256 k during training.
+
+---
+
+## 4. Integrating LongRoPE at Inference  
+
+Once you have your final set of scaling factors (\(\lambda_i^\*\)) you only need to *replace* the RoPE computation in your inference pipeline.
+
+```python
+def apply_longrope_rotary(qkv, position_ids, lam_factors):
+    """
+    qkv: tensor shape [batch, seq_len, heads, dim]
+    position_ids: [seq_len]
+    lam_factors: list of λ_i per half-dimension
+    """
+    # Compute scaled angles n / (β^i * λ_i)
+    angles = position_ids[:, None] / (beta ** torch.arange(dim//2).to(device)
+                                      * torch.tensor(lam_factors).to(device))
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+
+    # Apply rotary transformation as usual …
+```
+
+### Short‑Window Recovery  
+
+When the input length is ≤ 8 k it is beneficial to **research smaller λ bounds** so that positions inside the original window are not overly compressed (“crowded”). A lightweight way:
+
+* Run a quick evolutionary search with `max_lambda = min(s_target, 4)` on a few short samples.
+* Store two sets of factors: `long_factors` (for ≥ 256 k) and `short_factors` (for ≤ 8 k).
+* At runtime pick the appropriate set based on `seq_len`.
+
+The paper shows this dynamic adjustment lifts perplexity on standard benchmarks back to near‐original levels.
+
+---
+
+## 5. End‑to‑End Checklist  
+
+| Step | Action |
+|------|--------|
+| ✅ | Clone a RoPE model checkpoint (LLaMA 2 or Mistral). |
+| ✅ | Prepare ≥ 128 k token chunks from a large text corpus; keep a tiny validation set of ~5 PG19 documents for search evaluation. |
+| ✅ | Install required libraries (`torch`, `transformers`, optional `accelerate`). |
+| ✅ | Implement the evolutionary search loop (or reuse the authors’ released script). |
+| ✅ | Run Stage A: search & fine‐tune to 256 k (≈400 + 600 steps). |
+| ✅ | Run Stage B: second search targeting ×8 extension → obtain λ⁎ for 2048 k. |
+| ✅ | Replace RoPE in your inference code with λ⁎; add logic to switch to short‐window factors when needed. |
+| ✅ | Validate: compute perplexity on Proof‑Pile/PG19 at several lengths; run passkey retrieval or any downstream task you care about. |
+
+If everything lines up you should see perplexities comparable to those reported in Table 3 of the paper—often better than existing baselines even at intermediate lengths like 64 k or 128 k.
+
+---
+
+## 6. Common Pitfalls & How to Avoid Them  
+
+* **Running out of GPU memory during fine‑tuning:** Remember you never actually train on > 256 k sequences; all longer extensions are achieved via search only.
+* **Neglecting monotonic constraint:** Removing it makes the population explode and dramatically slows down convergence.
+* **Using too few validation samples:** Perplexity estimates become noisy; stick with at least five ~100 k–200 k passages.
+* **Overfitting during fine‐tuning:** Keep steps low (< 1 000); longer runs tend to degrade performance on short contexts.
+
+---
+
+## 7. Where to Find Code  
+
+The authors will release their implementation at:
+
+```
+https://github.com/microsoft/LongRoPE
+```
+
+In the meantime you can reproduce most steps with just three scripts:
+
+1. `prepare_data.py` – chunking & tokenization.
+2. `search_longrope.py` – evolutionary optimizer.
+3. `finetune_longrope.py` – light fine‐tuning loops.
+
+Feel free to open an issue if you hit any snags; the community has already built wrappers for HuggingFace’s `transformers` library.
+
+---
+
+### Bottom Line  
+
+LongRoPE demonstrates that extending an LLM’s context window from thousands to millions of tokens is no longer a massive engineering effort—it’s essentially an *optimization problem* over rotary angles plus a tiny amount of fine‐tuning on mid‑length data. By following this tutorial you can adapt any RoPE‐based model to handle truly long documents while preserving its original performance on short tasks.
+
+Happy hacking! 🚀

@@ -1,0 +1,79 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 4: From Standard Attention to FlashAttention-2
+
+# Standard attention on GPU: materializing S and P, excessive GMEM reads/writes
+
+The attention layer that sits at the core of Transformer models is simple to state but expensive to compute. For a single head, given query, key, and value matrices $\mathbf{Q}, \mathbf{K}, \mathbf{V} \in \mathbb{R}^{N\times d}$ (where $N$ is the sequence length and $d$ the head dimension) the forward pass is usually written as
+\[
+\mathbf{S} = \alpha\, \mathbf{Q}\mathbf{K}^\top,\qquad
+\mathbf{P} = \mathrm{softmax}(\mathbf{S}),\qquad
+\mathbf{O} = \mathbf{P}\mathbf{V},
+\]
+with $\alpha=1/\sqrt{d}$ a common scaling and the softmax applied row-wise. A standard, straightforward GPU implementation follows these mathematical steps directly: materialize the full score matrix $\mathbf{S}$ in global device memory (HBM), compute $\mathbf{P}$ from $\mathbf{S}$ (typically subtracting the rowwise maximum for numerical stability before exponentiation), materialize $\mathbf{P}$, and finally multiply by $\mathbf{V}$ to produce $\mathbf{O}$.
+
+The cost of that strategy is dominated by memory traffic. The intermediate matrices $\mathbf{S}$ and $\mathbf{P}$ are size $N\times N$, so materializing them incurs $O(N^2)$ storage and repeated reads/writes to global memory. On contemporary GPUs this is costly because of the memory hierarchy: registers and shared memory (SMEM) are fast but small, while global memory (HBM) is large but much slower. Repeatedly materializing $\mathbf{S}$ and $\mathbf{P}$ forces many passes over the same $O(N^2)$ entries through HBM, creating a memory-bound workload that limits throughput and makes scaling to long contexts (large $N$) expensive. In other words, the naive implementation trades compute locality for simplicity and becomes bottlenecked by global memory I/O rather than by raw arithmetic capability.
+
+# FlashAttention (the original): on‑chip tiling, fused softmax via streaming reductions, avoiding intermediate I/O
+
+FlashAttention (the original algorithm) was introduced to attack precisely that I/O bottleneck by rethinking how attention is computed on a GPU. The core idea is to avoid materializing the large intermediate matrices in HBM by fusing the three logical steps (score computation, softmax, and output accumulation) into a single GPU kernel that streams tiles through fast on‑chip storage and performs local reductions to implement softmax. In short: compute attention blockwise on‑chip and only write the final outputs once.
+
+Concretely, FlashAttention breaks the query matrix into row blocks $\mathbf{Q}_i$ of size $B_r\times d$ and the key/value matrices into column blocks $\mathbf{K}_j,\mathbf{V}_j$ of size $B_c\times d$. For a fixed query block $\mathbf{Q}_i$ the algorithm streams over $j=0,\dots,T_c-1$ and for each block computes the partial scores
+\[
+\mathbf{S}_i^{(j)} = \mathbf{Q}_i\,\mathbf{K}_j^\top,
+\]
+all held transiently in registers or shared memory. Rather than forming the full rowwise softmax across all $N$ keys at once, FlashAttention maintains a running rowwise maximum $m_i$ and a running row-sum accumulator $\ell_i$ that summarize the contributions of the blocks seen so far. When a new block $\mathbf{S}_i^{(j)}$ is computed the kernel forms the stabilized exponentials
+\[
+\widetilde{\mathbf{P}}_i^{(j)} = \exp\!\big(\mathbf{S}_i^{(j)} - m_i\big),
+\]
+and updates the normalization and output accumulators with numerically correct rescalings so that, after all blocks have been processed, the exact softmax outputs and the final $\mathbf{O}_i$ can be obtained. The register/shared‑memory updates in the inner loop follow the pattern implemented in the code (in pseudo-equation form):
+\[
+m_i \leftarrow \max\big(m_i,\,\mathrm{rowmax}(\mathbf{S}_i^{(j)})\big),
+\]
+\[
+\ell_i \leftarrow \exp(m_i^{\mathrm{old}}-m_i)\,\ell_i + \mathrm{rowsum}\big(\widetilde{\mathbf{P}}_i^{(j)}\big),
+\]
+\[
+\mathbf{O}_i \leftarrow \mathrm{diag}\big(\exp(m_i^{\mathrm{old}}-m_i)\big)^{-1}\mathbf{O}_i \;+\; \widetilde{\mathbf{P}}_i^{(j)}\,\mathbf{V}_j,
+\]
+and at the end an epilogue rescales $\mathbf{O}_i$ by $\ell_i$ and writes the final block out. The derivation that these streaming updates are algebraically equivalent to computing the usual softmax and $\mathbf{O}$ is given in the FlashAttention literature; intuitively, the running maximum and the multiplicative rescaling keep previously accumulated partial contributions consistent with the normalization used after all blocks are seen.
+
+Because FlashAttention never writes the full $\mathbf{S}$ or $\mathbf{P}$ to global memory and reads them back, it dramatically reduces global-memory I/O: each input block is read once (or a small constant number of times) into fast on‑chip storage and the output block $\mathbf{O}_i$ is written exactly once at the end. This on‑chip tiling plus fused softmax transforms attention from an I/O-dominated kernel into one that better leverages on‑chip bandwidth and compute, enabling much larger effective sequence lengths for the same hardware footprint.
+
+# FlashAttention-2: parallelizing across sequence blocks, improved occupancy and load balancing
+
+FlashAttention removed the dominant intermediate I/O, but there were still opportunities to better match the GPU execution model. FlashAttention-2 reorganized the computation to increase parallelism across the sequence-length dimension itself, rather than only across output query blocks. The key restructuring is to make the inner loop of the forward pass—the loop that iterates over key/value blocks—explicitly parallelizable across the GPU so that more warps and CTAs can be active concurrently. In practice this is done by dividing both the query and key/value dimensions into blocks and scheduling the work so that multiple compute groups operate on different $(\mathbf{Q}_i,\mathbf{K}_j,\mathbf{V}_j)$ tiles at the same time.
+
+This reorganization improves occupancy (the fraction of GPU resources actively doing useful work) and achieves a better distribution of work across SMs. By operating on blocks of $\mathbf{K}$ and $\mathbf{V}$ in a way that allows multiple CTAs to progress through different parts of the sequence at once, FlashAttention-2 reduces idle time and balances load when sequence lengths are long or when the mapping from blocks to warps would otherwise be imbalanced. Practically, FlashAttention-2 preserves the fused single-kernel, on‑chip streaming softmax idea of the original FlashAttention, but changes the parallel decomposition so that both the query-block dimension and the sequence-block dimension contribute to parallelism.
+
+The effect is that smaller tile sizes, more concurrent CTA scheduling, and careful staging of key/value tiles into shared memory can be used to keep the GPU busy over a wider range of sequence lengths and head dimensions than the original design. FlashAttention-2 therefore represents an important engineering evolution: it keeps the same algebraic strategy (no materialized intermediates) while improving how that work maps to the GPU's parallel-execution hierarchy.
+
+# Limitations on H100: synchronous execution model, low Tensor Core utilization (~35%) vs GEMM kernels (80–90%)
+
+Despite these improvements, FlashAttention-2 was observed to underutilize Hopper-generation GPUs such as the NVIDIA H100. Empirically, FlashAttention-2 achieves poor Tensor Core utilization on H100 (around 35\%) compared to highly optimized GEMM kernels which can reach 80–90\% utilization on the same hardware. The paper highlights two classes of causes for this shortfall.
+
+First, some of the gap is implementation-level: FlashAttention-2 implementations were not always using Hopper-specific instruction sequences in place of earlier-Ampere-oriented idioms. On Hopper, newer instructions and tile-based programming models can extract higher raw throughput from the Tensor Cores; failing to adopt these instruction patterns can leave performance on the table.
+
+Second, and more fundamentally, FlashAttention-2 was designed under a simplified, effectively synchronous execution model that did not exploit newer hardware features exposed by Hopper. Hopper introduces stronger hardware asynchrony (an asynchronous Tensor Core instruction WGMMA and an asynchronous tensor memory accelerator TMA) and supports warp-specialized scheduling and dynamic register allocation across warpgroups. FlashAttention-2's synchronous inner loop—compute a GEMM, wait, run softmax, wait, run the next GEMM—creates explicit dependencies and synchronization points that prevent the hardware from overlapping data movement and Tensor Core compute efficiently. In short, FlashAttention-2 minimized global-memory I/O, but it did not explicitly coordinate with the hardware's asynchronous execution primitives, which limited how effectively it could keep the Tensor Cores busy on Hopper.
+
+# Why softmax and data movement serialize GEMMs without explicit asynchrony-aware design
+
+At the heart of the serialization is the dependency chain inside the attention inner loop. For a given query block the typical sequence is:
+
+1. Compute the block scores $\mathbf{S}_i^{(j)} = \mathbf{Q}_i\mathbf{K}_j^\top$ (a GEMM on the Tensor Cores).
+2. Run the softmax-related elementwise reductions and exponentials on $\mathbf{S}_i^{(j)}$ to produce $\widetilde{\mathbf{P}}_i^{(j)}$ and update running normalizers.
+3. Multiply the resulting (stabilized) probabilities by the corresponding $\mathbf{V}_j$ block to accumulate into $\mathbf{O}_i$ (another GEMM).
+
+Because step (2) consumes the output of step (1) and step (3) consumes the output of step (2), a straightforward implementation issues a GEMM, waits for completion, runs the softmax arithmetic (rowwise maxima, exponentials and sums), waits for those scalar/vector updates to finish, and only then issues the next GEMM. The GPU is therefore forced into a sequence of blocking waits that prevent useful overlap.
+
+This serialization is especially harmful because of a large imbalance in the raw throughputs of the hardware units involved. The Tensor Cores deliver very high GEMM throughput (on H100 the FP16 matmul peak is reported at roughly 989 TFLOPs), whereas the special-function units that perform exponentials and similar elementwise operations have orders-of-magnitude lower throughput (the paper cites about 3.9 TFLOPs for special functions on H100). To build the intuition the paper gives: for FP16 attention with head dimension 128, the total number of matmul FLOPs in the forward pass is roughly 512 times the number of exponential FLOPs, while the exponential unit has about 256 times lower throughput; put together this means the exponential computations alone can occupy a non-negligible fraction of time that could have been used by the Tensor Cores if the two were not overlapped. In a synchronous implementation the Tensor Cores sit idle while the softmax step executes; conversely, when the Tensor Cores run, the special-function units are idle. Either way, the end-to-end utilization falls well below what the GPU could deliver if these streams were overlapped.
+
+Likewise, data movement from global memory into shared memory (or vice versa) can be asynchronous (on Hopper, TMA exposes this capability), but a synchronous kernel that issues loads and then waits for them to finish serializes the producer/consumer relationship and prevents overlapping of memory transfer with computation. Without an explicit asynchrony-aware scheduling and a producer–consumer decomposition, both movement and computation become serialized bottlenecks.
+
+# Lessons learned: I/O-aware algorithm design must match modern hardware execution
+
+The evolution from standard attention to FlashAttention and then to FlashAttention-2 illustrates a key theme: removing global-memory I/O is necessary but not sufficient for optimal performance on modern accelerators. FlashAttention demonstrated that fusing and tiling to avoid materializing $\mathbf{S}$ and $\mathbf{P}$ eliminates the dominant I/O costs of classical implementations and enables attention to scale to longer contexts. FlashAttention-2 showed that reorganizing the parallel decomposition across the sequence length can improve occupancy and load balance. But the Hopper observations make clear that algorithmic structure must also be aligned with the newer execution model of the hardware: asynchronous Tensor Core execution, asynchronous DMA-like memory transfers (TMA), warp-specialization, and low-precision tensor cores all change what the kernel must do to extract throughput.
+
+Practically, this means several design principles: (1) preserve the fused, on‑chip nature of computation to limit HBM traffic; (2) design the parallel decomposition so multiple warps/CTAs can work on different sequence blocks concurrently to improve occupancy; and (3) make the kernel asynchrony-aware so that independent hardware units (Tensor Cores, special-function units, and memory accelerators) can be kept busy simultaneously rather than serially. The last point requires changing the canonical inner-loop dependency pattern (GEMM → softmax → GEMM) into a pipelined, producer–consumer form that can overlap softmax computations and data movement with other GEMMs, as well as carefully handling low-precision execution and its layout constraints.
+
+In short: minimizing global-memory I/O (the FlashAttention insight) unlocked a large fraction of the potential speedups; to reach the peak arithmetic bandwidth of modern GPUs one must now also match the kernel's synchronization and data-layout patterns to the hardware's asynchronous execution model and its low-precision capabilities. The work described in the paper follows precisely this trajectory by taking FlashAttention-2 as the starting point and then introducing asynchrony-aware scheduling and FP8-aware layout/quantization strategies to close the utilization gap on Hopper.

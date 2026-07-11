@@ -1,0 +1,92 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 4: From Standard Attention to FlashAttention and FlashAttention-2
+
+# Standard attention on GPUs and the cost of materializing $\mathbf{S}$ and $\mathbf{P}$ in HBM
+
+For a single attention head, the paper defines the query, key, and value matrices as $\mathbf{Q}, \mathbf{K}, \mathbf{V} \in \mathbb{R}^{N \times d}$, where $N$ is the sequence length and $d$ is the head dimension. Standard attention computes the score matrix $\mathbf{S} = \alpha \mathbf{Q}\mathbf{K}^\top$, applies a row-wise softmax to obtain $\mathbf{P} = \mathrm{softmax}(\mathbf{S})$, and then produces the output $\mathbf{O} = \mathbf{P}\mathbf{V}$. In practice, $\alpha$ is usually set to $1/\sqrt{d}$, and the row maximum of $\mathbf{S}$ is subtracted before exponentiation to improve numerical stability. This is the familiar mathematical definition of attention, but on a GPU the way these steps are scheduled matters just as much as the arithmetic itself.
+
+The paper emphasizes that a standard GPU implementation wastes bandwidth by materializing the intermediate matrices $\mathbf{S}$ and $\mathbf{P}$ in high-bandwidth memory, or HBM. Both of these matrices are $N \times N$, so they grow quadratically with sequence length. That means the expensive part is not only the matrix multiplication, but also the repeated writing and reading of these large intermediates through the slowest level of the GPU memory hierarchy that is shared across all streaming multiprocessors. The paper’s background section contrasts this with the much smaller and faster on-chip storage available in shared memory and registers. The core bottleneck, then, is that standard attention keeps returning to HBM between stages that conceptually belong together.
+
+This is why standard attention becomes especially costly in long-context settings. As the sequence length grows, the score matrix and probability matrix become large enough that the memory traffic associated with them dominates the runtime. The paper presents FlashAttention as a response to this exact problem: not by changing the math of attention, but by changing where and when the intermediate results live.
+
+# The key insight of FlashAttention: IO-aware exact attention
+
+The central idea behind FlashAttention is that attention can be computed exactly while avoiding the expensive read-write pattern of standard attention. The paper is careful to call FlashAttention an exact-attention algorithm. It does not approximate $\mathbf{S}$ or $\mathbf{P}$, and it does not change the definition of the output. Instead, it reorganizes the computation so that the GPU spends far less time moving data between HBM and on-chip storage.
+
+This is what the paper means by an IO-aware design. Rather than treating attention as a sequence of separate stages that each write their full outputs to global memory, FlashAttention fuses the stages into one GPU kernel and keeps intermediate quantities on chip as long as possible. The score computation, the softmax normalization, and the multiplication by $\mathbf{V}$ are all coordinated so that the algorithm can stream through blocks of the keys and values while maintaining only the state it needs for the current query block.
+
+The intuition is simple but important. If the GPU can compute a piece of the attention scores, immediately use it to update the softmax state, and then immediately use that result to accumulate the output, there is no reason to materialize a full $N \times N$ matrix in HBM. The algorithm is still doing the same mathematical operation, but it is doing so in a way that respects the cost structure of the hardware. That is the key insight that made FlashAttention influential.
+
+# Tiling attention into query and key-value blocks
+
+FlashAttention works by dividing attention into tiles. In the paper’s notation, a query block $\mathbf{Q}_i \in \mathbb{R}^{B_r \times d}$ is paired with blocks of keys and values, $\mathbf{K}_j, \mathbf{V}_j \in \mathbb{R}^{B_c \times d}$. The full query sequence is split into $T_r = \lceil N/B_r \rceil$ query blocks, and the key and value sequences are split into $T_c = \lceil N/B_c \rceil$ blocks. A thread block, or CTA, can then work on one query tile at a time while streaming over the key and value tiles.
+
+This tiling is not just a convenience for implementation. It is the mechanism that makes the algorithm memory efficient. A query tile can stay on chip while the kernel iterates over all key-value tiles. At each step, it computes the score submatrix for the current tile pair, updates the running softmax state, and folds the corresponding value contribution into the output tile. Because only blocks are held at once, the algorithm avoids ever needing to keep the entire $\mathbf{S}$ or $\mathbf{P}$ matrix in HBM.
+
+The paper also uses this tiling structure to explain how the algorithm fits the GPU execution model. The forward pass is embarrassingly parallel across batch elements, attention heads, and query blocks. That means many CTAs can run independently, each producing a different output tile. Within each CTA, however, the work is organized as a loop over key and value blocks. That inner loop is where the core FlashAttention idea lives: stream, update, accumulate, and move on.
+
+# Online or local softmax with running maxima and normalization factors
+
+The most subtle part of FlashAttention is the softmax computation. If attention were computed on the full score matrix at once, a row-wise softmax would be straightforward. But when the row is split across blocks, the algorithm must preserve the exact global normalization while only seeing one block at a time. FlashAttention solves this with a local, or online, softmax that tracks a running row maximum and a running normalization factor.
+
+The paper’s algorithm maintains two row-wise quantities for each query tile: $m_i$, the running maximum, and $\ell_i$, the running sum of exponentials. When a new score block $\mathbf{S}_i^{(j)} = \mathbf{Q}_i \mathbf{K}_j^\top$ arrives, the algorithm first updates the row maximum by taking
+$m_i = \max(m_i^{\mathrm{old}}, \mathrm{rowmax}(\mathbf{S}_i^{(j)}))$.
+It then forms the shifted exponentials
+$\widetilde{\mathbf{P}}_i^{(j)} = \exp(\mathbf{S}_i^{(j)} - m_i)$
+and updates the normalization factor with
+$\ell_i = \exp(m_i^{\mathrm{old}} - m_i)\,\ell_i + \mathrm{rowsum}(\widetilde{\mathbf{P}}_i^{(j)})$.
+
+The intuition is that the softmax denominator changes whenever a new block reveals a larger score than any block seen before. Rather than recomputing everything from scratch, the algorithm rescales the old contribution by $\exp(m_i^{\mathrm{old}} - m_i)$ so that it stays consistent with the new maximum. This is what allows the blockwise computation to remain exact. The output is not an approximation formed from partial softmaxes; it is the same softmax you would get from the full matrix, assembled incrementally.
+
+This running-max formulation also explains why the algorithm is numerically stable. Subtracting the current maximum before exponentiation keeps the exponentials from blowing up, just as in the usual softmax implementation. The difference is that the maximum is now maintained across blocks, not over a fully materialized row. That is the key to making softmax compatible with tiling.
+
+# Why keeping intermediate softmax state on-chip improves both speed and accuracy
+
+FlashAttention’s softmax state is small compared with $\mathbf{S}$ or $\mathbf{P}$, so it is a good candidate to keep on chip. The paper’s algorithm stores the running output $\mathbf{O}_i$, the running maximum $m_i$, and the normalization factor $\ell_i$ on chip while it streams through the key and value blocks. This avoids the expensive global-memory round trips that would otherwise be needed if each intermediate step were written to HBM.
+
+The performance benefit is direct: HBM traffic is reduced because only the final output tile and a few small auxiliary values need to be written back. The paper frames this as the central reason FlashAttention is faster than standard attention. It is not that the GPU does less arithmetic. It is that the arithmetic is organized so the GPU does not waste time moving temporary matrices through memory.
+
+There is also an accuracy benefit. The paper reports that FlashAttention-2 and FlashAttention-3 in FP16 have lower numerical error than the standard implementation because intermediate results, such as the softmax rescaling, are kept in FP32. In other words, the on-chip recurrence is not just a performance trick; it is also a numerically careful way to perform the same computation. By maintaining the running normalization and rescaling partial outputs in a stable form, FlashAttention avoids some of the error that can accumulate when intermediate attention matrices are materialized and processed in a less controlled way.
+
+# How FlashAttention fuses score computation, softmax, and value aggregation
+
+The fusion in FlashAttention is easiest to understand by following one block of the algorithm from start to finish. For a fixed query tile $\mathbf{Q}_i$, the kernel loads a key tile $\mathbf{K}_j$, computes the score block $\mathbf{S}_i^{(j)} = \mathbf{Q}_i \mathbf{K}_j^\top$, updates the softmax state using the running maximum and normalization factor, and then uses the resulting block of exponentials to update the output tile through multiplication with $\mathbf{V}_j$. The paper’s pseudocode expresses this as an update of the form
+$\mathbf{O}_i = \mathrm{diag}(\exp(m_i^{\mathrm{old}} - m_i))^{-1} \mathbf{O}_i + \widetilde{\mathbf{P}}_i^{(j)} \mathbf{V}_j$,
+followed by a final division by $\ell_i$ at the end of the loop.
+
+What matters is that the score block never needs to become a standalone global-memory object. The softmax is computed immediately after the scores are formed, and the result is immediately consumed by the value aggregation. This is the essence of fusion. The attention kernel is no longer three separate stages connected by large temporary matrices; it is one streaming computation whose intermediate state stays local.
+
+This is also why FlashAttention can be described as a local version of the softmax reduction. The local softmax and the rescaling of the output blocks are what allow the blockwise computation to reconstruct the exact final output. The paper points readers to the earlier FlashAttention-2 derivation for the formal justification, but the intuition is already visible in the recurrence: every new tile is folded into the same running output, with the normalization adjusted so that nothing is lost.
+
+# What FlashAttention-2 changes: better work partitioning and sequence-length parallelism
+
+FlashAttention-2 keeps the same basic exact-attention goal, but it improves how work is distributed on the GPU. According to the paper, the key restructuring is to parallelize over the sequence-length dimension and to organize the forward pass so that the inner loop operates over blocks of the key and value matrices. This improves occupancy and balances the workload more effectively across the GPU.
+
+The practical motivation is that the original FlashAttention design, while already memory efficient, still left room for better use of the hardware. FlashAttention-2 addresses this by making the algorithm more parallel where possible and by ensuring that the blocks of work are arranged so the GPU can keep more execution resources busy. In the paper’s discussion, this is one of the reasons FlashAttention-2 is faster than the first FlashAttention on newer devices.
+
+At a conceptual level, FlashAttention-2 preserves the same blockwise recurrence that makes FlashAttention exact, but it organizes the computation so that more of the sequence can be covered concurrently. The paper describes this as an improvement in occupancy and distribution of work. In other words, FlashAttention-2 does not merely reduce memory traffic; it also tries to use the GPU’s execution capacity more evenly.
+
+# CTA-level execution in FlashAttention-2
+
+The natural unit of work in FlashAttention-2 is a CTA operating on a query tile. Since the forward pass is parallel across batches, heads, and query blocks, one CTA can be understood as responsible for producing one output tile $\mathbf{O}_i$ from one query tile $\mathbf{Q}_i$. Within that CTA, the key and value blocks are streamed one after another, and each block updates the same running softmax state.
+
+This CTA-level view is important because it shows how the algorithm maps onto the GPU’s thread hierarchy. The CTA is the level at which the tile is owned, the on-chip state is maintained, and the final output is assembled. The paper uses exactly this sort of tile-centric perspective when it later presents its more advanced algorithms, but the same mental model applies to FlashAttention-2 as well. For a student reading attention kernels in the literature, this is the right way to think about them: a CTA owns a query tile, loops over the key-value tiles, and accumulates a tile of the output.
+
+The appeal of this organization is that it matches the structure of attention itself. Each output row depends on all keys and values, but it does not depend on the full score matrix being present all at once. That makes the blockwise CTA loop a natural fit. FlashAttention-2 uses that fit to get better occupancy than the original FlashAttention design, while preserving exactness.
+
+# Why FlashAttention-2 still underutilizes Hopper hardware
+
+Even with these algorithmic improvements, the paper reports that FlashAttention-2 still falls short of what Hopper hardware can do. On the H100 GPU, FlashAttention-2 achieves only about $35\%$ utilization, while optimized GEMM kernels can reach roughly $80\%$ to $90\%$. That gap is the central motivation for the new work in the paper.
+
+The reason is not simply that FlashAttention-2 is a bad algorithm. The paper is explicit that the limitation is partly implementation-level and partly more fundamental. On the implementation side, the paper notes that some kernels do not use Hopper-specific instructions where they could, instead carrying over choices from earlier architectures. But more fundamentally, FlashAttention-2 still follows a simplified synchronous execution model. It does not explicitly take advantage of the asynchrony available in newer Hopper hardware, where data movement and matrix multiplication can be handled by specialized units with different execution characteristics.
+
+The paper also points out that Hopper introduces new hardware capabilities that are not fully exploited by FlashAttention-2, including asynchronous data movement and low-precision computation support. The important lesson is that an algorithm can be excellent in a platform-independent sense and still fail to saturate a specific GPU. FlashAttention-2 is a good example of this gap.
+
+# The difference between algorithmic efficiency and hardware-specific efficiency
+
+FlashAttention and FlashAttention-2 are highly algorithmically efficient because they reduce the amount of expensive memory traffic while preserving the exact attention computation. That is an enormous improvement over standard attention. But algorithmic efficiency is not the same thing as hardware-specific efficiency. An algorithm can do less unnecessary work and still leave performance on the table if it does not match the strengths of the target device.
+
+The paper’s Hopper discussion makes this distinction very clear. Hopper GPUs have specialized units for matrix multiplication and memory movement, and they are designed to hide latency through concurrency and asynchrony. An algorithm that is written as if all operations happen synchronously, one after another, will not necessarily keep those specialized units busy in the best possible way. That is why the paper can simultaneously say that FlashAttention-2 is much better than standard attention and still say that it underutilizes Hopper.
+
+This distinction is one of the most important lessons in modern systems-for-ML research. Algorithmic improvements matter, but they are only part of the story. To get the best results on a specific GPU, the algorithm must also be aligned with the hardware’s execution model. FlashAttention-2 moved attention far in that direction by making it IO-aware and by improving work partitioning. The paper argues that Hopper-specific asynchrony and low-precision support were the pieces still left on the table.

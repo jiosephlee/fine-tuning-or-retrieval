@@ -1,0 +1,183 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 10: Backward Pass Algorithms in FlashAttention-3
+
+This chapter explains how FlashAttention-3 (FA-3) computes the backward pass efficiently. We focus on the algorithmic structure, the numerical considerations for the row-wise softmax Jacobian, and how FA-3 reuses the forward execution model (warp-specialization, circular shared-memory buffers, asynchronous WGMMA/TMA) to avoid storing the full quadratic intermediates \(S\) and \(P\). Where appropriate we use the same tiling notation as in the forward algorithm: query blocks \(Q_i\) of size \(B_r\times d\) with \(T_r=\lceil N/B_r\rceil\) and key/value blocks \(K_j,V_j\) of size \(B_c\times d\) with \(T_c=\lceil N/B_c\rceil\). All math is written in LaTeX.
+
+# Gradients: dV = P^T dO, dP = dO V^T, dS = dsoftmax(dP), dQ = \alpha dS K, dK = \alpha dS^\top Q
+
+Start from the forward definitions used throughout the paper:
+\[
+S = \alpha\, Q K^\top,\qquad P=\mathrm{softmax}(S)\ (\text{row-wise}),\qquad O = P V,
+\]
+where \(Q,K,V\in\mathbb{R}^{N\times d}\), \(P,S\in\mathbb{R}^{N\times N}\), and \(\alpha\) is the usual scaling \(1/\sqrt{d}\). For a scalar loss \(\phi\) and the notation \(\mathbf{d}(\cdot)=\partial\phi/\partial(\cdot)\), the chain rule gives the following matrix-level backward relations that FA-3 must implement:
+
+- dV (gradient wrt values):
+  \[
+  \mathbf{dV} = \mathbf{P}^\top \mathbf{dO}\qquad(\text{shape }N\times d).
+  \]
+
+- dP (gradient wrt softmax outputs):
+  \[
+  \mathbf{dP} = \mathbf{dO}\,\mathbf{V}^\top\qquad(\text{shape }N\times N).
+  \]
+
+- dS (gradient wrt attention logits), obtained by applying the row-wise softmax Jacobian to \(\mathbf{dP}\):
+  \[
+  \mathbf{dS} = \mathrm{dsoftmax}(\mathbf{dP}).
+  \]
+
+- dQ and dK (gradients wrt queries and keys) are ordinary GEMMs:
+  \[
+  \mathbf{dQ} = \alpha\,\mathbf{dS}\,\mathbf{K},\qquad
+  \mathbf{dK} = \alpha\,\mathbf{dS}^\top \mathbf{Q}.
+  \]
+
+Each of these matrix equations translates to one or more block-wise GEMMs when executed with FA-3's tiling (e.g., computing \(\mathbf{dP}=\mathbf{dO}\,\mathbf{V}^\top\) is implemented as a sequence of small GEMMs between \(\mathbf{dO}_i\) and \(\mathbf{V}_j\) blocks). Notice that \(\mathbf{dS}\) is not a pure GEMM; it is formed by applying the softmax Jacobian row-wise (elementwise multiplies, row dot-products and broadcasts). The central challenge that FA-3 addresses is computing all of these quantities without materializing the full \(N\times N\) matrices \(S\) and \(P\) to global memory.
+
+# Row-wise softmax Jacobian and stability considerations in FP32
+
+The softmax Jacobian for a single row is the standard compact form. If for a row vector \(s\in\mathbb{R}^m\) we write \(p=\mathrm{softmax}(s)\) and an upstream gradient \(u\in\mathbb{R}^m\) (a row of \(\mathbf{dP}\)), then
+\[
+\mathrm{dsoftmax}(u) = J\,u,\qquad J=\mathrm{diag}(p)-p p^\top.
+\]
+A convenient and numerically stable way to evaluate this product is to compute the scalar
+\[
+\beta \;=\; p^\top u \quad(\text{a single dot-product per row}),
+\]
+and then
+\[
+\mathrm{dsoftmax}(u) \;=\; p \odot (u - \beta \mathbf{1}),
+\]
+where \(\odot\) is elementwise multiplication and \(\mathbf{1}\) is the all-ones vector. This formulation uses one dot-product and a vector-scale-and-subtract, which maps well to blockwise streaming implementations.
+
+Numerical stability: the forward pass already applies the standard row-max trick to compute \(p\) (compute \(m=\max s\), then \(\tilde p=\exp(s-m)\) and normalize by \(\sum \tilde p\)). FA-3 preserves the same stability conventions and — critically — performs the softmax exponentials, normalization and the dsoftmax computations in higher-precision accumulators (FP32) even when the matmuls run in lower precision (FP16 or FP8). Keeping softmax and the dsoftmax dot-products in FP32 avoids catastrophic cancellation and overflow/underflow that would otherwise arise if exponentials or the Jacobian operations were done in narrow types. This choice is an important reason FA-3 matches or improves numerical error versus earlier implementations.
+
+# Recomputation strategy to avoid storing S and P; streaming statistics reuse
+
+Storing the full \(S,P\in\mathbb{R}^{N\times N}\) is prohibitive for long sequences. FA-3 follows the same memory-efficient philosophy as FlashAttention: it recomputes small blocks of \(S\) and \(P\) on demand in the backward pass and never writes the full matrices to HBM. The key ingredients are (1) tiling in query and key dimensions, (2) saving compact streaming statistics during the forward pass that enable reconstruction of \(P\) blocks without running a numerically-sensitive multi-block reduction, and (3) a two‑phase backward sweep that computes quantities in a streaming fashion with a small number of temporaries.
+
+What FA-3 saves in forward: for each query block \(i\), the forward local-softmax procedure accumulates a per-row log-normalizer
+\[
+L_i = m_i + \log(\ell_i),
+\]
+where \(m_i\) is the running row-max and \(\ell_i\) the accumulated sum of exponentials relative to \(m_i\). FA-3 writes the block-wise \(L_i\) to HBM at the end of forward. These \(L_i\) are sufficient to reconstruct softmax probabilities for each block during backward: for any recomputed score block \(S_{ij}=\alpha Q_i K_j^\top\) we can form
+\[
+P_{ij} = \exp(S_{ij} - L_i),
+\]
+which yields correctly normalized entries (row-wise) because \(L_i\) is the log of the full row denominator used in the forward softmax.
+
+High-level backward recomputation procedure (block-wise, per query-block \(i\)):
+
+1. Initialize \(\mathbf{dP}_i \leftarrow 0\) (a \(B_r\times B_c\) or aggregated per-row structure depending on tiling), and initialize a per-row scalar accumulator \(\gamma_i\leftarrow 0\) that will hold \(p^\top \mathbf{dP}_i\) (the \(\beta\) above) as we build \(\mathbf{dP}_i\).
+
+2. For each key block \(j\):
+   - Load (via the producer/TMA) the key and value tiles \(K_j,V_j\) into SMEM.
+   - Recompute the score block
+     \[
+     S_{ij} = \alpha\,Q_i K_j^\top
+     \]
+     using an asynchronous WGMMA GEMM.
+   - Form the softmax block in FP32 using the saved \(L_i\):
+     \[
+     P_{ij} \;=\; \exp(S_{ij}-L_i).
+     \]
+   - Compute the two GEMMs that consume this block:
+     a) Accumulate partial \(\mathbf{dV}_j\) contribution:
+        \[
+        \Delta \mathbf{dV}_j \;=\; P_{ij}^\top \,\mathbf{dO}_i,
+        \]
+        and add it into a running \(\mathbf{dV}_j\).
+     b) Accumulate partial \(\mathbf{dP}_i\) contribution:
+        \[
+        \Delta \mathbf{dP}_i \;=\; \mathbf{dO}_i\,V_j^\top,
+        \]
+        and add into \(\mathbf{dP}_i\).
+   - While \(\Delta\mathbf{dP}_i\) is present, compute the per-row inner product contribution
+     \[
+     \gamma_i \;+=\; \mathrm{rowsum}(P_{ij}\odot \Delta\mathbf{dP}_i),
+     \]
+     accumulating the scalar \(p^\top \mathbf{dP}_i\) for every row in the query-block \(i\).
+
+3. After the loop over \(j\) completes, the block \(\mathbf{dP}_i\) is fully accumulated and the scalar vector \(\gamma_i\) equals \(p^\top \mathbf{dP}_i\) (row-wise). Compute the block-wise dsoftmax:
+   \[
+   \mathbf{dS}_i \;=\; P_i \odot (\mathbf{dP}_i - \gamma_i),
+   \]
+   where the operations are carried out row-wise in FP32.
+
+4. Finally, to obtain \(\mathbf{dQ}_i\) and the contributions to \(\mathbf{dK}_j\) for all \(j\), run a second pass over key blocks \(j\):
+   - For each \(j\), form GEMMs
+     \[
+     \Delta \mathbf{dQ}_i \;=\; \alpha\,\mathbf{dS}_i \,K_j,\qquad
+     \Delta \mathbf{dK}_j \;=\; \alpha\,\mathbf{dS}_i^\top Q_i,
+     \]
+     accumulating into \(\mathbf{dQ}_i\) and \(\mathbf{dK}_j\), respectively.
+
+This scheme requires two passes over the key/value blocks: the first pass recomputes \(S_{ij}\) and builds \(\mathbf{dV}\) and \(\mathbf{dP}\) while accumulating the scalar \(\gamma_i\); the second pass produces \(\mathbf{dQ}\) and \(\mathbf{dK}\) once \(\mathbf{dS}_i\) is known. Crucially, neither the full \(S\) nor the full \(P\) is ever written to global memory — only the compact per-query-block log-normalizers \(L_i\) are read from HBM and small temporary blocks are staged in SMEM or registers.
+
+# Adapting warp-specialization and ring buffers for backward
+
+FA-3 carries the forward execution model (producer/consumer warp-specialization and an \(s\)-stage circular SMEM buffer) over to backward. Conceptually the division of labor is the same: some warps (producer warpgroups) issue asynchronous TMA loads of \(Q_i\), \(K_j\), \(V_j\), and \(\mathbf{dO}_i\) into the shared SMEM circular buffer; other warps (consumer warpgroups) execute asynchronous WGMMA GEMMs and the non-GEMM softmax/dsoftmax logic. The ring buffer provides the same decoupling: while the consumer is finishing computations on stage \((j-1)\), the producer can already load stage \(j+s\).
+
+Two practical adaptations for backward are worth emphasizing.
+
+First, the consumer path now carries additional temporaries: besides \(\mathbf{O}_i\) and the running softmax statistics used in forward, the backward consumer must keep \(\mathbf{dP}_i\), the scalar per-row accumulators \(\gamma_i\), and partial accumulators for \(\mathbf{dV}_j\) and \(\mathbf{dK}_j\). FA-3 balances these extra live values between registers and SMEM with the same register reallocation trick (\verb|setmaxnreg|) used in forward: compute-heavy warps doing WGMMA get a larger register allocation, while the producer warps issuing TMAs are cheap in register use.
+
+Second, the backward pipeline naturally maps to a ping‑pong or multi-stage schedule across warpgroups. The first pass (recompute \(S\), evaluate \(P_{ij}\), accumulate \(\mathbf{dV}_j\) and \(\mathbf{dP}_i\)) contains both GEMM and non-GEMM (exponential) work. By splitting producer and consumer roles across warpgroups and inserting barriers analogously to the forward pingpong schedule, FA-3 can overlap the low-throughput exponential and dsoftmax operations of one warpgoup with WGMMA execution of another. The same caveats apply as in the forward case: the compiler may reorder instructions unless care is taken, and adding pipeline stages increases register pressure and constrains tile sizes. In practice FA-3 reuses the same circular-buffer synchronization and warpspecialization primitives so that the backward pass benefits from asynchronous TMA and WGMMA while preserving correctness.
+
+# GEMM count: 5 matmuls in backward vs 2 in forward; FLOPs factor (~2.5x of forward)
+
+Counting the large matrix products clarifies the compute cost of recomputation. A straightforward accounting (and the one used in FA-3's benchmarking) is:
+
+- Forward: two primary matmuls per full attention evaluation (per head):
+  1. \(QK^\top\) (to build scores \(S\)) and
+  2. \(P V\) (to build outputs \(O\)).
+  That is 2 GEMMs.
+
+- Backward (with recomputation, avoiding materializing \(S\) and \(P\)):
+  0. Recompute \(QK^\top\) blocks to obtain \(P\) on the fly (GEMM).
+  1. Compute \(\mathbf{dV} = P^\top \mathbf{dO}\) (GEMM).
+  2. Compute \(\mathbf{dP} = \mathbf{dO}\,V^\top\) (GEMM).
+  3. Compute \(\mathbf{dQ} = \alpha\,\mathbf{dS}\,K\) once \(\mathbf{dS}\) is formed (GEMM).
+  4. Compute \(\mathbf{dK} = \alpha\,\mathbf{dS}^\top Q\) (GEMM).
+
+That totals 5 matmuls. Hence the backward computational FLOPs are approximately \(5/2 = 2.5\) times the forward FLOPs. This is the same multiplier used in the paper when reporting backward FLOP counts and runtimes (the paper explicitly multiplies forward FLOPs by 2.5 to obtain backward FLOPs for benchmarking). The extra cost is the price of recomputation, paid in order to avoid writing or reading the quadratic \(S\) and \(P\) tensors from global memory.
+
+# Opportunities and constraints for GEMM–softmax overlap in backward
+
+FA-3 leverages hardware asynchrony (as in forward) to hide low-throughput softmax-like operations under Tensor Core GEMMs. However, the backward data dependencies place both opportunities and constraints on how much overlap is possible.
+
+Constraints coming from data dependencies:
+- For a fixed query block \(i\), the dsoftmax that produces \(\mathbf{dS}_i\) cannot be computed until \(\mathbf{dP}_i\) is fully accumulated across all key blocks \(j\). Thus the second-phase GEMMs that consume \(\mathbf{dS}_i\) (to form \(\mathbf{dQ}_i\) and per-key contributions to \(\mathbf{dK}_j\)) must be scheduled after the first phase completes for that query block.
+- The necessity to compute \(P_{ij}=\exp(S_{ij}-L_i)\) in FP32 (for accuracy) forces an exponential evaluation in the first phase that is expensive in throughput relative to WGMMA.
+
+Opportunities for overlap:
+- Cross-block pipelining (ping‑pong): while one warpgroup is finishing the expensive row-wise exponentials and accumulation for query block \(i\), another warpgroup can be performing the WGMMA calls to recompute \(S\) and/or do the GEMMs for a different query block \(i+1\). FA-3's warp-specialization and circular staging make this overlap practical. This is directly analogous to the forward pass overlap that hides exponentials under GEMMs.
+- Within a pass, the two GEMM-type operations associated with a given block (e.g., computing \(\Delta\mathbf{dP}_i\) and \(\Delta\mathbf{dV}_j\)) can be arranged so that one is issued as an asynchronous WGMMA and the softmax-related pointwise work (computing \(P_{ij}\) and partial inner products) is performed while the WGMMA is progressing on the next micro-task.
+- The second pass (forming \(\mathbf{dQ}_i\) and \(\mathbf{dK}_j\)) is purely GEMM-heavy: it can be overlapped with remaining non-GEMM reductions from earlier query blocks if the pipeline has multiple active blocks.
+
+Practical trade-offs: the more overlap you try to expose, the more live temporaries you must keep in registers or SMEM (e.g., saved \(\mathbf{S}_{\text{next}}\) or partial \(\mathbf{dP}\)), increasing register pressure and potentially causing spills that hurt performance. FA-3 therefore tunes depth of pipelining (2‑stage or 3‑stage variants) together with tile sizes to find the best trade-off for a given GPU (Hopper/H100 in the paper).
+
+# Masking and sequence tiling in backward
+
+Masked attention (for example causal masking) changes which \(S_{ij}\) and \(P_{ij}\) blocks were computed in the forward pass and therefore which blocks must be recomputed in backward. FA-3 follows the same tiling and loop boundaries in backward as were used in the forward kernel so that the backward recomputation reproduces exactly the same pattern of computed entries.
+
+Two practical points follow:
+
+1. Loop bounds per query block: for causal attention, a query block \(Q_i\) only attends to key blocks \(K_j\) with \(j\) up to some per-block limit (typically \(j\leq i\) when blocks align). FA-3 adapts the inner loop bounds so the backward first pass only recomputes \(S_{ij}\) and \(P_{ij}\) for those key blocks that were active in the forward pass. This reduces wasted computation and ensures the backward result matches the forward.
+
+2. Partial blocks and intra-block masking: when a block is partially outside the allowed triangular region (e.g., the block straddles the diagonal), FA-3 computes and applies the same per-entry mask during both recomputation and accumulation (treating masked logits as \(-\infty\) so their \(\exp\) yields zero probability). The ring buffer and TMA loading handle partial tiles by still copying the full tile to SMEM but only performing softmax/GEMM work on the active subset; the load-balancing considerations discussed for forward carry over: causal masking reduces arithmetic intensity and complicates warp load balancing, so FA-3 uses the same CTA partitioning and balancing heuristics from forward.
+
+In short, masking requires careful alignment between forward and backward tiling, but does not fundamentally change the recompute-and-stream strategy; it only restricts some loop bounds and requires attention to partial-block handling.
+
+# Practical summary and trade-offs
+
+- Memory versus compute: FA-3 avoids O(N^2) storage of \(S\) and \(P\) by recomputing score blocks on demand. The cost is an increase in computation in the backward pass (5 GEMMs vs 2 in forward, i.e., ~2.5× FLOPs). For long sequences the memory savings are essential and the compute cost is acceptable because GEMMs are highly optimized on GPU tensor cores.
+
+- Numerical stability: FA-3 intentionally keeps softmax exponentials, normalizations, and dsoftmax dot-products in FP32 regardless of lower-precision GEMMs (FP16/FP8). This yields accuracy comparable to or better than earlier FlashAttention variants, and is particularly important when block quantization and FP8 operand types are used in forward.
+
+- Execution model reuse: the same producer/consumer warp-specialization, circular shared-memory buffering, asynchronous TMA loads and asynchronous WGMMA execution that speed up the forward pass are reused and extended in the backward. This lets FA-3 hide non-GEMM softmax work under matrix-multiply activity via ping‑pong scheduling across warpgroups, at the cost of extra register pressure which must be tuned.
+
+- Implementation complexity: compared to a naive backward that materializes \(S\) and \(P\), FA-3's approach is more complex — it needs careful tiling, correct use of saved forward block statistics \(L_i\), two-phase passes over key/value blocks, and tuned pipelining to obtain the throughput benefits. The design choices and implementation details (register balancing, number of pipelining stages, how partial blocks are handled) are the source of the empirical gains reported in the paper.
+
+By streaming recomputed score blocks, reusing the compact forward log-normalizers, and mapping each algebraic gradient relation to the same asynchronous, warp-specialized execution model used in the forward pass, FlashAttention-3 computes the exact backward pass with minimal global-memory traffic while exploiting Hopper GPU asynchrony and tensor-core throughput.

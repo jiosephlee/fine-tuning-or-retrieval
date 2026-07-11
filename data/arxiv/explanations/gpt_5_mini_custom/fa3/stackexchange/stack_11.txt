@@ -1,0 +1,73 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### Block quantization math: how are per-block FP8 scales folded into the attention computation without extra FLOPs?
+Question:
+The FP8 path uses per-block scales for $\mathbf{Q}, \mathbf{K}, \mathbf{V}$ (block quantization). Suppose $\mathbf{Q}_b = s_Q^{(b)}\,\hat{\mathbf{Q}}_b$ and $\mathbf{K}_c = s_K^{(c)}\,\hat{\mathbf{K}}_c$ for blocks $b,c$, with hats denoting FP8-quantized integers. Then a score block is $\mathbf{S}_{bc} = \alpha\, s_Q^{(b)} s_K^{(c)}\, \hat{\mathbf{Q}}_b \hat{\mathbf{K}}_c^\top$. How are these scales incorporated into: (1) the stable-softmax running $m_i,\ell_i$ updates, and (2) the $\mathbf{O}$ accumulation with $\mathbf{V}$ (which itself has per-block scale $s_V^{(c)}$), without adding extra GEMMs or elementwise passes? A small worked example over two K/V blocks would be great.
+Answer:
+Short answer: the per-block FP8 scales are multiplied into the operands (or into the FP32 interpretation of the FP8 operands) so that every GEMM/WGMMA produces already-scaled score and contribution blocks. Once the blockwise scale is folded into the GEMM inputs, the running stable-softmax quantities $m_i$ and $\ell_i$ and the accumulation of $O$ are updated exactly as in the usual FlashAttention local-softmax algorithm — no extra GEMMs or full-array elementwise passes are needed because the only extra arithmetic is a small number of scalar multiplies (one per block or one per row of the block) done in registers.
+
+Why this is possible (intuitive + algebra). Write the FP8-block decompositions
+$Q_b = s_Q^{(b)} \cdot \hat Q_b$, $K_c = s_K^{(c)} \cdot \hat K_c$, $V_c = s_V^{(c)} \cdot \hat V_c$,
+and let $\alpha$ be the usual attention scale. The (row-block, col-block) score block computed in exact arithmetic is
+
+$S_{bc} = \alpha \cdot Q_b K_c^T = \alpha \cdot s_Q^{(b)} s_K^{(c)} \cdot ( \hat Q_b \hat K_c^T )$.
+
+Define the single scalar per-score-block
+$\gamma_{bc} := \alpha \cdot s_Q^{(b)} s_K^{(c)}$.
+Then the score block is $S_{bc} = \gamma_{bc} \cdot \hat S_{bc}$ where $\hat S_{bc} := \hat Q_b \hat K_c^T$ (the integer/FP8-GEMM result before accounting for scales).
+
+The key implementation point in FlashAttention-3 is to fold $s_Q^{(b)}$ and $s_K^{(c)}$ into the GEMM pipeline so that the hardware’s GEMM/dequantization step produces $\gamma_{bc} \cdot \hat S_{bc}$ directly (or produces $\hat S_{bc}$ and then immediately multiplies the small block by $\gamma_{bc}$ in registers as part of the same producer/consumer microkernel). Concretely, on Hopper you can arrange for the FP8→FP32 operand interpretation or the post-GEMM accumulation layout to apply the scalar factor per block; therefore WGMMA produces $S_{bc}$ already scaled by $\gamma_{bc}$, without issuing a separate GEMM or a large elementwise pass over the block in global memory.
+
+How the folded scale is used in the stable softmax running updates. FlashAttention’s fused (local) softmax maintains for each query row a running maximum $m_i$ and running normalizer $\ell_i$ (accumulated row-sum of exponentials in the numerically-stable formulation). Suppose we process two key/value blocks $c=1$ and $c=2$ for a fixed query block $b$ (query-block index suppressed). Let the two score blocks coming out of the GEMM be
+
+$S^{(1)} = \gamma^{(1)} \cdot \hat S^{(1)}$,    $S^{(2)} = \gamma^{(2)} \cdot \hat S^{(2)}$.
+
+The stable-softmax update for processing block $j$ (general block) is
+
+$m_{\text{new}} = \max(m_{\text{old}}, \operatorname{rowmax}(S^{(j)}))$,
+$\tilde P^{(j)} = \exp(S^{(j)} - m_{\text{new}})$,
+$\ell_{\text{new}} = \exp(m_{\text{old}} - m_{\text{new}}) \cdot \ell_{\text{old}} + \operatorname{rowsum}(\tilde P^{(j)})$.
+
+Because $S^{(j)}$ already equals $\gamma^{(j)}\cdot\hat S^{(j)}$, the code just computes $\operatorname{rowmax}(S^{(j)})$ etc. directly on the small block that sits in registers/SMEM. There is no need for extra GEMMs: the scalar $\gamma^{(j)}$ was applied before or during the GEMM result write, so the max and exp see the correct scaled values and the running $m, \ell$ math is identical to the FP16 path. The only extra arithmetic is computing $\gamma^{(j)}$ (a product of three scalars $\alpha, s_Q^{(b)}, s_K^{(c)}$) and using it to interpret the GEMM outputs; computing or loading $\gamma^{(j)}$ is $O(1)$ per block and done in registers.
+
+How the folded scales are used in $O$ accumulation with $V$ having its own scale. The output accumulation for block $j$ in the standard local-softmax algorithm is
+
+$O \leftarrow (\text{rescale previous } O) + P^{(j)} V^{(j)}$.
+
+With the block scales, $P^{(j)} =$ softmax rows of $S^{(j)} = \text{softmax}(\gamma^{(j)}\cdot\hat S^{(j)})$, while $V^{(j)} = s_V^{(j)} \cdot \hat V^{(j)}$. So the contribution to $O$ from block $j$ is
+
+$\Delta O^{(j)} = P^{(j)} V^{(j)} = s_V^{(j)} \cdot ( P^{(j)} \cdot \hat V^{(j)} )$.
+
+Again we can fold $s_V^{(j)}$ into the GEMM that computes $P^{(j)}\cdot\hat V^{(j)}$ by applying $s_V^{(j)}$ at the time the $\hat V^{(j)}$ tile is dequantized into FP32 (or by multiplying the small RS-GEMM accumulator by $s_V^{(j)}$ before writing back). The RS-GEMM therefore produces $\Delta O^{(j)}$ already scaled by $s_V^{(j)}$; no extra full-array elementwise multiply is needed. The only extra arithmetic is the scalar multiply by $s_V^{(j)}$ done on the RS-GEMM accumulator (again $O(1)$ per block, done in registers).
+
+Worked numeric-style example with two K/V blocks (concise). Fix a single query row (so row indices simplify). Let $\alpha = 1$ for clarity. Query block $b$ produces $s_Q^{(b)} = 0.1$, key/value blocks $c=1,2$ have $s_K^{(1)}=2.0$, $s_V^{(1)}=0.5$ and $s_K^{(2)}=0.25$, $s_V^{(2)}=4.0$. The scalar score-factors are
+
+$\gamma^{(1)} = \alpha\cdot 0.1\cdot 2.0 = 0.2$,    $\gamma^{(2)} = \alpha\cdot 0.1\cdot 0.25 = 0.025$.
+
+Suppose the integer-GEMM outputs (the dequantized-by-hardware $\hat S$ blocks) are
+
+$\hat S^{(1)} = [10, 2]$,    $\hat S^{(2)} = [6, 8]$
+
+(2 columns = two keys in each block for this toy row). The GEMM that is set up to fold scales returns
+
+$S^{(1)} = \gamma^{(1)}\cdot\hat S^{(1)} = 0.2\cdot[10,2] = [2.0, 0.4]$,
+$S^{(2)} = \gamma^{(2)}\cdot\hat S^{(2)} = 0.025\cdot[6,8] = [0.15, 0.20]$.
+
+Process block 1 first with initial $m_{\text{old}} = -\infty$, $\ell_{\text{old}} = 0$:
+
+$m_1 = \max(-\infty, \operatorname{rowmax}(S^{(1)})) = 2.0$.
+$\tilde P^{(1)} = \exp(S^{(1)} - m_1) = \exp([0, -1.6]) = [1, e^{-1.6}]$.
+$\ell_1 = 0 + (1 + e^{-1.6})$.
+
+When accumulating $O$, the RS-GEMM for block 1 uses the already-folded V scale $s_V^{(1)}$: if $\hat V^{(1)}$ tile is (small) $[v_1, v_2]$, the RS-GEMM returns $\Delta O^{(1)} = P^{(1)}\cdot(s_V^{(1)}\cdot\hat V^{(1)})$ directly ($s_V^{(1)}$ was folded into V dequantization/GEMM). No extra elementwise multiply over the whole block is necessary.
+
+Now process block 2:
+
+$m_2 = \max(m_1, \operatorname{rowmax}(S^{(2)})) = \max(2.0, 0.20) = 2.0$ (no change).
+$\tilde P^{(2)} = \exp(S^{(2)} - m_2) = \exp([0.15-2.0, 0.20-2.0]) = \exp([-1.85, -1.8])$.
+$\ell_2 = \exp(m_1 - m_2)\cdot \ell_1 + \operatorname{rowsum}(\tilde P^{(2)})$. Since $m_1==m_2$ here, $\exp(0)\cdot \ell_1 = \ell_1$.
+Finally, RS-GEMM for block 2 provides $\Delta O^{(2)} = P^{(2)}\cdot(s_V^{(2)}\cdot\hat V^{(2)})$ already scaled by $s_V^{(2)}$.
+
+All scalar multiplications by $\gamma^{(j)}$ or $s_V^{(j)}$ are either (a) applied as part of FP8→FP32 operand interpretation before GEMM or (b) applied to the small per-block accumulators in registers immediately after GEMM. There is no need for extra global GEMMs or full-block elementwise passes.
+
+In short: multiply the three per-block scalars into the GEMM/dequantization pipeline so the GEMM outputs are already in the correct scaled FP32 domain. Then the stable-softmax $m_i, \ell_i$ updates and the RS-GEMM accumulation of $O$ proceed unchanged and entirely locally (in registers/SMEM), so you get correct scaled attention with only $O(1)$ extra scalar operations per block (in registers) and without extra GEMMs or large elementwise passes. This is exactly the “scale each block of $S$ to account for block quantization at no computation cost” idea described in the paper.

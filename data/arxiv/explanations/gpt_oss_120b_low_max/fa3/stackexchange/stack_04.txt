@@ -1,0 +1,63 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### How is block quantization performed for FP8 attention without increasing memory bandwidth?
+Question:
+The authors claim that block quantization (one scale per tile) can be fused with rotary embedding at no extra cost. I don't understand how the scaling factor is applied to each block: do they quantize \(Q,K,V\) on‑the‑fly during TMA loads, or pre‑scale the tensors in global memory? If scaling is done on‑the‑fly, how is per‑block max/min computed without extra passes over the data?
+Answer:
+The short answer is that **the per‑tile scale is not recomputed inside the attention kernel; it is produced once (outside the kernel) and then applied “for free” while the tiles are being brought from global memory into shared memory.**  
+Because FlashAttention‑3 already works on the same tile granularity that the quantiser uses (a $B_r\times d$ query tile or a $B_c\times d$ key/value tile), the scale can be attached to each tile and consumed by the TMA load without any additional bandwidth or a separate reduction pass.
+
+### Where does the scale come from?
+
+Block quantisation is performed **prior to the attention kernel** (the paper calls this “fused with rotary embedding”).  
+The pipeline is:
+
+1. **Pre‑processing kernel** – before we launch FlashAttention‑3 we run a very cheap kernel that walks over the $Q,K,V$ tensors once, computes the maximum absolute value of each tile (or an equivalent “range” statistic), and stores a single 8‑bit‑or‑32‑bit scale factor together with each tile.  
+   - The work is linear in the number of elements and hidden‑layer memory traffic already dominates any realistic model, so this pre‑pass adds essentially no extra cost.  
+   - The scale vector lives in global memory next to the original tensor (e.g. interleaved or in a separate buffer); its size is negligible (one float per $B_r$ or $B_c$ rows).
+
+2. **Fusion with rotary embedding** – if rotary positional embeddings are applied, they are performed inside exactly the same kernel that writes out the scales.  Because rotary embedding is also memory‑bandwidth bound, stitching the two operations together does not increase the amount of data moved.
+
+Thus when attention starts, every tile already carries its own scale.
+
+### How is the scale applied without extra memory traffic?
+
+FlashAttention‑3 uses Hopper’s **Tensor Memory Accelerator (TMA)** to stream tiles from HBM directly into shared memory.  The TMA instruction can be programmed to perform a *user‑defined elementwise operation* on each loaded element before it lands in SMEM.  The authors exploit this capability as follows:
+
+* The TMA descriptor for a given tile contains a pointer to the per‑tile scale that was stored in step 1.  
+* While loading a $B_r\times d$ query tile, each FP32 element $x$ is multiplied by $\frac{1}{s_{\text{tile}}}$ and then cast to FP8 (e4m3).  This “scale‑and‑cast” happens inside the TMA data path, which means **the element never has to be written back to global memory at full precision**—the only data that crosses the HBM‑SMEM boundary are already quantised FP8 values plus one scalar for the next tile.
+
+Because the scaling is performed inside TMA, **no additional global‑memory reads or writes are incurred**: we still read exactly one tile’s worth of raw data and we still write exactly one tile’s worth of quantised data into shared memory.  The scalar itself resides in a register or shared‑memory cache that is fetched once per tile, which is negligible compared with the $B_r d$ elements transferred.
+
+### What about computing the per‑tile max/min on‑the‑fly?
+
+The paper emphasises that *“the quantisation can be fused with an operation right before attention … with no additional slowdown”*.  This means that during step 1 (the pre‑processing pass) we already have all the information needed to compute each block’s max/min; there is **no need to scan a block again inside the attention kernel**.  The pre‑processing pass uses a simple parallel reduction over each tile:
+
+```cuda
+// Pseudo code for one tile
+float maxabs = 0;
+for (int i = threadIdx.x; i < B*D; i += blockDim.x)
+    maxabs = max(maxabs, fabs(src[i]));
+// warp‐level reduction → one value per tile
+scale[tile_id] = maxabs / fp8_max_value;
+```
+
+Because this reduction runs on‐chip and writes only one scalar per tile, its cost is hidden by the much larger cost of moving the full tensor from DRAM to SMEM later on.
+
+### Putting it together
+
+When FlashAttention‑3 processes a query block:
+
+1. The consumer warpgroup issues a **TMA load** for $\mathbf{Q}_i$.  
+2. The TMA engine reads $\mathbf{Q}_i$’s raw FP32 values from HBM, multiplies each by $1/s_i$ (the per‑tile scale fetched from a tiny side buffer), and casts directly to FP8 while depositing into shared memory.  
+3. The same happens for $\mathbf{K}_j$ and $\mathbf{V}_j$.  
+
+All subsequent GEMMs operate on these FP8 tiles; their results are accumulated in FP32 as required by WGMMA, and because every tile has already been scaled consistently, no extra rescaling step is needed downstream.
+
+### Why this does not increase bandwidth
+
+* **Data volume unchanged** – we still stream exactly one FP32 element per entry from HBM; conversion to FP8 happens after it leaves HBM, not before.
+* **Scalar overhead negligible** – one float per tile adds at most a few kilobytes even for very long sequences.
+* **No extra passes** – the max/min reduction was performed once before attention launch; inside the kernel we never revisit a tile just to compute its statistics.
+
+Consequently, block quantisation incurs essentially zero additional memory traffic while providing a much tighter dynamic range than per‑tensor scaling, which explains why FlashAttention‑3 can keep its bandwidth bound even after moving to FP8 precision.

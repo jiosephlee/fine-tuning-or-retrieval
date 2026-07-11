@@ -1,0 +1,223 @@
+\title{Blogs about the Paper: "Group Sequence Policy Optimization"}
+
+# Simplifying RL Infrastructure: Using Inference Engine Likelihoods Directly with GSPO
+
+Reinforcement learning from human feedback (RLHF) has become the workhorse behind today’s most capable language models. Yet, when we move from research prototypes to production‑scale pipelines, the *engineering* side often becomes the bottleneck. A recurring pain point is the need to **re‑compute old‑policy likelihoods** on the training hardware before each policy update—especially in token‑level algorithms such as PPO or GRPO.  
+
+The recent **Group Sequence Policy Optimization (GSPO)** algorithm changes that picture dramatically. Because it operates on **sequence‑level importance ratios**, GSPO tolerates the inevitable precision mismatch between inference‑time engines (e.g., vLLM or SGLang) and training‑time engines (e.g., Megatron). This opens the door to a much leaner RL pipeline that can use the likelihoods produced by the inference engine *as‑is*.  
+
+In this post we walk through why old‑policy recomputation is costly, how GSPO’s sequence‑level formulation sidesteps it, and what concrete engineering gains you can expect when you adopt GSPO in your own RLHF stack.
+
+---
+
+## 1️⃣ Why Do Traditional RL Algorithms Need Old‑Policy Likelihoods?
+
+Most classic policy‑gradient methods—PPO, GRPO—work with **token‑wise importance weights**:
+
+\[
+w_{i,t}(\theta)=\frac{\pi_{\theta}\!\big(y_{i,t}\mid x,y_{i,<t}\big)}{\pi_{\theta_{\text{old}}}\!\big(y_{i,t}\mid x,y_{i,<t}\big)}.
+\]
+
+During a policy update we must evaluate both \(\pi_{\theta}\) *and* \(\pi_{\theta_{\text{old}}}\) at every token \(t\). The usual workflow looks like this:
+
+1. **Rollout generation** – a cheap inference cluster samples several responses \(\{y_i\}_{i=1}^G\) using \(\pi_{\theta_{\text{old}}}\).
+2. **Log‑probability recomputation** – before we can compute \(w_{i,t}(\theta)\), we feed the same token sequences back through the *training* model (often in FP32 or higher precision) to obtain \(\log\!\pi_{\theta_{\text{old}}}(y_{i,t}|x,y_{i,<t})\).
+3. **Policy update** – compute the clipped objective and back‑propagate.
+
+Step 2 is expensive for three reasons:
+
+* **Extra forward passes** every iteration effectively double the compute budget.
+* **Memory & bandwidth pressure** – we must store or stream full token logits for each rollout.
+* **Precision mismatches** – training engines typically run at higher numerical precision than inference engines, so even tiny differences in logits can explode when multiplied across thousands of tokens, leading to noisy importance weights.
+
+These challenges become especially acute when scaling up:
+- With Mixture‑of‑Experts (MoE) models we have to also keep track of expert routing decisions.
+- For long generations (code or math solutions) the token count grows into the tens of thousands.
+- Distributed training systems often separate generation workers from gradient workers, adding network I/O overhead for re‑computations.
+
+---
+
+## 2️⃣ Sequence-Level Importance Ratios: The Core Idea Behind GSPO
+
+GSPO replaces token‑wise ratios with a **single importance ratio per generated response**:
+
+\[
+s_i(\theta)=
+\left(
+\frac{\pi_{\theta}(y_i \mid x)}{\pi_{\theta_{\text{old}}}(y_i \mid x)}
+\right)^{\!\frac{1}{|y_i|}}
+=
+\exp\!\Bigg(
+\frac{1}{|y_i|}
+\sum_{t=1}^{|y_i|}
+\log
+\frac{\pi_{\theta}\!\big(y_{i,t}\mid x,y_{i,<t}\big)}
+     {\pi_{\theta_{\text{old}}}\!\big(y_{i,t}\mid x,y_{i,<t}\big)}
+\Bigg).
+\]
+
+A few points are worth emphasizing:
+
+* **Alignment with rewards** – Rewards \(r(x,y)\) are assigned **to whole sequences**, so correcting at the sequence level respects the unit of optimization.
+* **Length normalization** (\(^{1/|y_i|}\)) keeps \(s_i(\theta)\) in a comparable range across responses of different lengths, making clipping thresholds much easier to set.
+* The entire *group* objective becomes
+
+  \[
+  \mathcal{J}_{\text{GSPO}}(\theta)=
+  \mathbb{E}_{x,\{y_i\}}
+  \Bigg[
+    \frac{1}{G}
+    \sum_{i=1}^{G}
+    \min\!\Big(
+      s_i(\theta)\widehat{A}_i,\,
+      \operatorname{clip}(s_i(\theta),\,1-\varepsilon,\!1+\varepsilon)\widehat{A}_i
+    \Big)
+  \Bigg],
+  \]
+  
+  where \(\widehat{A}_i\) is the normalized advantage computed from group rewards—exactly as in GRPO but without a value model.
+
+Because only **one scalar** per response is needed (`logprob_sum / length`), we no longer have to keep per-token logits around once generation finishes.
+
+---
+
+## 3️⃣ Tolerating Precision Differences Between Engines
+
+Inference deployments often trade raw precision for throughput:
+- FP16/BF16 kernels on GPUs,
+- TensorRT or custom kernels on CPUs,
+- Quantized kernels (INT8) for massive serving clusters.
+
+When you recompute old‐policy logits on a separate training engine you introduce two sources of mismatch:
+1. **Rounding error accumulation** – each token’s probability may differ by a few ULPs; multiplied across thousands of tokens this yields large discrepancies in the product.
+2. **Different softmax implementations** – subtle differences in numerical stability tricks lead to distinct per-token scores even if underlying weights are identical.
+
+In practice these mismatches make \(w_{i,t}(\theta)\) noisy enough to destabilize training—a phenomenon described in Section 3 of the GSPO paper (“high variance noise” that “precipitates model collapse”).
+
+By contrast, GSPO’s \(s_i(\theta)\) aggregates *log‐probabilities* across tokens before any division occurs:
+
+\[
+\log s_i(\theta)=
+\frac{1}{|y_i|}
+\sum_{t=1}^{|y_i|}
+\bigl(
+  \log\pi_\theta(y_{i,t}|x,y_{i,<t})
+ - 
+  \log\pi_{\theta_{\text{old}}}(y_{i,t}|x,y_{i,<t})
+\bigr).
+\]
+
+A small per-token error translates into an additive constant inside a sum rather than a multiplicative factor. The averaging over thousands of tokens *smoothes out* those discrepancies. Empirically (see Figure 4 in the paper), clipping fractions are two orders of magnitude lower for GSPO than GRPO while still achieving higher sample efficiency—evidence that sequence‐level ratios are far less sensitive to precision drift.
+
+---
+
+## 4️⃣ How to Plug In Inference Engine Likelihoods Directly
+
+### 4.1 What Needs to Be Logged?
+
+When generating rollouts on your inference cluster you already obtain:
+- The sampled text \(y_i\),
+- The per‑token log probabilities from the model’s output distribution (`logits → log_softmax`).
+
+All you need to persist is **the sum of those log probabilities**, i.e.:
+
+```python
+logp_sum = torch.sum(log_probs)   # log_probs[t] = log πθold(y_t | x, y_<t)
+seq_len   = y_i.size(0)
+```
+
+Store `logp_sum` and `seq_len` alongside each `(x, y)` pair in your dataset (or write them into a cheap KV store). No additional forward pass is required after generation completes.
+
+### 4.2 Computing \(s_i(\theta)\) During Training
+
+During a gradient step you have access to:
+- The current policy \(\pi_\theta\), which you evaluate *once* on each response `y` to obtain `new_logp_sum`.
+- The stored `old_logp_sum`.
+
+Then:
+
+```python
+# Length normalization
+old_avg_logp = old_logp_sum / seq_len
+new_avg_logp = new_logp_sum / seq_len
+
+s_i = torch.exp(new_avg_logp - old_avg_logp)
+```
+
+Feed this scalar `s_i` into the clipped objective together with the group advantage `̂A_i`. That’s it—no per-token loops, no extra memory copies.
+
+### 4.3 Optional Token-Level Variant
+
+If you need finer granularity—for example multi‑turn dialogues where intermediate rewards matter—GSPO also offers a “GSPO‑token” variant that keeps per-token advantages while still using the same sequence‐level importance factor `s_i`. Implementation wise it means attaching `̂A_{i,t}` computed from turn‑specific rewards but still reusing `s_i` as shown in Equation (9) of the paper. This preserves all infrastructure benefits while enabling richer reward shaping.
+
+---
+
+## 5️⃣ Tangible Engineering Benefits
+
+| Aspect | Traditional Token‑Level RL (PPO/GRPO) | GSVO Sequence‑Level RL |
+|--------|---------------------------------------|------------------------|
+| **Forward passes per iteration** | Two (old + new policy per token) | One (new policy only) |
+| **Memory footprint** | Store logits for every token × rollout | Store one scalar (`logp_sum`) per rollout |
+| **Network traffic** | Transfer full token logits if generation & training are decoupled | Transfer only aggregated scalar + length |
+| **Precision sensitivity** | High – small FP16 errors amplify over long sequences | Low – errors averaged out |
+| **MoE routing handling** | Requires *Routing Replay* or extra bookkeeping | No extra routing logic needed |
+| **Latency in large clusters** | Dominated by recompute step | Generation → immediate ingestion → update |
+
+### 5.1 Cost Savings
+
+Running an extra forward pass on a GPU cluster can easily increase compute cost by ~30–40 % for typical batch sizes used in RLHF (~32 k tokens per GPU). Eliminating this step translates directly into lower GPU hours and lower electricity bills—critical when scaling up to hundreds of billions of parameters.
+
+### 5.2 Simplified System Architecture
+
+With GSPO we can truly decouple **generation workers** from **training workers**:
+- Generation workers run optimized inference stacks (vLLM/SGLang), possibly on cheaper hardware or even CPU clusters.
+- They export `(query, response, logp_sum, length)` records.
+- Training workers consume those records without ever touching an inference engine again.
+  
+No cross‑process “replay” buffers are needed; no synchronized checkpoints of routing states for MoE layers are required; no special care about whether GPUs run FP32 or BF16 during recomputation—the data already exists where it was produced.
+
+### 5.3 Multi-Turn & Partial Rollout Scenarios
+
+Partial rollouts (e.g., generating only a prefix before receiving an external signal) become easier because you already have intermediate `logp_sum`s recorded at each turn. When you later decide how many additional tokens to generate under a new policy you simply re-use those values without re-running previous steps under high precision—something that would otherwise necessitate an additional “replay” phase.
+
+---
+
+## 6️⃣ Real‑World Validation: Qwen3 Experiments
+
+The authors benchmarked GSPO on Qwen3-30B models—a Mixture-of‑Experts architecture—and observed:
+
+- Stable training curves without any “Routing Replay” tricks that were mandatory for GRPO.
+- Higher final reward scores despite clipping up to two orders of magnitude more tokens—a testament that sequence-level clipping does not sacrifice sample efficiency.
+- Ability to continuously improve performance by extending generation lengths and feeding more queries—exactly what modern RLHF pipelines aim for.
+
+These results confirm that the theoretical robustness of sequence-level importance weights materializes into tangible engineering robustness at scale.
+
+---
+
+## 7️⃣ Getting Started with GSPO
+
+If you’re already running a PPO/GRPO pipeline, transitioning involves modest changes:
+
+1. **Modify rollout logger:** Capture cumulative log probability (`logp_sum`) and length while generating responses.
+2. **Replace old weight computation:** Drop per-token ratios `w_{i,t}` and implement Eq (5)/(6)’s `s_i(θ)` using stored sums.
+3. **Tweak clipping ranges:** Because `s_i` lives near 1 after length normalization, typical clipping intervals are `[1−3e−4,\;1+4e−4]` rather than `[0.73,\;1.27]` used by GRPO.
+4. **(Optional)** adopt `GSPO-token` if you need token-wise advantages but still want sequence-level importance scaling.
+5. **Test on a small subset:** Verify that loss curves match expectations before scaling out to massive MoE clusters.
+
+The code changes are minimal compared with rewriting major parts of your RL infrastructure—yet they unlock dramatic savings in compute and simplify your deployment topology substantially.
+
+---
+
+## 8️⃣ Takeaway
+
+GSPO rewrites one core equation in RLHF—from a noisy product over thousands of tokens to an elegant average over sequence likelihoods—and that rewrite ripples through every layer of your system:
+
+- Fewer forward passes → lower compute cost,
+- Less data movement → faster pipelines,
+- Tolerance to FP16/BF16 quirks → robust mixed‑precision deployments,
+- No special MoE routing tricks → cleaner codebase,
+- And ultimately more stable learning dynamics at scale.
+
+If your team is grappling with “old policy recompute” bottlenecks or trying to squeeze extra performance out of massive MoE models, give sequence-level likelihoods a try. By letting your inference engine speak directly to your optimizer through simple scalars instead of massive tensors, you’ll discover a leaner path toward ever more capable language models—just as Qwen3 did with GSPO. 
+
+Happy scaling!

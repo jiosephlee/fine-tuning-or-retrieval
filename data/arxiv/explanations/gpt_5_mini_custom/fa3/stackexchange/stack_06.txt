@@ -1,0 +1,39 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### In Algorithm 2, which operations are actually overlapped—does exp run while Tensor Cores execute WGMMA?
+Question:
+In the 2-stage pipeline (Algorithm 2), the authors say the second WGMMA of iteration $j$ overlaps with softmax from iteration $j+1$. In concrete terms, which specific instructions overlap on Hopper: do the MFU exponentials and FP32 FMAs for softmax and rescaling execute concurrently with the Tensor Cores running wgmma.mma_async? A brief timeline for iterations $j$ and $j+1$ showing when waits happen for $\mathbf{Q}_i\mathbf{K}_j^\top$ vs. $\widetilde{\mathbf{P}}_{\text{cur}}\mathbf{V}_{j-1}$ and when softmax starts would help me reconcile the pseudocode with hardware reality.
+Answer:
+Short answer: yes — exponentials and FP32 multiply-adds that implement softmax/rescale run on the MFU/CUDA cores while the Tensor Cores are executing asynchronous WGMMA, and the code explicitly issues WGMMA instructions with "commit but do not wait" so the second WGMMA of iteration $j$ (the RS-GEMM that multiplies the already-computed $\widetilde{P}_{cur}$ by $V_{j-1}$) is overlapped with the softmax work that follows from the next iteration's QK WGMMA. The software enforces correctness by explicit waits only when results are actually needed.
+
+Explanation with a concise timeline (iterations $j$ and $j+1$)
+
+Think of each iteration producing two GEMMs (labels follow the paper): $\mathrm{GEMM0}_j = Q_i K_j^T$ (the "first" WGMMA for block $j$) and $\mathrm{GEMM1}_j = \widetilde{P}_{cur} V_{j-1}$ (the "second" WGMMA that consumes the softmax result from the previous $S$). The 2-stage pipeline rearranges issue/wait so these overlap.
+
+A compact timeline for iteration $j$ and the immediately following iteration $j+1$ (events in roughly issue order):
+
+1. Wait for $K_j$ in SMEM (so $\mathrm{GEMM0}_j$ can be issued).
+2. Issue $\mathrm{GEMM0}_j = Q_i K_j^T$ as a WGMMA (the code "Commit but do not wait"). This launches an asynchronous Tensor‑Core matmul; it will complete later without stalling the threadgroup immediately.
+3. Ensure $V_{j-1}$ is in SMEM.
+4. Issue $\mathrm{GEMM1}_j = \widetilde{P}_{cur} V_{j-1}$ as a WGMMA (also "Commit but do not wait"). This is the second Tensor‑Core matmul for iteration $j$; it is launched while $\mathrm{GEMM0}_j$ may still be in flight.
+5. Now the code explicitly waits for $\mathrm{GEMM0}_j$ to complete (the WGMMA that computes $S_{next}$). Once that wait returns, the $S_{next}$ tile (the QK result for block $j$) is available in registers/SMEM.
+6. Immediately compute softmax on $S_{next}$: compute rowmax, exponentials, row sums and update accumulator $\ell_i$ and $m_i$. These exponential/sum/rescale steps are implemented on the MFU/CUDA cores (exponentials on the MFU/special-function unit, FP32 FMAs/accumulates on CUDA cores) and are executed now while $\mathrm{GEMM1}_j$ (the second WGMMA) is still progressing on the Tensor Cores if it has not yet finished.
+7. After softmax finishes, the code waits for $\mathrm{GEMM1}_j$ to finish (because $\mathbf{O}_i$ must be updated with its result), then performs any rescale updates that depend on the finished $\mathrm{GEMM1}_j$.
+8. Copy $S_{next} \to S_{cur}$ and proceed: in the next loop iteration $j+1$ the pattern repeats ($\mathrm{GEMM0}_{j+1}$ is issued, $\mathrm{GEMM1}_{j+1}$ issued, then wait for $\mathrm{GEMM0}_{j+1}$ and do softmax on it, etc.).
+
+Key points and why the overlap is legal and effective
+
+- WGMMA on Hopper is asynchronous and can be launched without stalling the issuing warpgroup; results are later synchronized with an explicit wait. The algorithm uses that by issuing both WGMMA calls and only waiting when their outputs are actually required.
+- Exponentials and the FP32 FMAs that implement softmax/rescaling are performed on different functional units (MFU and CUDA FP units) than the Tensor Cores. Because those units are separate, the MFU/CUDA work can proceed while Tensor Cores are busy, i.e., true hardware parallelism enabling overlap.
+- The data dependency graph is respected: softmax on $S_{next}$ cannot start until $\mathrm{GEMM0}_j$ ($Q K_j^T$) completes, so the code waits for $\mathrm{GEMM0}_j$ before calling the MFU exponentials. But $\mathrm{GEMM1}_j$ does not depend on $S_{next}$; it depends on $\widetilde{P}_{cur}$ produced from the previous $S$. Therefore the second WGMMA for iteration $j$ can be running concurrently with the softmax on $S_{next}$ (which logically belongs to iteration $j+1$). That is exactly the overlap described in the paper: "the second WGMMA of iteration $j$ overlaps with softmax from iteration $j+1$."
+- The algorithm enforces correctness by issuing explicit waits at the two points where outputs are consumed: it waits for $\mathrm{GEMM0}$ before softmax on $S_{next}$, and it waits for $\mathrm{GEMM1}$ before using the product to update $\mathbf{O}_i$/rescale.
+
+Practical caveats the paper also calls out
+
+- Compiler reordering: NVCC/SASS may reorder instructions, so the implementation checks the generated SASS to ensure the intended overlap survives optimization. The pseudocode is the logical ordering; real code uses explicit commits/waits and synchronization to enforce it.
+- Register pressure and timing variability: the overlap relies on there being enough outstanding work on Tensor Cores to hide the MFU latency. If the MFU work is too large or register spilling happens, the net overlap and speedup will be reduced. The paper uses warp‑specialization and register budgeting to make the overlap practical.
+- Pingpong across warpgroups: beyond intra-warpgroup overlap, the algorithm also uses warp‑specialization at CTA level so that the softmax of warpgroup A is scheduled while warpgroup B performs both GEMMs, further increasing concurrency.
+
+Summary
+
+Concretely on Hopper, the MFU exponentials and FP32 FMA operations that implement softmax/rescale are executed concurrently with the WGMMA Tensor‑Core instructions for the second GEMM because WGMMA is issued asynchronously and softmax runs on different execution units. The code issues $\mathrm{GEMM0}$ (QK), issues $\mathrm{GEMM1}$ ($P_{cur}\!*V_{prev}$), then waits for $\mathrm{GEMM0}$ and computes softmax on its result — that softmax therefore overlaps with $\mathrm{GEMM1}$'s Tensor‑Core work. The algorithm only waits when it must (before using a WGMMA result), so correctness is preserved while hardware units are kept busy.

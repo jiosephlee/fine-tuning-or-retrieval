@@ -1,0 +1,100 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 5: FlashAttention-3, Part I: Producer–Consumer Asynchrony with Warp Specialization
+
+# CTA view: processing a Q tile $Q_i$ to output $O_i$; $B_r$ and $B_c$ tile sizes; $T_r$ and $T_c$ counts
+
+At the level of a single cooperative thread array (CTA) the FlashAttention-3 forward pass operates on a single query tile and produces the corresponding output tile. Concretely, let the sequence length be $N$ and the head dimension be $d$. FlashAttention-3 divides the query sequence into row tiles of size $B_r$ and the key/value sequence into column tiles of size $B_c$. We write the $i$-th query tile as $Q_i \in \mathbb{R}^{B_r \times d}$, and the full key and value matrices as $K, V \in \mathbb{R}^{N \times d}$. The number of query tiles is
+\[
+T_r = \left\lceil \frac{N}{B_r} \right\rceil,
+\]
+and the number of key/value tiles is
+\[
+T_c = \left\lceil \frac{N}{B_c} \right\rceil.
+\]
+
+A CTA is responsible for producing the output tile $O_i \in \mathbb{R}^{B_r \times d}$ corresponding to its assigned $Q_i$. The attention arithmetic that must be carried out for that tile follows the usual attention equations but executed in a tiled manner. For each key block index $j$ the CTA will compute the partial score block
+\[
+S_i^{(j)} = Q_i K_j^\top \in \mathbb{R}^{B_r \times B_c},
+\]
+form the numerically stabilized local softmax contributions from $S_i^{(j)}$, and accumulate the partial weighted value contribution
+\[
+\widetilde{P}_i^{(j)} V_j \in \mathbb{R}^{B_r \times d}
+\]
+into the running output $O_i$. At the end of processing all $T_c$ key/value blocks, the CTA finalizes $O_i$ with the appropriate softmax normalization factors and writes $O_i$ back to global memory.
+
+Thinking in terms of CTA responsibilities and tile shapes is essential because FlashAttention-3 is designed to keep data for these tiles on-chip whenever possible. The choice of $B_r$ and $B_c$ trades off on-chip storage and compute granularity: larger tiles amortize GEMM overheads better but consume more shared memory and registers, while smaller tiles reduce memory pressure but increase synchronization and kernel-invocation-related overhead.
+
+# Circular SMEM buffer with $s$ stages; pipeline object and barriers
+
+To coordinate transfers between global memory (HBM) and on-chip shared memory (SMEM), FlashAttention-3 uses a circular SMEM buffer with $s$ stages. Each stage is a chunk of SMEM sized to hold one tile pair (a $K_j$ and a $V_j$ tile, and the query tile $Q_i$ for the CTA). The buffer is used in a producer-consumer fashion: producer warps stream tiles from global memory into successive stages of the circular buffer, and consumer warps read those tiles out to perform computation.
+
+The system maintains a small pipeline object that encapsulates the synchronization state of the circular buffer. Conceptually the pipeline object provides the primitives the code uses to (1) claim a stage for writing, (2) commit a loaded stage to indicate the tile is ready for consumption, (3) wait for a stage to be available for reading, and (4) release a stage when the consumer is done so the producer can reuse it. These operations are implemented with lightweight barriers (for example, CUDA \texttt{bar.sync}-like semantics in the paper) so that multiple warps within the CTA can coordinate safely.
+
+Because the buffer is circular and has $s$ stages, the producer can get up to $s$ key/value tiles ahead of the consumer. In other words, the producer will not block on the consumer while filling the first $s$ stages. The consumer, conversely, waits for the producer to commit a stage before consuming it. When the consumer finishes using stage $(j \bmod s)$ it releases that stage, allowing the producer to write into it for iteration $j+s$. This simple cyclic ownership scheme allows memory transfers (loads into SMEM) to be pipelined against computation while respecting correctness and without requiring expensive global synchronizations.
+
+# Producer path: TMA loads of $Q_i$ then $K_j/V_j$; commit and notify consumers; stage reuse
+
+Within a CTA the producer role is assigned to a subset of warps (a warpgroup) whose responsibility is solely to move data from global memory to shared memory. FlashAttention-3 exploits hardware support for asynchronous device-to-shared-memory transfers via the Tensor Memory Accelerator (TMA). The producer warps issue TMA commands that load tiles into the next available stage of the circular SMEM buffer.
+
+The producer's sequence begins by issuing a TMA load for the CTA's assigned query tile $Q_i$ into a reserved region of SMEM. Once that load completes the producer commits the stage for $Q_i$ so that the consumer warps can proceed. The producer then iterates over $j=0,\dots,T_c-1$ and, for each iteration, waits only if the pipeline indicates the $(j \bmod s)$-th stage is still owned by the consumer. When the stage is available the producer issues TMA loads for $K_j$ and $V_j$ into that stage. As each TMA load completes, the producer performs a commit (a notify) so consumers know the new data are ready. The asynchronous nature of TMA means that issuing a load does not block the producer from issuing other instructions; the pipeline object governs only the inter-stage ownership.
+
+Stage reuse follows the circular discipline: once the consumer finishes using stage $(j \bmod s)$ and explicitly releases it, the producer may reuse that stage for tile index $j+s$. This reuse keeps SMEM usage bounded while allowing the producer to remain ahead of the consumer by up to $s$ stages. Because TMA is a dedicated hardware unit on Hopper, these producer transfers can proceed in parallel with compute issued by consumer warps.
+
+# Consumer path: SS-GEMM for $S$, local softmax updates ($m$, $\ell$, $\widetilde{P}$), RS-GEMM for $O$
+
+The consumer warps are specialized for compute. Their main loop processes the tiles that the producer places into the circular buffer. The consumer first waits for the CTA's $Q_i$ and the first key tile $K_0$ to be present in SMEM. Then it performs the first shared-memory-sourced GEMM to form the current score block:
+\[
+S_{\text{cur}} \leftarrow Q_i K_0^\top.
+\]
+This GEMM is typically issued using the WGMMA instruction (asynchronous WarpGroup MMA) and in the notation of the algorithm is called an SS-GEMM because the first operand is sourced from shared memory (SMEM) and the second operand is also in SMEM.
+
+After computing $S_{\text{cur}}$ the consumer updates the running numerical stabilization parameters used for the fused local softmax. Specifically, the consumer keeps two per-row vectors: $m_i$ which stores the running row-wise maximum (initialized to $-\infty$), and $\ell_i$ which stores the running scaled sum of exponentials. On receiving $S_{\text{cur}}$ the consumer computes the element-wise exponential after subtracting the updated row-max:
+\[
+\widetilde{P}_{\text{cur}} = \exp(S_{\text{cur}} - m_i),
+\]
+and updates the accumulation scalar per row as
+\[
+\ell_i \leftarrow \exp(m_i^{\text{old}} - m_i)\,\ell_i + \text{rowsum}(\widetilde{P}_{\text{cur}}),
+\]
+where $m_i^{\text{old}}$ is the previous value of the running max before considering $S_{\text{cur}}$. This local softmax reduction is the key to avoiding explicitly materializing the full attention matrix in global memory.
+
+Once $\widetilde{P}_{\text{cur}}$ has been produced, the consumer needs to multiply this block of probabilities by the corresponding value tile $V_j$ and accumulate it into the running output $O_i$. This second GEMM is typically an RS-GEMM in the algorithm's notation: the first operand $\widetilde{P}_{\text{cur}}$ is held in registers (R) because it is small and freshly computed, while the second operand $V_j$ is in shared memory (S). The RS-GEMM computes
+\[
+O_i \leftarrow \operatorname{diag}\bigl(\exp(m_i^{\text{old}}-m_i)\bigr)^{-1} O_i + \widetilde{P}_{\text{cur}} V_j,
+\]
+performing the necessary rescaling to maintain numerical correctness as the running max $m_i$ changes between blocks.
+
+The consumer repeats this process for each key/value tile: compute $S_i^{(j)}$ via SS-GEMM, update $m_i$ and $\ell_i$ and form $\widetilde{P}_i^{(j)}$, then apply RS-GEMM with the corresponding $V_j$ to update $O_i$. After the last block, the consumer performs the final normalization of $O_i$ using $\ell_i$ and writes the completed $O_i$ and the log-normalizer $L_i = m_i + \log(\ell_i)$ back to global memory.
+
+# SS vs RS GEMM semantics (operands from SMEM vs registers)
+
+The algorithm distinguishes two GEMM variants by where the GEMM operands are sourced from: SS-GEMM and RS-GEMM. These labels are short for "Shared–Shared" and "Register–Shared" respectively and reflect how the instructions should be issued to the Hopper Tensor Cores and how data are staged on-chip.
+
+An SS-GEMM denotes a matrix multiply where both operands are read from shared memory. In the consumer's first step per iteration the SS-GEMM multiplies the query tile $Q_i$ (in SMEM) with the key tile $K_j$ (in SMEM) to produce the score tile $S_i^{(j)}$. Because both inputs are resident in SMEM, an SS-GEMM can be issued to WGMMA in a way that reads operands directly from SMEM into the asynchronous Tensor Core pipeline.
+
+An RS-GEMM denotes a multiply where the first operand resides in registers (R) and the second operand is in shared memory (S). After the consumer computes $\widetilde{P}_i^{(j)}$ from $S_i^{(j)}$, it keeps that relatively small block in registers (to avoid re-writing it to SMEM) and then issues an RS-GEMM with $\widetilde{P}_i^{(j)}$ in registers multiplying the $V_j$ tile in SMEM. The RS-GEMM therefore saves SMEM bandwidth and latency by leveraging the low-latency register file for one operand while using SMEM for the larger $V_j$ tile.
+
+Understanding these semantics matters because the hardware instructions and memory access patterns differ between SS and RS forms; the runtime must lay out data and issue WGMMA and register-movement instructions appropriately to match the hardware's expectations for operand placement.
+
+# Register reallocation via setmaxnreg; latency hiding by decoupling data movement and compute
+
+Warp-specialization is not only about assigning different roles (producer vs consumer) to different warps; it also enables static or dynamic reallocation of on-chip resources to better fit each role's needs. On Hopper, FlashAttention-3 uses the PTX facility \texttt{setmaxnreg} to change the number of registers available per warpgroup. Producer warps, which primarily issue TMA loads and manage SMEM staging, need very few registers. Consumer warps, responsible for holding intermediate tiles, running numerically-sensitive softmax accumulators, and issuing WGMMA instructions, require a larger register footprint to avoid spilling and to keep RS-type operands in registers.
+
+By deallocating registers in the producer warps and reallocating them to the consumer warps via \texttt{setmaxnreg}, FlashAttention-3 reduces register pressure where it does not matter and increases register availability where it does. This improves overall occupancy and reduces register spilling to SMEM or global memory, which would otherwise hurt performance and add latency.
+
+The producer–consumer split together with the TMA and WGMMA asynchrony allows decoupling data movement from computation. Producer warps can continue filling future stages of the circular buffer via TMA while consumer warps are using WGMMA to perform GEMMs on already-resident tiles. Because TMA is a dedicated DMA-like unit and WGMMA launches asynchronous Tensor Core work that can be in flight, the CTA can exploit intra-CTA concurrency: the producer keeps the data pipeline full and the consumers keep the Tensor Cores fed, while register reallocation ensures each role has an appropriate resource budget. This explicit decoupling is the core latency-hiding mechanism: the long-latency, high-bandwidth global memory transfers are executed and overlapped with compute, minimizing idle cycles and improving sustained utilization of the GPU's specialized units.
+
+# Baseline non-overlapped inner loop (putting it all together)
+
+The baseline, non-overlapped inner loop of FlashAttention-3 (the CTA-level view without additional GEMM–softmax interleaving) ties the previous concepts into a concrete execution order. First, the producer warps load $Q_i$ and then stream in $K_j, V_j$ pairs into successive stages of the circular SMEM buffer using TMA, committing each stage when its data are ready. Meanwhile, consumer warps wait for stages to become available and then perform the per-stage sequence:
+
+1. Wait for $K_j$ (and ensure $Q_i$ is present).
+2. Execute the SS-GEMM $S_i^{(j)} = Q_i K_j^\top$ via WGMMA and wait for its completion.
+3. Update the running max $m_i$ and compute $\widetilde{P}_i^{(j)} = \exp(S_i^{(j)} - m_i)$, updating the running normalization $\ell_i$.
+4. Wait for $V_j$ to be present and then execute the RS-GEMM to update $O_i$ with $\widetilde{P}_i^{(j)} V_j$. Wait for the RS-GEMM to complete.
+5. Release the buffer stage so the producer can reuse it.
+
+After processing all $T_c$ key/value tiles the consumer performs the final normalization of $O_i$ using $\ell_i$ and writes results back to global memory.
+
+This baseline loop already gains significant benefit from the producer–consumer asynchrony: producer TMA transfers and consumer WGMMA computation are separated into warp-specialized roles, the circular buffer allows the producer to keep ahead by up to $s$ stages, and register allocation is tuned per-role so that the expensive register resources are concentrated in the compute warps. The non-overlapped inner loop is the foundational CTA-level algorithmic structure on which more advanced overlapping (interleaving softmax and GEMMs across iterations) builds, but understanding this baseline is necessary to appreciate how FlashAttention-3 uses hardware asynchrony to hide memory and instruction latencies while preserving the exact attention semantics.

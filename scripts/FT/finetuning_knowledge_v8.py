@@ -338,6 +338,8 @@ def continue_pretraining(model, tokenizer, log, args):
             "explanations_num_tracks": args.explanations_num_tracks,
             "explanations_insertion_strategy": args.explanations_insertion_strategy,
             "explanations_insert_every_n": args.explanations_insert_every_n,
+            "explanation_model": args.explanation_model,
+            "paraphrase_model": args.paraphrase_model,
         }
 
         use_special_injection = args.with_explanations or args.with_specific_explanation
@@ -528,6 +530,8 @@ if __name__ == "__main__":
     parser.add_argument("--overlap_ratio", type=str, default="1_4", help="Ratio of overlap when chunking")
     parser.add_argument("--with_explanations", default=False, action="store_true", help="Use explanations when fine-tuning on paraphrased texts")
     parser.add_argument("--with_specific_explanation", type=str, nargs='+', default=None, help="Use specific explanation type(s). For granular these are subfolders; for whole/legacy these map to flat files (e.g., textbooks -> textbook.txt).")
+    parser.add_argument("--explanation_model", type=str, default="gpt_5_mini_custom", help="Generator-model subfolder for explanations, i.e. data/{source}/explanations/{slug}/{domain}/. Defaults to gpt_5_mini_custom (migrated legacy data, custom reasoning-effort mix); use e.g. 'gpt_5_mini_low' / 'glm' for other corpora.")
+    parser.add_argument("--paraphrase_model", type=str, default="gpt_5_mini_custom", help="Generator-model subfolder for paraphrases, i.e. data/{source}/paraphrased/{slug}/{domain}/. Defaults to gpt_5_mini_custom.")
     parser.add_argument("--raw", action="store_true", help="Use raw texts instead of cleaned/semi-cleaned corpora.")
     parser.add_argument("--times_explanations", type=int, default=1, help="Number of times to repeat the explanation texts.")
     parser.add_argument("--do_eval", default=False, action="store_true", help="Enable evaluation of generations using an LLM judge.")

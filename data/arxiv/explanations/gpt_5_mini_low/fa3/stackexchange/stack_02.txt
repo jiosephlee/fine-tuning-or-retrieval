@@ -1,0 +1,50 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### What exactly is being overlapped in the 2-stage pipeline, and what depends on what?
+Question:
+In Algorithm 2 (consumer warpgroup), the main loop overlaps the WGMMA for Q_i K_j^T with the softmax derived from S_next, and also overlaps the WGMMA for P_cur V_{j-1}. I’m confused about the dependency ordering: which waits guarantee correctness, and which steps are safe to execute without waiting? Could someone annotate the loop with a dependency graph indicating when S_cur, P_cur, S_next, and O_i are valid, and why it’s safe to compute softmax for the next block while the previous P_cur V_{j-1} is still in flight?
+Answer:
+Short answer: nothing magical is being guessed away — the 2-stage loop explicitly preserves all true data dependencies by waiting exactly where a value is consumed, while exploiting hardware asynchrony so independent work can run concurrently. Concretely, the algorithm keeps two “in-flight” objects in registers/shared memory: the score block $S$ (call it $S_{\text{cur}}$) whose softmax produces $\tilde{P}_{\text{cur}}$, and the next score block $S_{\text{next}}$ computed by a WGMMA. It issues the two WGMMA calls (the $QK$ GEMM that produces $S_{\text{next}}$ and the $\tilde{P}_{\text{cur}} V$ GEMM that accumulates into $O_i$) without waiting for them, but then performs explicit waits before using their outputs. Because each consumer waits for the specific producer it depends on, correctness is preserved while unrelated work overlaps.
+
+Here is a compact, ordered dependency picture of one main-loop iteration (index $j$) in the notation of Algorithm 2, with the invariants that are waited for explicitly in the code:
+
+1) Before the loop body for iteration $j$ starts the algorithm already has in registers:
+   - $S_{\text{cur}} = Q_i K_{j-1}^\top$ (computed by the previous iteration's WGMMA and now available),
+   - $\tilde{P}_{\text{cur}} = \mathrm{exp}(S_{\text{cur}} - m_i)$ (computed in the previous iteration's softmax), and
+   - possibly the in-flight WGMMA producing $\tilde{P}_{\text{cur}} V_{j-1}$ (issued but not yet completed).
+
+2) Within iteration $j$ the code issues two asynchronous GEMMs (WGMMA) in this order:
+   - Issue A (line 8 in Alg. 2): start WGMMA to compute $S_{\text{next}} = Q_i K_j^\top$. The code "commit but do not wait". This produces $S_{\text{next}}$ when it completes.
+   - Issue B (line 10): start WGMMA to compute contribution $\tilde{P}_{\text{cur}} V_{j-1}$ and add it to $O_i$. The code "commit but do not wait". This produces an update to $O_i$ when it completes.
+
+3) After issuing both GEMMs the code waits for exactly what it needs in the right order:
+   - Wait for the completion of Issue A (the $QK$ WGMMA) before computing the softmax for the next block (line 12). So the softmax depends only on $S_{\text{next}}$ and thus waits for that WGMMA to finish. At that point $S_{\text{next}}$ is valid and $\tilde{P}_{\text{next}}$ can be computed deterministically from it (and the running $m_i, \ell_i$).
+   - The softmax computation uses only $S_{\text{next}}$ (and the current $m_i,\ell_i$ internal scalars) — it does not read or depend on the $\tilde{P}_{\text{cur}} V_{j-1}$ GEMM that is still in flight. Therefore it is safe to execute softmax while Issue B is executing.
+   - Only after computing $\tilde{P}_{\text{next}}$ (and updating $m_i,\ell_i$ and rescaling $O_i$ as per the local-softmax bookkeeping) does the code wait for Issue B to finish (line 13) before using/normalizing the portion of $O_i$ that depended on $\tilde{P}_{\text{cur}} V_{j-1}$.
+
+To summarize with a small timeline per iteration $j$ (left = earlier):
+
+Issue A: start $QK_j$ -> $S_{\text{next}}$ (async, on Tensor Cores)
+Issue B: start $\tilde{P}_{\text{cur}} V_{j-1}$ -> partial $O_i$ (async, on Tensor Cores)
+Wait (Issue A) -> compute softmax on $S_{\text{next}}$ -> produce $\tilde{P}_{\text{next}}$ (uses MFU/exponent hardware)
+Wait (Issue B) -> finish and rescale/add to $O_i$
+Shift: $S_{\text{next}}$ becomes $S_{\text{cur}}$ for next iteration
+
+Why this is safe (intuitive + technical):
+
+- Dependency locality: softmax for block $j$ depends only on $S_{\text{next}} = Q_i K_j^\top$ (and the scalar $m_i,\ell_i$ state). It does not depend on the $\tilde{P}_{\text{cur}} V_{j-1}$ GEMM result. Thus the softmax can begin as soon as $S_{\text{next}}$ is ready, regardless of whether the earlier RS-GEMM that updates $O_i$ has completed. The algorithm enforces that by explicitly waiting for the $QK$ WGMMA before softmax and waiting for the $\tilde{P}V$ WGMMA before consuming its updated $O_i$ pieces.
+
+- Hardware asynchrony separation: Tensor Cores (WGMMA) are asynchronous and the special-function unit (MFU) that computes exponentials and reductions is distinct. By issuing WGMMA calls without waiting and then running softmax, the implementation leverages the different hardware units to run concurrently. The correctness does not rely on the concurrency — it only relies on the explicit waits before a value is consumed.
+
+- Explicit waits preserve semantics: the code contains the required wait points: wait for the $QK$ WGMMA before computing softmax (line 12), and wait for the $\tilde{P}V$ WGMMA before rescaling/using that partial $O_i$ (line 13). Because those waits are present, no value is used before it exists and numerical invariants (the running max $m_i$ and normalization $\ell_i$) are updated in the correct order.
+
+- Register buffering resolves the dataflow: $S_{\text{next}}$ is kept in registers (or a private buffer) after its WGMMA completes so the softmax can compute $\tilde{P}_{\text{next}}$ without clobbering anything. $\tilde{P}_{\text{cur}}$ is also held (or its register-formed accumulator layout is prepared) so Issue B can be launched. After softmax completes and $\tilde{P}_{\text{next}}$ is produced, the algorithm copies $S_{\text{next}}\to S_{\text{cur}}$ and proceeds to the next iteration.
+
+A minimal dependency graph you can imagine is: for each $j$ there are nodes $S_{\text{next}}(j)$ and $P_{\text{cur}}(j)$ and $O\_update(j)$. Edges are:
+$S_{\text{next}}(j) \to$ softmax $\to \tilde{P}_{\text{next}}(j)$;
+$\tilde{P}_{\text{cur}}(j) \to$ RS-GEMM $\to O\_update(j)$;
+QK WGMMA for $j$ must complete before softmax of $j$; RS-GEMM for $j$ must complete before rescaling/consuming that contribution to $O_i$. There is no edge from RS-GEMM($j$) -> softmax($j$) (they are independent) so they can overlap.
+
+Finally, note the bookkeeping around $m_i$ and $\ell_i$ (the running row max and accumulated row-sum) enforces the numerically correct incremental softmax normalization despite the interleaving. The code updates $m_i$ and $\ell_i$ only after the waited QK WGMMA for the current score block, and rescales $O_i$ only after the waited $\tilde{P}V$ GEMM is finished; these waits ensure the algebra of the local softmax fusion remains identical to the sequential fused algorithm in FlashAttention-2.
+
+In short: the pipelining is possible because producers and consumers that the softmax needs are different from those the RS-GEMM needs; the algorithm issues both GEMMs asynchronously, waits only for the specific GEMMA it needs to compute softmax, and later waits for the $P V$ GEMM before using its result. That preserves correctness while overlapping otherwise idle cycles on different hardware units.

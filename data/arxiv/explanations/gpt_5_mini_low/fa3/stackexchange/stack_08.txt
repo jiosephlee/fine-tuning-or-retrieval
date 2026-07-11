@@ -1,0 +1,66 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### How does block quantization change the softmax scaling, and what is actually rescaled where?
+Question:
+With block quantization, Q, K, V are quantized per block with their own scales. The paper says the algorithm can "scale each block of S" to account for this with no extra compute. Could someone spell out the formulas? If Q_block = q_scale * Q_fp8 and K_block = k_scale * K_fp8, then S_block = Q_block K_block^T = (q_scale k_scale) (Q_fp8 K_fp8^T). How and where is the factor q_scale k_scale folded into the streamed softmax updates of m_i and l_i, and how are P V products rescaled to remain consistent with the final O?
+Answer:
+Short answer: the block quantization scale $c = q_{\text{scale}} \cdot k_{\text{scale}}$ multiplies the whole block of raw logits, so you fold it in by applying it to the streamed softmax math exactly where the block's logits enter the softmax pipeline: multiply the block logits before taking exponentials, and propagate that same multiplicative factor into the streamed normalization (the running $m_i$) and into the $P\!\cdot\!V$ accumulator. Concretely you replace every occurrence of the block logits $S_{\text{block}}$ by $c\cdot S_{\text{fp8}}$ and use those scaled values in the usual streamed-softmax updates
+
+$$
+m_i \leftarrow \max(m_i, \operatorname{rowmax}(c\cdot S_{\text{fp8}})),
+$$
+
+$$
+\widetilde{P} \leftarrow \exp(c\cdot S_{\text{fp8}} - m_i),
+$$
+
+$$
+\ell_i \leftarrow \exp(m_i^{\text{old}} - m_i)\cdot \ell_i + \operatorname{rowsum}(\widetilde{P}),
+$$
+
+$$
+O_i \leftarrow \operatorname{diag}\big(\exp(m_i^{\text{old}} - m_i)\big)^{-1}\cdot O_i + \widetilde{P}\cdot V_{\text{block}}.
+$$
+
+Because $c$ is a single scalar per (Q,K) block, these multiplies are pointwise scalings of the block's logits / exponent inputs and of the block's $P$ contributions, so they do not change the algebraic correctness and can be fused into the same instruction stream that computes the block GEMM and the exponent — the paper's “no extra compute” remark means you do the scalar multiplications where you already have the $S$ values in registers/shared memory (or fold $c$ into the exponent input).
+
+Longer (but still compact) explanation and the key math to keep in mind:
+
+1) Definitions and the source of $c$.  
+If $Q_{\text{block}} = q_{\text{scale}}\cdot Q_{\text{fp8}}$ and $K_{\text{block}} = k_{\text{scale}}\cdot K_{\text{fp8}}$, define $c := q_{\text{scale}}\cdot k_{\text{scale}}$. The true logits for that block are
+$$
+S_{\text{block}} = Q_{\text{block}} K_{\text{block}}^\top = c \cdot (Q_{\text{fp8}} K_{\text{fp8}}^\top) = c \cdot S_{\text{fp8}},
+$$
+where $S_{\text{fp8}}$ denotes the inner-product results computed from the FP8 operands (and accumulated into FP32 accumulators).
+
+2) Where $c$ enters softmax.  
+Attention computes row-wise softmax on $S$. If you stream over blocks, for one row (fixed query row index) you are maintaining a running row-max $m_i$ and running normalizer $\ell_i$ and accumulating $O_i$. The streamed updates for a new block with scaled logits $c\cdot s$ (writing $s$ for the block's row of $S_{\text{fp8}}$) are exactly
+
+$$
+m_i^{\text{new}} = \max(m_i^{\text{old}}, \operatorname{rowmax}(c \cdot s)),
+$$
+
+$$
+\widetilde{p} = \exp(c \cdot s - m_i^{\text{new}}),
+$$
+
+$$
+\ell_i^{\text{new}} = \exp(m_i^{\text{old}} - m_i^{\text{new}})\cdot \ell_i^{\text{old}} + \operatorname{rowsum}(\widetilde{p}),
+$$
+
+$$
+O_i^{\text{new}} = \operatorname{diag}\big(\exp(m_i^{\text{old}} - m_i^{\text{new}})\big)^{-1}\cdot O_i^{\text{old}} + \widetilde{p}\cdot V_{\text{block}}.
+$$
+
+This is identical to the non-quantized streamed-softmax formula except that every occurrence of the block logits $S_{\text{block}}$ has the factor $c$ multiplied in.
+
+3) Why this is algebraically consistent.  
+Softmax and the two-step streamed update are linear in the unnormalized probabilities (the exponentials) and the log-shift $m_i$ is the per-row offset used to avoid overflow. Scaling the block logits by $c$ multiplies that block's unnormalized probabilities by exp factor(s) that are consistent with multiplying those exponentials in the numerator and adding to the denominator ($\ell_i$). Folding $c$ into the exponent input is therefore the correct way to adjust both the $\ell$ and the $O$ accumulation so the final $O = \operatorname{softmax}(S) V$ is unchanged relative to computing with the full-precision $Q,K$ (provided you apply the same $c$ for that block everywhere).
+
+4) Practical/fused implementation detail (why “no extra compute”).  
+In practice you already compute $S_{\text{fp8}}$ (the block GEMM) and you already form the argument to the exponential ($S - m$). Folding the per-block scalar $c$ is just one additional multiply of that argument (or equivalently of the $S_{\text{fp8}}$ result) before calling $\exp$. On modern GPU kernels this scalar multiply can be fused into the instruction stream that already materializes $S_{\text{fp8}}$ in registers and prepares the $\exp$ input; you do not need a separate pass over memory or any extra reduction. Similarly, when forming $\widetilde{P}\cdot V$ you are using $\widetilde{P}$ just computed from $c\cdot S_{\text{fp8}}$, so no further special adjustment is needed beyond using the correct $\widetilde{P}$ values; the same scalar $c$ has already affected $\ell_i$ through $\operatorname{rowsum}(\widetilde{P})$ so the normalization is consistent.
+
+5) Summary intuition.  
+Block quantization gives each block its own multiplicative scale on logits. Softmax only depends on the relative magnitudes of exponentials, so you must multiply the block’s logits by that scalar before exponentiating and then propagate the resulting scaled exponentials into the running normalizer $\ell_i$ and into the $P\!\cdot\!V$ accumulation. Because the scalar is per-block (not per-element) you can apply it at the point where the block’s logits are already resident (registers/SMEM) and fold the multiply into the same tight kernel that computes the block GEMM and the $\exp/\operatorname{rowsum}$, which is why the paper says you can “scale each block of $S$” at no extra compute cost.
+
+If you want a micro-code-style listing, replace lines that compute $S_i^{(j)}$ and then compute $\exp(S_i^{(j)} - m) / \operatorname{rowsum}$ by the exact same lines but using $S_i^{(j)} := c \cdot S_{\text{fp8}}$ (with $c = q_{\text{scale}}\cdot k_{\text{scale}}$ for that $j$) in every place $S$ appears (rowmax, exp input, rowsum, and $P\!\cdot\!V$ accumulation).

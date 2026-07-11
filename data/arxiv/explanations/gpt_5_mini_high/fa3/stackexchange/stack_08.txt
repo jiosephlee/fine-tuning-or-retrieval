@@ -1,0 +1,36 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### For FP8 WGMMA, why must operands be k-major and how do LDSM/STSM enable an efficient in-kernel transpose of $\mathbf{V}$?
+Question:
+The paper notes that FP8 WGMMA on Hopper only accepts k-major operands from SMEM, but typical $\mathbf{V}$ is stored contiguous in the head dimension (mn-major). They opt for an in-kernel transpose using LDSM and STSM. Could you explain concretely how a warp uses LDSM/STSM to read a tile of FP8 $\mathbf{V}$, transpose it, and store it back in SMEM in k-major form, including how FP8 values are packed into 16-bit lanes for these instructions and what extra register moves are required because transpose variants cannot split packed 8-bit pairs?
+Answer:
+Short answer: FP8 WGMMA on Hopper requires $k$‑major operand tiles because the FP8 Tensor‑Core fragment mapping expects the inner ($K$) dimension to be contiguous in SMEM (the microkernel fetches $8\times 8$ fragments as 16‑bit words packed along $K$). To avoid a costly global‑memory transpose, FlashAttention‑3 transposes FP8 tiles in shared memory using the warp‑level LDSM/STSM (ldmatrix/stmatrix) $8\times 8$ 16‑bit move primitives. Because those instructions operate on 16‑bit elements, you pack two FP8 values into each 16‑bit lane, then do a small in‑register split + byte‑permute sequence to turn the 16‑bit‑wise transpose into a true byte (FP8) transpose, and finally STSM writes the tile back in $k$‑major order. The extra work is only register ALU/permute ops (no extra global memory) and can be overlapped with WGMMA, so the cost is small.
+
+Concrete step‑by‑step (compact, with indexing to make it explicit). Work on an $8\times 8$ FP8 tile $V = [v_{r,c}]$ ($r,c = 0,\dots,7$) taken from SMEM in the usual head‑contiguous (mn‑major) layout. LDSM/STSM move an $8\times 8$ block of 16‑bit entries ($128$ bytes) per warp, so we pack two adjacent FP8s into one 16‑bit half‑word:
+
+- packing in SMEM (natural when head dimension is contiguous): for each row $r$ and pair index $j = 0,\dots,3$ form the 16‑bit word
+  $p_{r,j} = v_{r,2j} + 256\cdot v_{r,2j+1},$
+  i.e. low byte = $v_{r,2j}$, high byte = $v_{r,2j+1}$.
+
+- LDSM (warp cooperative ldmatrix) reads the $8\times 8$ block of 16‑bit words $p_{r,j}$ into the warp register fragments. LDSM (and its transpose variant) only treats those 16‑bit words as the atomic elements; it can move/transpose $8\times 8$ of 16‑bit words very efficiently, but it never breaks a 16‑bit word into its two bytes.
+
+- to obtain a true FP8 (byte) transpose we must rearrange the bytes inside and across those 16‑bit words in registers. First split each $p_{r,j}$ into low and high bytes
+  $L_{r,j} = p_{r,j} \& 0xFF = v_{r,2j},$
+  $H_{r,j} = (p_{r,j} >> 8) \& 0xFF = v_{r,2j+1}.$
+  These are inexpensive register ops (byte‑extract via shifts/masks or a byte‑permute).
+
+- the transposed tile $T$ we want to store back so that memory contains $k$‑major FP8 elements satisfies
+  $T_{c,r} = v_{r,c}.$
+  It is convenient to re‑pack the transposed tile into 16‑bit words $q_{c,k}$ ($k = 0,\dots,3$) by pairing two output bytes per word:
+  $q_{c,k} = v_{2k,c} + 256\cdot v_{2k+1,c}.$
+  Using the split arrays L/H, this becomes (with $j = \lfloor c/2 \rfloor$ and $b = c \bmod 2$)
+  $q_{c,k} = \big((b==0 ? L_{2k,j} : H_{2k,j})\big) + 256\cdot\big((b==0 ? L_{2k+1,j} : H_{2k+1,j})\big).$
+  In words: each $q_{c,k}$ takes one byte from row $2k$ and one byte from row $2k+1$ (the correct bytes of column $c$), so $q_{c,k}$ gathers bytes from different original $p_{r,j}$.
+
+- implementationally you do those gathers with in‑register byte‑permute/shuffle instructions (the paper refers to these as “byte permute”): extract the needed low/high bytes into temporary registers and then combine them pairwise into $q_{c,k}$. Because LDSM already distributed ownership of $p_{r,j}$ to registers in a warp‑friendly mapping, these re‑packings are done locally in each thread’s registers (or with only very local lane‑aligned permutes), so you avoid expensive cross‑thread shuffles.
+
+- finally STSM (stmatrix) writes the $8\times 8$ block of 16‑bit words $q_{c,k}$ back to SMEM. Because $q_{c,k}$ was formed so that each 16‑bit word holds two FP8s in the order the FP8 WGMMA expects, the resulting SMEM region is now $k$‑major for the next WGMMA call.
+
+Why the extra moves? The transpose variants of LDSM/STSM only transpose 16‑bit elements, they cannot split the two FP8 bytes inside each 16‑bit element and move those bytes independently. Thus the “missing” operation is the byte‑level regrouping: split 16‑bit words into bytes, permute bytes across the register set into the new pairings, and re‑pack into 16‑bit lanes before store. Those register moves are the only extra cost; they are a small number of mask/shift/byte‑permute operations per 128‑byte tile and are performed entirely on‑chip and can be overlapped with WGMMA computation (as the paper describes), so the wall‑clock overhead is low compared to the avoided global‑memory transpose.
+
+Intuition / why this is worth it: LDSM/STSM give a very high‑bandwidth, warp‑cooperative 128‑byte on‑chip copy; using them plus a few in‑register byte permutations turns an expensive global transpose into a cheap on‑chip rearrangement. That allows FlashAttention‑3 to present $V$ to the FP8 WGMMA in the required $k$‑major layout without extra HBM traffic, and the small register shuffles are cheap and hideable behind WGMMA’s asynchrony.

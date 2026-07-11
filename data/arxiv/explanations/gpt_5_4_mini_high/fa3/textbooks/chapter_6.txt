@@ -1,0 +1,91 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 6: Producer-Consumer Asynchrony with Warp Specialization
+
+# CTA-level decomposition over query blocks
+
+The forward pass in \textsc{FlashAttention-3} is organized around a CTA-level decomposition. At this level, one threadblock, or CTA, is assigned a single query tile $\mathbf{Q}_i \in \mathbb{R}^{B_r \times d}$ and is responsible for computing the matching output tile $\mathbf{O}_i \in \mathbb{R}^{B_r \times d}$. The rest of the attention computation is then carried out by streaming through the key and value matrices in smaller blocks. This is a natural way to parallelize attention on a GPU because the forward pass is already embarrassingly parallel across the batch size, the number of heads, and the query sequence length.
+
+This decomposition matters because it turns attention into a repeated interaction between one fixed query block and many key/value blocks. Instead of thinking of attention as a single large matrix operation over the full sequence, \textsc{FlashAttention-3} treats it as a sequence of blockwise updates. Each CTA can therefore keep the state for its own query block on-chip while it repeatedly consumes key and value tiles. That is the basic structure that makes producer-consumer asynchrony possible.
+
+# Choosing query and key block sizes $B_r$ and $B_c$
+
+The algorithm parameterizes the tiling of the sequence dimension with two block sizes. The query matrix is divided into blocks of size $B_r$, giving $T_r = \lceil N / B_r \rceil$ query tiles $\mathbf{Q}_1, \dots, \mathbf{Q}_{T_r}$. The key and value matrices are divided into blocks of size $B_c$, giving $T_c = \lceil N / B_c \rceil$ key/value tiles. In the CTA-level view, one CTA works on one query tile $\mathbf{Q}_i$ and iterates over all $T_c$ key/value tiles.
+
+These block sizes are not just bookkeeping. They determine the shape of the work assigned to the CTA and the amount of data that must be staged on-chip at once. A larger tile can increase the amount of computation done per load, but it also increases pressure on shared memory and registers. The paper emphasizes that this trade-off is practical and should be guided by profiling, especially because the pipelined design introduces extra register demands. The important point is that $B_r$ and $B_c$ are the knobs that let the kernel fit the attention computation to the GPU’s on-chip resources.
+
+# The circular shared-memory buffer with multiple stages
+
+To move data efficiently between global memory and the compute units, \textsc{FlashAttention-3} uses a circular shared-memory buffer with $s$ stages. Each stage is a slot in shared memory that can hold a tile of key and value data. The producer side fills these slots, and the consumer side reads from them. Because the buffer is circular, the stage index advances modulo $s$, so later tiles can reuse earlier slots once those slots have been released.
+
+The circular structure is what makes the pipeline practical. It allows the kernel to keep a bounded amount of data in shared memory while still streaming through the full sequence. During the first $s$ iterations, the buffer is simply being filled, so the producer does not yet need to wait for old stages to be freed. After that, the producer must wait until a stage has been consumed before reusing it. This arrangement preserves correctness while keeping the data flow moving steadily through the kernel.
+
+# Producer warpgroups: loading $Q$, $K$, and $V$ tiles with TMA
+
+In the warp-specialized design, some warpgroups are assigned the producer role. Their job is data movement, not arithmetic. They use Hopper’s Tensor Memory Accelerator, or TMA, to move tiles from HBM into shared memory. The producer first loads the query tile $\mathbf{Q}_i$ and then loads each key and value tile $\mathbf{K}_j$ and $\mathbf{V}_j$ into the appropriate stage of the circular buffer.
+
+This role separation is important because TMA is asynchronous. The producer does not need to stop and wait for each transfer to complete before issuing the next one, as long as the pipeline protocol is respected. In the algorithm, the producer issues a load, commits it to notify the consumers, and then continues to the next transfer. Since its purpose is only to keep the buffer supplied, it can be given a smaller register budget than the compute side. That makes the producer a good candidate for a lightweight warpgroup.
+
+# Consumer warpgroups: computing score tiles, local softmax, and output updates
+
+The consumer warpgroups perform the actual attention computation. Once the required tiles are present in shared memory, the consumer computes the score block
+$\mathbf{S}_i^{(j)} = \mathbf{Q}_i \mathbf{K}_j^\top$.
+This first matrix multiplication is performed with WGMMA and is referred to in the paper as an SS-GEMM, meaning that both operands are sourced from shared memory. The consumer then uses the score block to update the local softmax statistics for the query tile.
+
+The core of this update is the running maximum and normalization factor. The consumer stores a previous maximum $m_i^{\mathrm{old}}$, updates it to
+$m_i = \max\!\bigl(m_i^{\mathrm{old}}, \mathrm{rowmax}(\mathbf{S}_i^{(j)})\bigr)$,
+and forms
+$\widetilde{\mathbf{P}}_i^{(j)} = \exp(\mathbf{S}_i^{(j)} - m_i)$.
+It then updates the normalization term as
+$\ell_i = \exp(m_i^{\mathrm{old}} - m_i)\ell_i + \mathrm{rowsum}\!\bigl(\widetilde{\mathbf{P}}_i^{(j)}\bigr)$.
+After that, the consumer updates the output accumulator with the value tile using another WGMMA, namely
+$\mathbf{O}_i = \mathrm{diag}\!\bigl(\exp(m_i^{\mathrm{old}} - m_i)\bigr)^{-1}\mathbf{O}_i + \widetilde{\mathbf{P}}_i^{(j)} \mathbf{V}_j$.
+This is the RS-GEMM in the paper, because the first operand is taken from registers and the second from shared memory.
+
+# Barrier synchronization between producers and consumers
+
+The producer and consumer roles are connected through explicit synchronization barriers. The producer commits each load when it is ready, and the consumer waits for the corresponding tile before using it. For example, the consumer waits for $\mathbf{Q}_i$ before beginning the inner loop, and then waits for each $\mathbf{K}_j$ and $\mathbf{V}_j$ tile before using it in the corresponding GEMM. This ensures that computation never reads data that has not yet been loaded.
+
+The reverse direction is just as important. After a consumer finishes with a buffer stage, it releases that stage so the producer can reuse it. In the pseudocode, the producer also waits when a stage is still occupied. These barriers are local to the pipeline rather than global to the whole GPU, so they coordinate just the data that needs to be shared between the producer and consumer warpgroups. That is what makes the design fine-grained enough to overlap work without losing correctness.
+
+# Why asynchronous loads allow the producer to stay ahead of consumers
+
+The reason this design helps is that memory movement and computation are carried out by different hardware units. Hopper provides TMA for memory copies and WGMMA for matrix multiplication, and both are asynchronous. This means the producer can keep issuing loads while the consumer is still computing on previously loaded tiles. The two roles do not have to march in lockstep.
+
+The paper points out that the producer does not issue waits for the first $s$ iterations because the circular buffer is still filling. In effect, the producer gets ahead of the consumer and stays ahead as long as the pipeline has free stages. This is exactly the behavior one wants in a throughput-oriented GPU kernel: whenever one part of the machine is busy with math, another part should be busy preparing the next data. The producer-consumer split gives the kernel a way to express that overlap directly.
+
+# SS-GEMM and RS-GEMM in the forward pass
+
+The forward pass uses two different GEMM forms inside the consumer loop, and the distinction is tied to where each operand lives. The score computation
+$\mathbf{S}_i^{(j)} = \mathbf{Q}_i \mathbf{K}_j^\top$
+is an SS-GEMM, because both operands are held in shared memory when WGMMA executes it. This fits naturally with the producer side, which has already loaded the query and key tiles into the shared-memory buffer.
+
+The output update
+$\widetilde{\mathbf{P}}_i^{(j)} \mathbf{V}_j$
+is an RS-GEMM. Here the softmaxed score block $\widetilde{\mathbf{P}}_i^{(j)}$ is available on-chip in registers, while the value tile $\mathbf{V}_j$ is in shared memory. The paper uses the SS and RS prefixes to indicate this operand placement. This is not just a naming detail; it reflects how the kernel is structured around the data already available to the consumer at each point in the loop.
+
+# Keeping $\mathbf{O}$, $m$, and $\ell$ on-chip during the main loop
+
+A key feature of the algorithm is that the output accumulator and softmax state remain on-chip while the loop over key/value tiles runs. The consumer initializes $\mathbf{O}_i$ to zero and initializes $m_i$ and $\ell_i$ to $-\infty$- and zero-like starting values, then updates them block by block. Nothing needs to be written back to HBM until the end of the query tile’s computation.
+
+This on-chip state is what makes the local softmax exact. The running maximum $m_i$ and the running normalization $\ell_i$ allow the kernel to combine contributions from many blocks without materializing the full score matrix $\mathbf{S}$ or probability matrix $\mathbf{P}$ in global memory. In other words, the kernel preserves the mathematical effect of row-wise softmax while using a streaming, blockwise implementation. At the end of the loop, the consumer performs the final rescaling
+$\mathbf{O}_i = \mathrm{diag}(\ell_i)^{-1}\mathbf{O}_i$
+and writes $\mathbf{O}_i$ and the corresponding $L_i = m_i + \log(\ell_i)$ back to HBM.
+
+# Releasing shared-memory stages back to the producer
+
+The shared-memory buffer only works because the consumer tells the producer when a stage is no longer needed. Once the consumer has used a key tile and the matching value tile, it releases the stage that held them. This frees that slot for the producer to overwrite with a future tile.
+
+In the pseudocode, the consumer releases the key stage and the value stage separately, each according to the circular indexing scheme. That detail matches the fact that the key and value tiles are consumed at different points in the loop. This release mechanism is what makes the buffer safe to reuse. Without it, the producer could overwrite data that the consumer still needs; with it, the kernel gets reuse without corruption.
+
+# Using \texttt{setmaxnreg} to shift registers away from producer warps and toward compute warps
+
+Hopper supports dynamic register reallocation between warpgroups through \texttt{setmaxnreg}. \textsc{FlashAttention-3} uses this to tailor register usage to the roles of the warpgroups. The producer side does not need many registers, because its job is mostly to issue TMA loads. The consumer side, in contrast, needs more registers to hold intermediate values and to keep the computation flowing smoothly through WGMMA and the softmax updates.
+
+The paper’s design explicitly deallocates a predetermined number of registers from the producer and reallocates them to the consumer warps as a function of the number of consumer warps. This is a practical consequence of warp specialization: once the work is split into separate producer and consumer roles, the hardware resources can also be split more intelligently. Rather than giving every warp the same register budget, the kernel gives more to the warps that actually need them.
+
+# How this design extends FlashAttention-2 without changing the exact attention result
+
+The main mathematical computation is still exact attention. What changes in \textsc{FlashAttention-3} is not the result, but the way the result is scheduled on the GPU. The kernel still processes each query tile against all key/value tiles, and it still uses the same local softmax logic as FlashAttention. The running maximum, normalization, and rescaling steps ensure that the blockwise computation is equivalent to the standard row-wise softmax formulation.
+
+What \textsc{FlashAttention-3} adds is a more hardware-aware execution model. FlashAttention-2 already reduced HBM traffic by keeping intermediates on-chip, but it used a more synchronous view of the inner loop. \textsc{FlashAttention-3} keeps the same exact attention semantics while restructuring the kernel around asynchronous producers and consumers, TMA loads, WGMMA compute, and a circular shared-memory buffer. In that sense, the algorithm is an extension of FlashAttention-2 that preserves the exact output while exposing more opportunities for overlap on Hopper GPUs.

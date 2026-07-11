@@ -1,0 +1,126 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# FP8 is Not a Myth: Making Ultra‑Low Precision Work for Transformers
+
+## Why FP8 Matters
+
+Large‑scale transformers are notorious for the sheer volume of floating‑point operations the attention layer consumes. On recent NVIDIA Hopper GPUs the Tensor Cores can deliver **2× the throughput** when using FP8 versus FP16 or BF16. That means a single matrix multiplication that once ran in 10 ms could drop to 5 ms or less—an enticing prospect for both training and inference.  
+However, the theoretical speedup disappears almost immediately in practice because FP8 introduces two hard‑to‑beat obstacles:
+
+1. **Hardware layout constraints** – only *k‑major* operands are accepted by FP8 WGMMA.
+2. **Quantization noise** – the 3‑bit mantissa and 4‑bit exponent can blur subtle differences in activations, especially when a few outliers dominate.
+
+Below we walk through how FlashAttention‑3 turns these roadblocks into a feature set that keeps FP8 accuracy on par with FP16 while still hitting silicon’s raw limits.
+
+---
+
+## The Layout Puzzle
+
+In a standard attention forward pass you compute three GEMMs:
+
+```
+S = Q * Kᵀ   (SS-GEMM)
+P = softmax(S)
+O = P * V   (RS-GEMM)
+```
+
+The Tensor Core instruction `WGMMA` on Hopper has special requirements:
+
+| Operand | Accepted Layout (FP16) | Accepted Layout (FP8) |
+|---------|-----------------------|----------------------|
+| **A**   | mn‑major or k‑major   | **k‑major only**      |
+| **B**   | mn‑major or k‑major   | k‑major only          |
+
+For an attention head `Q, K, V ∈ ℝⁿˣ𝑑`, the natural memory layout is *n‑major* (contiguous along the sequence length). That works fine for FP16 but violates the k‑major rule when you switch to e4m3 FP8.  
+
+### Two Options
+
+1. **Pre‑transpose V in global memory**  
+   A standalone kernel could swap the strides so that V becomes k‑major before it ever reaches the GPU L2 cache. This is wasteful for inference and adds an extra pass for training.
+
+2. **Transpose inside the kernel**  
+   The hardware provides `LDSM` (load matrix) and `STSM` (store matrix) instructions that can load & store 128 bytes at once with an implicit transpose of an 8 × 8 tile. By loading V tiles with `LDSM`, rearranging them into registers, then storing them back with `STSM`, you effectively create a k‑major view *inside* shared memory—all without touching global memory again.
+
+The second approach is what FlashAttention‑3 uses: it keeps the transpose logic self‑contained inside the producer warpgroup, saving bandwidth and keeping kernel latency low.
+
+---
+
+## The Quantization Conundrum
+
+Even after solving the layout issue, simply casting Q, K, V to FP8 would lose precision:
+
+- **Outliers matter** – transformers often have a handful of very large activations (e.g., from token embeddings or auto‑regressive decoding). In FP8 these values saturate or get mapped to infinities.
+- **Uniform scaling fails** – per‐tensor scaling (one float per whole matrix) inflates these outliers even more and distorts relative magnitudes across blocks.
+
+FlashAttention‑3 introduces two complementary tricks that keep loss small while still enjoying e4m3 speed.
+
+### 1. Block Quantization
+
+Instead of one global scale factor per tensor, limit each block (e.g., 128 × 𝑑) to its own scale:
+
+```text
+scale_{block} = max(|block|)
+Q_block_fp8 = Q_block / scale_{block}
+```
+
+Because attention works on blocks already – each warpgroup processes one query block against all key/value blocks – you can apply the block scale *on the fly*. No extra passes or Memory traffic are required; you just multiply each block by its own scalar before feeding it into WGMMA.
+
+*Effect:* Large values that were previously clamped to ±∞ now sit comfortably within FP8’s exponent range for their block, drastically reducing quantization error.
+
+### 2. Incoherent Processing
+
+Let ⃗𝑀 be a cheap random orthogonal matrix built from diagonal ±1 matrices fused with a Hadamard transform (`O(d log d)` operations). Multiply both Q and K by ⃗𝑀 before quantizing:
+
+```
+Q' = Q @ M
+K' = K @ M
+```
+
+Because M is orthogonal (`M Mᵀ = I`), attention outputs stay unchanged (`Q' K'^T = Q Kᵀ`). The key benefit is that previously **outlying elements** get “spread out” over many entries: each element of Q' or K' becomes a weighted sum of many original values, making them less volatile and easier to quantize accurately.
+
+*Effect:* When combined with block quantization, incoherent processing reduces RMSE in FP8 by up to **2.6×** compared to standard per-tensor scaling—matching or exceeding FP16 accuracy while running at twice the throughput.
+
+---
+
+## Tuning Throughput vs Accuracy
+
+The flop count for an N‐length single head is roughly \(4 N^2 h\) (where \(h\) is head dimension). On an H100 SXM5:
+
+- **FP16 WGMMA:** ~989 TFLOPs/s theoretical.
+- **FP8 WGMMA:** ~1 PFLOPs/s theoretical—exactly double because each OP now uses 4 bits instead of 16.
+
+FlashAttention‑3 achieves up to **740 TFLOPs/s** in FP16 and gets close to **1 PFLOPs/s** in e4m3—they’re both finishing within two contention cycles on Tensor Cores thanks to perfect pipelining of softmax and matmul across warpgroups (“ping‑pong scheduling”).
+
+#### Trade-off Breakdown
+
+| Precision | Target → Throughput Gain | Key Optimizations                                 |
+|-----------|--------------------------|----------------------------------------------------|
+| FP16      | ×2 vs CUDA BF16          | Warp-specialized TMA + WGMMA + eager caching       |
+| e4m3      | ×2 vs FP32               | Block quantization + incoherent orthogonal transform + in-kernel transpose |
+
+Because both techniques are already inherent to FlashAttention totals—a single persistent kernel for all blocks—the *only* extra work required is deciding per-batch whether DP/FP32 or e4m3 DP will hit your accuracy target best.
+
+---
+
+## What Does This Mean for Model Training?
+
+- **Large‐context LLMs:** A typical LLM mixing 128-heads over sequences of 8192 tokens spends >70% of its compute on self-attention. Switching from FP32 to e4m3 cuts FLOPs by ~90% *and* doubles clock speed—a real game changer.
+- **Deployment pipelines:** For inference you’re often willing to tolerate marginally higher error if latency drops dramatically; e4m3 now gives you almost identical outputs with half the cost.
+- **Energy budgets:** GPUs shine when they saturate their compute units; using lower precision expands your throughput without overheating or upping power draw—keeping cluster energy consumption comfortable.
+
+Practitioners should still monitor validation loss when turning to e4m3: if backpropagation sees more noise early on you may lose convergence speed because gradients become less accurate. Many teams already use mixed-precision frameworks that keep gradients in higher precision while allowing activations in e4m3; this fits neatly into FlashAttention‑3’s design.
+
+---
+
+## Takeaway
+
+FP8 isn’t a silver bullet that magically turns all transformer workloads into lightning-fast jobs; it’s a set of disciplined optimizations that turn hardware quirks into programmatic advantages:
+
+- ***Understand layout constraints*** and use *in-kernel transpose* rather than wholesale recollection.
+- ***Quantize locally*** so outliers don’t get blown up globally.
+- ***Shatter outliers with incoherent processing*** so each block behaves well under limited mantissa bits.
+- ***Overlap softmax and matmul execution*** with warp-specialized producers/consumers—pythonic simplicity beats manual register juggling here.
+
+By following these principles you unlock SiX­PEN·eɛ∞—speedup plus integrity—and may find yourself pushing new long-context models without buying more GPUs or throttling data pipelines.”
+
+[👉 Try it out](https://github.com/Dao-AILab/flash-attention) – focus your next experiment on whether your training loss gracefully tolerates e4m3!

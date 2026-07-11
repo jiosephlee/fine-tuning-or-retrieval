@@ -1,0 +1,114 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# Overlapping GEMM and Softmax: The Two-Stage Pipeline That Squeezes More From Tensor Cores
+
+## Why this matters
+
+Attention is a bottleneck in Transformers because computing the attention matrix scales quadratically with sequence length. Modern GPUs (Hopper/H100 in the paper) give you huge Tensor Core throughput for GEMMs (matrix-multiply-accumulate), but non-GEMM work needed by attention—softmax, reductions, exponentials—has far lower throughput and sits on a different functional unit. If you naively run softmax and GEMMs serially, the Tensor Cores sit idle while exponentials and rescalings run, wasting the device's best resource.
+
+FlashAttention-3 introduces an intra-warpgroup two-stage pipeline that breaks the iteration-level dependency between the two GEMMs and softmax within the attention inner loop. The result: much better Tensor Core utilization and substantially higher measured TFLOPs/s.
+
+This post unpacks the core idea, how it is scheduled on the GPU, what buffers and synchronization are required, and the practical trade-offs—especially around register pressure and the tempting but costly 3-stage variant.
+
+## The inner-loop dependency problem (recap)
+
+For one query block Q_i and a stream of key/value blocks {K_j, V_j}, the usual fused-attention inner loop does roughly:
+
+1. Compute S^{(j)} = Q_i K_j^T (GEMM).
+2. From S^{(j)} update the running row-wise max m_i, compute scaled/exp-ed block \widetilde{P}^{(j)} = exp(S^{(j)} - m_i), and update row-wise normalizer \ell_i (softmax work).
+3. Use \widetilde{P}^{(j)} to accumulate O_i += \widetilde{P}^{(j)} V_j (GEMM).
+
+Steps 1 → 2 → 3 are serially dependent inside iteration j. That serial ordering forces the Tensor Cores to wait for the multi-function/exponential unit and scalar work that implements softmax, or vice versa—resulting in suboptimal utilization. The trick is to pipeline across iterations.
+
+## Two-stage pipelining: the main idea
+
+Instead of fully serializing per-iteration, FlashAttention-3 keeps an extra set of registers (a small buffer) to hold the "next" S tile and interleave operations from iteration j and j+1. Concretely, in the consumer warpgroup the inner loop is reorganized like this:
+
+- Precondition: Q_i and K_0 already loaded.
+- Compute S_cur = Q_i K_0^T (WGMMA; asynchronous GEMM).
+- Do softmax work on S_cur, produce \widetilde{P}_cur and update O_i as needed.
+
+Then for each j from 1 to T_c − 2:
+
+1. Wait for K_j to be present in SMEM, then launch S_next = Q_i K_j^T via an asynchronous WGMMA and immediately "commit" but do not block waiting for completion. (This is the "first WGMMA".)
+2. Wait for V_{j-1} to be present, then launch O_i += \widetilde{P}_cur V_{j-1} as another asynchronous WGMMA. Commit but do not wait. (This is the "second WGMMA".)
+3. Wait for the first WGMMA (S_next) to complete. Now perform the softmax work on S_next to produce \widetilde{P}_next.
+4. Wait for the second WGMMA (the accumulation into O_i) to complete and do any rescale/epilogue necessary.
+5. Slide: S_cur := S_next and \widetilde{P}_cur := \widetilde{P}_next, continue.
+
+At the loop boundaries you handle the first and last blocks appropriately.
+
+The key observation: while the exponential/rescaling (softmax) for iteration j+1 is executing, the Tensor Cores are occupied by the WGMMA launched earlier for iteration j+1 (and by the accumulation launched for iteration j). This overlaps low-throughput softmax work with high-throughput GEMMs, reducing idle time on Tensor Cores.
+
+## How waits and commits are orchestrated
+
+FlashAttention-3 uses the GPU's asynchronous execution model:
+
+- WGMMA is an asynchronous warpgroup-level instruction that can be launched and committed without stalling the issuing warpgroup; completion is polled with explicit waits. Similarly, the Tensor Memory Accelerator (TMA) issues asynchronous loads from global memory to shared memory.
+- The implementation relies on explicit "commit" semantics (issue but do not block) and uses barrier synchronization to ensure correct ordering and mutual visibility among producer/consumer warpgroups.
+
+A typical sequence in the two-stage loop:
+
+- Issue WGMMA(Q_i, K_j) and immediately commit—this starts the k-major GEMM on Tensor Cores and returns control to the warps.
+- Later, when you need S_next you call a "wait" that blocks until that WGMMA is finished (so the registers/shared memory holding S_next are valid).
+- For the accumulate step, launch WGMMA(\widetilde{P}_cur, V_{j-1}) and commit; then you can continue to compute softmax for S_next while the accumulation runs asynchronously.
+- Before reusing results or releasing shared-memory buffers, the code issues waits to ensure those WGMMA results are visible.
+
+This explicit commit/wait choreography is what allows softmax (on scalar/float units) to be executed while another WGMMA runs on the Tensor Cores.
+
+## The buffer strategy that breaks the dependency
+
+To avoid overwriting shared memory and to pipeline safely, FlashAttention-3 uses small circular buffers and a register-resident staging area:
+
+- A circular SMEM buffer (with s stages) holds blocks of K and V loaded by the producer warpgroup. The consumer waits on a stage index before reading it.
+- Within the consumer warpgroup, the two-stage pipeline keeps S_cur and S_next in registers. S_next is produced by an earlier asynchronous WGMMA and held until it's needed for softmax, so subsequent GEMM launches don't clobber data needed for the in-flight softmax.
+- After the accumulate WGMMA for \widetilde{P}_cur V_{j-1} is launched, the code can safely free the previous SMEM stage.
+
+This ring-buffer plus per-iteration register staging allows you to decouple the compute order from the strict serial data dependencies while preserving correctness of the reductions and softmax normalizers (m_i and \ell_i). The local softmax reduction still follows the numerically stable streaming softmax update (maintaining running max and scaled sum), but it acts on the S tiles that are available when the softmax step runs.
+
+## Why this helps on Hopper / H100
+
+On Hopper, WGMMA (warpgroup matmul) is asynchronous and very fast; exponentials and special functions are run by a comparatively limited multi-function unit. By overlapping the multi-function-unit-bound softmax work with WGMMA you:
+
+- Keep Tensor Cores busy more of the time (higher utilization).
+- Amortize the low-throughput exponentials over GEMM time windows.
+- Reduce the fraction of cycles where the "best" hardware (Tensor Cores) is idle waiting on scalar or special-function work.
+
+Empirically in the paper, this contributes to moving FW TFLOPs/s numbers from ~570 to ~620–640 TFLOPs/s for the example configuration—an appreciable improvement.
+
+## Trade-offs and costs
+
+The two-stage pipeline is not free. The main trade-offs are:
+
+Register pressure. You must keep S_next (size proportional to B_r × B_c) live in registers while launching additional WGMMA operations and while computing the softmax for other blocks. That consumes registers per thread/block and raises the risk of register spilling to local memory (which hurts performance). The extra registers limit how large you can choose tile sizes (B_r, B_c), so you must balance tile size against pipeline depth.
+
+Compiler reordering. NVCC and the assembler (SASS) may reorder instructions. The correctness and the desired overlap rely on a particular sequence of issue/commit/wait operations. The implementation needs careful control (and examination of generated SASS) to ensure the intended launch/commit/wait pattern survives compilation and that asynchronous launches are not inadvertently serialized.
+
+Shared-memory pressure and buffer sizing. The circular SMEM buffer must be large enough to hold the producer's in-flight K/V tiles but small enough to fit per-CTA SMEM budgets. Choosing s (the number of stages) affects both latency-hiding benefits and SMEM usage.
+
+Complexity and maintainability. The two-stage code is more complex than a purely synchronous kernel. Debugging, porting to other architectures, and integrating with higher-level frameworks require extra care.
+
+## The 3-stage variant: tempting, but tricky
+
+Extending the approach from two overlapping stages to three (or more) stages is conceptually straightforward: keep extra S buffers (S_next2, S_next1, S_cur) and launch an additional WGMMA ahead of time so that more of the softmax work can be hidden under GEMMs. In theory, deeper pipelining can further increase Tensor Core utilization.
+
+But there are important practical obstacles:
+
+- Register blow-up: each additional stage requires more register-resident storage for S tiles (and possibly partial \widetilde{P} buffers). Registers are the scarcest per-thread resource; a 3-stage pipeline quickly forces either much smaller tile sizes or register spilling.
+- Complexity of synchronization: more stages increase the number of dependencies to track (more careful commit/wait logic) and the potential for bugs caused by misses in ordering or missed releases of SMEM stages.
+- Diminishing returns: eventually the asymmetry between GEMM throughput and special-function throughput bounds the gains. If the softmax work per block is tiny compared to the GEMM time, two stages may be enough; if it's large, adding stages helps—until other resources (registers, SMEM, or occupancy) become the limiter.
+- Practical occupancy: increasing per-CTA resource usage (more registers/SMEM) reduces the number of co-resident CTAs on an SM, which can hurt the ability to hide unrelated latencies and ultimately reduce overall throughput.
+
+Because of these trade-offs, the paper focuses on a two-stage design as the sweet spot: measurable improvements with controlled extra register usage and manageable complexity. The authors do discuss a 3-stage variant and note its potential, but also the tougher balancing act between tile sizes and pipeline depth.
+
+## Practical notes for implementers
+
+- Measure register use and occupancy. Profile both the number of registers per thread and CTA occupancy when enabling the pipeline. If register spilling is happening, either reduce tile sizes or back off pipeline depth.
+- Inspect generated SASS. Make sure the compiler did not reorder your WGMMA launches and waits into a form that degrades overlap. The observed SASS in the paper showed the expected overlapped code for the two-stage design.
+- Tune circular buffer size s. The SMEM circular buffer size affects producer/consumer decoupling; it should be set to allow the producer to stay ahead but not waste SMEM.
+- Combine with warp-specialization. The two-stage intra-warpgroup overlap complements warp-specialization across producer/consumer warpgroups (the paper’s "pingpong" scheduling): both are useful to hide different sources of latency.
+- Watch for corner cases. Small sequence lengths or causal masking change the balance of work and may reduce or reverse benefits; test targeted workloads.
+
+## Bottom line
+
+The two-stage intra-warpgroup pipeline in FlashAttention-3 is a practical, implementable way to break iteration-level serialization between GEMM and softmax inside attention. By staging one "next" S tile in registers and carefully issuing asynchronous WGMMA calls with commit/wait orchestration, you can overlap the low-throughput softmax computations with high-throughput Tensor Core matmuls. This reduces idle Tensor Core time and yields substantial real-world speedups on Hopper-class GPUs, at the cost of modest increases in register pressure and implementation complexity. A 3-stage pipeline could give even more overlap, but it rapidly runs into resource limits and complexity, so two stages hit the pragmatic sweet spot.

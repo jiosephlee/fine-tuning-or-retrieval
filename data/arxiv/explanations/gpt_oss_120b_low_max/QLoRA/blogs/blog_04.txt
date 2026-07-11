@@ -1,0 +1,216 @@
+\title{Blogs about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+# LoRA Meets Quantization: Why Low‑Rank Adapters Are the Secret Sauce
+
+## Intro – The bottleneck of finetuning giant LLMs  
+
+Finetuning a large language model (LLM) is the go‑to way to make it follow instructions, correct unwanted behaviours, or specialise on a niche domain.  
+The problem? A 65 B‑parameter LLaMA model needs **more than 780 GB** of GPU memory when you try to finetune it in the usual 16‑bit (bfloat16) regime – far beyond the capacity of any single consumer or even most professional GPUs.  
+
+Quantisation solves the *inference* memory issue (e.g., compressing weights to 4‑bit), but those schemes crumble when you need to back‑propagate through the model. That’s where **QLoRA** (Quantized LoRA) steps in and turns the table: by freezing a 4‑bit backbone and inserting tiny low‑rank adapters, you can finetune a 65 B model on a single 48 GB GPU without any performance loss compared to full‑precision finetuning.
+
+In this post we unpack **why LoRA adapters are the secret sauce**, how they interact with a frozen quantised model, and give you a concrete, step‑by‑step recipe to get LoRA + QLoRA running with the Hugging Face 🤗 Transformers library.
+
+---
+
+## 1️⃣ LoRA in a nutshell  
+
+LoRA (“Low‑Rank Adaptation”, Hu *et al.* 2021) replaces the costly update of every weight matrix **W** with a pair of tiny matrices **L₁** and **L₂**:
+
+\[
+\mathbf{Y}= \mathbf{X}\mathbf{W} \;+\; s\,\mathbf{X}\mathbf{L}_1\mathbf{L}_2,
+\]
+
+* **W** stays frozen (no gradient needed).  
+* **L₁ ∈ ℝ^{h×r}** and **L₂ ∈ ℝ^{r×o}** are learned, where *r* (the rank) is typically 4–64 – orders of magnitude smaller than *h* or *o*.  
+* The scalar *s* rescales the adapter contribution.
+
+Because gradients flow through **W** to compute updates for **L₁/L₂**, only the adapters need to be stored and optimised. The memory saved is dramatic: for LLaMA‑7B, LoRA parameters take ≈ 26 MB while activation gradients dominate the footprint (~ 600 MB). This means we can **sprinkle adapters across many layers** without blowing up memory usage.
+
+---
+
+## 2️⃣ Why LoRA pairs perfectly with a frozen 4‑bit backbone  
+
+QLoRA’s key insight is that we can treat the **quantised weights as read‑only storage**:
+
+| Component | Storage type | Computation type |
+|-----------|--------------|------------------|
+| Base model weights | 4‑bit NF4 (NormalFloat) | Dequantised on‑the‑fly to bfloat16 |
+| LoRA adapters | bfloat16 (or fp16) | Directly used in matmuls |
+
+*The quantised base model never receives gradients.* When we back‑prop through a layer, the gradient w.r.t. **W** is *not* materialised; instead, it is used implicitly to compute gradients for **L₁/L₂**. Consequently:
+
+1. **Memory stays at 4‑bit per base parameter** – no need for an extra full‑precision copy.  
+2. **Training dynamics remain high precision**, because all arithmetic happens in bfloat16 (the dequantised representation).  
+3. **Adapters become the sole trainable degrees of freedom**, yet they are expressive enough when placed **in every linear sub‐module** (query/key/value projections, feed‑forward layers, etc.).
+
+The authors of QLoRA observed that limiting adapters to just a few matrices (the “default” LoRA setting) leaves a noticeable gap from full finetuning, especially for models > 7 B. By inserting LoRA on *every* transformer layer they recovered **exactly the same performance as a fully finetuned 16‑bit model**, even at 65 B scale.
+
+---
+
+## 3️⃣ NF4 – The quantisation format that makes this possible  
+
+A naïve 4‑bit integer quantisation discards too much information; outliers dominate the scaling factor and most bins stay empty. QLoRA introduces **NormalFloat‑4 (NF4)**:
+
+* It assumes pretrained weights follow a zero‑centered normal distribution \(N(0,\sigma^2)\).  
+* The quantile boundaries of a standard normal are precomputed once, then each block of weights is simply rescaled to fit \([-1,1]\) and mapped to those fixed quantiles.  
+* This yields an “information‑theoretically optimal” mapping for normal data—empirically superior to FP4/Int4.
+
+Combined with *double quantisation* (compressing the per‑block scaling constants themselves), NF4 trims roughly another 0.37 bits per parameter, shaving ~3 GB off a 65 B model’s footprint.
+
+---
+
+## 4️⃣ Putting it all together: QLoRA workflow  
+
+Below is the high‑level pipeline that QLoRA follows during training:
+
+1. **Load pretrained weights** → quantise each linear layer to NF4 with blocksize = 64.  
+2. **Attach LoRA modules** to every linear projection (query, key, value, up/down projections).  
+3. During forward pass:  
+   * Dequantise NF4 → bfloat16 on demand (efficient CUDA kernels).  
+   * Compute \(\mathbf{X}\mathbf{W} + s\,\mathbf{X}\mathbf{L}_1\mathbf{L}_2\).  
+4. During backward pass:  
+   * Gradients flow through the dequantised \(\mathbf{W}\) but are only accumulated for \(\mathbf{L}_1,\mathbf{L}_2\).  
+5. Optimiser states live in *paged memory*: NVIDIA Unified Memory automatically spills optimizer buffers to CPU RAM when GPU memory peaks (important for long sequences).  
+
+All three ingredients—NF4, double quantisation, paged optimisers—keep peak GPU usage under ~48 GB for LLaMA‑65B while preserving full‑precision learning dynamics.
+
+---
+
+## 5️⃣ Step‑by‑step guide: LoRA + QLoRA in 🤗 Transformers  
+
+The community has already integrated QLoRA into Hugging Face’s `peft` library and bitsandbytes kernels. Below is a minimal script that reproduces the “Guanaco” training setup on a single GPU.
+
+```python
+# -------------------------------------------------
+# 1️⃣ Install required packages
+# -------------------------------------------------
+# pip install torch transformers bitsandbytes peft accelerate
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model
+from bitsandbytes import NormalFloat
+
+# -------------------------------------------------
+# 2️⃣ Load a pretrained model and apply NF4 quantisation
+# -------------------------------------------------
+model_name = "meta-llama/Llama-13b-hf"   # any size works (7b/33b/65b too)
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+# Load in fp16 first then convert to NF4 – bitsandbytes takes care of it
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16,
+    device_map="auto"
+)
+
+# Switch storage dtype to NF4 (4-bit NormalFloat)
+model = model.quantize(
+    bits=4,
+    dtype="nf4",                # <— key flag
+    blocksize=64,
+    double_quant=True          # enable double quantisation
+)
+
+# -------------------------------------------------
+# 3️⃣ Configure LoRA – adapters on *every* linear layer
+# -------------------------------------------------
+lora_cfg = LoraConfig(
+    r=64,                 # rank of low‑rank matrices
+    lora_alpha=16,
+    target_modules=["q_proj", "k_proj", "v_proj",
+                    "o_proj", "gate_proj", "up_proj", "down_proj"],
+    # The above covers all transformer linear layers in LLaMA.
+    # For other architectures adapt names accordingly.
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+
+model = get_peft_model(model, lora_cfg)
+
+# -------------------------------------------------
+# 4️⃣ Prepare data (example – Alpaca style JSON)
+# -------------------------------------------------
+from datasets import load_dataset
+
+dataset = load_dataset("json", data_files="alpaca_data.json")["train"]
+def tokenize_fn(example):
+    # Prompt formatting follows Alpaca/Vicuna convention
+    prompt = f"### Instruction:\n{example['instruction']}\n\n### Input:\n{example.get('input','')}\n\n### Response:\n"
+    tokenized = tokenizer(prompt + example['output'],
+                          truncation=True,
+                          max_length=1024,
+                          padding="max_length")
+    tokenized["labels"] = tokenized["input_ids"].copy()
+    return tokenized
+
+train_data = dataset.map(tokenize_fn, batched=True, remove_columns=dataset.column_names)
+
+# -------------------------------------------------
+# 5️⃣ Training with Accelerate (handles paging internally)
+# -------------------------------------------------
+from accelerate import Accelerator
+from torch.utils.data import DataLoader
+
+accelerator = Accelerator()
+train_loader = DataLoader(train_data,
+                          batch_size=2,               # adjust for GPU memory
+                          shuffle=True,
+                          collate_fn=lambda x: {k: torch.stack([d[k] for d in x]) for k in x[0]})
+
+model.train()
+optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+
+model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+
+for epoch in range(3):          # epochs ≈ number of passes over ~9k samples
+    for batch in train_loader:
+        optimizer.zero_grad()
+        outputs = model(**batch)
+        loss = outputs.loss
+        accelerator.backward(loss)
+        optimizer.step()
+        # You may add gradient checkpointing (`model.gradient_checkpointing_enable()`) if needed.
+```
+
+### Key flags explained
+
+| Flag | Why it matters |
+|------|----------------|
+| `bits=4` & `dtype="nf4"` | Installs our NF4 storage format – the “secret sauce”. |
+| `blocksize=64` | Small blocks give finer granularity → higher fidelity after dequantising. |
+| `double_quant=True` | Shrinks per‑block scaling constants → frees several GB on large models. |
+| `target_modules=` list | Explicitly adds adapters on *every* linear projection; this is what let QLoRA match full‐precision performance. |
+| `accelerate` + paged optimizer | Handles CUDA unified memory spilling automatically; crucial for long sequences (> 1024 tokens). |
+
+That’s it! After training you can save only the LoRA weights (`model.save_pretrained("./guanaco_13b_lora")`) – they’re typically < 500 MB even for a 65 B base model – and later merge them back (`model.merge_and_unload()`) for inference or keep them separate for lightweight deployment.
+
+---
+
+## 6️⃣ Recap – What makes LoRA the secret sauce?  
+
+1. **Parameter efficiency** – updates are confined to tiny low‑rank matrices, so memory is dominated by activation storage rather than trainable weights.  
+2. **Layerwise coverage** – adding adapters at *every* transformer submodule restores representational capacity that would otherwise be lost when freezing a low‑precision backbone.  
+3. **Quantisation friendliness** – frozen NF4 weights can be dequantised on demand without ever requiring their full‐precision copy; gradients never touch them, sidestepping instability issues that plagued earlier attempts at training through quantised tensors.  
+4. **Scalable tooling** – bitsandbytes kernels handle NF4/FP8 double quantisation; `peft` manages adapter injection; `accelerate` takes care of paging and distributed execution.
+
+The combination yields an unbelievable result demonstrated by the paper: **finetuning LLaMA‑65B on a single RTX A6000 (48 GB) reaches > 99 % of ChatGPT’s Vicuna benchmark score**, all within roughly one day of compute.
+
+---
+
+## 7️⃣ Where to go from here  
+
+- **Experiment with different adapter ranks (`r`) and dropout values**; smaller ranks reduce storage further but may need more epochs.  
+- Try other PEFT methods (IA³, prefix tuning) inside QLoRA’s frozen NF4 backbone – they might be even lighter for specific tasks.  
+- Push beyond 4 bits: the paper hints that with strong adapters even aggressive 3‑bit quantisation could still recover full precision performance.  
+- Finally, explore fine‐grained evaluation pipelines (human vs GPT‑4 Elo tournaments) to verify that your own models truly close the gap on your target use case.
+
+---
+
+### TL;DR  
+
+Low‑rank adapters let us freeze an aggressively quantised LLM while still learning rich task‐specific behaviour. By sprinkling LoRA modules over every transformer layer—and using the information‑optimal NF4 format plus double quantisation—we recover exactly the same quality as full‐precision finetuning but at a fraction of the memory cost. Thanks to Hugging Face’s `peft`, bitsandbytes kernels and Accelerate’s paging support, turning this research insight into production code today is only a few dozen lines away.
+
+Happy finetuning! 🚀
