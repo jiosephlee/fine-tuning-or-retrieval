@@ -1,0 +1,141 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# FP8 Is Here: Low‑Precision Attention Without Losing Accuracy  
+
+---
+
+## Why Attention Still Bottlenecks Large Models  
+
+Transformer models compute attention as a series of matrix multiplications followed by a softmax.  
+For a single head they compute  
+
+\[
+\mathbf{S}= \alpha\,\mathbf{Q}\mathbf{K}^{\top},\qquad 
+\mathbf{P}= \operatorname{softmax}(\mathbf{S}),\qquad 
+\mathbf{O}= \mathbf{P}\mathbf{V},
+\]
+
+where \(\alpha=1/\sqrt{d}\) scales the dot‑product and \(d\) is the head dimension.  
+Even though the arithmetic itself is dense, the quadratic dependence on the sequence length \(N\) makes the operation a serious bottleneck for long‑context models and for inference at scale.
+
+The original **FlashAttention** kernels eliminated expensive global‑memory traffic by fusing all steps into a single GPU kernel. **FlashAttention‑2** added extra parallelism over the sequence dimension, but on NVIDIA’s Hopper H100 GPUs it still achieved only ~35 % tensor‑core utilization – far below what a hand‑tuned GEMM can reach. The picture changed dramatically when we started exploiting two newer hardware features:
+
+1. **Asynchronous Tensor‑Core execution** (WGMMA) that can overlap data movement with compute.
+2. **FP8 tensor cores**, which double matmul throughput compared with FP16/BF16.
+
+The challenge is to harness these capabilities **without sacrificing numerical fidelity** – especially because attention’s softmax magnifies any quantization error present in \(\mathbf{Q},\mathbf{K},\mathbf{V}\).
+
+---
+
+## What Exactly Is FP8?  
+
+FP8 on Hopper follows the IEEE‑style **e4m3** layout: 4 exponent bits and 3 mantissa bits (plus a sign bit). An element occupies a single byte instead of two (FP16) or four (FP32), so you get *twice* as many numbers per memory transaction and *twice* the raw FLOP rate when using WGMMA’s FP8 instruction set.
+
+The trade‑off is clear:
+
+| Format | Exponent bits | Mantissa bits | Relative dynamic range |
+|--------|---------------|--------------|------------------------|
+| FP16   | 5             | 10           | \(2^{5}\)               |
+| **FP8**| **4**         | **3**        | \(2^{4}\)               |
+
+A smaller mantissa means larger rounding error, while a smaller exponent narrows the representable range – an issue when LLMs exhibit *outlier* activations that are orders of magnitude larger than the bulk of values.
+
+Hopper’s Tensor Cores expose an asynchronous **WGMMA** instruction that can multiply two \(\text{FP8}\) tiles directly from shared memory, delivering up to **1.2 PFLOP/s** on an H100 SXM5 in our benchmarks – roughly double the performance of an equivalent FP16 kernel.
+
+---
+
+## Quantizing Attention Isn't Trivial  
+
+A naïve approach would be to cast \(\mathbf{Q},\mathbf{K},\mathbf{V}\) to FP8 using a *single* scaling factor per tensor (the “per‑tensor” method). Unfortunately this hurts attention in two ways:
+
+1. **Outlier amplification** – Rarely large entries dominate the scaling factor, causing most elements to be under‑represented after quantization.
+2. **Layout restrictions** – For WGMMA’s FP8 GEMM, operand B must be stored in *k‑major* order (contiguous along the inner reduction dimension). Standard memory layouts place \(\mathbf{V}\) contiguous in the head dimension, so a transpose is needed before it can be consumed by an FP8 GEMM.
+
+These obstacles mean we cannot simply drop in an FP8 GEMM and expect either speed or accuracy.
+
+---
+
+## FlashAttention‑3’s Two Clever Tricks  
+
+### 1️⃣ Block Quantization – “scale locally”  
+
+Instead of one global scale per tensor, FlashAttention‑3 splits each input matrix into blocks that match the algorithm’s tiling strategy (e.g., \(B_r \times d\) query blocks and \(B_c \times d\) key/value blocks). Each block gets its own scale factor:
+
+\[
+\tilde{\mathbf{Q}}_{b} = \operatorname{round}\!\bigl(\frac{\mathbf{Q}_{b}}{s^{Q}_{b}}\bigr),\qquad 
+s^{Q}_{b} = \max_{i,j} |\!\,[\mathbf{Q}_{b}]_{ij}\!|,
+\]
+
+(and analogously for \(\tilde{\mathbf{K}}_{b},\,\tilde{\mathbf{V}}_{b}\)). Because each block sees a much tighter dynamic range, the effective quantization error drops dramatically. Moreover, this block‑wise scaling integrates naturally into FlashAttention‑3’s pipeline – no extra memory passes are required because the computation already processes one block at a time.
+
+### 2️⃣ Incoherent Processing – “shuffle outliers”  
+
+Even with block scales we can still see spikes if an outlier lands inside a block together with many small values. FlashAttention‑3 inserts an *orthogonal* preprocessing step:
+
+\[
+\widehat{\mathbf{Q}} = \mathbf{Q}\,\mathbf{M}, \qquad 
+\widehat{\mathbf{K}} = \mathbf{K}\,\mathbf{M},
+\]
+
+where \(\mathbf{M}\) is a random orthogonal matrix built as a product of random diagonal \(\pm1\) matrices and a Hadamard matrix (i.e., \( \mathbf{M}= \operatorname{diag}(\pm1)\,\mathbf{H}\)). Because \(\mathbf{M}\mathbf{M}^{\top}= \mathbf I\),
+
+\[
+\widehat{\mathbf{Q}}\,\widehat{\mathbf{K}}^{\top}
+= (\mathbf Q \mathbf M)(\mathbf K \mathbf M)^{\top}
+= \mathbf Q \,\bigl(\underbrace{\mathbf M^{\top}\!\!\,\! \,\mathbf M}_{=\bf I}\bigr)\,\!\!\!\,\!^\top
+= \mathbf Q\,\mathbf K^{\top},
+\]
+
+so the true attention scores are unchanged. What does change is *where* each entry ends up after mixing: an outlier becomes distributed across many positions, reducing its peak magnitude before we truncate to eight bits. The transformation costs only \(O(d\,\log d)\) per head and can be fused with existing rotary‑embedding kernels at zero extra runtime overhead.
+
+Both techniques together form what we call **incoherent low‑precision processing** – “incoherent” because each block’s scaling lives independently of its neighbors, and “processing” because we deliberately scramble the data before quantizing it.
+
+---
+
+## Performance Gains on Hopper  
+
+| Precision | Peak TFLOP/s (H100 SXM5) | Observed TFLOP/s* | Speedup vs FlashAttention‑2 |
+|-----------|--------------------------|-------------------|-----------------------------|
+| FP16      | 989                      | ≈ 740             | 1.5–2.0 ×                 |
+| **FP8**   | **~1 200**               | ≈ 1 200           | ~2 ×                     |
+
+*TFLOP/s measured on full forward passes with head dimension 128 and sequence length 8192.*  
+
+Key observations:
+
+- The asynchronous pipeline (“producer–consumer warp specialization”) hides TMA loads behind WGMMA matmuls, keeping tensor cores busy > 70 % of the time instead of ~35 % seen in FlashAttention‑2.
+- With block quantization + incoherent processing in place, switching from FP16 to FP8 almost doubles raw throughput without falling off due to numerical issues.
+- For large sequences (> 4 k tokens) FlashAttention‑3 even surpasses NVIDIA’s cuDNN‐optimized attention kernels that were tuned specifically for H100.
+
+---
+
+## Accuracy: Keeping Errors Low  
+
+To stress test robustness we injected synthetic outliers:
+
+```
+x ∼ N(0,1) + N(0,100)·Bernoulli(0.001)
+```
+
+Only 0.1 % of entries receive a ±10× boost—exactly the regime where naïve per‑tensor FP8 fails spectacularly. Using root‑mean‑square error against a double‐precision reference:
+
+| Method                | RMSE (outlier test) |
+|-----------------------|---------------------|
+| Standard FP8 (+per‐tensor scaling)   | 1 (baseline) |
+| FlashAttention‑3 FP8 (block + incoherent) | **0.38** (~2.6× lower) |
+| FlashAttention‑2 / ‑3 FP16            | ≈ 0.62 (≈ 1.7× lower than standard fp16 implementation) |
+
+Thus our low‑precision path delivers *the same numerical quality as high‑precision kernels* while reaping almost twice the speed advantage.
+
+---
+
+## Bottom Line  
+
+- **FP8 isn’t just “smaller floats.”** On modern GPUs it unlocks double matmul throughput *if* we handle its limited dynamic range carefully.
+- **Block quantization** adapts scaling to each computation tile without extra memory passes.
+- **Incoherent processing** shuffles outliers via an orthogonal transform that preserves dot products while flattening extreme values.
+- Combining both ideas inside FlashAttention‑3 yields an *exact* attention implementation that runs at near‐hardware limits (≈ 75 % tensor‐core utilization) and maintains—or even improves—the numerical fidelity of existing fp16 kernels.
+
+The immediate payoff is faster inference for long-context LLMs and vision models; long term, such techniques will be essential whenever new low‑precision formats appear (e.g., fp4 on Blackwell). FlashAttention‑3’s codebase is already open source and slated for integration into PyTorch and Hugging Face stacks—so you can start experimenting right away without having to reinvent these tricks yourself.
+
+Stay tuned: as GPUs keep adding asynchronous compute units and ever smaller floating formats, clever algorithmic redesigns like those in FlashAttention‑3 will be key to turning raw hardware horsepower into real AI progress.

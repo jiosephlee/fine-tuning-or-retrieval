@@ -28,6 +28,8 @@ ENABLE_THINKING=""   # "1"/"0"; empty leaves the pipeline default (thinking on)
 TEMPERATURE=""       # e.g. 0.7 for sampling; empty leaves the default (greedy, temp 0)
 TOP_P=""             # e.g. 0.8; empty leaves the default
 REPETITION_PENALTY=""  # e.g. 1.1 to break LaTeX-structure loops; empty leaves it off
+MIN_P=""             # e.g. 0.05 min-p nucleus (pair with temp ~1.0, top_p off); empty leaves it off
+MAX_TOKENS=""        # per-generation output cap; empty leaves the pipeline default
 PAPERS=""            # comma-separated items to target (empty = all items in the domain)
 PARTS="all"          # comma-separated views: stack_exchange,textbook,blog (or all)
 EXCLUDE=""           # comma-separated nodes to avoid (e.g. a flaky dgx0NN)
@@ -43,6 +45,8 @@ while [[ $# -gt 0 ]]; do
         --temperature) TEMPERATURE="$2"; shift 2 ;;
         --top-p) TOP_P="$2"; shift 2 ;;
         --repetition-penalty) REPETITION_PENALTY="$2"; shift 2 ;;
+        --min-p) MIN_P="$2"; shift 2 ;;
+        --max-tokens) MAX_TOKENS="$2"; shift 2 ;;
         --papers) PAPERS="$2"; shift 2 ;;
         --parts) PARTS="$2"; shift 2 ;;
         --exclude) EXCLUDE="$2"; shift 2 ;;
@@ -73,11 +77,11 @@ config_for_size() {
         # a multiple of 128. The 35B's shared expert is 512, so TP=8 (512/8=64) fails to load;
         # TP=4 (512/4=128) is the max safe value. The 122B/397B shared expert is 1024, so TP=8 is fine.
         35B-A3B-FP8)   MODEL_ID="Qwen/Qwen3.5-35B-A3B-FP8";   TAG="35b_a3b_fp8"
-                       GPUS=4; TP=4; CPUS=112; MEM="800G"; MAX_NUM_SEQS=256; MML="auto"; EXTRA=("${MOE_EXTRA[@]}") ;;
+                       GPUS=4; TP=4; CPUS=112; MEM="896G"; MAX_NUM_SEQS=256; MML="auto"; EXTRA=("${MOE_EXTRA[@]}") ;;
         122B-A10B-FP8) MODEL_ID="Qwen/Qwen3.5-122B-A10B-FP8"; TAG="122b_a10b_fp8"
-                       GPUS=8; TP=8; CPUS=224; MEM="1600G"; MAX_NUM_SEQS=256; MML="auto"; EXTRA=("${MOE_EXTRA[@]}") ;;
+                       GPUS=8; TP=8; CPUS=224; MEM="1792G"; MAX_NUM_SEQS=256; MML="auto"; EXTRA=("${MOE_EXTRA[@]}") ;;
         397B-A17B-FP8) MODEL_ID="Qwen/Qwen3.5-397B-A17B-FP8"; TAG="397b_a17b_fp8"
-                       GPUS=8; TP=8; CPUS=224; MEM="1600G"; MAX_NUM_SEQS=256; MML="auto"; EXTRA=("${MOE_EXTRA[@]}") ;;
+                       GPUS=8; TP=8; CPUS=224; MEM="1792G"; MAX_NUM_SEQS=256; MML="auto"; EXTRA=("${MOE_EXTRA[@]}") ;;
         *) echo "Unknown model size: $1" >&2; exit 2 ;;
     esac
 }
@@ -95,6 +99,8 @@ for size in "${MODELS[@]}"; do
         [[ -n "$TEMPERATURE" ]] && SAMPLE_ARG+=(--temperature "$TEMPERATURE")
         [[ -n "$TOP_P" ]] && SAMPLE_ARG+=(--top-p "$TOP_P")
         [[ -n "$REPETITION_PENALTY" ]] && SAMPLE_ARG+=(--repetition-penalty "$REPETITION_PENALTY")
+        [[ -n "$MIN_P" ]] && SAMPLE_ARG+=(--min-p "$MIN_P")
+        [[ -n "$MAX_TOKENS" ]] && SAMPLE_ARG+=(--max-tokens "$MAX_TOKENS")
         PAPERS_ARG=()
         [[ -n "$PAPERS" ]] && PAPERS_ARG=(--item "$PAPERS")
         EXCLUDE_ARG=()

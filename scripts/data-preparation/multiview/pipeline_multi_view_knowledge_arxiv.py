@@ -13,6 +13,7 @@ ARXIV_CLEANED_DIR = DATA_ROOT / "arxiv" / "cleaned"
 sys.path.insert(0, str(PROJECT_ROOT))
 import utils.utils as utils
 from utils.granular_outputs import write_granular_files
+from utils.multiview_recovery import TEXTBOOK_SCHEMA, manifest_valid, record_validated_view
 from importlib import reload
 reload(utils)
 
@@ -227,8 +228,12 @@ There have been other implementation attempts, like gradient checkpointing(e.g. 
             qa_pair['answer'] = refined_answer_text
         return qa_pair
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        qa_pairs = list(tqdm(executor.map(refine_answer_latex, qa_pairs), total=len(qa_pairs), desc="Refining LaTeX"))
+    active_model = (model or writing_model).lower()
+    if "gpt-oss" in active_model:
+        print("Skipping LLM LaTeX refinement for GPT-OSS; retaining validated original answers")
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            qa_pairs = list(tqdm(executor.map(refine_answer_latex, qa_pairs), total=len(qa_pairs), desc="Refining LaTeX"))
 
     # --- 5. Create single Stack Exchange style explanation file ---
     print("Creating Stack Exchange explanation file...")
@@ -299,11 +304,15 @@ Provide the output as a JSON object with a single key "outline", which is a list
         reasoning_effort=efforts["outline"],
         system_prompt_included=True,
         return_json=True,
+        json_schema={"type": "json_schema", "json_schema": {
+            "name": "textbook_outline", "strict": True, "schema": TEXTBOOK_SCHEMA}},
         max_tokens=MAX_TOKENS,
         provider=provider,
         base_url=base_url,
     )
     
+    if isinstance(response_outline_str, dict):
+        response_outline_str = json.dumps(response_outline_str, ensure_ascii=False)
     # Save the generated textbook outline
     outline_log_path = os.path.join(OUTPUT_DIR, "textbook_outline.json")
     with open(outline_log_path, 'w') as f:
@@ -343,6 +352,9 @@ Provide the output as a JSON object with a single key "outline", which is a list
     # Drop chapters missing a required field (schema drift under json_object mode).
     outline = [c for c in outline if isinstance(c, dict) and c.get('chapter_title')
                and c.get('description') and isinstance(c.get('subtopics'), list)]
+    with open(outline_log_path, 'w', encoding='utf-8') as f:
+        json.dump({'outline': outline}, f, ensure_ascii=False, indent=2)
+        f.write('\n')
     print(f"Parsed outline with {len(outline)} chapters.")
 
     # --- 2. Write each chapter in parallel ---
@@ -566,19 +578,27 @@ def process_papers(paper_names=None, parts=None, model=None, model_slug=None,
           f"reasoning_effort mode={mode})")
 
     selected_parts = resolve_parts(parts)
+    failures = []
     for paper_name in paper_names:
         for part in selected_parts:
-            PART_GENERATORS[part](
-                paper_name,
-                model=model,
-                slug=slug,
-                efforts=efforts[part],
-                outline_model=outline_model,
-                writing_model=writing_model,
-                provider=provider,
-                base_url=base_url,
-                max_workers=max_workers,
-            )
+            view = "stackexchange" if part == "stack_exchange" else part
+            item_dir = utils.explanations_dir('arxiv', slug, paper_name, root=str(DATA_ROOT))
+            if manifest_valid(item_dir, view):
+                print(f"Skipping manifest-validated {paper_name}/{view}")
+                continue
+            try:
+                PART_GENERATORS[part](
+                    paper_name, model=model, slug=slug, efforts=efforts[part],
+                    outline_model=outline_model, writing_model=writing_model,
+                    provider=provider, base_url=base_url, max_workers=max_workers,
+                )
+                record_validated_view(item_dir, view, {"model": model or writing_model,
+                    "provider": provider, "reasoning_effort": mode})
+            except Exception as exc:
+                failures.append(f"{paper_name}/{view}: {exc}")
+                print(f"ERROR: failed {paper_name}/{view}: {exc}", file=sys.stderr)
+    if failures:
+        raise RuntimeError("Incomplete multiview run:\n" + "\n".join(failures))
 
 if __name__ == "__main__":
     import argparse

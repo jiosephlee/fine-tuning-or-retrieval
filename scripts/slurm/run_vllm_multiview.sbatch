@@ -30,10 +30,15 @@ ENABLE_THINKING=""
 TEMPERATURE=""
 TOP_P=""
 REPETITION_PENALTY=""
+MIN_P=""
 TRUST_REMOTE_CODE=""
 ENABLE_EXPERT_PARALLEL=""
 LANGUAGE_MODEL_ONLY=""
 MAX_NUM_BATCHED_TOKENS=""
+MOE_BACKEND=""
+TOOL_CALL_PARSER=""
+ENABLE_AUTO_TOOL_CHOICE=""
+DISABLE_FLASHINFER_AUTOTUNE=""
 
 usage() {
     echo "Usage: $0 [options]"
@@ -70,12 +75,17 @@ while [[ $# -gt 0 ]]; do
         --temperature) TEMPERATURE="$2"; shift 2 ;;
         --top-p) TOP_P="$2"; shift 2 ;;
         --repetition-penalty) REPETITION_PENALTY="$2"; shift 2 ;;
+        --min-p) MIN_P="$2"; shift 2 ;;
         # Boolean serve flags take an explicit 1/0 value so they survive the submit
         # wrapper, which only forwards "--flag value" pairs (a bare flag would abort it).
         --trust-remote-code) TRUST_REMOTE_CODE="$2"; shift 2 ;;
         --enable-expert-parallel) ENABLE_EXPERT_PARALLEL="$2"; shift 2 ;;
         --language-model-only) LANGUAGE_MODEL_ONLY="$2"; shift 2 ;;
         --max-num-batched-tokens) MAX_NUM_BATCHED_TOKENS="$2"; shift 2 ;;
+        --moe-backend) MOE_BACKEND="$2"; shift 2 ;;
+        --tool-call-parser) TOOL_CALL_PARSER="$2"; shift 2 ;;
+        --enable-auto-tool-choice) ENABLE_AUTO_TOOL_CHOICE="$2"; shift 2 ;;
+        --disable-flashinfer-autotune) DISABLE_FLASHINFER_AUTOTUNE="$2"; shift 2 ;;
         --ready-timeout-seconds) READY_TIMEOUT_SECONDS="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -175,6 +185,18 @@ fi
 if [[ -n "$MAX_NUM_BATCHED_TOKENS" ]]; then
     EXTRA_SERVE_ARGS+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS")
 fi
+if [[ -n "$MOE_BACKEND" ]]; then
+    EXTRA_SERVE_ARGS+=(--moe-backend "$MOE_BACKEND")
+fi
+if [[ -n "$TOOL_CALL_PARSER" ]]; then
+    EXTRA_SERVE_ARGS+=(--tool-call-parser "$TOOL_CALL_PARSER")
+fi
+if [[ "$ENABLE_AUTO_TOOL_CHOICE" == "1" ]]; then
+    EXTRA_SERVE_ARGS+=(--enable-auto-tool-choice)
+fi
+if [[ "$DISABLE_FLASHINFER_AUTOTUNE" == "1" ]]; then
+    EXTRA_SERVE_ARGS+=(--kernel-config '{"enable_flashinfer_autotune":false}')
+fi
 # MoE serve toggles (value 1 enables the corresponding boolean vLLM flag).
 if [[ "$TRUST_REMOTE_CODE" == "1" ]]; then
     EXTRA_SERVE_ARGS+=(--trust-remote-code)
@@ -246,7 +268,15 @@ do
     sleep 15
 done
 
-echo "Running plain-text and JSON endpoint smoke tests"
+if [[ "$MOE_BACKEND" == "flashinfer_trtllm_afp8" ]]; then
+    if ! grep -q "FLASHINFER_TRTLLM_MXFP4_MXFP8" "$SERVER_LOG"; then
+        echo "Requested FlashInfer AFP8 backend was not activated; refusing generation" >&2
+        tail -n 100 "$SERVER_LOG" >&2 || true
+        exit 1
+    fi
+fi
+
+echo "Running structured and long-prose endpoint smoke tests at low/high reasoning"
 MODEL="$MODEL" VLLM_BASE_URL="$VLLM_BASE_URL" VLLM_API_KEY="$VLLM_API_KEY" "$VLLM_PYTHON" - <<'PY'
 import json
 import os
@@ -258,22 +288,22 @@ client = OpenAI(
     timeout=600,
 )
 model = os.environ["MODEL"]
-plain = client.chat.completions.create(
-    model=model,
-    messages=[{"role": "user", "content": "Reply with exactly: vllm ready"}],
-    max_tokens=8192,
-)
-if not (plain.choices[0].message.content or "").strip():
-    raise RuntimeError("plain-text smoke completion was empty")
-structured = client.chat.completions.create(
-    model=model,
-    messages=[{"role": "user", "content": "Return JSON with key ready and boolean value true."}],
-    response_format={"type": "json_object"},
-    max_tokens=8192,
-)
-payload = json.loads(structured.choices[0].message.content or "")
-if payload.get("ready") is not True:
-    raise RuntimeError(f"unexpected JSON smoke response: {payload}")
+for effort in ("low", "high"):
+    plain = client.chat.completions.create(
+        model=model, reasoning_effort=effort,
+        messages=[{"role": "user", "content": "Write at least 300 coherent words explaining why transactional file publication prevents stale partial outputs."}],
+        max_tokens=12288 if effort == "low" else 24576,
+    )
+    if len((plain.choices[0].message.content or "").split()) < 250:
+        raise RuntimeError(f"{effort} long-prose smoke completion was empty or short")
+    structured = client.chat.completions.create(
+        model=model, reasoning_effort=effort,
+        messages=[{"role": "user", "content": "Return JSON with key ready and boolean value true."}],
+        response_format={"type": "json_object"}, max_tokens=16384 if effort == "low" else 32768,
+    )
+    payload = json.loads(structured.choices[0].message.content or "")
+    if payload.get("ready") is not True:
+        raise RuntimeError(f"unexpected {effort} JSON smoke response: {payload}")
 print("vLLM smoke tests passed")
 PY
 
@@ -324,6 +354,10 @@ fi
 if [[ -n "$REPETITION_PENALTY" ]]; then
     export QWEN_REPETITION_PENALTY="$REPETITION_PENALTY"
     echo "Qwen sampling: QWEN_REPETITION_PENALTY=$REPETITION_PENALTY"
+fi
+if [[ -n "$MIN_P" ]]; then
+    export QWEN_MIN_P="$MIN_P"
+    echo "Qwen sampling: QWEN_MIN_P=$MIN_P"
 fi
 
 echo "Running $DOMAIN multiview pipeline for $ITEM (parts=$PARTS, slug=$MODEL_SLUG)"

@@ -28,11 +28,14 @@ TYPES = {
 CHANNEL_MARKERS = ("<|channel|>", "<|message|>", "assistantfinal")
 
 FAMILIES = {
-    "gpt_oss_20b_low": ["gpt_oss_20b_low", "gpt_oss_20b_low_max", "gpt_oss_20b_low_max_v2", "gpt_oss_20b_low_64k"],
-    "gpt_oss_120b_low": ["gpt_oss_120b_low", "gpt_oss_120b_low_max", "gpt_oss_120b_low_max_v2", "gpt_oss_120b_low_64k"],
-    "gpt_oss_20b_high": ["gpt_oss_20b_high", "gpt_oss_20b_high_v2", "gpt_oss_20b_high_64k"],
-    "gpt_oss_120b_high": ["gpt_oss_120b_high", "gpt_oss_120b_high_v2", "gpt_oss_120b_high_64k"],
+    "gpt_oss_20b_low": ["gpt_oss_20b_low", "gpt_oss_20b_low_max", "gpt_oss_20b_low_max_v2", "gpt_oss_20b_low_64k", "gpt_oss_20b_low_recovery"],
+    "gpt_oss_120b_low": ["gpt_oss_120b_low", "gpt_oss_120b_low_max", "gpt_oss_120b_low_max_v2", "gpt_oss_120b_low_64k", "gpt_oss_120b_low_recovery"],
+    "gpt_oss_20b_high": ["gpt_oss_20b_high", "gpt_oss_20b_high_v2", "gpt_oss_20b_high_64k", "gpt_oss_20b_high_recovery"],
+    "gpt_oss_120b_high": ["gpt_oss_120b_high", "gpt_oss_120b_high_v2", "gpt_oss_120b_high_64k", "gpt_oss_120b_high_recovery"],
 }
+# Superseded variant runs live in _archive/ after merging; recovery runs (gap refills)
+# are added as candidates above and merged when their generation completes.
+ARCHIVE_DIR = "_archive"
 
 
 def has_channel_markers(path):

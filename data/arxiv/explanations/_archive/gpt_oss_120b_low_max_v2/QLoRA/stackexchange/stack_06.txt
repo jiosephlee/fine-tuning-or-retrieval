@@ -1,0 +1,118 @@
+\title{Stack Exchange of the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+### Can NF4 quantization be combined with other PEFT methods besides LoRA (e.g., IA³ or BitFit), and what would be expected challenges?
+Question:
+The authors focus on LoRA adapters but mention many other parameter‑efficient finetuning techniques. If we were to use IA³ (scaling hidden states) or BitFit (bias only) on top of an NF4‑quantized base model, would any of the QLoRA components (NF4, Double Quantization, Paged Optimizers) need to be modified? In particular:
+- Does backpropagation through NF4 affect bias updates differently than weight updates?
+- Would Double Quantization of scaling constants still provide a net memory benefit if fewer trainable parameters are used?
+Answer:
+**Short answer:**  
+Yes – the QLoRA building blocks (NF4 storage, double‑quantised scale constants and the paged‑optimizer machinery) are completely agnostic to *which* PEFT method you attach to the frozen 4‑bit model.  You can therefore place IA³ (per‑layer hidden‑state scalings) or BitFit (trainable bias vectors) on top of an NF4‑quantised backbone without changing the quantisation code.  The only things you have to keep in mind are:
+
+1. **Back‑propagation through NF4 works exactly as described for LoRA:** gradients are computed with respect to the de‑quantised BFloat16 values, but the underlying 4‑bit storage never receives a gradient update.  Consequently, whether you are updating a bias term (BitFit) or a hidden‑state scaling factor (IA³) does not alter the way the NF4 tensors are de‑quantised or differentiated – they remain a fixed “read‑only” weight matrix.
+
+2. **Double quantisation of the per‑block scales still saves memory even when the number of trainable parameters is tiny:** the scale constants belong to the *base* model, not to the adapter.  IA³ and BitFit typically add only a few megabytes of extra parameters (a set of scalars per layer or a bias vector per linear map), so the dominant memory consumption of the quantised model is still in the weight blocks and their scales.  Quantising those scales a second time therefore reduces the overall footprint by roughly the same ≈0.37 bits/weight that QLoRA reports, regardless of how many adapter parameters you introduce.
+
+Below is a more detailed walk‑through that ties each point back to the paper’s design.
+
+---
+
+### 1. What part of QLoRA is tied to LoRA?
+
+QLoRA’s core equations (Section 3) can be rewritten rather generically as  
+
+$$
+\mathbf{y}= \underbrace{\mathbf{X}\,\bigl[\text{dequant}(\mathbf{W}^{\text{NF4}})\bigr]}_{\text{frozen quantised backbone}}
+      \;+\; \underbrace{f_{\text{PEFT}}(\mathbf{X};\boldsymbol{\theta})}_{\text{trainable PEFT module}} .
+$$
+
+In the paper $f_{\text{PEFT}}(\cdot)$ is instantiated as a LoRA low‑rank product  
+$\mathbf{X}\mathbf{L}_1\mathbf{L}_2$.  Nothing else in the forward pass depends on *how* those extra parameters are produced; they are simply added to the backbone output.
+
+During back‑propagation we need two gradients:
+
+* $\displaystyle \frac{\partial \mathcal L}{\partial \mathbf{L}_i}$ – for LoRA it is a 16‑bit BFloat16 gradient.
+* $\displaystyle \frac{\partial \mathcal L}{\partial \mathbf{W}}$ – **not required**, because $\mathbf{W}$ is frozen.
+
+The paper emphasises (Eq. 5, paragraph after it) that *only* LoRA gradients are computed; gradients w.r.t. `$W$` never touch the NF4 storage.  This property holds for any differentiable PEFT head $f_{\text{PEFT}}$.  Whether $f_{\text{PEFT}}$ outputs a bias addition ($b$) or a per‑layer hidden‑state multiplier ($\alpha$) does not change the fact that `$W$` stays constant.
+
+Hence:
+
+| PEFT | Gradient flow through NF4 | Needed modification? |
+|------|---------------------------|----------------------|
+| LoRA | Yes (via `L₁,L₂`)         | No |
+| IA³  | Yes (via hidden scaling)   | No |
+| BitFit| Yes (via bias)            | No |
+
+The only practical change is that you must expose the new trainable parameters to the optimizer (e.g., add `model.bias` or `ia3.scaling` to `optimizer.parameters()`), but the quantisation kernels remain untouched.
+
+---
+
+### 2. Does back‑propagation treat biases differently?
+
+In a standard FP16 model there is no distinction – both weight and bias gradients are computed in full precision.  In QLoRA biases can still be stored in FP16/BFloat16 because they are not quantised; they belong to the *adapter* side of the computation graph, not to the frozen base model.  
+
+If you use **BitFit**, each linear layer’s bias vector becomes a trainable tensor with its own FP16/BFloat16 state and gradient.  The forward pass simply adds this bias after de‑quantising `$\displaystyle W^{\text{NF4}}$`:
+
+```python
+y = torch.nn.functional.linear(x,
+                               dequant_nf4(W_nf4),
+                               bias_bitfit)   # bias is FP16
+```
+
+The backward pass will compute  
+
+$$
+\frac{\partial \mathcal L}{\partial\,\text{bias}} = \sum_{j} \frac{\partial \mathcal L}{\partial y_j},
+$$
+
+exactly as in any dense model.  The de‑quantisation step remains identical because it only involves `$W^{\text{NF4}}$`; no extra “bias scaling” appears in Eq. (5).  Consequently there is **no special handling** required for biases versus low‑rank matrices.
+
+---
+
+### 3. Double quantisation of scaling constants when PEFT adds few parameters
+
+Double quantisation (DQ) targets *the per‑block scale constants* (`c₂` in Eq. (2)).  
+These scales are needed for **every** weight block irrespective of how many adapter parameters you later introduce.  IA³ and BitFit do **not** introduce new blockwise scales; they merely add either:
+
+* one scalar per layer (`α_l` for IA³), or  
+* one vector per linear projection (`b_l` for BitFit).
+
+Both kinds live in full precision and occupy negligible memory compared with a model that has billions of weight blocks.  Therefore compressing `c₂` a second time still yields roughly the same memory saving as reported in Table 1 of the paper (≈0.37 bits per original weight).  
+
+Even when you replace LoRA with an adapter that has only 0.02 % of total parameters, DQ continues to shave off several gigabytes on a 65 B model because it reduces *the dominant term*: “weights + per‑block scales”. The extra trainable scalars/biases do not affect those statistics, so DQ’s benefit stays essentially unchanged.
+
+---
+
+### 4. Practical checklist for mixing QLoRA with IA³ / BitFit
+
+1. **Quantise once** – run `quantize_model(model, dtype="nf4", blocksize=64)` exactly as described; this produces frozen NF4 tensors and their initial scale constants.
+2. **Apply Double Quantisation** – enable it (`double_quant=True`) so that each block’s scale constant is stored as an FP8 tensor plus its own FP32 master copy.
+3. **Add your PEFT head**  
+   * *IA³*: create a `nn.Parameter` per transformer layer (or per attention/ffn submodule) that multiplies hidden activations after dequantisation:  
+     `x = x * ia3_scale[l]`.
+   * *BitFit*: replace each linear layer’s bias with a learnable FP16 tensor.
+4. **Tell Optimizer about new params** – e.g., `optimizer = AdamW([...] + list(ia3.parameters()) + list(bitfit.biases()))`.
+5. **Leave paged optimizers unchanged** – they manage optimizer state memory spikes independent of parameter count, so they work identically for any PEFT method.
+6. **Train exactly as in QLoRA** – forward passes dequantise NF4 weights on‑the‑fly, compute loss, backpropagate through both dequantised weights and your new PEFT parameters, and update only those PEFT parameters.
+
+---
+
+### 5. Expected challenges & tips
+
+| Challenge | Why it appears | Mitigation |
+|-----------|----------------|------------|
+| **Gradient scaling mismatch** | IA³ scales live in FP32 while activations are BFloat16 → potential overflow/underflow if learning rate is too high | Use a modest learning rate (the same range used for LoRA works: 1e‑5–5e‑5) and optionally cast IA³ scalars to BF16 during the forward pass |
+| **Bias-only updates may be too small** | BitFit adds far fewer degrees of freedom than LoRA; training can become under‑parameterised on some tasks | Increase number of training steps or employ a slightly larger batch size; sometimes mixing BitFit with a tiny LoRA rank improves convergence |
+| **Interaction with Double Quantisation** | DQ operates on positive scales only; adding per‑layer scalings that can be negative does not interfere but you must keep them separate from DQ tensors | Store IA³ scalings as separate full‑precision tensors; do not attempt to quantise them together with `c₂`. |
+| **Memory accounting confusion** | When reporting memory you might think IA³/BitFit erase DQ gains because adapters are tiny | Remember that DQ savings come from *base model* storage; adapter memory (< 30 MB even for IA³ on a 65 B model) is negligible relative to saved ~3 GB from DQ.|
+
+Overall, no code modification to the NF4 kernels or double‐quantisation pipeline is required; you only need to plug in your new parameter tensors just like you would when adding LoRA adapters.
+
+---
+
+### 6. Takeaway
+
+The three pillars introduced by QLoRA—NF4 weight storage, Double Quantisation of block scales, and Paged Optimizers—are orthogonal to any specific Parameter‑Efficient Fine‑Tuning technique.  Backward passes always flow through de‑quantised weights but never touch their stored bits, so replacing LoRA with IA³ or BitFit incurs no extra bookkeeping for NF4 itself.  Double Quantisation continues to deliver its ≈0.37 bits/weight memory reduction because it compresses data that dominates memory use regardless of how many trainable PEFT parameters you introduce.
+
+Consequently, you can safely experiment with IA³ or BitFit on an NF4‐quantised LLM using exactly the same QLoRA infrastructure described in the paper, keeping an eye only on usual PEFT hyper‑parameters (learning rate, number of epochs) rather than on any special treatment of NF4 or its double‐quantised constants.

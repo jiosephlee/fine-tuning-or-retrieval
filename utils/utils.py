@@ -108,7 +108,7 @@ def _clamp_max_tokens_for_context(exc, params):
     return True
 
 
-def _create_vllm_completion(client, api_params, require_complete=False):
+def _create_vllm_completion(client, api_params, require_complete=False, max_cap=None):
     """Call local vLLM, growing an exhausted completion budget on truncation.
 
     Unlike the PARCC proxy path, the first request honors the caller's requested
@@ -125,6 +125,7 @@ def _create_vllm_completion(client, api_params, require_complete=False):
     remaining room be used for the completion.
     """
     params = dict(api_params)
+    max_cap = max_cap or VLLM_MAX_MAX_TOKENS
     empty_retries = 0
     initial_max_tokens = params.get("max_tokens", 1)
     while True:
@@ -138,14 +139,14 @@ def _create_vllm_completion(client, api_params, require_complete=False):
         content = (choice.message.content or "").strip()
         truncated = choice.finish_reason == "length"
         if (not content and truncated and empty_retries < VLLM_EMPTY_RETRIES
-                and params.get("max_tokens", 1) < VLLM_MAX_MAX_TOKENS):
+                and params.get("max_tokens", 1) < max_cap):
             # Only length exhaustion is retryable. Keep sampling fixed: changing it
             # makes recovery non-reproducible and made GPT-OSS degeneration worse.
             empty_retries += 1
             params["max_tokens"] = min(
                 max(params.get("max_tokens", initial_max_tokens) * 2,
                     initial_max_tokens + 1),
-                VLLM_MAX_MAX_TOKENS,
+                max_cap,
             )
             continue
         if not content:
@@ -153,9 +154,9 @@ def _create_vllm_completion(client, api_params, require_complete=False):
         if not truncated or (content and not require_complete):
             return completion
         current = params.get("max_tokens", 1)
-        if current >= VLLM_MAX_MAX_TOKENS:
+        if current >= max_cap:
             return completion
-        params["max_tokens"] = min(current * 2, VLLM_MAX_MAX_TOKENS)
+        params["max_tokens"] = min(current * 2, max_cap)
 
 
 def is_litellm_model(model: str) -> bool:
@@ -318,6 +319,32 @@ def _strip_code_fences(text: str) -> str:
     return stripped
 
 
+_LATEX_JSON_COMMANDS = frozenset("""
+bar begin big bigg biggl biggr bigl bigr bm boldsymbol cdot cos delta Delta end
+epsilon exp frac gamma Gamma hat infty lambda left lvert mathbb mathbf mathrm
+operatorname overline partial phi pi prod rangle right rvert sigma sin sqrt sum
+tau text textstyle theta tilde times underbrace underline vec vert
+""".split())
+_JSON_BACKSLASH_WORD = re.compile(r"\\([A-Za-z]+)")
+
+
+def _repair_json_latex_escapes(text: str) -> str:
+    """Escape single LaTeX command slashes in model-produced JSON.
+
+    Guided JSON guarantees syntactic JSON, but ``\frac`` with one raw slash is
+    syntactically interpreted as a form-feed plus ``rac``; likewise ``\bar`` and
+    ``\text`` become control escapes. Preserve those commands as literal LaTeX.
+    Already-correct double slashes are left unchanged.
+    """
+    def replace(match):
+        if match.group(1) not in _LATEX_JSON_COMMANDS:
+            return match.group(0)
+        if match.start() and text[match.start() - 1] == "\\":
+            return match.group(0)
+        return "\\\\" + match.group(1)
+    return _JSON_BACKSLASH_WORD.sub(replace, text)
+
+
 def extract_dict_list(data, preferred_key=None):
     """Best-effort extraction of a list-of-dicts from LLM JSON output.
 
@@ -445,6 +472,12 @@ def query_gpt(prompt: str | dict, model: str = 'gpt-4.1-mini', max_tokens: int =
                 else max_tokens
             ),
         }
+        vllm_max_cap = None
+        if resolved_provider == "vllm" and "gpt-oss" in model.lower():
+            high = reasoning_effort == "high"
+            initial = (32768 if high else 16384) if return_json else (24576 if high else 12288)
+            vllm_max_cap = (65536 if high else 32768) if return_json else (49152 if high else 24576)
+            api_params["max_tokens"] = min(api_params["max_tokens"], initial)
         if temperature and temperature > 0:
             api_params["temperature"] = temperature
         if top_p and top_p > 0:
@@ -490,6 +523,13 @@ def query_gpt(prompt: str | dict, model: str = 'gpt-4.1-mini', max_tokens: int =
             _rp = os.environ.get("QWEN_REPETITION_PENALTY")
             if _rp is not None:
                 api_params.setdefault("extra_body", {})["repetition_penalty"] = float(_rp)
+            # Optional min-p nucleus (vLLM extension). An alternative to top_p that keeps
+            # only tokens above min_p * max_prob; paired with temperature ~1.0 it truncates
+            # the distribution differently and can escape repetition attractors that top_p
+            # can't. Off unless QWEN_MIN_P is set.
+            _mp = os.environ.get("QWEN_MIN_P")
+            if _mp is not None:
+                api_params.setdefault("extra_body", {})["min_p"] = float(_mp)
     elif 'gpt-5' in model:
         api_params = {
             "model": model,
@@ -523,10 +563,12 @@ def query_gpt(prompt: str | dict, model: str = 'gpt-4.1-mini', max_tokens: int =
             if resolved_provider == "litellm":
                 completion = _create_litellm_completion(temp_client, api_params)
             elif resolved_provider == "vllm":
-                completion = _create_vllm_completion(temp_client, api_params, require_complete=True)
+                completion = _create_vllm_completion(temp_client, api_params, require_complete=True, max_cap=vllm_max_cap)
             else:
                 completion = temp_client.chat.completions.create(**api_params)
-            response = _strip_code_fences(completion.choices[0].message.content or "")
+            response = _repair_json_latex_escapes(
+                _strip_code_fences(completion.choices[0].message.content or "")
+            )
             # Self-hosted backends don't strictly enforce the json_object grammar (weak
             # models emit unescaped quotes; runaway repetition yields unterminated
             # strings). Blank a malformed payload so the caller's empty-response guard
@@ -544,9 +586,11 @@ def query_gpt(prompt: str | dict, model: str = 'gpt-4.1-mini', max_tokens: int =
                 completion = (
                     _create_litellm_completion(temp_client, api_params)
                     if resolved_provider == "litellm"
-                    else _create_vllm_completion(temp_client, api_params, require_complete=True)
+                    else _create_vllm_completion(temp_client, api_params, require_complete=True, max_cap=vllm_max_cap)
                 )
-                raw = _strip_code_fences(completion.choices[0].message.content or "")
+                raw = _repair_json_latex_escapes(
+                    _strip_code_fences(completion.choices[0].message.content or "")
+                )
                 try:
                     response = json.loads(raw)
                 except json.JSONDecodeError as exc:
@@ -560,7 +604,7 @@ def query_gpt(prompt: str | dict, model: str = 'gpt-4.1-mini', max_tokens: int =
         elif resolved_provider == "vllm":
             # Prose too: with thinking on, reasoning can eat the budget and truncate the
             # answer. Grow-on-truncation so the saved content isn't cut off mid-sentence.
-            completion = _create_vllm_completion(temp_client, api_params, require_complete=True)
+            completion = _create_vllm_completion(temp_client, api_params, require_complete=True, max_cap=vllm_max_cap)
         else:
             completion = temp_client.chat.completions.create(**api_params)
         # Reasoning models (e.g. GLM via vLLM) return content=None when the token budget
