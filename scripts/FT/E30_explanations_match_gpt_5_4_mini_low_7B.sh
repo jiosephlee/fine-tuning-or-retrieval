@@ -5,8 +5,8 @@
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=4
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=512G
+#SBATCH --cpus-per-task=112
+#SBATCH --mem=896G
 #SBATCH --time=0-8:00:00
 
 # Train with gpt_5_4_mini_low-generated explanations inserted into a matched auxiliary track
