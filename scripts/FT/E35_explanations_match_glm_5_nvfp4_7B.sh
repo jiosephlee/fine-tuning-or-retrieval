@@ -3,10 +3,10 @@
 #SBATCH --output=logs/E35_expl_match_glm_5_nvfp4-%j.out
 #SBATCH --error=logs/E35_expl_match_glm_5_nvfp4-%j.err
 #SBATCH --partition=dgx-b200
-#SBATCH --gpus=4
+#SBATCH --gpus=2
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=112
-#SBATCH --mem=896G
+#SBATCH --cpus-per-task=56
+#SBATCH --mem=448G
 #SBATCH --time=0-8:00:00
 
 # Train with the audited GLM-5-NVFP4 explanations inserted into a matched
@@ -32,7 +32,7 @@ mkdir -p logs
 
 MODEL_ID="${MODEL_ID:-allenai/OLMo-2-1124-7B}"
 CONDA_ENV="${CONDA_ENV:-openrlhf}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 NUM_EPOCHS="${NUM_EPOCHS:-100}"
 NUM_PARAPHRASED="${NUM_PARAPHRASED:-9}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-32}"
