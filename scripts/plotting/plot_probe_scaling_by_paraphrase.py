@@ -60,11 +60,11 @@ MODEL_RUNS: Dict[str, Dict[str, str]] = {
         "para49": "results/FT/full/7b/para49/fill_dclm/domains_arxiv_all-legal_all-medical_all/e50/bs256_lr4e-05/overlap_1_16/E2_paraphrase_all_domains_local_no_explanation_match/eval_bundles/inf_mcqa_v14",
     },
     "13b": {
-        "source_only": "results/FT/full/allenai_OLMo-2-1124-13B/source_only/fill_dclm/domains_arxiv_all-legal_all-medical_all/e50/bs256_lr4e-05/overlap_1_16/E20_source_13b_all_domains_no_explanation_match_para0/eval_bundles/inf_mcqa_v14",
-        "para4": "results/FT/full/allenai_OLMo-2-1124-13B/para4/fill_dclm/domains_arxiv_all-legal_all-medical_all/e50/bs256_lr4e-05/overlap_1_16/E2_paraphrase_13b_all_domains_no_explanation_match_para9/eval_bundles/inf_mcqa_v14",
-        "para9": "results/FT/full/allenai_OLMo-2-1124-13B/para9/fill_dclm/domains_arxiv_all-legal_all-medical_all/e50/bs256_lr4e-05/overlap_1_16/E2_paraphrase_13b_all_domains_no_explanation_match_para9/eval_bundles/inf_mcqa_v14",
-        "para24": "results/FT/full/allenai_OLMo-2-1124-13B/para24/fill_dclm/domains_arxiv_all-legal_all-medical_all/e50/bs256_lr4e-05/overlap_1_16/E2_paraphrase_13b_all_domains_no_explanation_match_para24/eval_bundles/inf_mcqa_v14",
-        "para49": "results/FT/full/allenai_OLMo-2-1124-13B/para49/fill_dclm/domains_arxiv_all-legal_all-medical_all/e50/bs256_lr4e-05/overlap_1_16/E2_paraphrase_13b_all_domains_no_explanation_match_para49/eval_bundles/inf_mcqa_v14",
+        "source_only": "results/FT/full/13b/source_only/fill_dclm/domains_arxiv_all-legal_all-medical_all/e50/bs256_lr4e-05/overlap_1_16/E20_source_13b_all_domains_no_explanation_match_para0/eval_bundles/inf_mcqa_v14",
+        "para4": "results/FT/full/13b/para4/fill_dclm/domains_arxiv_all-legal_all-medical_all/e50/bs256_lr4e-05/overlap_1_16/E2_paraphrase_13b_all_domains_no_explanation_match_para9/eval_bundles/inf_mcqa_v14",
+        "para9": "results/FT/full/13b/para9/fill_dclm/domains_arxiv_all-legal_all-medical_all/e50/bs256_lr4e-05/overlap_1_16/E2_paraphrase_13b_all_domains_no_explanation_match_para9/eval_bundles/inf_mcqa_v14",
+        "para24": "results/FT/full/13b/para24/fill_dclm/domains_arxiv_all-legal_all-medical_all/e50/bs256_lr4e-05/overlap_1_16/E2_paraphrase_13b_all_domains_no_explanation_match_para24/eval_bundles/inf_mcqa_v14",
+        "para49": "results/FT/full/13b/para49/fill_dclm/domains_arxiv_all-legal_all-medical_all/e50/bs256_lr4e-05/overlap_1_16/E2_paraphrase_13b_all_domains_no_explanation_match_para49/eval_bundles/inf_mcqa_v14",
     },
 }
 LEGACY_DOMAINS = ("1_58", "BOFT", "DPO", "GRPO", "OFT", "QLoRA")
@@ -92,11 +92,11 @@ LEGACY_MODEL_RUNS: Dict[str, Dict[str, str]] = {
         "para49": "results/FT/full/7b/probes_v9/newline2/para49/sep_1_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs32_lr2e-05/overlap_1_4/09_22_22_16",
     },
     "13b": {
-        "source_only": "results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_30",
-        "para4": "results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para4/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_22_16_48",
-        "para9": "results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_13_18",
-        "para19": "results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para19/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_22_18_39",
-        "para49": "results/FT/full/allenai_OLMo-2-1124-13B/probes_v9/newline2/para49/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_22_20_30",
+        "source_only": "results/FT/full/13b/probes_v9/newline2/source_only/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_11_30",
+        "para4": "results/FT/full/13b/probes_v9/newline2/para4/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_22_16_48",
+        "para9": "results/FT/full/13b/probes_v9/newline2/para9/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_21_13_18",
+        "para19": "results/FT/full/13b/probes_v9/newline2/para19/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_22_18_39",
+        "para49": "results/FT/full/13b/probes_v9/newline2/para49/fill_dclm/domains_DPO-1_58-GRPO-BOFT-OFT-QLoRA/e100/bs64_lr2e-05/overlap_1_4/11_22_20_30",
     },
 }
 LEGACY_MODEL_COLORS = {

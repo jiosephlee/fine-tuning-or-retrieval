@@ -664,7 +664,11 @@ def construct_experiment_name(args):
     # 2. Model Size: e.g., '1b', '7b'
     model_id_lower = args.model_id.lower()
     if "olmo" in model_id_lower:
-        if "1b" in model_id_lower:
+        if "13b" in model_id_lower:
+            model_size = "13b"
+        elif "32b" in model_id_lower:
+            model_size = "32b"
+        elif "1b" in model_id_lower:
             model_size = "1b"
         elif "7b" in model_id_lower:
             model_size = "7b"
