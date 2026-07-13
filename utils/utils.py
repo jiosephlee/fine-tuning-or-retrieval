@@ -320,10 +320,10 @@ def _strip_code_fences(text: str) -> str:
 
 
 _LATEX_JSON_COMMANDS = frozenset("""
-bar begin big bigg biggl biggr bigl bigr bm boldsymbol cdot cos delta Delta end
+bar begin beta big bigg biggl biggr bigl bigr bm boldsymbol cdot cos delta Delta end
 epsilon exp frac gamma Gamma hat infty lambda left lvert mathbb mathbf mathrm
 operatorname overline partial phi pi prod rangle right rvert sigma sin sqrt sum
-tau text textstyle theta tilde times underbrace underline vec vert
+tau text textstyle theta tilde times top underbrace underline vec vert
 """.split())
 _JSON_BACKSLASH_WORD = re.compile(r"\\([A-Za-z]+)")
 
@@ -456,6 +456,14 @@ def query_gpt(prompt: str | dict, model: str = 'gpt-4.1-mini', max_tokens: int =
     else:
         messages = [{"role": "user", "content": prompt}]
     messages = _sanitize_for_json_payload(messages)
+    if (resolved_provider == "vllm" and "qwen" in model.lower() and not return_json
+            and os.environ.get("QWEN_COMPACT_PROSE", "").strip().lower() in {"1", "true", "yes"}):
+        messages[-1]["content"] += (
+            "\n\nINTEGRITY CONSTRAINT: Write 600-900 words of complete, polished prose. "
+            "Finish every sentence and section. Do not include drafting notes, internal reasoning, "
+            "placeholder text, word lists, repeated phrases, or languages other than English. "
+            "Stop after a concise concluding paragraph."
+        )
     if resolved_provider in {"litellm", "vllm"}:
         # PARCC/LiteLLM OpenAI-compatible (vLLM) backends: send standard sampling params
         # but omit 'seed' (some backends reject it). vLLM also requires top_p in (0, 1];
@@ -530,6 +538,16 @@ def query_gpt(prompt: str | dict, model: str = 'gpt-4.1-mini', max_tokens: int =
             _mp = os.environ.get("QWEN_MIN_P")
             if _mp is not None:
                 api_params.setdefault("extra_body", {})["min_p"] = float(_mp)
+        if resolved_provider == "vllm":
+            _vllm_temperature = os.environ.get("VLLM_TEMPERATURE")
+            _vllm_top_p = os.environ.get("VLLM_TOP_P")
+            _vllm_top_k = os.environ.get("VLLM_TOP_K")
+            if _vllm_temperature is not None:
+                api_params["temperature"] = float(_vllm_temperature)
+            if _vllm_top_p is not None:
+                api_params["top_p"] = float(_vllm_top_p)
+            if _vllm_top_k is not None:
+                api_params.setdefault("extra_body", {})["top_k"] = int(_vllm_top_k)
     elif 'gpt-5' in model:
         api_params = {
             "model": model,

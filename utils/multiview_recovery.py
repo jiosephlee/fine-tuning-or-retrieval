@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import tempfile
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -105,6 +106,12 @@ def content_reasons(text: str, *, assembled=False) -> list[str]:
     if RESERVED_TOKEN.search(text): reasons.append("reserved_token_leakage")
     if "\ufffd" in text: reasons.append("unicode_replacement_character")
     if any(ord(c) < 32 and c not in "\n\r\t" for c in text): reasons.append("invalid_control_character")
+    # Generated prose should finish at a sentence/Markdown boundary. Across the
+    # corpus, a trailing word or clause delimiter is a strong, deterministic sign
+    # that vLLM stopped after emitting only a prefix of the answer.
+    ending = text.rstrip()
+    if ending and (ending[-1].isalnum() or ending[-1] in ",;:"):
+        reasons.append("truncated_ending")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     # Repeated Markdown delimiters, math fences, and field labels are normal in an
     # assembled multi-item view. Detect loops only in substantive lines.
@@ -114,13 +121,28 @@ def content_reasons(text: str, *, assembled=False) -> list[str]:
                    and line not in {"Question:", "Answer:"}]
     if substantive and max((substantive.count(line) for line in set(substantive)), default=0) >= 5:
         reasons.append("line_repetition_loop")
-    words = re.findall(r"[A-Za-z][A-Za-z'-]*", text.lower())
+    # TeX control sequences such as ``\bm`` and ``\top`` can legitimately occur
+    # hundreds of times in a mathematical answer.  They are formatting commands,
+    # not generated prose tokens, and must not trigger the word-frequency loop gate.
+    lexical_text = re.sub(r"\\[A-Za-z]+", " ", text)
+    words = re.findall(r"[A-Za-z][A-Za-z'-]*", lexical_text.lower())
     if len(words) >= 80:
         trigrams = list(zip(words, words[1:], words[2:]))
         if trigrams and len(set(trigrams)) / len(trigrams) < .28: reasons.append("lexical_degeneration")
-        if max((words.count(word) for word in set(words)), default=0) / len(words) > .16: reasons.append("word_repetition_loop")
+        # High-frequency function words are normal in short explanatory prose;
+        # repeated stopword sequences are already caught by the trigram gate.
+        stopwords = {
+            "a", "an", "and", "are", "as", "at", "be", "been", "being", "by",
+            "for", "from", "in", "is", "it", "of", "on", "or", "that", "the",
+            "this", "to", "was", "were", "with",
+        }
+        content_counts = [count for word, count in Counter(words).items() if word not in stopwords]
+        if max(content_counts, default=0) / len(words) > .16: reasons.append("word_repetition_loop")
     separator_count = len(re.findall(r"(?:^|\n)\s*(?:[-=_*]){5,}\s*(?:\n|$)", text))
-    if separator_count >= 12 or (separator_count >= 4 and separator_count / max(len(lines), 1) > .25):
+    # Horizontal rules around headings are legitimate in long textbook/blog output.
+    # Reject only when separators dominate the non-empty lines; a fixed count would
+    # incorrectly reject long, coherently sectioned documents.
+    if separator_count >= 4 and separator_count / max(len(lines), 1) > .25:
         reasons.append("separator_abuse")
     if text.rstrip().endswith("\\") and not text.rstrip().endswith("\\\\"):
         reasons.append("malformed_trailing_backslash")

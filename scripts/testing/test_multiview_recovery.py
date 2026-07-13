@@ -21,6 +21,43 @@ class SequenceClient:
 
 
 class RecoveryTests(unittest.TestCase):
+    @staticmethod
+    def _unique_alpha_words(count):
+        def suffix(number):
+            letters = ""
+            while True:
+                number, remainder = divmod(number, 26)
+                letters = chr(ord("a") + remainder) + letters
+                if number == 0:
+                    return letters
+                number -= 1
+        return [f"token{suffix(index)}" for index in range(count)]
+
+    def test_mid_sentence_ending_is_rejected_as_truncated(self):
+        text = "A complete-looking but actually truncated explanation. " * 8 + "The final unfinished clause"
+        self.assertIn("truncated_ending", content_reasons(text))
+
+    def test_completed_prose_ending_is_accepted(self):
+        text = "A complete explanatory sentence with enough useful prose. " * 8
+        self.assertNotIn("truncated_ending", content_reasons(text))
+
+    def test_section_dividers_in_long_document_are_not_separator_abuse(self):
+        text = "\n".join(
+            line
+            for index in range(15)
+            for line in (
+                "-" * 68,
+                f"### Coherent section {index}",
+                *(f"Complete explanatory sentence {index}.{n} with useful prose."
+                  for n in range(5)),
+            )
+        )
+        self.assertNotIn("separator_abuse", content_reasons(text))
+
+    def test_separator_dominated_content_is_rejected(self):
+        text = "\n".join(["-" * 68, "tiny label"] * 8)
+        self.assertIn("separator_abuse", content_reasons(text))
+
     def test_harmony_and_repetition_are_hard_failures(self):
         self.assertIn("harmony_marker", content_reasons("<|channel|>" + " coherent" * 50))
         self.assertIn("line_repetition_loop", content_reasons(
@@ -36,10 +73,24 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn("malformed_trailing_backslash", content_reasons(
             "Coherent explanatory prose. " * 10 + "\\"))
 
+    def test_latex_commands_do_not_count_as_repeated_prose_words(self):
+        text = " ".join(
+            rf"\mathbf{{{word}}}"
+            for word in self._unique_alpha_words(100)
+        ) + "."
+        self.assertNotIn("word_repetition_loop", content_reasons(text))
+
+    def test_common_stopwords_do_not_trigger_unigram_loop_gate(self):
+        text = " ".join(
+            f"the {word}"
+            for word in self._unique_alpha_words(100)
+        ) + "."
+        self.assertNotIn("word_repetition_loop", content_reasons(text))
+
     def test_json_latex_repair_covers_bm_and_frac(self):
-        raw = r'{"math":"\bm{x}=\frac{1}{2}"}'
+        raw = r'{"math":"\bm{x}=\frac{1}{2}; \beta^\top"}'
         repaired = utils._repair_json_latex_escapes(raw)
-        self.assertEqual(json.loads(repaired)["math"], r"\bm{x}=\frac{1}{2}")
+        self.assertEqual(json.loads(repaired)["math"], r"\bm{x}=\frac{1}{2}; \beta^\top")
 
     def test_stop_empty_is_not_retried_or_resampled(self):
         client = SequenceClient([("", "stop"), ("should not run", "stop")])
