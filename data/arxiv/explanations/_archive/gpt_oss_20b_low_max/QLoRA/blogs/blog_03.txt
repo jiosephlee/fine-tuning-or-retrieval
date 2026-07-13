@@ -1,0 +1,170 @@
+\title{Blogs about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+# Double Quantization & Paged Optimizers: The Secret Sauce Behind 4‑Bit Training  
+
+Training a 65‑B parameter model on a single GPU feels like a myth.  In reality it is possible—if you first reduce every weight to 4 bits *and then* keep the optimizer from blowing up the memory budget.  Two of the key ideas that make this possible are **Double Quantization** and **Paged Optimizers**.  In this post we unpack how they work, why they are safe for training, and how you can use them to keep the GPU memory footprint under control while still training a full‑scale decoder.
+
+---
+
+## 1. The memory problem in a nutshell  
+
+When you fine‑tune an LLM with LoRA adapters:
+
+| Memory component | Size (per training step) |
+|------------------|-------------------------|
+| Base weights (4‑bit) | ≈ 5 GB (for 65 B params) |
+| Activation gradients | ≈ 10–20 GB (depends on sequence length) |
+| Optimizer states | ≈ 2× the model size if you use Adam |
+
+The first two numbers already push a single 48 GB GPU to its limits.  The third—optimizer states—is the real killer: Adam stores two 16‑bit copies of each parameter, meaning “every FAKE weight” doubles the memory cost again.  
+
+Remember that during *training* we never actually update those base weights; only the tiny LoRA adapters change.  So the optimizer doesn’t need high‑precision copies of the base weights at all.  The trick is to avoid allocating them *and* if we do need them (for copy‑based optimizers or gradient checkpointing) not to let them fill the entire GPU memory.
+
+Two techniques do exactly that:
+
+1. **Double Quantization** – aggressively compress the *scale constants* that live alongside every block‑quantized weight column.
+2. **Paged Optimizers** – shuttle optimizer state bits to CPU RAM on demand using NVIDIA’s Unified Memory.
+
+Let’s look at each in detail.
+
+---
+
+## 2. Double Quantization – shrinking what matters twice
+
+### 2.1 Block‑wise 4‑bit quantization  
+Weights are split into blocks of size \(B\) (e.g., \(B=64\)).  
+Each block has its own scale constant \(c_2^{\text{FP32}}\):
+\[
+W_{\text{block}}^\text{4bit}
+ = \operatorname{round}\!\Big(
+      \frac{127}{\lVert W_{\text{block}}\rVert_{\infty}}
+       W_{\text{block}}
+     \Big)
+\]
+The scale constant lives in FP32, so per parameter we store:
+
+- 4 bits for the weight
+- \(\tfrac{32}{B}\) bits for its block’s FP32 scale
+
+With \(B=64\), this overhead is **0.5 bits per parameter**—to say nothing about all those extra optimizer copies!
+
+### 2.2 Quantize *the scales*  
+The Naïve diet: every FP32 has ten digits of precision but we only need it as a multiplier inside the dot product.  
+Acquisition: Treat each FP32 scale as a new scalar tensor and run a second round of quantization on it.
+
+Procedure:
+1. Gather all FP32 scales \(\{c_2^{\text{FP32}}\}_{i=1}^{N/B}\).
+2. Subtract their mean so they are centered around zero—this makes symmetric quantization sensible.
+3. Apply an **8‑bit float** quantizer on these centred values:
+   \[
+   c_2^{\text{8bit}}
+   = \operatorname{round}\!\Big(
+        \frac{\max |c_2-\bar c_2|}{127}
+        (c_2-\bar c_2)
+     \Big)
+   \]
+   The resulting constants are stored as FP8.
+4. At runtime, you *double dequantize*:
+   - First dequantize FP8 back to FP32 (reconstructing \(c_2^{\text{FP32}}\)).
+   - Then dequantize from FP32 to BF16 alongside \(W^\text{NF4}\).
+
+### 2.3 The math behind “0.37 bits per weight”  
+With blocksize \(B=64\) for weights and \(B'=256\) for second‑level scales:
+
+- Weight block overhead: \(32/64 = 0.5\) bits
+- Scale block overhead after second quantization:
+  \[
+    \frac{8}{256} + \frac{32}{64\times256}
+    =0.125+0.002
+    =0.127\,\text{bits}
+  \]
+- **Reduction**: 
+  \[
+    0.5 - 0.127 =0.373~\text{bits per parameter}
+  \]
+For a 65 B model, that translates into roughly **3 GB saved**—enough to fit many more checkpoints or free a buffer for aggressive learning rates.
+
+### Why this works
+- **Uniformity**: All batches use the same scaling routine; there's no per-sample idiosyncrasy, so we can afford the extra lookup without pain.
+- **Empirical Showdown**: Experiments show zero drop in perplexity or Vicuna performance when switching from standard FP4 quantized scales to double‑quantized scales.
+- **Simplicity**: Implementation just needs an extra `dequant()` kernel, which is already in most modern frameworks.
+
+---
+
+## 3.Paged Optimizers – unshackling Adam
+
+### 3.1 What’s happening with Adam?  
+Adam keeps:
+
+- Momentum vector (\(m_t\))
+- Velocity vector (\(v_t\))
+
+Each vector is **16 bit BFloat16 or FP16** and at full precision occupies roughly **two times** the base tensor memory.
+
+For LoRA adapters that number only few MBs, Adam states occupy just MBs too, but with acceleration usage you quickly hit scenarios where very deep gradients or long context windows produce huge activation gradients that trigger *gradient checkpointing*. That overhead spikes at moments when combined with an optimizer that expects all parameters to be resident in CUDA space.
+
+### 3.2 Unified Memory to the rescue  
+NVIDIA’s Unified Memory implements *paged* transfers between CPU RAM and GPU VRAM behind-the-scenes:
+
+```cuda
+// Allocator using Unified Memory
+auto opt_state = torch::empty(
+    {num_params}, torch::kFloat16,
+    torch::kCUDA,
+    /*options=*/torch::memory_format::Unordered,
+    /*use_pinned=*/false,
+    /*unified_mem=*/true); // <‑ enable paging
+```
+
+When the GPU starts running out of free VRAM, CUDA silently pages some `opt_state` pages down to RAM; when needed later they are streamed back in automatically.
+
+#### Benefits
+- No explicit spilling logic; you write ordinary Adam code.
+- During checks‐pointing peaks (often only a few milliseconds), less than ~10% of batches actually trigger paging—most steps see zero effect.
+- With typical batch sizes ≥ 8 on long prompts (> 1024 tokens), global peak memory stays under ~42 GB even on a single A100 48 GB card.
+
+### 3.3 What happens under different workloads?  
+
+| Workload | Typical Peak Memory | Did paging occur? |
+|----------|--------------------|-------------------|
+| Short (~128 tokens), small batch | ~35 GB | No |
+| Medium (~512 tokens), batch=4 | ~38 GB | Rare |
+| Long (~2048 tokens), batch=16 | ~43 GB | Yes ↔ ~10% |
+| Very long (~4096 tokens), batch=8 | ~49 GB | Yes<sup>*</sup> |
+
+<sup>*</sup>In some pathological cases, larger sequences produce so much activations that padding triggers an overshoot; paging happens for a brief <10ms burst before enough memory is reclaimed by backward passes.
+
+---
+
+## 4 Putting it together – why training huge models becomes tractable
+
+1. **Weight storage** reduces from full FP16 (~130 GB for LLaMA‑65B) → NF4 + double quantized scales (~11 GB).
+2. **Optimizer spread** remains light because Adam operates only over LoRA adapters (~50 MB).
+3. **Cache pressure** from activations stays below *dynamic* thresholds thanks to gradient checkpointing plus paged optimizers, preventing out-of-memory (OOM).
+
+In practice this enables:
+
+- Training LLaMA‑65B with QLoRA on a single consumer A5000 GPU within ~24 h.
+- Training LLaMA‑33B on even older RTX 3090 cards.
+- Training triple precision adapters at aggressive learning rates without needing DRAM banks.
+
+---
+
+## 5 Quick sanity checklist before trying QLoRA
+
+| Item | Why it matters |
+|------|----------------|
+| Blocksize set to `64` for weights, `256` for scale constants | Guarantees better precision while still producing non‑trivial savings |
+| Enable Unified Memory flag on optimizer state allocations | Automatic eviction of heavy tensors under pressure |
+| Keep `gradient_checkpointing=True` during inference / evaluation passes | Prevents accidental reuse of stale activations that would inflate VRAM |
+| Use EF or LLaMA as base model with NF4 initial calibration | NormalFloat assumes ±1 range; other distributions may need pre‑warping |
+
+---
+
+## 🚀 TL;DR
+
+- Double Quantization slices off ~0.37 bits per weight by compressing block scales with an extra layer of quantization.
+- Paged Optimizers let Adam churn through adapters without ever blowing VRAM thanks to NVIDIA Unified Memory.
+- Together they bring training large chatbots from scratch onto moderately sized GPUs into reach—something once limited to giga-DL pipelines.
+
+Happy training!

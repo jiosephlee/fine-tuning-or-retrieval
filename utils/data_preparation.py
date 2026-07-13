@@ -378,10 +378,27 @@ def prepare_training_mix(
     explanation_model_slug = strategy_args.get("explanation_model") or "gpt_5_mini_custom"
     paraphrase_model_slug = strategy_args.get("paraphrase_model") or "gpt_5_mini_custom"
 
-    def _synthetic_dir(kind: str, slug: str, source: str, domain: str) -> str:
-        slugged = f'../../data/{source}/{kind}/{slug}/{domain}/'
+    def _synthetic_dir(
+        kind: str,
+        slug: str,
+        source: str,
+        domain: str,
+        *,
+        allow_legacy: bool = True,
+    ) -> str:
+        # A single all-domain training run may use generator directories whose
+        # slugs include the high-level source (for example
+        # gemma_4_12b_it_arxiv_w16).  ``{source}`` lets one CLI value resolve to
+        # the arxiv/medical/legal directory selected by the current loop.
+        resolved_slug = slug.replace("{source}", source)
+        slugged = f'../../data/{source}/{kind}/{resolved_slug}/{domain}/'
         if os.path.isdir(slugged):
             return slugged
+        if not allow_legacy:
+            raise FileNotFoundError(
+                f"Requested {kind} generator corpus does not exist: {slugged} "
+                f"(template={slug!r}, source={source!r}, domain={domain!r})"
+            )
         return f'../../data/{source}/{kind}/{domain}/'  # legacy flat layout
     shuffle_chunks_flag = strategy_args.get("shuffle_chunks", False)
     shuffle_seed = strategy_args.get("shuffle_seed", 42)
@@ -758,7 +775,8 @@ def prepare_training_mix(
             # Insert content may come from a different generator slug than the sizing corpus.
             if document_match_insert_explanation_model:
                 insert_dir = _synthetic_dir(
-                    'explanations', document_match_insert_explanation_model, domain_source, domain
+                    'explanations', document_match_insert_explanation_model,
+                    domain_source, domain, allow_legacy=False,
                 )
                 insert_label = f"{document_match_insert_content}[{document_match_insert_explanation_model}]"
             else:

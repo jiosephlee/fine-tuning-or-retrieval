@@ -1,0 +1,205 @@
+\title{Blogs about the Paper: "xLSTM: Extended Long Short-Term Memory"}
+
+# Parallelism vs. Mixing: Understanding the Speed Trade‑offs in sLSTM and mLSTM  
+
+Large Language Models have turned the spotlight on Transformers, but the classic Recurrent Neural Network (RNN) family—especially Long Short‑Term Memory (LSTM) networks—has never truly disappeared. The recent **xLSTM** paper revives LSTMs by introducing two new siblings:
+
+* **sLSTM** – a scalar‑memory LSTM equipped with *exponential gating* and *memory mixing*.  
+* **mLSTM** – a matrix‑memory LSTM that also uses exponential gates but **drops** memory mixing entirely, making it **fully parallelizable**.
+
+Both variants bring impressive language‑modeling results, yet they differ dramatically in how fast they run on modern GPUs. In this post we unpack why the seemingly innocuous choice of “mixing” or “no mixing” leads to such divergent speed characteristics, how the authors mitigated the slowdown with custom CUDA kernels, and why mLSTM’s heavy matrix arithmetic still lets it ride the parallelism wave.
+
+---  
+
+## 1. A Quick Refresher: From Classic LSTMs to xLSTMs  
+
+The original LSTM updates its scalar cell state $c_t$ by adding a new input $z_t$ (scaled by an *input gate* $i_t$) while retaining part of the previous state (scaled by a *forget gate* $f_t$):
+
+\[
+c_t = f_t\,c_{t-1} + i_t\,z_t ,\qquad
+h_t = o_t\,\psi(c_t)\ .
+\]
+
+Two major bottlenecks have haunted LSTMs since then:
+
+1. **Inflexible storage decisions** – once a value is written into $c_{t-1}$ it cannot be cleanly overwritten later.
+2. **Scalar‑only memory** – each cell compresses everything into a single number.
+3. **Hidden‑to‑hidden recurrence** – the hidden state $h_{t-1}$ feeds back into every gate at the next step, forcing strict sequential execution.
+
+xLSTMs address these pain points by adding *exponential gating* (so gates can grow or shrink much faster) and redefining the memory structure:
+
+* **sLSTM:** Keeps a scalar cell ($c_t$) but introduces a **normalizer state** $n_t$ that tracks the cumulative effect of gates and implements *memory mixing* across multiple cells/heads.
+* **mLSTM:** Expands the cell into a full matrix $\mathbf{C}_t \in \mathbb{R}^{d\times d}$ using a covariance update rule,
+\[
+\mathbf{C}_t = f_t\,\mathbf{C}_{t-1} + i_t\,\mathbf{v}_t\mathbf{k}_t^\top ,
+\]
+and removes hidden‑to‑hidden connections altogether.
+
+Both variants share an *exponential gate stabilization* mechanism (a “stabilizer state” $m_t$) that rescales exponentially large gate values without altering gradients:
+
+\[
+\begin{aligned}
+m_t &= \max\!\bigl(\log f_t + m_{t-1},\, \log i_t\bigr),\\
+i'_t &= \exp(\log i_t - m_t),\qquad
+f'_t = \exp(\log f_t + m_{t-1} - m_t).
+\end{aligned}
+\]
+
+Now let’s turn to why this redesign matters for speed.
+
+
+---  
+
+## 2. Memory Mixing in sLSTM – The Serial Bottleneck  
+
+### 2.1 How Mixing Works  
+
+In a multi‑cell sLSTM each cell’s input and gates are not independent; instead they are linked through recurrent weight matrices $\mathbf{R}_{z}, \mathbf{R}_{i}, \mathbf{R}_{f}, \mathbf{R}_{o}$. The forward equations look like
+
+\[
+\begin{aligned}
+\tilde{z}_t &= \mathbf{w}_z^\top\mathbf{x}_t + \mathbf{R}_z\,h_{t-1} + b_z ,\\
+\tilde{i}_t &= \mathbf{w}_i^\top\mathbf{x}_t + \mathbf{R}_i\,h_{t-1} + b_i ,\\
+&\vdots 
+\end{aligned}
+\]
+
+Because each gate depends on $h_{t-1}$—the hidden vector produced **after** all cells have mixed their information at time $t{-}1$—the entire layer forms a *hidden‑to‑hidden* dependency chain across timesteps:
+
+```
+h0 → h1 → h2 → … → hT
+```
+
+Even if you split the model into many heads or cells, every head still needs its predecessor’s mixed hidden state before it can compute its own gate values at the next step.
+
+
+### 2.2 Why This Kills Parallelism  
+
+GPU hardware thrives when it can evaluate many operations simultaneously. The hidden‑to‑hidden chain forces a *strict order*: you cannot compute $h_{t+5}$ before you know $h_{t+4}$, which in turn needs $h_{t+3}$… In other words, you’re forced into **sequential scanning** which runs at best at $\mathcal O(T)$ wall‑clock time where $T$ is sequence length—exactly what Transformers tried to avoid with self‑attention’s $\mathcal O(T^2)$ cost but massive parallelism.
+
+
+### 2.3 The Authors’ Workaround: Fast CUDA Kernels  
+
+Knowing that “mixing = serial” is inherent, the authors didn’t try to remove it completely—they instead focused on making each step *as cheap as possible*. Their solution:
+
+| Component | Optimization |
+|-----------|---------------|
+| Gate pre‑computations | Fused matmul + bias + activation inside one kernel |
+| Normalizer update ($n_t = f_t n_{t-1}+ i_t$) | Register‐level accumulation avoiding global writes |
+| Stabilizer computation | Jointly computed with gates using warp shuffles |
+| Hidden‐state construction | Single‐kernel `o_t * ψ(c_t / n_t)` |
+
+By packing all per‑time‑step work into one custom CUDA kernel they reduced kernel launch overhead and kept intermediate tensors in registers instead of spilling them to DRAM. The result? sLSTM runs **less than twice as slow** as its fully parallel counterpart (mLSTM) on typical hardware—a remarkable achievement given its inherent sequential nature.
+
+
+---  
+
+## 3. Parallel-Friendly Design of mLSTM  
+
+### 3.1 No Hidden‑to‑Hidden Connections  
+
+The key design decision that unlocks parallelism is abandoning any dependence on $h_{t-1}$ inside gate computations:
+
+\[
+\tilde{i}_t = \mathbf{w}_i^\top\mathbf{x}_t + b_i,\qquad
+\tilde{f}_t = \mathbf{w}_f^\top\mathbf{x}_t + b_f,\qquad
+\dots
+\]
+
+All gates now rely only on the current input $\mathbf{x}_t$. This eliminates the hidden-to-hidden chain entirely—a classic “feedforward” recurrence.
+
+
+### 3.2 Scan‑Friendly Recurrence  
+
+Even though there is still a recurrence because $\mathbf{C}_{t}$ depends on $\mathbf{C}_{t-1}$,
+the update has an additive form reminiscent of prefix sums:
+
+\[
+\mathbf{C}_t = f_0 f_1 \dots f_{t}\,\mathbf{C}_0 
+   + \sum_{\tau=0}^{t}\Bigl( i_\tau\,f_{\tau+1}\dots f_{t}\Bigr)\,\bigl(\mathbf{v}_\tau \mathbf{k}_\tau^\top\bigr).
+\]
+
+Both terms are expressible as **parallel scans** (also called prefix reductions), which GPUs handle efficiently using existing libraries or custom kernels similar to those used by FlashAttention.
+
+
+### 3.3 Heavy Matrix Ops That Still Parallelize  
+
+Every timestep touches a $d\times d$ matrix:
+* The decay term `f_t · C_{t−1}` is just an elementwise scaling.
+* The addition `i_t · vₜ kₜᵀ` builds an outer product (`vₜ` column × `kₜᵀ` row).
+
+Because these are pure linear algebra primitives (`gemm`, `ger`, `scal`), modern GPUs execute them massively in parallel across thousands of cores. The only extra work stems from:
+* Computing the normalizer vector $\mathbf{n}_t$ (a scaled sum of keys).
+* Normalizing retrieved activations via `$|\mathbf{n}_t^\top q_t|$`.
+
+Both require only vector–vector products—trivial compared to an outer product when $d$ is moderate (e.g., $d=256$). Consequently,
+even though each step processes quadratic data ($d^2$), we can batch many steps together or run them concurrently thanks to batch GEMM kernels.
+
+
+### 3.4 Implementation Highlights  
+
+The authors implemented two crucial tricks:
+
+| Trick | Effect |
+|------|--------|
+| Fuse `f_t·C` & `i_tv_kᵀ` inside one kernel | Saves one read/write pass over $\mathbf C$. |
+| Use cuBLAS batched GEMM for outer products over many timesteps | Leverages well‑optimized BLAS kernels instead of hand‑written loops.|
+
+Although their current kernels are about **four times slower** than FlashAttention’s hand‑crafted attention kernel—largely because they haven’t yet applied FlashAttention’s “blockwise tiling” tricks—their wall clock overhead remains modest relative to sequential models because everything scales linearly with sequence length.
+
+
+---  
+
+## 4. Speed Benchmarks & What They Mean  
+
+| Model | Parameter count | Sequence length 2048 | Relative speed vs baseline |
+|-------|-----------------|----------------------|----------------------------|
+| sLSTM (pure mixing) | 350 M | ~2× slower than mLSTM |
+| mLSTM (matrix memory) | 350 M | Baseline |
+| FlashAttention Transformer | same size | ≈4× faster than both LSTMs for inference (quadratic scaling hurts long contexts) |
+| Mamba (SSM) | similar | Comparable to mLSTM after tuning |
+
+A few takeaways:
+
+* **Linear scaling:** Both s-/m-LSTMs show true $\mathcal O(T)$ runtime growth, while Transformers blow up as $\mathcal O(T^2)$ once context exceeds ~4k tokens.
+* **Parallel advantage:** Even with raw matrix ops, mLSTM stays within constant factor of Transformer inference when handling long sequences because it never incurs quadratic attention costs.
+* **Memory footprint:** Neither variant stores per-token activations beyond what’s needed for the scan; thus max GPU memory stays constant irrespective of context length—a decisive win for edge deployment.
+
+
+---  
+
+## 5. Trade‑offs Summarized  
+
+| Aspect | sLSTM | mLSTM |
+|--------|-------|-------|
+| **Expressivity** | Memory mixing lets cells exchange information across heads; excels at *state tracking* tasks (e.g., formal language parity). | Matrix memory gives huge capacity for associative recall but lacks inter-cell communication beyond shared matrix updates. |
+| **Parallelism** | Inherently sequential due to hidden-to-hidden connections → requires optimized per-step kernels. | Fully parallelizable via scan/branchless BLAS ops → runs close to pure feedforward layers despite quadratic inner dimension. |
+| **Compute cost** | Lightweight per step (scalar ops + few vector ops). | Heavy per step (`d×d` outer product), yet efficiently batched on GPUs. |
+| **Speed gap (empirical)** | ≤ 2× slower than mLSTM under same hardware/configuration. | Baseline speed; still ≈ 4× slower than highly tuned attention kernels but linear w.r.t sequence length.|
+
+
+In practice you might pick:
+* **sLSTM** when your task demands explicit hidden-state interaction—think program execution tracing or entity tracking over very long narratives.
+* **mLSTM** when raw storage capacity outweighs fine-grained mixing—e.g., massive associative recall or language modeling where context windows stretch beyond what attention can handle efficiently.
+
+
+---  
+
+## 6. Looking Ahead: Closing the Gap  
+
+The authors note three immediate avenues for squeezing more speed out of both flavors:
+
+1️⃣ **Optimized flash‐style kernels for mLLM:** Tiling strategies that minimize intermediate writes could bring matrix updates down from “~4× slower than FlashAttention” to comparable levels.
+
+2️⃣ **Hybrid blocks:** An architecture where most layers are fast‐parallel mLM­S™, punctuated by occasional sLM­S™ blocks could combine expressive mixing with overall throughput.
+
+3️⃣ **Mixed precision & sparsity:** Leveraging FP16/Ampere Tensor Cores for outer products while keeping critical stabilizer logic in FP32 may cut flop counts without breaking numerical stability.
+
+
+---  
+
+## 7️⃣ Final Thoughts  
+
+The contrast between sLSTM and mLSTM illustrates a classic systems dilemma: richer algorithmic structure versus raw hardware efficiency. By carefully engineering custom kernels and embracing scan-friendly recurrences, xLSTMs prove that “old-school” recurrent models can still compete at scale—especially when you need linear runtime and constant memory footprints.
+
+If you’re building next‑generation language models or any sequence processor where extreme context lengths matter, consider whether your workload leans toward *state tracking* (favor sLM­S™) or pure *capacity* (favor mLM­S™). And remember—sometimes spending a day writing an efficient CUDA kernel pays off more than adding another layer of attention heads!

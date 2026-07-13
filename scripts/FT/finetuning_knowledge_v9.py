@@ -1372,6 +1372,8 @@ if __name__ == "__main__":
         help=(
             "Generator-model slug for the matched-insert explanation content, i.e. "
             "data/{source}/explanations/{slug}/{domain}/ (e.g. glm, gpt_5_mini_low, gpt_5_mini_high). "
+            "Use a {source} placeholder when each high-level source has a distinct slug, e.g. "
+            "gemma_4_12b_it_{source}_w16. "
             "Only the inserted content uses this slug; the track schedule/size is still defined by the "
             "default gpt_5_mini_custom corpus. When unset, insert content comes from the sizing corpus."
         ),

@@ -10,6 +10,7 @@ MEDICAL_CLEANED_DIR = DATA_ROOT / "medical" / "cleaned"
 sys.path.insert(0, str(PROJECT_ROOT))
 import utils.utils as utils
 from utils.granular_outputs import write_granular_files
+from utils.multiview_recovery import MEDICAL_TEXTBOOK_SCHEMA, manifest_valid, record_validated_view
 from importlib import reload
 reload(utils)
 
@@ -221,6 +222,9 @@ Provide the output as a JSON object with a single key "sections", which is a lis
         reasoning_effort=efforts["outline"],
         system_prompt_included=True,
         return_json=True,
+        json_schema={"type": "json_schema", "json_schema": {
+            "name": "medical_textbook_outline", "strict": True,
+            "schema": MEDICAL_TEXTBOOK_SCHEMA}},
         max_tokens=MAX_TOKENS,
         provider=provider,
         base_url=base_url,
@@ -230,6 +234,8 @@ Provide the output as a JSON object with a single key "sections", which is a lis
         print(f"WARNING: LLM returned None for textbook outline on {case_name}, skipping")
         return
 
+    if isinstance(response_outline_str, dict):
+        response_outline_str = json.dumps(response_outline_str, ensure_ascii=False)
     outline_log_path = os.path.join(OUTPUT_DIR, "textbook_outline.json")
     with open(outline_log_path, 'w') as f:
         f.write(response_outline_str)
@@ -247,6 +253,9 @@ Provide the output as a JSON object with a single key "sections", which is a lis
     if not sections:
         print(f"WARNING: no valid textbook sections for {case_name}; skipping textbook view")
         return
+    with open(outline_log_path, 'w', encoding='utf-8') as f:
+        json.dump({'sections': sections}, f, ensure_ascii=False, indent=2)
+        f.write('\n')
     print(f"Parsed outline with {len(sections)} sections.")
 
     # --- 2. Write each section in parallel ---
@@ -481,13 +490,27 @@ def process_cases(case_names=None, parts=None, model=None, model_slug=None,
           f"reasoning_effort mode={mode})")
 
     selected_parts = resolve_parts(parts)
+    failures = []
     for case_name in case_names:
         for part in selected_parts:
-            PART_GENERATORS[part](
-                case_name, model=model, slug=slug, efforts=efforts[part],
-                outline_model=outline_model, writing_model=writing_model,
-                provider=provider, base_url=base_url, max_workers=max_workers,
-            )
+            view = "stackexchange" if part == "qa" else part
+            item_dir = utils.explanations_dir('medical', slug, case_name, root=str(DATA_ROOT))
+            if manifest_valid(item_dir, view):
+                print(f"Skipping manifest-validated {case_name}/{view}")
+                continue
+            try:
+                PART_GENERATORS[part](
+                    case_name, model=model, slug=slug, efforts=efforts[part],
+                    outline_model=outline_model, writing_model=writing_model,
+                    provider=provider, base_url=base_url, max_workers=max_workers,
+                )
+                record_validated_view(item_dir, view, {"model": model or writing_model,
+                    "provider": provider, "reasoning_effort": mode})
+            except Exception as exc:
+                failures.append(f"{case_name}/{view}: {exc}")
+                print(f"ERROR: failed {case_name}/{view}: {exc}", file=sys.stderr)
+    if failures:
+        raise RuntimeError("Incomplete multiview run:\n" + "\n".join(failures))
 
 
 if __name__ == "__main__":

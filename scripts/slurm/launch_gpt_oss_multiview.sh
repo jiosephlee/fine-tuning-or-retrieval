@@ -26,12 +26,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUBMIT="$SCRIPT_DIR/submit_vllm_multiview.sh"
 
 DRY_RUN=""
-MODELS=(20b 120b)
+MODELS=(20b)
 DOMAINS=(arxiv medical legal)
-REASONING_EFFORT="high"
+REASONING_EFFORTS=(low high)
 TIME_LIMIT="48:00:00"
-MAX_MODEL_LEN=131072
-MAX_TOKENS=131072
+MAX_MODEL_LEN=auto
+MAX_TOKENS=48000
 PARTITION="dgx-b200"
 MAX_WORKERS_OVERRIDE=""
 
@@ -41,7 +41,7 @@ while [[ $# -gt 0 ]]; do
         --models) shift; MODELS=(); while [[ $# -gt 0 && "$1" != --* ]]; do MODELS+=("$1"); shift; done ;;
         --domains) shift; DOMAINS=(); while [[ $# -gt 0 && "$1" != --* ]]; do DOMAINS+=("$1"); shift; done ;;
         --max-workers) MAX_WORKERS_OVERRIDE="$2"; shift 2 ;;
-        --reasoning-effort) REASONING_EFFORT="$2"; shift 2 ;;
+        --reasoning-effort) REASONING_EFFORTS=("$2"); shift 2 ;;
         --time) TIME_LIMIT="$2"; shift 2 ;;
         --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
         --max-tokens) MAX_TOKENS="$2"; shift 2 ;;
@@ -55,7 +55,7 @@ done
 config_for_size() {
     CPUS=28; MEM="224G"
     case "$1" in
-        20b)  MODEL_ID="openai/gpt-oss-20b";  TAG="20b";  GPUS=1; TP=1; WORKERS=8 ;;
+        20b)  MODEL_ID="openai/gpt-oss-20b";  TAG="20b";  GPUS=1; TP=1; WORKERS=4 ;;
         120b) MODEL_ID="openai/gpt-oss-120b"; TAG="120b"; GPUS=2; TP=2; WORKERS=4 ;;
         *) echo "Unknown model size: $1 (expected 20b or 120b)" >&2; exit 2 ;;
     esac
@@ -67,13 +67,19 @@ config_for_size() {
 for size in "${MODELS[@]}"; do
     config_for_size "$size"
     for domain in "${DOMAINS[@]}"; do
-        SLUG="gpt_oss_${TAG}_high"
+      for REASONING_EFFORT in "${REASONING_EFFORTS[@]}"; do
+        SLUG="gpt_oss_${TAG}_${REASONING_EFFORT}_recovery"
         echo ">>> ${size} (${MODEL_ID}) x ${domain}  [${PARTITION}, ${GPUS}gpu/tp${TP}, ${CPUS}cpu/${MEM}]  slug=${SLUG}"
         "$SUBMIT" ${DRY_RUN} \
             --partition "$PARTITION" --gpus "$GPUS" --tensor-parallel-size "$TP" \
             --cpus "$CPUS" --memory "$MEM" --time "$TIME_LIMIT" \
             --model "$MODEL_ID" --domain "$domain" --parts all \
             --model-slug "$SLUG" --reasoning-effort "$REASONING_EFFORT" \
-            --max-workers "$WORKERS" --max-model-len "$MAX_MODEL_LEN" --max-tokens "$MAX_TOKENS"
+            --max-workers "$WORKERS" --max-model-len "$MAX_MODEL_LEN" --max-tokens "$MAX_TOKENS" \
+            --gpu-memory-utilization 0.95 --max-num-batched-tokens 8192 --max-num-seqs 256 \
+            --moe-backend flashinfer_trtllm --disable-flashinfer-autotune 1 \
+            --tool-call-parser openai \
+            --enable-auto-tool-choice 1
+      done
     done
 done
