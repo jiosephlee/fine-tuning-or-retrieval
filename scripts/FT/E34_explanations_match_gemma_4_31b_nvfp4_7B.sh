@@ -9,7 +9,9 @@
 #SBATCH --mem=896G
 #SBATCH --time=0-8:00:00
 
-# Train with the audited NVIDIA Gemma 4 31B IT NVFP4 explanations inserted\n# into the same matched auxiliary-track schedule as E30. The {source}\n# placeholder selects the arXiv, legal, or medical corpus slug.
+# Train with the audited NVIDIA Gemma 4 31B IT NVFP4 explanations inserted
+# into the same matched auxiliary-track schedule as E30. All sources use the
+# shared gemma_4_31b_nvfp4 corpus slug.
 
 set -euo pipefail
 
@@ -53,7 +55,7 @@ DOCUMENT_MATCH_EXPLANATION_TYPES="${DOCUMENT_MATCH_EXPLANATION_TYPES:-textbooks 
 DOCUMENT_MATCH_EXPLANATIONS_CYCLE="${DOCUMENT_MATCH_EXPLANATIONS_CYCLE:-full}"
 DOCUMENT_MATCH_INSERT_CONTENT="${DOCUMENT_MATCH_INSERT_CONTENT:-explanations}"
 if [[ -z "${DOCUMENT_MATCH_INSERT_EXPLANATION_MODEL:-}" ]]; then
-    DOCUMENT_MATCH_INSERT_EXPLANATION_MODEL='gemma_4_31b_it_nvfp4_{source}_w16'
+    DOCUMENT_MATCH_INSERT_EXPLANATION_MODEL='gemma_4_31b_nvfp4'
 fi
 
 for source in arxiv legal medical; do

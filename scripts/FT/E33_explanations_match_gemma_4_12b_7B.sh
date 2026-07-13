@@ -9,7 +9,9 @@
 #SBATCH --mem=896G
 #SBATCH --time=0-8:00:00
 
-# Train with the audited Gemma 4 12B IT explanations inserted into the same\n# matched auxiliary-track schedule as E30. The {source} placeholder selects the\n# arXiv, legal, or medical corpus slug for each source loop.
+# Train with the audited Gemma 4 12B IT explanations inserted into the same
+# matched auxiliary-track schedule as E30. All sources use the shared
+# gemma_4_12b_it corpus slug.
 
 set -euo pipefail
 
@@ -53,7 +55,7 @@ DOCUMENT_MATCH_EXPLANATION_TYPES="${DOCUMENT_MATCH_EXPLANATION_TYPES:-textbooks 
 DOCUMENT_MATCH_EXPLANATIONS_CYCLE="${DOCUMENT_MATCH_EXPLANATIONS_CYCLE:-full}"
 DOCUMENT_MATCH_INSERT_CONTENT="${DOCUMENT_MATCH_INSERT_CONTENT:-explanations}"
 if [[ -z "${DOCUMENT_MATCH_INSERT_EXPLANATION_MODEL:-}" ]]; then
-    DOCUMENT_MATCH_INSERT_EXPLANATION_MODEL='gemma_4_12b_it_{source}_w16'
+    DOCUMENT_MATCH_INSERT_EXPLANATION_MODEL='gemma_4_12b_it'
 fi
 
 for source in arxiv legal medical; do
