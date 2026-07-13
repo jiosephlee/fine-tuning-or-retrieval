@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=E40_source_docmatch_scale0_5
-#SBATCH --output=logs/E40_source_docmatch_scale0_5-%j.out
-#SBATCH --error=logs/E40_source_docmatch_scale0_5-%j.err
+#SBATCH --job-name=E45_source_docmatch_scale0_5
+#SBATCH --output=logs/E45_source_docmatch_scale0_5-%j.out
+#SBATCH --error=logs/E45_source_docmatch_scale0_5-%j.err
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=4
 #SBATCH --ntasks=1
@@ -30,7 +30,7 @@ EFFECTIVE_BATCH_SIZE="${EFFECTIVE_BATCH_SIZE:-256}"
 LEARNING_RATE="${LEARNING_RATE:-4e-5}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
-CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E40_source_7b_docmatch_expl_scale0_5}"
+CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E45_source_7b_docmatch_expl_scale0_5}"
 MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v15}"
 MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 MCQA_PROBE_BATCH_SIZE="${MCQA_PROBE_BATCH_SIZE:-32}"

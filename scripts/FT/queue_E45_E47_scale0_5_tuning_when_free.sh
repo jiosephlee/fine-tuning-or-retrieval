@@ -8,7 +8,7 @@ mkdir -p logs
 GPU_MEMORY_THRESHOLD_MIB="${GPU_MEMORY_THRESHOLD_MIB:-2000}"
 POLL_SECONDS="${POLL_SECONDS:-300}"
 
-echo "$(date -Is) Waiting for all 8 GPUs to have <= ${GPU_MEMORY_THRESHOLD_MIB} MiB used before starting E40-E42"
+echo "$(date -Is) Waiting for all 8 GPUs to have <= ${GPU_MEMORY_THRESHOLD_MIB} MiB used before starting E45-E47"
 
 while true; do
     free_enough_gpus="$(
@@ -38,16 +38,16 @@ export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 export USE_PARCC="${USE_PARCC:-0}"
 export INFERENCE_MCQA_PROMPT_COLUMN="${INFERENCE_MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 
-echo "$(date -Is) Starting E40"
-PUSH_TO_HUB_CPT_ID="${E40_PUSH_TO_HUB_CPT_ID:-e40-olmo2-7b-source-docmatch-scale0_5-20260712}" \
-    bash E40_source_training_doc_match_scale0_5.sh
+echo "$(date -Is) Starting E45"
+PUSH_TO_HUB_CPT_ID="${E45_PUSH_TO_HUB_CPT_ID:-e45-olmo2-7b-source-docmatch-scale0_5-20260713}" \
+    bash E45_source_training_doc_match_scale0_5.sh
 
-echo "$(date -Is) Starting E41"
-PUSH_TO_HUB_CPT_ID="${E41_PUSH_TO_HUB_CPT_ID:-e41-olmo2-7b-para9-docmatch-scale0_5-20260712}" \
-    bash E41_paraphrase_training_doc_match_scale0_5.sh
+echo "$(date -Is) Starting E46"
+PUSH_TO_HUB_CPT_ID="${E46_PUSH_TO_HUB_CPT_ID:-e46-olmo2-7b-para9-docmatch-scale0_5-20260713}" \
+    bash E46_paraphrase_training_doc_match_scale0_5.sh
 
-echo "$(date -Is) Starting E42"
-PUSH_TO_HUB_CPT_ID="${E42_PUSH_TO_HUB_CPT_ID:-e42-olmo2-7b-para9-expl-scale0_5-20260712}" \
-    bash E42_granular_explanations_scale0_5.sh
+echo "$(date -Is) Starting E47"
+PUSH_TO_HUB_CPT_ID="${E47_PUSH_TO_HUB_CPT_ID:-e47-olmo2-7b-para9-expl-scale0_5-20260713}" \
+    bash E47_granular_explanations_scale0_5.sh
 
-echo "$(date -Is) Completed E40-E42"
+echo "$(date -Is) Completed E45-E47"
