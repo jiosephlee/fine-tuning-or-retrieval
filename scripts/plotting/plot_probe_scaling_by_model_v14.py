@@ -69,16 +69,16 @@ DEFAULT_RUNS: Dict[str, Dict[str, Optional[str]]] = {
     "para9": {
         "1b": "results/FT/full/1b/para49/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E2_paraphrase_all_domains_local/eval_bundles/inf_mcqa_v14",
         "7b": "results/FT/full/7b/para49/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E2_paraphrase_all_domains_local/eval_bundles/inf_mcqa_v14",
-        "13b": "results/FT/full/allenai_OLMo-2-1124-13B/para49/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E2_paraphrase_all_domains/eval_bundles/inf_mcqa_v14",
+        "13b": "results/FT/full/13b/para49/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E2_paraphrase_all_domains/eval_bundles/inf_mcqa_v14",
         # 32B has no pure para49 run; para49_docmatch_expl is the paraphrase-only
         # (doc-count-matched) variant, matching the original "Paraphrased" convention.
-        "32b": "results/FT/full/allenai_OLMo-2-0325-32B/para49_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E11_paraphrase_32b_all_domains_chunked_nll/eval_bundles/inf_mcqa_v14",
+        "32b": "results/FT/full/32b/para49_docmatch_expl/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E11_paraphrase_32b_all_domains_chunked_nll/eval_bundles/inf_mcqa_v14",
     },
     "with_explanations": {
         "1b": "results/FT/full/1b/para49_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E3_granular_explanations_all_domains_local/eval_bundles/inf_mcqa_v14",
         "7b": "results/FT/full/7b/para49_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E3_granular_explanations_all_domains_local/eval_bundles/inf_mcqa_v14",
-        "13b": "results/FT/full/allenai_OLMo-2-1124-13B/para49_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E9_granular_explanations_13b_all_domains/eval_bundles/inf_mcqa_v14",
-        "32b": "results/FT/full/allenai_OLMo-2-0325-32B/para49_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E12_granular_explanations_32b_all_domains/eval_bundles/inf_mcqa_v14",
+        "13b": "results/FT/full/13b/para49_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E9_granular_explanations_13b_all_domains/eval_bundles/inf_mcqa_v14",
+        "32b": "results/FT/full/32b/para49_expl_textbooks+stackexchange+blogs_cyclefull/fill_dclm/domains_arxiv_all-legal_all-medical_all/e100/bs256_lr4e-05/overlap_1_16/E12_granular_explanations_32b_all_domains/eval_bundles/inf_mcqa_v14",
     },
 }
 

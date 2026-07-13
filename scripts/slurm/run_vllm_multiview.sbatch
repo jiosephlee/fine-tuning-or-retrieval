@@ -29,8 +29,12 @@ MAX_TOKENS=""
 ENABLE_THINKING=""
 TEMPERATURE=""
 TOP_P=""
+TOP_K=""
 REPETITION_PENALTY=""
 MIN_P=""
+COMPACT_PROSE=""
+QUANTIZATION=""
+LIMIT_MM_PER_PROMPT=""
 TRUST_REMOTE_CODE=""
 ENABLE_EXPERT_PARALLEL=""
 LANGUAGE_MODEL_ONLY=""
@@ -39,11 +43,13 @@ MOE_BACKEND=""
 TOOL_CALL_PARSER=""
 ENABLE_AUTO_TOOL_CHOICE=""
 DISABLE_FLASHINFER_AUTOTUNE=""
+ENABLE_CHUNKED_PREFILL=""
+SMOKE_TEST_MODE="standard"
 
 usage() {
     echo "Usage: $0 [options]"
     echo "  --model ID                    Hugging Face model id"
-    echo "  --domain arxiv|medical|legal  Multiview pipeline"
+    echo "  --domain arxiv|medical|legal|all  Multiview pipeline(s)"
     echo "  --item NAME                   Paper or case basename"
     echo "  --parts CSV                   all or comma-separated view names"
     echo "  --model-slug NAME             Output model folder (derived when omitted)"
@@ -74,8 +80,12 @@ while [[ $# -gt 0 ]]; do
         --enable-thinking) ENABLE_THINKING="$2"; shift 2 ;;
         --temperature) TEMPERATURE="$2"; shift 2 ;;
         --top-p) TOP_P="$2"; shift 2 ;;
+        --top-k) TOP_K="$2"; shift 2 ;;
         --repetition-penalty) REPETITION_PENALTY="$2"; shift 2 ;;
         --min-p) MIN_P="$2"; shift 2 ;;
+        --compact-prose) COMPACT_PROSE="$2"; shift 2 ;;
+        --quantization) QUANTIZATION="$2"; shift 2 ;;
+        --limit-mm-per-prompt) LIMIT_MM_PER_PROMPT="$2"; shift 2 ;;
         # Boolean serve flags take an explicit 1/0 value so they survive the submit
         # wrapper, which only forwards "--flag value" pairs (a bare flag would abort it).
         --trust-remote-code) TRUST_REMOTE_CODE="$2"; shift 2 ;;
@@ -86,6 +96,8 @@ while [[ $# -gt 0 ]]; do
         --tool-call-parser) TOOL_CALL_PARSER="$2"; shift 2 ;;
         --enable-auto-tool-choice) ENABLE_AUTO_TOOL_CHOICE="$2"; shift 2 ;;
         --disable-flashinfer-autotune) DISABLE_FLASHINFER_AUTOTUNE="$2"; shift 2 ;;
+        --enable-chunked-prefill) ENABLE_CHUNKED_PREFILL="$2"; shift 2 ;;
+        --smoke-test-mode) SMOKE_TEST_MODE="$2"; shift 2 ;;
         --ready-timeout-seconds) READY_TIMEOUT_SECONDS="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -93,19 +105,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$DOMAIN" in
-    arxiv)
-        PIPELINE="$PROJECT_ROOT/scripts/data-preparation/multiview/pipeline_multi_view_knowledge_arxiv.py"
-        ITEM_FLAG="--papers"
-        ;;
-    medical)
-        PIPELINE="$PROJECT_ROOT/scripts/data-preparation/multiview/pipeline_multi_view_knowledge_medical.py"
-        ITEM_FLAG="--cases"
-        ;;
-    legal)
-        PIPELINE="$PROJECT_ROOT/scripts/data-preparation/multiview/pipeline_multi_view_knowledge_legal.py"
-        ITEM_FLAG="--cases"
-        ;;
+    arxiv|medical|legal) DOMAINS=("$DOMAIN") ;;
+    all) DOMAINS=(arxiv medical legal) ;;
     *) echo "Unsupported domain: $DOMAIN" >&2; exit 2 ;;
+esac
+case "$SMOKE_TEST_MODE" in
+    standard|quick) ;;
+    *) echo "Unsupported smoke-test mode: $SMOKE_TEST_MODE" >&2; exit 2 ;;
 esac
 
 for value in "$MAX_WORKERS" "$TENSOR_PARALLEL_SIZE"; do
@@ -128,6 +134,16 @@ PIPELINE_LOG="$PROJECT_ROOT/logs/vllm/${JOB_TAG}_pipeline.log"
 VLLM_PYTHON="$VLLM_ENV/bin/python"
 VLLM_BIN="$VLLM_ENV/bin/vllm"
 CLIENT_PYTHON="$CLIENT_ENV/bin/python"
+
+# Triton and TorchInductor compile artifacts are node-specific scratch data.  A
+# shared NFS cache can produce stale-file-handle failures when several Gemma jobs
+# compile the same kernels concurrently, so keep these caches allocation-local.
+LOCAL_COMPILE_ROOT="${SLURM_TMPDIR:-/tmp}/vllm_compile_${JOB_TAG}"
+mkdir -p "$LOCAL_COMPILE_ROOT/triton" "$LOCAL_COMPILE_ROOT/torchinductor" "$LOCAL_COMPILE_ROOT/vllm"
+export TRITON_CACHE_DIR="$LOCAL_COMPILE_ROOT/triton"
+export TORCHINDUCTOR_CACHE_DIR="$LOCAL_COMPILE_ROOT/torchinductor"
+export VLLM_CACHE_ROOT="$LOCAL_COMPILE_ROOT/vllm"
+export VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR="$LOCAL_COMPILE_ROOT/flashinfer_autotune"
 
 if [[ ! -x "$VLLM_PYTHON" || ! -x "$VLLM_BIN" ]]; then
     echo "Missing vLLM runtime under $VLLM_ENV" >&2
@@ -188,6 +204,12 @@ fi
 if [[ -n "$MOE_BACKEND" ]]; then
     EXTRA_SERVE_ARGS+=(--moe-backend "$MOE_BACKEND")
 fi
+if [[ -n "$QUANTIZATION" ]]; then
+    EXTRA_SERVE_ARGS+=(--quantization "$QUANTIZATION")
+fi
+if [[ -n "$LIMIT_MM_PER_PROMPT" ]]; then
+    EXTRA_SERVE_ARGS+=(--limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT")
+fi
 if [[ -n "$TOOL_CALL_PARSER" ]]; then
     EXTRA_SERVE_ARGS+=(--tool-call-parser "$TOOL_CALL_PARSER")
 fi
@@ -196,6 +218,9 @@ if [[ "$ENABLE_AUTO_TOOL_CHOICE" == "1" ]]; then
 fi
 if [[ "$DISABLE_FLASHINFER_AUTOTUNE" == "1" ]]; then
     EXTRA_SERVE_ARGS+=(--kernel-config '{"enable_flashinfer_autotune":false}')
+fi
+if [[ "$ENABLE_CHUNKED_PREFILL" == "1" ]]; then
+    EXTRA_SERVE_ARGS+=(--enable-chunked-prefill)
 fi
 # MoE serve toggles (value 1 enables the corresponding boolean vLLM flag).
 if [[ "$TRUST_REMOTE_CODE" == "1" ]]; then
@@ -217,7 +242,12 @@ export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-$READY_TIMEOU
 echo "Launching $MODEL at $VLLM_BASE_URL (reasoning-parser=${REASONING_PARSER:-none})"
 echo "Server log: $SERVER_LOG"
 echo "Engine ready timeout: VLLM_ENGINE_READY_TIMEOUT_S=$VLLM_ENGINE_READY_TIMEOUT_S"
-"$VLLM_BIN" serve "$MODEL" \
+VLLM_COMMAND=("$VLLM_BIN")
+if [[ "$QUANTIZATION" == "modelopt" ]]; then
+    VLLM_COMMAND=("$VLLM_PYTHON" "$PROJECT_ROOT/scripts/vllm_modelopt_tied_lm_head.py")
+    echo "ModelOpt tied-LM-head compatibility wrapper enabled"
+fi
+"${VLLM_COMMAND[@]}" serve "$MODEL" \
     --served-model-name "$MODEL" \
     --host 127.0.0.1 \
     --port "$PORT" \
@@ -276,8 +306,8 @@ if [[ "$MOE_BACKEND" == "flashinfer_trtllm_afp8" ]]; then
     fi
 fi
 
-echo "Running structured and long-prose endpoint smoke tests at low/high reasoning"
-MODEL="$MODEL" VLLM_BASE_URL="$VLLM_BASE_URL" VLLM_API_KEY="$VLLM_API_KEY" "$VLLM_PYTHON" - <<'PY'
+echo "Running endpoint smoke tests (mode=$SMOKE_TEST_MODE)"
+MODEL="$MODEL" VLLM_BASE_URL="$VLLM_BASE_URL" VLLM_API_KEY="$VLLM_API_KEY" SMOKE_TEST_MODE="$SMOKE_TEST_MODE" "$VLLM_PYTHON" - <<'PY'
 import json
 import os
 from openai import OpenAI
@@ -288,6 +318,24 @@ client = OpenAI(
     timeout=600,
 )
 model = os.environ["MODEL"]
+if os.environ["SMOKE_TEST_MODE"] == "quick":
+    plain = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": "Reply with one complete sentence confirming that the endpoint is ready."}],
+        max_tokens=4096,
+    )
+    if not (plain.choices[0].message.content or "").strip():
+        raise RuntimeError("quick prose smoke completion was empty")
+    structured = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": "Return JSON with key ready and boolean value true."}],
+        response_format={"type": "json_object"}, max_tokens=8192,
+    )
+    payload = json.loads(structured.choices[0].message.content or "")
+    if payload.get("ready") is not True:
+        raise RuntimeError(f"unexpected quick JSON smoke response: {payload}")
+    print("vLLM quick smoke tests passed")
+    raise SystemExit(0)
 for effort in ("low", "high"):
     plain = client.chat.completions.create(
         model=model, reasoning_effort=effort,
@@ -306,25 +354,6 @@ for effort in ("low", "high"):
         raise RuntimeError(f"unexpected {effort} JSON smoke response: {payload}")
 print("vLLM smoke tests passed")
 PY
-
-IFS=',' read -r -a PART_ARGS <<< "$PARTS"
-PIPELINE_ARGS=(
-    "$PIPELINE"
-    --parts "${PART_ARGS[@]}"
-    --model "$MODEL"
-    --model_slug "$MODEL_SLUG"
-    --provider vllm
-    --base_url "$VLLM_BASE_URL"
-    --max_workers "$MAX_WORKERS"
-)
-if [[ -n "$ITEM" ]]; then
-    # Accept a comma-separated list so a targeted re-run can name several papers/cases.
-    IFS=',' read -r -a ITEM_ARR <<< "$ITEM"
-    PIPELINE_ARGS+=("$ITEM_FLAG" "${ITEM_ARR[@]}")
-fi
-if [[ -n "$REASONING_EFFORT" ]]; then
-    PIPELINE_ARGS+=(--reasoning_effort "$REASONING_EFFORT")
-fi
 
 # Per-generation output budget: exported so the multiview pipeline (MULTIVIEW_MAX_TOKENS)
 # and the vLLM truncation-growth cap (VLLM_MAX_MAX_TOKENS) both honor the requested size.
@@ -345,11 +374,17 @@ if [[ -n "$ENABLE_THINKING" ]]; then
 fi
 if [[ -n "$TEMPERATURE" ]]; then
     export QWEN_TEMPERATURE="$TEMPERATURE"
-    echo "Qwen sampling: QWEN_TEMPERATURE=$TEMPERATURE"
+    export VLLM_TEMPERATURE="$TEMPERATURE"
+    echo "vLLM sampling: temperature=$TEMPERATURE"
 fi
 if [[ -n "$TOP_P" ]]; then
     export QWEN_TOP_P="$TOP_P"
-    echo "Qwen sampling: QWEN_TOP_P=$TOP_P"
+    export VLLM_TOP_P="$TOP_P"
+    echo "vLLM sampling: top_p=$TOP_P"
+fi
+if [[ -n "$TOP_K" ]]; then
+    export VLLM_TOP_K="$TOP_K"
+    echo "vLLM sampling: VLLM_TOP_K=$TOP_K"
 fi
 if [[ -n "$REPETITION_PENALTY" ]]; then
     export QWEN_REPETITION_PENALTY="$REPETITION_PENALTY"
@@ -359,10 +394,48 @@ if [[ -n "$MIN_P" ]]; then
     export QWEN_MIN_P="$MIN_P"
     echo "Qwen sampling: QWEN_MIN_P=$MIN_P"
 fi
+if [[ -n "$COMPACT_PROSE" ]]; then
+    export QWEN_COMPACT_PROSE="$COMPACT_PROSE"
+    echo "Qwen compact prose: QWEN_COMPACT_PROSE=$COMPACT_PROSE"
+fi
 
-echo "Running $DOMAIN multiview pipeline for $ITEM (parts=$PARTS, slug=$MODEL_SLUG)"
-echo "Pipeline log: $PIPELINE_LOG"
-PYTHONPATH="$PROJECT_ROOT" "$CLIENT_PYTHON" "${PIPELINE_ARGS[@]}" \
-    2>&1 | tee "$PIPELINE_LOG"
+for CURRENT_DOMAIN in "${DOMAINS[@]}"; do
+    case "$CURRENT_DOMAIN" in
+        arxiv)
+            PIPELINE="$PROJECT_ROOT/scripts/data-preparation/multiview/pipeline_multi_view_knowledge_arxiv.py"
+            ITEM_FLAG="--papers"
+            ;;
+        medical)
+            PIPELINE="$PROJECT_ROOT/scripts/data-preparation/multiview/pipeline_multi_view_knowledge_medical.py"
+            ITEM_FLAG="--cases"
+            ;;
+        legal)
+            PIPELINE="$PROJECT_ROOT/scripts/data-preparation/multiview/pipeline_multi_view_knowledge_legal.py"
+            ITEM_FLAG="--cases"
+            ;;
+    esac
+    IFS=',' read -r -a PART_ARGS <<< "$PARTS"
+    PIPELINE_ARGS=(
+        "$PIPELINE"
+        --parts "${PART_ARGS[@]}"
+        --model "$MODEL"
+        --model_slug "$MODEL_SLUG"
+        --provider vllm
+        --base_url "$VLLM_BASE_URL"
+        --max_workers "$MAX_WORKERS"
+    )
+    if [[ -n "$ITEM" ]]; then
+        IFS=',' read -r -a ITEM_ARR <<< "$ITEM"
+        PIPELINE_ARGS+=("$ITEM_FLAG" "${ITEM_ARR[@]}")
+    fi
+    if [[ -n "$REASONING_EFFORT" ]]; then
+        PIPELINE_ARGS+=(--reasoning_effort "$REASONING_EFFORT")
+    fi
+    PIPELINE_LOG="$PROJECT_ROOT/logs/vllm/${JOB_TAG}_${CURRENT_DOMAIN}_pipeline.log"
+    echo "Running $CURRENT_DOMAIN multiview pipeline for $ITEM (parts=$PARTS, slug=$MODEL_SLUG)"
+    echo "Pipeline log: $PIPELINE_LOG"
+    PYTHONPATH="$PROJECT_ROOT" "$CLIENT_PYTHON" "${PIPELINE_ARGS[@]}" \
+        2>&1 | tee "$PIPELINE_LOG"
+done
 
 echo "Multiview generation completed successfully"

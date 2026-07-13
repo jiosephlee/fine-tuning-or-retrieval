@@ -1,8 +1,9 @@
 import os
+import json
 import torch
 import numpy as np
 import random
-from typing import List, Optional
+from typing import List, Mapping, Optional, Tuple
 from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
 
@@ -11,13 +12,108 @@ import utils.chunking as chunking
 from itertools import cycle, repeat
 
 
+def _normalize_tokenizer_id(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    return str(value).strip().rstrip("/").replace("///", "/")
+
+
+def _get_tokenizer_revision(tokenizer) -> Optional[str]:
+    init_kwargs = getattr(tokenizer, "init_kwargs", None)
+    if isinstance(init_kwargs, Mapping) and init_kwargs.get("revision"):
+        return str(init_kwargs.get("revision"))
+    tokenizer_id = getattr(tokenizer, "name_or_path", "")
+    if isinstance(tokenizer_id, str) and "@" in tokenizer_id:
+        return tokenizer_id.split("@", 1)[1]
+    return None
+
+
+def _metadata_path(file_path: str) -> str:
+    file_path = str(file_path)
+    candidate = f"{file_path}.metadata.json"
+    if file_path.endswith(".npy"):
+        candidate = f"{file_path[:-4]}.npy.metadata.json"
+    return candidate
+
+
+def _load_replay_metadata(file_path: str) -> Optional[Mapping[str, object]]:
+    file_path = str(file_path)
+    metadata_path = _metadata_path(file_path)
+    if not os.path.exists(metadata_path):
+        return None
+    with open(metadata_path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _validate_replay_metadata(file_path: str, tokenizer, metadata: Mapping[str, object]) -> None:
+    tokenizer_meta = metadata.get("tokenizer")
+    if not isinstance(tokenizer_meta, Mapping):
+        raise ValueError(f"Replay metadata for '{file_path}' is missing tokenizer details.")
+
+    active_id = _normalize_tokenizer_id(getattr(tokenizer, "name_or_path", None))
+    active_revision = _get_tokenizer_revision(tokenizer)
+    expected_id = _normalize_tokenizer_id(tokenizer_meta.get("id"))
+    expected_revision = tokenizer_meta.get("revision")
+
+    if expected_id and active_id and expected_id != active_id:
+        raise ValueError(
+            f"Replay tokenizer mismatch for '{file_path}': metadata expects '{expected_id}', "
+            f"but active tokenizer is '{active_id}'."
+        )
+    if expected_revision and active_revision and expected_revision != active_revision:
+        raise ValueError(
+            f"Replay tokenizer revision mismatch for '{file_path}': metadata "
+            f"expects '{expected_revision}', got '{active_revision}'."
+        )
+
+    metadata_bos = tokenizer_meta.get("bos_token_id")
+    metadata_eos = tokenizer_meta.get("eos_token_id")
+    if metadata_bos is not None and tokenizer.bos_token_id is not None and metadata_bos != tokenizer.bos_token_id:
+        raise ValueError(
+            f"Replay tokenizer BOS mismatch for '{file_path}': "
+            f"metadata {metadata_bos} vs active {tokenizer.bos_token_id}."
+        )
+    if metadata_eos is not None and tokenizer.eos_token_id is not None and metadata_eos != tokenizer.eos_token_id:
+        raise ValueError(
+            f"Replay tokenizer EOS mismatch for '{file_path}': "
+            f"metadata {metadata_eos} vs active {tokenizer.eos_token_id}."
+        )
+
+    metadata_dtype = metadata.get("dtype")
+    if metadata_dtype and metadata_dtype != "int32":
+        raise ValueError(
+            f"Replay array dtype mismatch for '{file_path}': metadata indicates '{metadata_dtype}', expected 'int32'."
+        )
+
+
+def resolve_pretraining_replay_path(strategy_args) -> Tuple[str, bool]:
+    pretraining_data_path = getattr(strategy_args, "pretraining_data_path", None)
+    if pretraining_data_path:
+        return str(pretraining_data_path), True
+    pretraining_data_type = (
+        strategy_args.get("pretraining_data_type")
+        if isinstance(strategy_args, dict)
+        else getattr(strategy_args, "pretraining_data_type", "dclm")
+    )
+    return f"../../data/olmo/{pretraining_data_type}_100M_tokens.npy", False
+
+
 class PretrainingDataReplay:
     """
     An object that centralizes data replay from a tokenized .npy file.
     It continues from the last place it started to ensure unique coverage of pretraining data.
     """
-    def __init__(self, file_path):
+    def __init__(self, file_path, tokenizer=None, require_metadata: bool = False):
         self.file_path = file_path
+        self.metadata = _load_replay_metadata(self.file_path)
+        if require_metadata and self.metadata is None:
+            raise ValueError(
+                "Replay metadata sidecar required but missing for "
+                f"'{self.file_path}'. Expected "
+                f"'{_metadata_path(self.file_path)}'."
+            )
+        if tokenizer is not None and self.metadata is not None:
+            _validate_replay_metadata(self.file_path, tokenizer, self.metadata)
         self.data = np.load(self.file_path, mmap_mode='r')
         self.position = 0
 
@@ -222,6 +318,21 @@ def _build_chunk_granular_pool_from_objects(
     return _chunk_groups(flat_chunks, group_size)
 
 
+def _downsample_track_pool_by_scale(track_pool: List[List[str]], scale: float) -> List[List[str]]:
+    if not track_pool:
+        return []
+    if not (0.0 < scale <= 1.0):
+        raise ValueError(f"Track scale must be in (0, 1], got: {scale!r}.")
+    if scale == 1.0:
+        return track_pool
+
+    target_len = max(1, int(round(len(track_pool) * scale)))
+    if target_len >= len(track_pool):
+        return track_pool
+    selected_indices = np.linspace(0, len(track_pool) - 1, target_len, dtype=int).tolist()
+    return [track_pool[idx] for idx in selected_indices]
+
+
 def _rotate_track_pool(track_pool: List[List[str]], track_idx: int, num_tracks: int) -> List[List[str]]:
     if not track_pool:
         return []
@@ -365,6 +476,8 @@ def prepare_training_mix(
 
     # ... [Args extraction remains the same] ...
     test_script = strategy_args.get("test_script", False)
+    # Optional collector for per-step knowledge batches (OLMo injection-schedule exporter).
+    step_batches_out = strategy_args.get("step_batches_out", None)
     specific_explanation_type = strategy_args.get("with_specific_explanation", None)
     if isinstance(specific_explanation_type, list) and len(specific_explanation_type) == 1:
         specific_explanation_type = specific_explanation_type[0]
@@ -439,6 +552,15 @@ def prepare_training_mix(
         raise ValueError(
             "--explanation_granularity chunk is only supported with granular or granular_queue insertion."
         )
+    explanation_track_scale = float(strategy_args.get("explanation_track_scale", 1.0))
+    if not (0.0 < explanation_track_scale <= 1.0):
+        raise ValueError(f"--explanation_track_scale must be in (0, 1], got: {explanation_track_scale}")
+    explanation_match_scale = strategy_args.get("explanation_match_scale", explanation_track_scale)
+    if explanation_match_scale is None:
+        explanation_match_scale = explanation_track_scale
+    explanation_match_scale = float(explanation_match_scale)
+    if not (0.0 < explanation_match_scale <= 1.0):
+        raise ValueError(f"--explanation_match_scale must be in (0, 1], got: {explanation_match_scale}")
     whole_explanations_insert_every_n = int(
         strategy_args.get(
             "whole_explanations_insert_every_n",
@@ -451,7 +573,6 @@ def prepare_training_mix(
     fill_with_pretraining = strategy_args.get("fill_batches_with_pretraining", True)
     domain_data_sources = strategy_args.get("domain_data_sources", {}) or {}
     document_track_baseline = bool(strategy_args.get("document_track_baseline", False))
-    match_explanation_source_replay = bool(strategy_args.get("match_explanation_source_replay", False))
     document_match_specific_explanation = strategy_args.get("document_match_specific_explanation", None)
     document_match_insert_content = strategy_args.get("document_match_insert_content", "document")
     document_match_insert_explanation_model = strategy_args.get("document_match_insert_explanation_model", None)
@@ -892,12 +1013,20 @@ def prepare_training_mix(
                         track_idx,
                         granular_explanations_num_tracks,
                     )
+                    explanation_track_pool = _downsample_track_pool_by_scale(
+                        explanation_track_pool,
+                        explanation_match_scale,
+                    )
                     track_pool = _create_document_match_pool_from_step_sizes(
                         [len(step) for step in explanation_track_pool],
                         matched_insert_chunks,
                     )
                 else:
                     track_pool = _create_document_match_pool_from_objects(track_objects, matched_insert_chunks)
+                    track_pool = _downsample_track_pool_by_scale(
+                        track_pool,
+                        explanation_match_scale,
+                    )
                 if track_pool:
                     current_domain_document_match_tracks.append(track_pool)
             if current_domain_document_match_tracks:
@@ -1020,6 +1149,10 @@ def prepare_training_mix(
                                 track_idx,
                                 granular_explanations_num_tracks,
                             )
+                            track_pool = _downsample_track_pool_by_scale(
+                                track_pool,
+                                explanation_track_scale,
+                            )
                             if track_pool:
                                 if track_idx > 0:
                                     log.info(
@@ -1048,6 +1181,10 @@ def prepare_training_mix(
                                     track_objects[e_type] = e_list[offset:] + e_list[:offset]
 
                             track_pool = _create_granular_pool_from_objects(track_objects)
+                            track_pool = _downsample_track_pool_by_scale(
+                                track_pool,
+                                explanation_track_scale,
+                            )
                             if track_pool:
                                 if track_idx > 0:
                                     log.info(
@@ -1068,6 +1205,10 @@ def prepare_training_mix(
                                 track_idx,
                                 granular_explanations_num_tracks,
                             )
+                            track_pool = _downsample_track_pool_by_scale(
+                                track_pool,
+                                explanation_track_scale,
+                            )
                             if track_pool:
                                 queue_tracks.append(track_pool)
                     else:
@@ -1077,6 +1218,11 @@ def prepare_training_mix(
                             shuffle_seed=shuffle_seed,
                             domain=domain,
                         )
+                        queue_tracks = [
+                            _downsample_track_pool_by_scale(track_pool, explanation_track_scale)
+                            for track_pool in queue_tracks
+                        ]
+                        queue_tracks = [track_pool for track_pool in queue_tracks if track_pool]
                     if queue_tracks:
                         queued_items = sum(len(track_pool) for track_pool in queue_tracks)
                         item_unit = "chunk groups" if explanation_granularity == "chunk" else "files"
@@ -1095,32 +1241,6 @@ def prepare_training_mix(
                 raise ValueError(
                     f"Unsupported explanations_insertion_strategy: {explanations_insertion_strategy}. "
                     "Expected one of: granular, granular_queue, whole, legacy, legacy_v2, random_splice."
-                )
-
-        if match_explanation_source_replay and current_domain_tracks:
-            document_replay_chunks = list(source_chunks)
-            if num_paraphrased_texts > 0:
-                for chunks in paraphrased_chunks_by_doc:
-                    document_replay_chunks.extend(chunks)
-
-            for track_pool in current_domain_tracks:
-                matched_track_pool = _create_document_match_pool_from_step_sizes(
-                    [len(step) for step in track_pool],
-                    document_replay_chunks,
-                )
-                if matched_track_pool:
-                    current_domain_document_match_tracks.append(matched_track_pool)
-
-            if current_domain_document_match_tracks:
-                matched_chunks = sum(
-                    len(step)
-                    for track_pool in current_domain_document_match_tracks
-                    for step in track_pool
-                )
-                log.info(
-                    f"Domain {domain}: matched explanation source replay "
-                    f"({len(current_domain_document_match_tracks)} tracks, "
-                    f"{matched_chunks} scheduled source/paraphrase chunks)."
                 )
 
         # Load prior-knowledge chapters for this domain (used as a one-pass injection block)
@@ -1180,9 +1300,13 @@ def prepare_training_mix(
     # --- 3. Replay & Replications ---
     data_replay = None
     if fill_with_pretraining or pretraining_separators > 0 or fill_chunk_gaps:
-        pretraining_data_type = strategy_args.get('pretraining_data_type', 'dclm')
-        log.info(f"Creating Pretraining Data Replayer from '{pretraining_data_type}'...")
-        data_replay = PretrainingDataReplay(f'../../data/olmo/{pretraining_data_type}_100M_tokens.npy')
+        pretraining_data_path, require_metadata = resolve_pretraining_replay_path(strategy_args)
+        log.info(f"Creating Pretraining Data Replayer from '{pretraining_data_path}'...")
+        data_replay = PretrainingDataReplay(
+            pretraining_data_path,
+            tokenizer=tokenizer,
+            require_metadata=require_metadata,
+        )
 
     original_epochs = train_cfg.num_train_epochs
     replication_factor = 1
@@ -1264,7 +1388,8 @@ def prepare_training_mix(
             tokenizer=tokenizer,
             log=log,
             test_script=test_script,
-            fill_with_pretraining=fill_with_pretraining
+            fill_with_pretraining=fill_with_pretraining,
+            step_batches_out=step_batches_out,
         )
     else:
         final_chunks = replicate_and_interleave_legacy(
@@ -1278,6 +1403,17 @@ def prepare_training_mix(
             log=log,
             test_script=test_script,
             fill_with_pretraining=fill_with_pretraining,
+            step_batches_out=step_batches_out,
+        )
+
+    # Guard: the schedule exporter only supports the track/legacy paths (not
+    # 'whole' insertion or prior-knowledge injection) for now.
+    if step_batches_out is not None and (
+        explanations_insertion_strategy == "whole" or with_prior_knowledge
+    ):
+        raise NotImplementedError(
+            "step_batches_out is only supported for track/legacy insertion "
+            "(not 'whole' or prior-knowledge injection)."
         )
 
     # --- 3b. Prior-Knowledge Injection (one-pass, granular cadence) ---
@@ -1375,9 +1511,14 @@ def replicate_and_interleave_tracks(
     log,
     test_script: bool = False,
     fill_with_pretraining: bool = False,
+    step_batches_out: Optional[List[List[str]]] = None,
 ) -> List[str]:
     """
     The New Way: "Track" based mixing with independent domain cycling AND multiple tracks per domain.
+
+    If ``step_batches_out`` is provided, each per-step knowledge batch (documents +
+    explanations, before any pretraining fill) is appended to it in schedule order.
+    Used by the OLMo injection-schedule exporter to recover per-step boundaries.
     """
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     effective_batch_size = (
@@ -1431,6 +1572,8 @@ def replicate_and_interleave_tracks(
     max_knowledge_chunks = 0
     for i in range(total_batches):
         current_batch = track_docs[i] + track_explanations[i]
+        if step_batches_out is not None:
+            step_batches_out.append(list(current_batch))
         knowledge_chunks = len(current_batch)
         scheduled_batches += 1
         total_knowledge_chunks += knowledge_chunks
@@ -1478,10 +1621,15 @@ def replicate_and_interleave_legacy(
     log,
     test_script: bool = False,
     fill_with_pretraining: bool = False,
+    step_batches_out: Optional[List[List[str]]] = None,
 ) -> List[str]:
     """
     The old coupled-batch schedule. If explanation-spliced batches exist, use
     them for every replication; otherwise use the ordinary document batches.
+
+    If ``step_batches_out`` is provided, each per-step knowledge batch (before any
+    pretraining fill) is appended to it in schedule order. Used by the OLMo
+    injection-schedule exporter to recover per-step boundaries.
     """
     final_chunks = []
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1507,6 +1655,8 @@ def replicate_and_interleave_legacy(
 
         for i, batch in enumerate(batches_for_this_rep):
             current_batch = list(batch)
+            if step_batches_out is not None:
+                step_batches_out.append(list(current_batch))
             knowledge_chunks = len(current_batch)
             scheduled_batches += 1
             total_knowledge_chunks += knowledge_chunks

@@ -40,7 +40,10 @@ EXPLANATIONS_CYCLE="${EXPLANATIONS_CYCLE:-full}"
 EXPLANATIONS_NUM_TRACKS="${EXPLANATIONS_NUM_TRACKS:-1}"
 EXPLANATION_GRANULARITY="${EXPLANATION_GRANULARITY:-file}"
 EXPLANATION_TRACK_SIZE_BY_CHUNK="${EXPLANATION_TRACK_SIZE_BY_CHUNK:-4}"
-MATCH_EXPLANATION_SOURCE_REPLAY="${MATCH_EXPLANATION_SOURCE_REPLAY:-0}"
+EXPLANATION_TRACK_SCALE="${EXPLANATION_TRACK_SCALE:-1.0}"
+EXPLANATION_MATCH_SCALE="${EXPLANATION_MATCH_SCALE:-$EXPLANATION_TRACK_SCALE}"
+KNOWLEDGE_PROBES_VERSION="${KNOWLEDGE_PROBES_VERSION:-v13}"
+PARAPHRASED_KNOWLEDGE_PROBES_VERSION="${PARAPHRASED_KNOWLEDGE_PROBES_VERSION:-v13}"
 MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v14}"
 MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 MCQA_PROBE_BATCH_SIZE="${MCQA_PROBE_BATCH_SIZE:-32}"
@@ -78,12 +81,11 @@ EXPLANATION_SCHEDULE_ARGS=(
     --granular_explanations_num_tracks "$EXPLANATIONS_NUM_TRACKS"
     --explanation_granularity "$EXPLANATION_GRANULARITY"
     --explanation_track_size_by_chunk "$EXPLANATION_TRACK_SIZE_BY_CHUNK"
+    --explanation_track_scale "$EXPLANATION_TRACK_SCALE"
+    --explanation_match_scale "$EXPLANATION_MATCH_SCALE"
 )
 if [[ "$EXPLANATIONS_INSERTION_STRATEGY" == "granular" ]]; then
     EXPLANATION_SCHEDULE_ARGS+=(--granular_explanations_cycle "$EXPLANATIONS_CYCLE")
-fi
-if [[ "$MATCH_EXPLANATION_SOURCE_REPLAY" == "1" ]]; then
-    EXPLANATION_SCHEDULE_ARGS+=(--match_explanation_source_replay)
 fi
 
 if command -v module >/dev/null 2>&1; then
@@ -97,9 +99,9 @@ torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" finetuning_knowledge_v9
     --wandb_group finetuning_official \
     --push_to_hub_cpt_id "$PUSH_TO_HUB_CPT_ID" \
     --model_id "$MODEL_ID" \
-    --knowledge_probes_version v13 \
+    --knowledge_probes_version "$KNOWLEDGE_PROBES_VERSION" \
     --paraphrased_knowledge_probes \
-    --paraphrased_knowledge_probes_version v13 \
+    --paraphrased_knowledge_probes_version "$PARAPHRASED_KNOWLEDGE_PROBES_VERSION" \
     --paraphrased_knowledge_probe_filename_suffix _paraphrased \
     --mcqa_probes \
     --mcqa_probes_version "$MCQA_PROBES_VERSION" \

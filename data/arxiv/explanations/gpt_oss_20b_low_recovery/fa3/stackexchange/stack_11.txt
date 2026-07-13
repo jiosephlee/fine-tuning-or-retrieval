@@ -1,171 +1,122 @@
 \title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
 
-### "Quantization error" analysis: do outliers truly dominate error in FP8 when using incoherent processing?
+### What is the effect of causal masking on the FP8 kernel performance?
 Question:
-
-A quantitative bound would be helpful: given a normal distribution with variance σ² plus occasional outliers with variance (10 σ)² at probability p=0.001, can we estimate linearly how much error is contributed by outliers under per‑tensor scaling versus block scaling? I’d like to understand why incoherent processing further helps even once block scaling is used.
+The results mention that for head dimensions 128 and 256, FP8 is at par or behind with causal masking. Why does causal masking reduce the performance benefits of FP8? Does it change the memory access pattern or the depth of the pipeline, and how might the algorithm be modified to better handle causal masks in low‑precision?
 Answer:
+**Why causal masking hurts the FP8 variant**
 
-### Quantization‑error under a mixed‑scale spectrum
+1. **Asynchrony is harder to hide** – In the FP8 kernel the main source of slowdown is the tight
+   overlap between the two GEMMs (the *“GEMM–softmax”* pipeline described in the
+   paper).  When a causal mask is present the second GEMM
+   (the *P V* multiply) can only consume the upper‑triangular part of the
+   score matrix.  The GPU has to compute a *partial* matrix‑multiply:
+   many warps are idle while the masked elements would have otherwise been
+   produced.  Because the producer‑consumer warp‑specialization relies on a
+   constant‑size cascade of shared‑memory stages, such idle warps force the
+   latch between stages to stall, breaking the perfect ping‑pong
+   synchronisation that gives FP8 its throughput advantage.  With FP16
+   (where the arithmetic intensity is lower) the extra idle cycles are
+   less problematic; with FP8 the asymmetry between the 2 × faster GEMM
+   throughput and the 1× softmax throughput is amplified, so the pipeline
+   becomes more latency‑bound.
 
-In the experiments of FlashAttention‑3 the authors plant *outliers* by adding a heavy‑tailed component to normally distributed activations.  Concretely, every entry is drawn from  
+2. **Memory‑layout penalties** – For causal attention the algorithm needs the
+   *row‑major* form of `K` and the *column‑major* form of `V` in the
+   second GEMM.  With FP8 the authors already perform an *in‑kernel*
+   transpose of `V` (see Section 4.3 – “in‑kernel transpose” using
+   `STSM`/`LDSM`).  Adding a causal mask forces the kernel to load only
+   the triangular part of `V` and to write the output only up to the
+   diagonal.  That means every warp has to scatter its results,
+   destroying the nice tile‑contiguous writes that allow the Tensor
+   Cores to fire at full speed.  Consequently the effective FLOP
+   density drops, the TMA overlap is less effective, and the kernel
+   spends more time in the out‑of‑order memory subsystem.
 
-\[
-X = Z_1+Z_2\,,\qquad
-Z_1\sim\mathcal{N}(0,1),\; Z_2\sim \mathcal{N}(0,10^2)\;\text{with prob. }p=10^{-3}.
-\]
+3. **Pipeline depth disappears** – The 2‑stage GEMM‑softmax pipeline
+   (Algorithm 3) assumes that the first GEMM of iteration `j+1`
+   finishes before the softmax of iteration `j` begins.  With causal
+   masking the *softmax* itself can no longer be strictly overlapped
+   with the second GEMM because the mask changes the reduction pattern:
+   each row now depends on all earlier columns, so the reduction must be
+   performed serially over the triangular block.  As a result the
+   “wind‑up” stage of the pipeline is no longer fully overlapped
+   and the Tensor Cores are idle for a significant fraction of the
+   time.
 
-Because the outlier probability is only \(0.1\%\), the bulk of the tensor behaves like a standard normal while a few entries are order‑of‑magnitude larger.
-
----
-
-#### 1.  Quantization error in **per‑tensor** scaling
-
-With per‑tensor scaling one chooses a single scale factor \(s_Q,s_K,s_V\) for each of the three tensors,
-
-\[
-Q^{(8)}= \operatorname{round}\!\bigl(Q/s_Q\bigr)\,s_Q,\qquad
-K^{(8)}= \operatorname{round}\!\bigl(K/s_K\bigr)\,s_K,\qquad
-V^{(8)}= \operatorname{round}\!\bigl(V/s_V\bigr)\,s_V .
-\]
-
-Let \(M_Q=\max |Q|\) (the same for \(K,V\)).  The scale is usually set to \(s_Q=M_Q/127\), because FP8 has 128 quantisation levels (including zero).  
-The squared error per element is
-
-\[
-E_{\text{tex}}= \frac{s_Q^2}{4}
-   \quad (\text{for uniform quantisation}),
-\]
-
-so that the *relative* error on a normal entry is tiny, but on an outlier
-\( |x|\approx 10\,M_Q \) it becomes
-
-\[
-E_{\text{out}} \approx \frac{(10 M_Q)^2}{4} = 25 M_Q^2 ,
-\]
-
-i.e. roughly 25 × larger than the typical error. Because only \(p=10^{-3}\) elements are outliers, the expected per‑tensor RMSE over an \(n\times d\) matrix grows roughly as
-
-\[
-\sigma_{\text{RMSE}}^{\,2} \;\approx\; 
-   (1-p)\,\frac{s^2}{12}\;+\;p\,25\,M^2 ,
-   \tag{1}
-\]
-where \(s^2/12 \approx E_{\text{tex}}\) and \(M\simeq\E|Z_1|\approx0.8\).
+In short, causal masking turns the perfect, dense, square‑blocks of
+attention into sparse, triangular blocks.  That destroys the
+high arithmetic‑intensity, fully‑tile‑aligned memory flow that the FP8
+Tensor Cores rely on, and the asynchrony that the warp‑specialised
+producer‑consumer design provides.
 
 ---
 
-#### 2.  Block quantization
+**How to mitigate the effect**
 
-Block quantization replaces one global scale with one per‑block scale:
+1. **Triangular GEMM harness**  
+   Use a custom triangular‑matrix‑multiply primitive that keeps
+   the work largely dense from the perspective of the Tensor Cores
+   (e.g. perform a *group‑wise* GEMM that only loads the non‑masked
+   columns of `V` and updates the rows in a streaming fashion).  By
+   keeping the data flow tile‑aligned, BLAS‑style convolutions can
+   still be used and the FP8 pipeline remains largely overlapped.
 
-* divide each tensor into blocks of size \(B_r\times d\) (Queries/Keys) or \(B_c\times d\) (Values);
-* for each block compute its own max \(M_{\text{blk}}\) and set
-  \(s_{\text{blk}} = M_{\text{blk}}/127.\)
+2. **Mask‑aware softmax**  
+   Fuse the mask into the softmax reduction itself.  In the forward
+   pass the softmax can be rewritten as  
 
-Because outliers are usually isolated to a single element in a block,
-the max of a block is typically dominated by the outlier only rarely.
-For an outlier with magnitude say \(10M_{\text{blk}}\!-\!M_{\text{blk}}\),
-the resulting scale is about ten times larger than the normal case.
-Therefore the quantisation step size inside that block is also roughly
-ten times larger – which zooms in on the outlier rather than blowing
-up its error.
+   \[
+   \tilde P_{ij} = 
+   \begin{cases}
+     \exp(S_{ij} - m_i) & j \le i \\
+     0 & j > i
+   \end{cases}
+   \]
 
-A simple linear model for RMSE reduction is obtained by noting that
-the proportion of blocks that contain an outlier is
+   If the exponential is computed *only* for the triangular part
+   (by a conditional within the warp), the reduction can still be
+   performed in a single warp‑level operation, keeping the
+   softmax latency low and the *synchronisation* between the two
+   GEMMs tight.
 
-\[
-p_{\text{blk}} = 1-(1-p)^{B} \;\approx\; B\,p,
-   \quad B = B_r d .
-\]
+3. **Pre‑masked data layout**  
+   Store `K` and `V` in a “packed” triangular format in global memory
+   (only the lower‑triangular half).  The TMA can then load exactly
+   the required sub‑tiles with a single copy, eliminating the need to
+   scatter writes back to a full square block.  This keeps the
+   occupancy high and the shared‐memory traffic minimal.
 
-Thus we may write an approximate variance expression
+4. **Starving the pipeline deliberately**  
+   When the matrix is very sparse, the authors’ baseline technique
+   “**incoherent processing**” (random orthogonal scrambling) can
+   be extended to the causal case: scramble the rows of `Q` and the
+   columns of `K` before masking.  This spreads the non‑zero
+   entries across the block, allowing the kernel to maintain a
+   more balanced workload even with a mask.  Once the block is
+   multiplied, apply the inverse scramble to restore the order.
+   The extra LCSC multiply is inexpensive (≈ O(d log d)) and does not
+   affect the FP8 performance substantially.
 
-\[
-\sigma_{\!{\rm BLK}}^{\,2} 
-    \;\approx\; (1-p_{\rm blk})\,E_{\rm tex}
-                + p_{\rm blk}\,\frac{s_{\!{\rm blk}}^{\,2}}{4},
-   \tag{2}
-\]
-where \(s_{\!\rm blk}\) is now about ten times smaller than in the per‑tensor case whenever an outlier exists.
-
-For realistic block sizes used in FlashAttention (e.g.  
-\(B_r=32,\;d=64 \Rightarrow B=2048 , p_{\rm blk}\approx0.002{\color{red}*\!} , 
- p_{\rm blk}\approx0.41.\))
-Equation (2) predicts roughly a **3–4×** drop in RMSE compared with (1), which matches newer papers reporting ~ 2–3× improvement.
-
----
-
-#### 3.  Incoherent processing
-
-The trick of multiplying both \(Q,K,V\) by a random orthogonal matrix
-\(M=\mathbf D H,\;D=\operatorname{diag}(\pm 1)\)
-does not change the dot product:  
-
-\(QK^\top=(QM)(KM^\top).\)
-
-But it *spreads* any extreme values among many entries: each new entry
-is a random linear combination of many original ones.
-Statistically, this reduces the tail probability for a *single*
-component from \(p=10^{-3}\) to approximately  
-
-\(p' = p\times symb , \qquad symb <1.\)
-
-In practice, experiments show that incoherent processing reduces the frequency of blockwise maxima dominated by singular outliers by about **60 %**.
-If we include this effect in our block formula:
-
-```
-      m'_blk = m_blk × γ       with γ ≃ 0.6
-```
-
-then equations (1)–(3) become
-
-```
-σ_rmse_block_incoh² ≈ (1-bp_o)(ETex) + bp_o · (γ·s_blk)^2 /4 ,
-```
-
-and plugging in γ≈0.6 gives another ~ 30 % total RMSE improvement.
+5. **Use a two‑kernel fusion** – split the full‑attention pass into
+   two sub‑kernels: (i) a “score‑generation” kernel that forms the
+   triangular matrix in FP8, and (ii) a call‑time “softmax‑mul”
+   kernel that only consumes the valid triangle.  This allows the
+   *score‑generation* kernel to exploit the full FP8 pipelines,
+   while the *softmax‑mul* kernel, being much smaller, can be
+   implemented with a higher‑level BLAS routine that automatically
+   handles the irregular shapes.
 
 ---
 
-#### Putting it all together
+**Take‑away**
 
-Combining both techniques leads to an **overall linear dependence** on
-the block size and a still‑exponential suppression of outliers:
-
-```math
-σ_\mathrm{FP8}^{\,2}
-≈ α·E_\mathrm{text}(B)
-+ β·p·B·γ^2·E_\mathrm{text}(B),
-```
-
-where  
-
-* \(α≈0.7,\;β≈0.3,\)
-* \(γ≈0.6,\)
-* and `E_text(B)` scales as `s_B²/12` with `s_B` inversely proportional to `B`.
-
-Numerically, with `B_r=32`, `d=64`, and `p=10⁻³` one obtains:
-
-| Scheme | Approximate RMSE factor relative to FP16 |
-|--------|----------------------------------------|
-| Per‑tensor FP8 | 1 × |
-| Block FP8 (no incoherence) | ≈ 0.35 |
-| Block + incoherent FP8 | ≈ 0.13 |
-
-These ball‑park numbers align with Table 5 and Fig 9 of FlashAttention‑3  
-(which report 2–3× better RMSE for block+incoherent over per‑tensor).
-
----
-
-### Bottom line
-
-* **Per‑tensor scaling** blows up when any entry becomes an eclipse – its scale dominates all other values, making almost all other entries under‑quantised.
-* **Block quantization** caps each block’s max separately, dramatically reducing the impact of rare large elements.
-* **Incoherent processing** further dilutes any given large value across many coefficients through random orthogonal mixing – effectively shrinking the tail probability before quantisation.
-
-Hence, under the mixture distribution described,
-outliers still matter under per‑tensor scaling but become largely harmless once
-blockwise scales and incoherent random mixing are applied,
-explaining both the linear dependence on block size and why FP8 
-FlashAttention-3 can achieve up to *2–3× lower* numerical error as reported in §5.4 of the paper.
+Causal masking breaks the dense, square‑block structure that the
+FP8 FlashAttention‑3 algorithm is tuned for.  The resulting loss of
+arithmetic intensity, increased branching, and inability to keep the
+Tensor Cores in a tight producer–consumer pipeline is why the FP8
+kernel falls behind FP16 for head dimensions 128 and 256.  By
+introducing mask‑aware triangular GEMMs, fusing the mask into
+softmax, or reshaping the data layout to preserve tile‑aligned
+streams, one can largely recover the pipeline overlap and regain the
+performance advantage that FP8 offers on Hopper/H100 GPUs.

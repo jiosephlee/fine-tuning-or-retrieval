@@ -1,46 +1,62 @@
 \title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
 
-### "Pingpong" scheduling: what barriers synchronize and why?
+### What is block quantization and how does it reduce FP8 numerical error?
 Question:
-In the description of the overlapping GEMM–softmax pipeline, two warp groups are said to ping‑pong by swapping roles every iteration. The paper references `bar.sync` barriers but doesn’t detail which specific operations are preordered by them. Which WGMMA invocations must finish before the exponential operations begin, and how does this ordering avoid hazards if the compiler reorders instructions?
+The paper mentions block quantization as keeping one scalar per block (e.g., per B_r × d block). I’d like to understand how this works in practice. Does each block get its own scale factor that is applied during the dot‑product, and how is this incorporated into the softmax computation? Also, how does this interact with the scaling used for Q, K, V during quantization—do we apply the block scale to the quantized values or to the outputs?
 Answer:
-**Answer**
+**Block quantization** in *FlashAttention‑3* is the practice of keeping a *single* scaling scalar for each **block** of the input tensors (Q, K, V) instead of one scalar for the whole tensor.  
+A block is the natural unit of computation in FlashAttention: during the forward‑pass the kernel loads a tile of the query matrix \(Q_i\) (size \(B_r\times d\)) and a tile of the key/value matrices (size \(B_c\times d\)).  Thus every block that is read from HBM already fits in a small on‑chip buffer; it is therefore cheap to associate a separate scale with each block.
 
-The “ping‑pong” technique in FlashAttention‑3 is a *software pipeline* that interleaves two warp‑groups (WG1 and WG2).  
-Each warp‑group issues the same set of instructions, but they are offset by one iteration:
+---
 
-* WG1:  **GEMM** (first WGMMA, `$S_{\text{cur}} = Q\cdot K^{2\,T}$`) → **softmax** → **GEMM** (second WGMMA, `$O \;+=\; P\cdot V$`)  
-* WG2:  begins its own **GEMM** for the *next* block while WG1 is finishing the **softmax** of its current block.
+### How the scale is used
 
-A `bar.sync` placed before the start of a warp‑group’s loop ensures that
+1. **Quantization step**  
+   For a block \(\mathbf{X}\) (say a \(B_r\times d\) chunk of \(\mathbf{Q}\)) we choose a scalar \(s_{\mathbf{X}}\) (often the maximum absolute value in the block or a percentile).  
+   The block is quantized to FP8 as  
+   \[
+      \mathbf{X}^{(\mathrm{FP8})}= \operatorname{round}\!\bigl(\mathbf{X}/s_{\mathbf{X}}\bigr),
+   \]
+   and the scale \(s_{\mathbf{X}}\) is stored once for that block.  
+   The same procedure is applied independently to every block of \(\mathbf{K}\) and \(\mathbf{V}\).
 
-```
-   WG1’s GEMM0   ($Q\cdot K_{j}^{T}$)  and  WG2’s GEMM1 ($Q\cdot K_{j+1}^{T}$)
-```
+2. **GEMM‑step**  
+   In the tensor‑core WGMMA the operands are still the *quantized* blocks \(\mathbf{Q}^{(\mathrm{FP8})}\) and \(\mathbf{K}^{(\mathrm{FP8})}\).  
+   When two blocks are multiplied, the implicit scales multiply as well:
+   \[
+      \mathbf{S}^{(\mathrm{FP8})}
+        = \mathbf{Q}^{(\mathrm{FP8})}\mathbf{K}^{(\mathrm{FP8})\,T}
+        \;\; \Longrightarrow \;\;
+      \mathbf{S}
+        = s_{\mathbf{Q}}\; s_{\mathbf{K}}\;\mathbf{S}^{(\mathrm{FP8})}.
+   \]
+   Rather than performing a separate scaling operation after the WGMMA, *FlashAttention‑3* folds the product \(s_{\mathbf{Q}}\;s_{\mathbf{K}}\) into the subsequent softmax.  
+   The accumulated scalar is compared with the row‑wise maximum used in the softmax normalisation, and the final matrix \(P\) is obtained exactly as if the blocks had been multiplied in full precision.
 
-complete in a guaranteed order. Thus the softmax of one block can be computed only after the antecedent matrix multiplication (`$S_{\text{cur}}$`) has finished, and the result of that softmax (`$\tilde{P}_{\text{cur}}$`) can be used by the following matrix multiplication (`$O \;+\!=$ $\tilde{P}_{\text{cur}}\cdot V_{j-1}$`) only after it too has completed. The `bar.sync` therefore enforces two *layers* of ordering:
+3. **Softmax and rescaling**  
+   The softmax routine in FlashAttention is *local*—each block of scores \(\mathbf{S}\) is normalised independently.  
+   Because the scale product \(s_{\mathbf{Q}}\,s_{\mathbf{K}}\) is just a single scalar per block, the softmax implementation can treat it like any other scalar multiplier:
+   \[
+      \tilde{\mathbf{P}} = \exp\!\Bigl(\frac{\mathbf{S}-m}{s_{\mathbf{Q}}\;s_{\mathbf{K}}}\Bigr)
+   \]
+   where \(m\) is the row‑wise maximum of \(\mathbf{S}\).  
+   After this, the block‑wise product \(s_{\mathbf{Q}}\;s_{\mathbf{K}}\) is incorporated into the *numerical* values of \(\tilde{\mathbf{P}}\) that are used to weight the value matrix in the second GEMM.  No extra multiply of the output is required because the subsequent WGMMA already interprets the quantised scores as if they were scaled.
 
-1. **Between iterations within a warp‑group** – a later iteration may not start its first WGMMA until the previous iteration’s second WGMMA (`WGMMA2`) has finished and its registers have been written back.  
-2. **Between the two warp‑groups** – WG2’s first WGMMA for block *j+1* may only begin after WG1’s first WGMMA for block *j* has been issued and committed, so that the shared‑memory buffer that holds `$K_j$` is still occupied when WG2 reads it.
+---
 
-In concrete terms, for an iteration `j` the following must hold before any instruction from the next iteration can start:
+### Interaction with Q/K/V scaling
 
-| operation | depends on | required barrier |
-|-----------|-----------|-------------------|
-| `$S_{\text{next}} = Q\cdot K_j^{T}$` (WGMMA1) | results of previous iteration’s second WGMMA (`$O \;+\!=$ $\tilde{P}_{\text{prev}}\cdot V_{j-2}$`) | bar.sync before WG2’s launch |
-| `$\tilde{P}_{\text{next}} = \exp(S_{\text{next}} - m_{\text{new}})$` | completion of `S_next` | implicit guard inside softmax code |
-| `$O \;+\!=$ $\tilde{P}_{\text{cur}}\cdot V_{j-1}$` (WGMMA2) | completion of `$\tilde{P}_{\text{cur}}$` (softmax of previous block) | implicit compile sequence |
+The usual per‑tensor scaling that was used in earlier FP8 attention pipelines scales the entire tensor \(\mathbf{Q}\), \(\mathbf{K}\), or \(\mathbf{V}\) with a single scalar.  Block quantization replaces this with **many** scalars (one per block), so the *quantised* Q, K, V contain block‑wise normalised entries.  In the GEMM the FP8 Tensor Core produces an *FP32 accumulator* that holds the sum of products of quantised values; the block scales are multiplied into that accumulator *before* the softmax step, thus preserving the correct magnitude of each score.
 
-These dependencies guarantee that:
+Because each block can be scaled independently, outliers that appear in only a few positions no longer dominate the global scale.  The “incoherent processing” trick (multiplying Q and K by a random orthogonal matrix before quantisation) further spreads such outliers, making the per‑block scales more representative of the typical magnitude within that block.  Together, block quantisation + incoherent processing cut the FP8 numerical error by about \(2.6\times\) relative to a naive per‑tensor scaling strategy.
 
-* The *score matrix block* (`$S_{\text{cur}}$`) produced by the first WGMMA is fully available before the exponential is evaluated; otherwise we would be exponentiating uninitialized data.  
-* The *softmax intermediate* (`$\tilde{P}_{\text{cur}}$`) is ready before it is multiplied by the corresponding value block (`$V_{j-1}$`); otherwise we would be feeding garbage into a Tensor Core kernel.
+---
 
-The compiler in NVCC could, in principle, reorder or fuse instructions across these boundaries. However, by explicitly emitting a `bar.sync` one can create a **global control dependency** that NVCC respects: it merely places instructions before or after a chip‑wide barrier but never removes or moves instructions that cross it. Because each warp‑group executes its own barrier region independently, no instruction from WG2 can slip ahead of WG1 past a scheduled barrier unless both reach it simultaneously—precisely what we need to keep the pipeline consistent.
+### Practical take‑away
 
-Thus, when we say “WG1’s GEMMs must finish before WG2’s GEMMs begin”, we refer to two distinct barriers:
+* **One scalar per block** → residual error scales with the *dynamic range* of the block, not the whole tensor.  
+* **Scales are fused into the softmax** → no extra multiplies on the RHS of the attention formula.  
+* The FP8 Tensor Cores still operate on 8‑bit operands, but the FP32 accumulator automatically receives the correct scaling thanks to the per‑block factors.  
+* Because FlashAttention‑3 already processes tensors block‑wise, the implementation incurs virtually zero extra cost to keep the scales in registers or shared memory.
 
-1. **Iteration boundary barrier** inside each warp‑group – ensures an intervening matrix multiply does not overlap with its own predecessor’s matrix multiply or with its own softmax.
-2. **Ping‑pong barrier** between warp‑groups – ensures WG2 does not steal data from buffers still being consumed by WG1.
-
-Because both barriers are explicit via CUDA's `bar.sync`, any aggressive compiler reordering cannot violate these constraints; the operations remain correctly serialized while still allowing asynchronous execution within each stage. This ordering is what makes ping‑pong pipelining safe and effective on Hopper GPUs.
+In short, block quantisation turns the expensive “global‑scale” quantisation problem into a cheap **localized‑scale** one, and this local scaling is seamlessly incorporated into the block‑wise softmax and GEMM operations that FlashAttention‑3 already performs.

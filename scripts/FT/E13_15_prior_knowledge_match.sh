@@ -35,7 +35,8 @@ LEARNING_RATE="${LEARNING_RATE:-4e-5}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
 CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E13_15_prior_knowledge_expl_match_all_domains}"
-PUSH_TO_HUB_CPT_ID="${PUSH_TO_HUB_CPT_ID:-e13-15-olmo2-7b-para9-prior-knowledge-expl-match-20260524}"
+PUSH_TO_HUB_CPT_ID="${PUSH_TO_HUB_CPT_ID:-e13-15-olmo2-7b-para9-prior-knowledge-expl-match-20260713}"
+KNOWLEDGE_PROBE_VARIANT="${KNOWLEDGE_PROBE_VARIANT:-short_targets}"
 MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v15}"
 MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 MCQA_PROBE_BATCH_SIZE="${MCQA_PROBE_BATCH_SIZE:-32}"
@@ -107,6 +108,7 @@ torchrun --standalone --nproc_per_node "$NPROC_PER_NODE" --log-dir "$TORCHRUN_LO
     --push_to_hub_cpt_id "$PUSH_TO_HUB_CPT_ID" \
     --include_sources arxiv legal \
     --knowledge_probes_version v14 \
+    --knowledge_probe_variant "$KNOWLEDGE_PROBE_VARIANT" \
     --paraphrased_knowledge_probes \
     --paraphrased_knowledge_probes_version v14 \
     --paraphrased_knowledge_probe_filename_suffix _paraphrased \

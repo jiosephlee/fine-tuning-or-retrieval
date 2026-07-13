@@ -50,3 +50,12 @@ vllm serve openai/gpt-oss-20b \
 In a second shell on the same allocation, set
 `VLLM_BASE_URL=http://127.0.0.1:8000/v1` and run a pipeline with
 `--provider vllm --base_url "$VLLM_BASE_URL"`.
+
+## Post-generation agentic review
+
+After generation and structural validation, use the Codex-native binary
+sensibility review in
+[`AGENTIC_MULTIVIEW_SENSIBILITY_REVIEW.md`](AGENTIC_MULTIVIEW_SENSIBILITY_REVIEW.md).
+It requires no LLM API credits: a parent Codex session assigns every generated
+prose unit to interactive subagents and reconciles complete `PASS`/`FAIL`
+coverage.

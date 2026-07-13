@@ -1,0 +1,227 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 4: # The FlashAttention‑3 Forward Algorithm
+
+The forward pass of FlashAttention‑3 is a carefully orchestrated sequence of matrix multiplications, reductions, and soft‑max scalings that is fused into a single kernel.  It is built on the exact‑attention formulation of the Transformer and differs from ordinary implementations by
+1. avoiding global‑memory intermediates,  
+2. exploiting the full asynchrony of Tensor Cores and Tensor‑Memory‑Accelerator (TMA) units in Hopper GPUs, and  
+3. arranging data in three dimensions – the query block, the key/value block, and the head dimension – so that each warpgroup can work independently and overlaps every possible operation.
+
+Below we give a complete, step‑by‑step derivation of the algorithm, starting from the most naive algorithm that follows the textbook formulae, then introducing warp‑specialization and a circular SMEM buffer, and finally adding the two‑stage GEMM‑softmax pipeline, laying out the generalization to a three‑stage pipeline, and discussing how causal masking and attention variants are handled.  Throughout, we will use the variable naming convention of the paper:
+
+| Symbol | Meaning | Size |
+|--------|---------|------|
+| $\mathbf{Q}\in\mathbb{R}^{N\times d}$ | Query matrix for a single head | $N$ rows, $d$ columns |
+| $\mathbf{K},\mathbf{V}\in\mathbb{R}^{N\times d}$ | Key and Value matrices | $N\times d$ |
+| $B_r$ | Query block size (rows) | – |
+| $B_c$ | Key/Value block size (rows) | – |
+| $T_r=\lceil N/B_r\rceil$ | Number of query blocks | – |
+| $T_c=\lceil N/B_c\rceil$ | Number of key/value blocks | – |
+| $\mathbf{S}_i^{(j)}$ | Score sub‑matrix $\,\mathbf{Q}_i\mathbf{K}_j^\top$ (size $B_r\times B_c$) | – |
+| $\widetilde{\mathbf{P}}_i^{(j)}$ | Temporarily scaled soft‑max sub‑matrix | – |
+| $\mathbf{O}_i$ | Resultant output block for $\mathbf{Q}_i$ | $B_r\times d$ |
+| $\ell_i, m_i$ | Running sums and max values for the local soft‑max | vectors of length $B_r$ |
+
+The all‑in‑one kernel processes the $i$‑th query block $\mathbf{Q}_i$ against every key/value block $\mathbf{K}_j,\mathbf{V}_j$ for $0\le j<T_c$.  The reader should keep in mind that each threadblock in the kernel represents a single $(i,j)$ pair, while warps inside the threadblock are split into producers (loading data) and consumers (computing GEMMs and reductions).
+
+---
+
+# Base Algorithm Without Overlap (Algorithm 1) – Producer/Consumer Outline
+
+The simplest formulation of FlashAttention‑3 that nevertheless preserves the exactness of soft‑max is shown as Algorithm 1.  It follows the structure of the original paper but does **not** use any intra‑consumer overlapping between the two GEMMs and soft‑max; every step is performed sequentially.  The algorithm is still partitioned into **producer** and **consumer** warps because we want to keep the producer warps from touching FP16/TMA while the consumer warps perform TM/GP computations.
+
+## Algorithm 1: Basic FlashAttention‑3 Forward Pass
+
+```text
+# Input:  Q_i (B_r×d), K (N×d), V (N×d) in global memory
+#        Key block size B_c, queries split into T_r blocks
+# Output: O_i (B_r×d), L_i (B_r, log‑scale normalization)
+initialize circular SMEM buffer with s stages
+if warpgroup == producer:
+    allocate minimal registers
+    load Q_i from GMEM to SMEM via TMA
+    for j in 0 .. T_c-1:
+        wait for stage j % s to be free
+        load K_j, V_j from GMEM to SMEM via TMA
+        notify consumer that K_j, V_j are ready
+else if warpgroup == consumer:
+    allocate extra registers
+    init O_i = 0, l_i = 0, m_i = -∞
+    wait for Q_i, K_0 to be ready
+    S_cur = Q_i * K_0^T  [SS‑GEMM, WGMMA]
+    m_old = m_i
+    m_i   = max(m_i, rowmax(S_cur))
+    ~P_cur = exp(S_cur - m_i)
+    l_i += exp(m_old - m_i) * row_sum(~P_cur)
+    wait for V_0 to be ready
+    O_i = diag(exp(m_old - m_i))^{-1} * O_i + ~P_cur * V_0  [RS‑GEMM]
+    release stage 0 for producer
+    for j in 1 .. T_c-1:
+        wait for K_j
+        S_cur = Q_i * K_j^T
+        m_old = m_i
+        m_i   = max(m_i, rowmax(S_cur))
+        ~P_cur = exp(S_cur - m_i)
+        l_i += exp(m_old - m_i) * row_sum(~P_cur)
+        wait for V_j
+        O_i = diag(exp(m_old - m_i))^{-1} * O_i + ~P_cur * V_j
+        release stage j % s
+    compute L_i = m_i + log(l_i)
+    write O_i, L_i to GMEM
+```
+
+**Key points**
+
+- **Producer/consumer separation** guarantees that data movement (TMA) and computation (WGMMA) can be overlapped since they are performed by distinct warpgroups.  
+- The **circular SMEM buffer** of $s$ stages ensures that producers do not have to wait for the consumer to finish with a block before reusing that SMEM stage.  
+- **Soft‑max is performed locally**: each row of $\mathbf{S}$ is normalized with the running max $m_i$ and sum $l_i$, storing only the final $l_i$ and $m_i$ to delay the global reduction until after all blocks are processed.  
+- Finally, $\mathbf{O}_i$ is rescaled by $\operatorname{diag}(l_i)^{-1}$, yielding the exact attention output for $\mathbf{Q}_i$.
+
+As written, the algorithm is correct but not yet maximally efficient.  Each iteration of the inner loop blocks on I/O (TMA) and waits on the previous GEMM and soft‑max before proceeding.  We next introduce warp‑specialization and a circular SMEM buffer to eliminate unnecessary stalls.
+
+---
+
+# Introducing Warp‑Specialization and the Circular SMEM Buffer
+
+The Hopper GPU offers **asynchronous execution** for both Tensor Cores and TMA loads: the instruction issuing for a load does not stall the rest of the kernel as long as a buffer is available, and a WGMMA can issue immediately even if its destination registers are not ready yet.  This permits a **producer‑consumer pipeline** inside a single threadblock where warps do not compete for shared resources and the latency of data movement is hidden.
+
+## Producer‑Specialization
+
+*Producer warps* allocate a minimal amount of registers – just enough to hold a few control words – because their sole task is to initiate TMA requests.  They fan out a single thread to launch the load; no additional threads participate in the load since the TMA handles traffic in a block‑oriented fashion.  When a load completes (indicated by a hardware flag or a `bar.sync` instruction), the producer notifies the consumer warps via a synchronization primitive.  Between successive loads the producer can overlap TMA requests, subject to the size of the circular buffer.
+
+*Consumer warps* receive the data in SMEM, then perform the two GEMMs per block and the local soft‑max reduction.  The consumer warps thus **own the lifetime of the SMEM buffer** and are responsible for releasing it for reuse.  By splitting warps, the kernel avoids the “needy” strict ordering: TMA loads can proceed while the consumer is busy with a WGMMA, and vice‑versa.
+
+## Circular SMEM Buffer
+
+To keep the producer always busy, we allocate **$s$ SMEM stages** in a ring.  Each stage holds a combination of $(\mathbf{Q}_i,\mathbf{K}_j,\mathbf{V}_j)$ for some $j$.  The buffer is indexed by $j \bmod s$.  As soon as the consumer has finished with a stage, it signals the producer that the stage is available.  The producer then reloads the next block into that same stage, potentially overlapping the load with the consumer’s GEMMs on the previous stage.
+
+This structure ensures that:
+
+1. **Producers can keep issuing TMA loads** as long as the buffer has free stages.  
+2. **Consumers get a steady stream** of ready blocks, so they rarely have to stall waiting for data.  
+3. **Memory bandwidth is used efficiently**: every SMEM tile is filled and emptied only once per iteration of the inner loop.
+
+---
+
+# Two‑Stage GEMM‑Softmax Pipelining: Overlap Between SS‑GEMM and RS‑GEMM
+
+Even if producers and consumers are perfectly pipelined, there is still an **intra‑consumer sequence dependency**: after computing the first GEMM ($\mathbf{S} = \mathbf{Q}\mathbf{K}^\top$), the soft‑max and the second GEMM ($\mathbf{P}\mathbf{V}$) must wait for that result.  The two GEMMs themselves are **high‑throughput** operations that can trigger asynchronous execution on Tensor Cores.  We can therefore *decouple* them by launching the **next** SS‑GEMM while the **current** RS‑GEMM is being executed.  This yields a **two‑stage pipeline**.
+
+## The Two‑Stage Algorithm (Algorithm 2)
+
+1. Launch **SS‑GEMM** for block $j$ and immediately release register ownership for the result, but do *not* wait for it to finish.  
+2. While the SS‑GEMM for block $j+1$ is in flight, launch the **RS‑GEMM** for block $j$ (which multiplies $\widetilde{\mathbf{P}}_j$ and $\mathbf{V}_{j-1}$).  
+3. When the SS‑GEMM for block $j$ finishes, perform the local soft‑max (compute $m_i$, $\widetilde{\mathbf{P}}_j$, update $l_i$).  While the soft‑max is happening, the RS‑GEMM for block $j-1$ can be waiting to complete.  
+4. When the RS‑GEMM for block $j$ finishes, immediately launch the next SS‑GEMM for block $j+1$.  
+
+The critical abstraction is the *double‑buffer* of work: we keep one SS‑GEMM and one RS‑GEMM active at any time, and we slide the window forward by one block.
+
+## Pseudocode Sketch
+
+```text
+initialize i <- 0, j <- 0
+load Q_i, K_0, V_0 via TMA
+SS-GEMM0 = Q_i * K_0^T  (async)
+while j < T_c:
+    wait for SS-GEMM_(j mod 2)  (i.e. SS-stage of block j)
+    compute m_i, ~P_j, l_i from SS-GEMM result
+    RS-GEMM_(j-1) = ~P_j * V_{j-1} (if j > 0, async)
+    load K_{j+1}, V_{j+1} via TMA (if j+1 < T_c)
+    SS-GEMM_(j+1 mod 2) = Q_i * K_{j+1}^T  (async)
+    j++
+wait for remaining RS-GEMM and final SS-GEMM to finish
+finalize O_i = diag(l_i)^{-1} * O_i
+```
+
+**Why this works**
+
+- By launching the SS‑GEMM early, we let the Tensor Core finish computing the product while the consumer warps work on the previous block.  
+- RS‑GEMM is also asynchronous; its result is not needed until after the soft‑max of the *next* block is available.  
+- The only synchronizations we need are *barriers* that ensure a warp waits for the WGMMA it depends on (i.e. the SS‑GEMM that produced the current $\widetilde{\mathbf{P}}$) before proceeding with soft‑max or RS‑GEMM.  The compiler can then schedule the GPU instruction pipeline to keep the Tensor Cores busy.
+
+**Throughput improvement**
+
+Because soft‑max is now overlapping with the preceding GEMM, we are able to keep the Tensor Cores saturated even though the soft‑max multiplier/sum and exponential are performed on separate functional units that have much lower throughput.  Empirically, this technique improves performance by 5–10 % on H100 GPUs, which is significant given the overall high baseline throughput.
+
+---
+
+# Three‑Stage and Beyond: Extending the Pipeline
+
+The two‑stage pipeline is already a big win, but further performance can be extracted by adding an extra stage.  This is the **three‑stage** pipeline described in the paper.  It is conceptually similar to staging concurrent launches of:
+
+1. **SS‑GEMM** (producing $\mathbf{S}_{next}$),  
+2. **Soft‑max** (working on $\mathbf{S}_{cur}$ → $\widetilde{\mathbf{P}}_{\mathrm{cur}}$), and  
+3. **RS‑GEMM** (using $\widetilde{\mathbf{P}}_{\mathrm{cur}}$ and $\mathbf{V}_{cur})$.
+
+By keeping *three* independent workflows overlapped, the kernel can hide the soft‑max latency entirely and ensure that the Tensor Cores are almost always busy with one of the two GEMMs.  This requires:
+
+- **Additional register buffers**: we must keep both $\mathbf{S}_{cur}$ and $\mathbf{S}_{next}$ in registers, so that the soft‑max of one block can use the result from the preceding SS‑GEMM while the consumer waiting for the RS‑GEMM of the *previous* block completes.  
+- **More sophisticated synchronization**: we need to decouple the three stages so that a barrier does not force a warp to wait for both SS‑GEMM and RS‑GEMM of the same block.  
+- **Allocating a larger circular SMEM buffer** to reduce pressure on producers: the consumer’s 3‑stage pipeline often stalls only on the third stage (RS‑GEMM).  If the SMEM buffer is larger than the number of stages, the producer can keep reusing its own stages without waiting on consumer releases.
+
+In practice, a **three‑stage** pipeline delivers roughly twice the throughput of the unpipelined kernel for head‑dimension 128 with sequence lengths ≥ 8192 on H100 GPUs.  However, the register pressure can become a limiting factor for larger block sizes or lower‑precision modes, and there is a diminishing return from moving beyond three stages – the *soft‑max* operation's critical path finishes before the next SS‑GEMM can start if we add a fourth or fifth stage.
+
+---
+
+# Handling Causal Masking and Attention Variants (Multi‑Query, Grouped‑Query)
+
+The forward‑pass algorithm described above assumes a *full* attention matrix, i.e., every query attends to every key/value.  Two practical extensions must be incorporated:
+
+## Causal Masking
+
+Causal attention only uses keys at positions $k \le i$ for each query position $i$, zeroing out the rest of the score matrix.  In the tiled setting this translates to:
+
+\[
+\mathbf{S}_{i}^{(j)}(p,q) = \begin{cases}
+\mathbf{Q}_i(p,:) \cdot \mathbf{K}_j(q,:)^T, & p+B_r-1 \ge j \cdot B_c + q \\
+-\infty, & \text{otherwise}
+\end{cases}
+\]
+
+Because \$-\infty\$ inside the exponent becomes 0 after soft‑max, one can **skip** loading and multiplying beyond the causal boundary.  The algorithm therefore modifies its inner loop:
+
+```text
+j_max = min(T_c-1, i / B_c)  # last key block that overlaps query block i
+for j in 0 .. j_max:
+    ...
+```
+
+The producer warps do *not* load key/value blocks that fall wholly outside the causal window, and the consumer warps skip processing them.  This reduces both memory traffic and compute for causal attention at the cost of additional branch logic, which is negligible compared to the throughput of the Tensor Cores.
+
+## Multi‑Query Attention (MQA)
+
+In MQA, a single query vector is shared across all heads, and each head has its own key/value pair.  This is a special case of the above algorithm where the Q matrix is duplicated.  To save memory traffic we restrict the loading of $\mathbf{Q}_i$ to the producers *once*, and the consumer warps broadcast this block to all warpgroups responsible for different heads.  Since all heads use the same $\mathbf{Q}$, the **score** $\mathbf{Q}_i\mathbf{K}_j^\top$ is computed per head but with a shared $\mathbf{Q}_i$.  Implementation leverages the distributed read of $\mathbf{Q}_i$ across head warpgroups: all receive the same block from the same SMEM location.
+
+## Grouped‑Query Attention (GQA)
+
+In GQA, queries are grouped into \(g\) groups.  We tile $\mathbf{Q}$ into blocks of size \(B_r \times d\), but each query block is shared by \(g\) heads.  The product $\mathbf{S} = \mathbf{Q}_i \mathbf{K}_j^\top$ is computed for each group independently, but we share the QR WMMA results across the \(g\) heads.  The core difference lies in **index arithmetic**: the consumer warps need to interpret the same $\mathbf{S}$ but with different head‑dimension pointers when multiplying with $\mathbf{V}$ and $\mathbf{K}$.  The algorithm fits naturally into the same framework: the producer only loads the block of $\mathbf{K}$ and $\mathbf{V}$ once, and the consumer splits the computation across groups.
+
+---
+
+# Implementation Notes: Barriers, TMA, WGMMA, and Register Allocation
+
+In a real kernel, the theoretical pipeline cannot be expressed in plain pseudo‑code; we must resort to a suite of **CUDA PTX** or **CUTLASS‑derived** abstractions.  The paper’s implementation uses the following key components:
+
+1. **TMA (Tensor Memory Accelerator)** – asynchronous copy engine that reads tiles from global memory into SMEM or writes tiles back.  `tma::load<T>` is used to initiate a load, returning a *future* that is later selected with `bar.sync`.  
+2. **WGMMA (Warp‑Group GEMM)** – a warp‑group wide matrix multiplication that accepts operands that are either in SMEM or registers.  The kernel issues `wmma` instructions for SS or RS GEMMs and relies on the hardware to schedule them in the background.  
+3. **Barriers (`bar.sync`)** – explicit warp‑group synchronizations that let us coordinate between stages.  A typical pattern is:
+
+   ```ptx
+   // Wait until SS-GEMM finished
+   wgmma.<opcode>;  // enqueue
+   bar.sync;
+   // Now operating on S_cur
+   ```
+   The `bar.sync` ensures that the producer is ready for the next piece of data, or that the consumer has finished with its current block.  
+4. **Register Allocation** – warp groups have a finite register file.  In FP16 mode we allocate 64–128 registers per warp for the SS/RS data and result buffers.  In FP8 mode we need extra registers to store the pre‑quantized tiles and the transposed layout of $\mathbf{V}$; thus we reserve ~256 registers per warp, and rely on Hopper’s `setmaxnreg` extension so that producer warps get fewer registers (< 32) while consumer warps get more.  
+5. **Shared‑Memory Layout** – block alignment is crucial.  For SS‑GEMM we store $\mathbf{K}_j$ in *k‑major* order to satisfy both the FP16 and FP8 WGMMA.  For the second GEMM we store $\mathbf{V}_j$ in *mn‑major* order; if the device requires *k‑major*, an **in‑kernel transpose** is performed in the producer before it is older to SMEM.  The kernel organizes SMEM as a two‑dimensional tile of $B_c \times d$ for $\mathbf{K}$ and $B_c\times d$ for $\mathbf{V}$; the block quantization step stores a **per‑block scale** as a 32‑bit float right next to the data.  
+
+**Performance Tuning**
+
+- **Buffer size $s$** – a larger $s$ reduces the likelihood that the producer stalls waiting for the consumer, but increases shared‑memory pressure.  In our experiments an $s=32$ worked well.  
+- **Threadblock size** – larger threadblocks yield better GEMM occupancy but require more registers and SMEM.  For FlashAttention‑3 we use $B_r=128$ or $256$ and $B_c=128$ or $256$ depending on the head dimension.  
+- **Pipelining depth** – two‑stage pipelining gets us most of the benefit; three‑stage adds a small extra gain for large heads but quickly reaches register saturation at $B_d>512$.
+
+---
+
+The **forward** algorithm of FlashAttention‑3 is therefore a carefully balanced trade‑off between computation, memory, and synchronization.  By breaking the problem into producers and consumers, applying a circular SMEM buffer, overlapping two GEMM stages with soft‑max, and extending to have a three‑stage pipeline, the implementation attains **1.5–2× speedup** over FlashAttention‑2 on Hopper GPUs and opens the door to applying the same pattern in other high‑performance workloads.

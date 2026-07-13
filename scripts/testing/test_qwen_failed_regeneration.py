@@ -27,6 +27,13 @@ class QwenFailedRegenerationTests(unittest.TestCase):
         command = command_for([target], 3)
         self.assertEqual(command[command.index("--max-tokens") + 1], "8192")
         self.assertEqual(command[command.index("--max-workers") + 1], "16")
+        self.assertEqual(command[command.index("--enable-thinking") + 1], "1")
+        self.assertEqual(command[command.index("--compact-prose") + 1], "1")
+
+    def test_dense_model_size_is_supported(self):
+        target = Target("arxiv", "qwen3_5_4b_arxiv_w16", "Paper", "textbook",
+                        Path("data/arxiv/explanations/qwen3_5_4b_arxiv_w16/Paper/textbook.txt"))
+        self.assertEqual(target.model_size, "4B")
 
     def test_launcher_forwards_max_tokens_and_policy_compliant_memory(self):
         launcher = Path(__file__).parents[1] / "slurm/launch_qwen35_multiview.sh"

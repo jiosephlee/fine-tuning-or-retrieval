@@ -9,7 +9,7 @@ Example usage::
     cd scripts/FT
     python evaluate_probes.py \
         --model_path jiosephlee/e8-olmo2-13b-para9-20260516 \
-        --experiment_dir ../../results/FT/full/allenai_OLMo-2-1124-13B/.../E8_paraphrase_13b_all_domains \
+        --experiment_dir ../../results/FT/full/13b/.../E8_paraphrase_13b_all_domains \
         --inference_mcqa_probes \
         --inference_mcqa_probes_version v12_reviewed v12 \
         --inference_mcqa_prompt_column formatted_question_5shot \

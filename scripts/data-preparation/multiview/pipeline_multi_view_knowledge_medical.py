@@ -411,6 +411,7 @@ As you write the blog post:
 - Include clinical pearls and take-home points
 - Write in prose paragraphs, use bullet points only for key take-home messages, but stay concise and to the point
 - Stay grounded in the case report — do not fabricate clinical details
+- End with a complete concluding sentence and terminal punctuation; never stop mid-sentence or mid-list
 
 Start with the blog title as a markdown header. Use '##' for sections.""",
             'user': f"""### Clinical Case Report

@@ -136,17 +136,16 @@ Granular explanation tracks:
   selected explanation chunks and schedules
   `--explanation_track_size_by_chunk` chunks per step, default `4`, with a
   final partial step allowed.
-- Source-relative matching: `--match_explanation_source_replay` appends a
-  source/paraphrase replay track for every active explanation track. Each replay
-  step has the same chunk count as the corresponding explanation step for that
-  domain, so a domain with 23 explanation chunks in a cycle also receives 23
-  matched source/paraphrase chunks in that cycle.
-- Baseline document matching: E1/E2 should use `--document_track_baseline`
-  instead of `--match_explanation_source_replay`. This adds no explanations;
-  it only replays source/paraphrase chunks using the granular explanation file
-  schedule named by `--document_match_specific_explanation`, so document
-  exposure can be matched against E3 without switching to chunk-granularity
-  scheduling.
+- Baseline document matching: use `--document_track_baseline` with
+  `--document_match_specific_explanation` instead of
+  `--match_explanation_source_replay` (removed). This keeps explanation
+  insertion behavior unchanged and adds a matched source/paraphrase replay
+  schedule driven by the selected explanation track shape.
+- Matching schedule scaling:
+  - `--explanation_track_scale S` applies step-level downsampling to granular
+    explanation tracks (`S` in `(0,1]`).
+  - `--explanation_match_scale M` applies an independent step-level scale to the
+    document-matching track (defaults to `S` when unset).
 - MCQA probe memory: MCQA uses `--mcqa_probe_batch_size`, separate from
   `--device_batch_size`, because few-shot MCQA prompts produce large full-logit
   tensors during callback evaluation. E1/E2/E3 scripts default this to `32`.

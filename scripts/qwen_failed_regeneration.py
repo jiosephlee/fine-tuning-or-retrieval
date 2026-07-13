@@ -25,12 +25,17 @@ DEFAULT_REPORTS = (
     ROOT / "docs/reports/qwen_explanation_integrity_legal.tsv",
     ROOT / "docs/reports/qwen_explanation_integrity_medical.tsv",
 )
+BINARY_REPORT = ROOT / "docs/reports/qwen_all_views_binary_integrity_audit.tsv"
 LAUNCHER = ROOT / "scripts/slurm/launch_qwen35_multiview.sh"
 VIEW_FILES = {
     "blog": ("blogs.txt", "blog_outline.json", "blogs"),
+    "stackexchange": ("stackexchange.txt", "stack_exchange_outline.json", "stackexchange"),
     "textbook": ("textbook.txt", "textbook_outline.json", "textbooks"),
 }
 MODEL_SIZES = {
+    "qwen3_5_4b": "4B",
+    "qwen3_5_9b": "9B",
+    "qwen3_5_27b": "27B",
     "qwen3_5_35b_a3b_fp8": "35B-A3B-FP8",
     "qwen3_5_122b_a10b_fp8": "122B-A10B-FP8",
     "qwen3_5_397b_a17b_fp8": "397B-A17B-FP8",
@@ -71,9 +76,11 @@ def load_targets(reports: list[Path], accepted_statuses=("FAIL",)) -> list[Targe
                 if len(parts) != 6 or parts[0] != "data" or parts[2] != "explanations":
                     raise ValueError(f"unexpected audit path: {path}")
                 domain, model_dir, item, filename = parts[1], parts[3], parts[4], parts[5]
-                if domain not in {"legal", "medical"}:
+                if domain not in {"arxiv", "legal", "medical"}:
                     continue
-                view = "blog" if filename == "blogs.txt" else "textbook" if filename == "textbook.txt" else None
+                view = ("blog" if filename == "blogs.txt" else
+                        "textbook" if filename == "textbook.txt" else
+                        "stackexchange" if filename == "stackexchange.txt" else None)
                 if view is None:
                     raise ValueError(f"failed unsupported view: {path}")
                 targets.add(Target(domain, model_dir, item, view, path))
@@ -136,11 +143,13 @@ def restore_view(target: Target, backup_root: Path) -> None:
 def command_for(group: list[Target], round_number: int) -> list[str]:
     first = group[0]
     profile = PROFILES[round_number]
-    max_tokens = "8192" if round_number == 3 and first.view == "blog" else "16384" if round_number == 3 else "12288"
+    max_tokens = "8192" if round_number == 3 else "6144" if round_number == 2 else "12288"
+    thinking = "1" if round_number == 3 else "0"
+    pipeline_part = ("stack_exchange" if first.domain == "arxiv" else "qa") if first.view == "stackexchange" else first.view
     command = [
         str(LAUNCHER), "--models", first.model_size, "--domains", first.domain,
-        "--papers", ",".join(target.item for target in group), "--parts", first.view,
-        "--max-workers", "16", "--reasoning-effort", "low", "--enable-thinking", "0",
+        "--papers", ",".join(target.item for target in group), "--parts", pipeline_part,
+        "--max-workers", "16", "--reasoning-effort", "low", "--enable-thinking", thinking,
         "--temperature", profile["temperature"], "--repetition-penalty", profile["repetition_penalty"],
         "--max-tokens", max_tokens, "--time", "08:00:00",
     ]
@@ -148,6 +157,8 @@ def command_for(group: list[Target], round_number: int) -> list[str]:
         command += ["--top-p", profile["top_p"]]
     if "min_p" in profile:
         command += ["--min-p", profile["min_p"]]
+    if round_number >= 2:
+        command += ["--compact-prose", "1"]
     return command
 
 
@@ -164,8 +175,14 @@ def main() -> None:
     parser.add_argument("--report", action="append", type=Path, dest="reports")
     parser.add_argument("--candidate-report", type=Path,
                         help="For retries, select SUSPECT/FAIL rows from a refreshed targeted audit TSV.")
+    parser.add_argument("--model-size", choices=tuple(MODEL_SIZES.values()),
+                        help="Restrict targets to one Qwen size.")
+    parser.add_argument("--domain", choices=("arxiv", "legal", "medical"),
+                        help="Restrict targets to one domain.")
     parser.add_argument("--backup-root", type=Path)
     parser.add_argument("--submit", action="store_true")
+    parser.add_argument("--backup-only", action="store_true",
+                        help="Create round-one backups without submitting generation jobs.")
     parser.add_argument("--restore", action="store_true",
                         help="Restore selected non-PASS targets from --backup-root instead of submitting.")
     args = parser.parse_args()
@@ -173,10 +190,15 @@ def main() -> None:
     reports = [args.candidate_report] if args.candidate_report else (args.reports or list(DEFAULT_REPORTS))
     statuses = ("SUSPECT", "FAIL") if args.candidate_report else ("FAIL",)
     targets = load_targets(reports, statuses)
+    if args.model_size:
+        targets = [target for target in targets if target.model_size == args.model_size]
+    if args.domain:
+        targets = [target for target in targets if target.domain == args.domain]
     if not targets:
         raise SystemExit("No eligible targets found")
     if args.candidate_report:
-        original = set(load_targets(list(DEFAULT_REPORTS), ("FAIL",)))
+        scope_reports = list(DEFAULT_REPORTS) + ([BINARY_REPORT] if BINARY_REPORT.exists() else [])
+        original = set(load_targets(scope_reports, ("FAIL",)))
         unexpected = set(targets) - original
         if unexpected:
             raise SystemExit(f"candidate report expands original scope: {sorted(unexpected)[:3]}")
@@ -206,6 +228,8 @@ def main() -> None:
             encoding="utf-8",
         )
         print(f"backed_up={len(targets)}")
+        if args.backup_only:
+            return
 
     for group in grouped(targets):
         command = command_for(group, args.round)

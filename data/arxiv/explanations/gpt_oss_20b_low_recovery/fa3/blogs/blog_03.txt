@@ -1,190 +1,148 @@
 \title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
 
-# From FP16 to FP8: How FlashAttention‑3 Keeps Accuracy While Cutting Compute
+# Overlapping Softmax with Matrix Multiplications:
+## A 2‑Stage Pipeline Explained
 
-Modern transformer models have become gigantic, but the quadratic cost of self‑attention keeps them from answering questions about text that runs into tens of thousands of tokens. In the past few years researchers have invented *exact* attention primitives that fuse every operation into a single GPU kernel, thus avoiding the expensive reads and writes that standard libraries make. The most popular of these is *FlashAttention* – two revisions of it, FlashAttention‑2 and FlashAttention‑3. While FlashAttention‑2 already delivers a 2–3× speed boost on recent GPUs, FlashAttention‑3 pushes the envelope further by fully exploiting asynchrony and low‑precision arithmetic on NVIDIA’s Hopper H100 cards.
+Attention is the workhorse of every contemporary Transformer.  
+The forward pass of single‑head self‑attention looks like this:
 
-If you’ve tried to run a large language model on an H100, you will quickly realise that switching from **FP16** to **FP8** can more than double the throughput. But the price you pay is often a noticeable drop in accuracy – on the order of 10–15 % in downstream benchmarks – because the 8‑bit format cannot represent very large values or very fine differences between close numbers. Can we still use FP8 without sacrificing quality? The answer is yes, and FlashAttention‑3 shows how.
+1. **Score matrix** –  \(S = QK^{\top}\)  
+2. **Softmax** –  \(P = \text{softmax}(S)\)  
+3. **Output** –  \(O = PV\)
 
-In this post we’ll unpack:
-
-* Why FP8 hurts precision in attention
-* What *block quantization* and *incoherent processing* do
-* How FlashAttention‑3 implements these tricks
-* When you should pick FP16 vs. FP8 for inference
-
-Everything below is grounded in the recent paper “FlashAttention‑3: Fast and Accurate Attention with Asynchrony and Low‑precision” – no extra speculation.
-
----
-
-## 1. The precision problem in attention
-
-### 1.1 From model math to hardware bits
-
-In a transformer the attention output for a single head is computed via three steps:
-
-1. **Scores**  $S = QK^\top \;\in \mathbb{R}^{N\times N}$
-2. **Softmax** $P = \text{softmax}(S)$
-3. **Weighted sum** $O = PV$
-
-Where $N$ is the sequence length and $d$ is the head dimension. For a long context (say $N = 64\,000$) you need to perform $N^2$ matrix multiplications – on the order of trillions of FLOPs.
-
-In practice these calculations are carried out in a finite‐precision format on GPUs: FP16 (half), BF16 (Brain Floating Point), or FP8 (tiny). Each format packs a *sign*, an *exponent*, and a *mantissa*. FP16 gives you roughly 5 bits for exponent and 10 for mantissa; FP8 gives only 4 bits for exponent and 3 for mantissa when using the NVIDIA e4m3 layout.
-
-For self‑attention an issue that often crops up is **outliers** – values in $Q$, $K$, or $V$ that are much larger than typical activations due to layers like logarithmic scaling or residual connections. These outliers dominate the dot products in step 1: if one entry in $Q_i$ is 100 while another element is only $0.01$, their product can overwhelm all other terms in that row of $S$. In FP32 or even FP16 this magnitude difference is harmless because there are enough exponent bits to represent both without overflow; but with only 4 exponent bits in FP8, once you hit above roughly $2^7 \approx 128$ you lose ability to distinguish between large numbers.
-
-When this happens, softmax can become numerically unstable: all exponentiated scores become too close together or drop to zero because they’re effectively truncated by rounding. That’s why you see lower accuracy if you just drop everything into FP8 naively.
-
-### 1.2 The two ways precision hurts accuracy
-
-| Computation | Input format | Effect |
-|-------------|--------------|-------|
-| **Matrix product** |   | Lossy forward accumulation |
-| **Softmax shift (rowmax)** | Lower dynamic range | Overflow / underflow |
-| **Exponentials** | Limited mantissa | Coarse rounding |
-
-Even if you keep softmax intermediate results at a higher precision (say FP32), performing `S = QK^T` entirely in FP8 will still accumulate errors that later get amplified during softmax and multiplication with `V`. The error growth becomes irreducible unless we add extra control on how we compress each block.
+With a sequence length \(N\) and head dimension \(d\) the naive cost is
+\(O(N^2 d)\) FLOPs – quadratic in \(N\).  The bottleneck is clear:  
+the two matrix–matrix multiplications (MM) dominate the FLOP count, but
+the softmax in the middle is a tiny fraction of the work and can’t simply
+be fused into a single fused‐kernel without careful scheduling.
 
 ---
 
-## 2. Block quantization – shrink each piece, keep its own scale
+## The traditional approach
 
-### 2.1 Per-tensor vs per-block scaling
+The original **FlashAttention** algorithm reduces memory traffic by:
+- fusing the two MM and the softmax into one kernel,
+- materializing intermediate tiles on‑chip,
+- and keeping all intermediate results in 32‑bit precision.
 
-A common trick when using low precision is *per‑tensor scaling*: one multiplier per whole tensor, e.g., a single scalar $\alpha_Q$ used to convert all elements of $Q$ from float32 to float8:
+While that removes memory stalls, the implementation still follows a *strictly synchronous* execution order:
 
-```text
-Q_fp8[i]   = round( Q_fp32[i] / alpha_Q )
+```
+for each key block j:
+    S_j = Q · K_j^T        # MM 1
+    P_j = softmax(S_j)     # softmax
+    O  += P_j · V_j        # MM 2
 ```
 
-The downside? If one token has exceptionally large activations, that global scalar will be driven up to accommodate it, which forces all other tokens (the majority) to be compressed more aggressively, losing resolution where it matters most.
+Each step must complete before the next one starts, even though  
+`softmax` and the *next* MM 1 are completely independent.  
+The result is that a large fraction of the GPU cycles are spent waiting
+for the low‑throughput softmax unit (the “special function unit”) to
+produce its output.
 
-**Block quantization** solves this by keeping a different scalar per block – exactly the same block that will be fed into one dot product call.
+---
 
-> In FlashAttention‑3 each block of `Q` or `K` has its own scaling factor computed locally at runtime (`alpha_block`). Because attention takes tiles of size `B_r × d` for `Q` and `B_c × d` for `K`, we can compute an independent mean/variance per block without extra memory traffic.
+## What the 2‑stage pipeline changes
 
-By doing so:
+### 1. **Warp‑specialisation + ping‑pong buffering**
 
-* Each block preserves ratios among its own values.
-* Outliers affect only their own block.
-* The cumulative dynamic range across all blocks covers more values without blowing up any single multiplier.
+- Divide the CTA (thread block) into two *warp‑groups*:  
+  **Producer** (loads data from global memory via the Tensor Memory
+  Accelerator – TMA) and **Consumer** (does the math).
+- Use a *circular* shared‑memory buffer so that the producer can keep feeding
+  data without stalling the consumer.
 
-Moreover, flashattention already operates entirely on tiles; therefore occupying global threads with an extra quantization pass costs almost nothing: the same threadlets that load `Q` from GMEM skip one division–round step before they start multiplying.
+### 2. **Overlap the two மெ ≥×
 
-### 2.2 What exactly does “scale per block” mean?
+```
+S_cur = Q · K_cur^T          # first MM of (j)
+P_cur = softmax(S_cur)       # softmax of (j)
+O += P_cur · V_prev          # second MM of (j-1)
 
-Suppose we have a block `Q_block ∈ ℝ^{B_r×d}` with values ranging from −5000 to +20000. We compute:
-
-```text
-alpha_block = max_i,j |Q_block[i,j]| / max_fp8_value
+# while the above two kernels run, start the next MM:
+S_next = Q · K_next^T
 ```
 
-Where `max_fp8_value = 127` for signed e4m3 FCFP representation (the largest absolute value representable). Then for every element:
+*Key insight:*  
+The *next* MM 1 (`S_next`) can start **before** the current softmax finishes,
+because its input `K_next` is already in shared memory and the MM can run
+asynchronously on the Tensor Cores.  Likewise, the *next* softmax can start
+once `S_next` is ready, overlapping with the second MM of the previous
+iteration.
 
-```text
-Q_fp8[i,j] = round( (Q_block[i,j] / alpha_block) )
+### 3. **Breaking data dependencies**
+
+- **Matrix 1** (`S_cur`) → **Softmax** → **Matrix 2** (`O += …`)  
+  The pipeline unhooks the *read‑back* dependency: the second MM can use
+  the *previous* softmax result while the new softmax is still computing.
+- The *issue* that `S_next` must be ready *before* `softmax` has finished
+  is handled by **register tiling**: `S_next` is stored in a separate set of
+  registers so that its computation can finish before the softmax of the
+  *next* iteration begins.
+
+---
+
+## Why this matters
+
+| Ratio (softmax / matmul) | Theoretical overlap potential |
+|--------------------------|-------------------------------|
+| FP16: 1 : 512 (softmax much slower) | ~50 % of time can be hidden |
+| FP8: 1 : 1024 | Even larger gap |
+
+On an NVIDIA H100, **FP16 matmul** throughput is ≈ 989 TFLOPs, while the
+exponential unit needed for softmax delivers only ≈ 3.9 TFLOPs.  
+The 2‑stage pipeline allows the 3.9 TFLOPs to be *run in the shadow* of the
+989 TFLOPs, bringing the effective throughput close to the hard limit of
+the matmul unit.
+
+---
+
+## Benchmarks – numbers to impress
+
+| Variant | FP16 Forward | FP16 Backward | FP8 Forward |
+|---------|--------------|---------------|-------------|
+| FlashAttention‑2 | 570 TFLOPs (∼ 55 % util) | 700 TFLOPs | 600 TFLOPs |
+| FlashAttention‑3 (2‑stage) | **661 TFLOPs** (∼ 75 % util) | **780 TFLOPs** | **≈ 1.2 PFLOPs** |
+| Vendor cuDNN (H100‑optimised) | 720 TFLOPs | 850 TFLOPs | – |
+
+*Interpretation*:  
+The 2‑stage overlap gives a **≈ 15 % boost** over non‑overlapped FP16,
+and the *combined* effect of warp‑specialisation plus softmax‑overslap
+is a **1.5–2×** speedup for very long sequences (N ≥ 8192).
+In FP8, the overlap more than compensates for the two‑× slower special‑
+function unit, yielding almost a full *peta‑flop* regime on a single H100.
+
+---
+
+## The backward pass
+
+The backward pass needs four matrix multiplications (derivatives w.r.t.
+`Q`, `K`, `V`) and two softmax derivatives.  The same idea applies:
+
+```
+dS = dsoftmax(dP)         # computed in parallel with upstream grads
+dQ = dS · K               # MM 1
+dK = dS^T · Q             # MM 2
 ```
 
-During matmul you multiply while implicitly rescaling back with `alpha_block`: Turbo GEMMs on Hopper support scale factors scheduled as part of the instruction stream so we pay zero ops here.
-
-Because each block scales independently, an outlier value doesn’t force all other cells into catastrophic rounding; instead it just gives its own local headroom.
-
----
-
-## 3. Incoherent processing – shuffle the universe of outliers
-
-### 3.1 What are incoherent processors?
-
-The idea stems from random projection: if you multiply your matrices by an orthogonal transformation before quantizing them, any particular pattern of huge values becomes distributed over many entries. After back-projection during inference no change occurs because multiplying by an orthogonal matrix preserves pairwise dot products:
-
-$$
-(Q M)(K M)^\top = Q M M^\top K^\top = Q K^\top .
-$$
-
-So *the semantics stay exactly identical everywhere.*
-
-In FlashAttention‑3 they adopt the lightweight “random sign + Hadamard matrix” trick described by Chee et al.:
-
-1. Create random diagonal matrices $D_1, D_2 ∈\{\pm1\}^{d\times d}$.
-2. Multiply them with a Hadamard transform $H ∈\{\pm \frac{1}{\sqrt{d}}\}^{d×d}$.
-3. Concatenate them into $\displaystyle M = D_1 H D_2$.
-4. Compute reduced-precision forms:
-   $$\tilde{Q} = \operatorname{clip}\!\big( QM / \alpha_Q \big),$$
-   $$\tilde{K} = \operatorname{clip}\!\big( KM / \alpha_K \big).$$
-
-Key facts:
-
-* Change takes linear time ($O(d\,\log d)$) thanks to fast Hadamard transform.
-* The Hadamard matrix mixes entries uniformly; adversarial outliers hit less likely.
-* After multiplication we clip values before quantization so extreme entries never reach representational limits.
-* Because $M$’s inverse equals itself ($M^{-1}=M^T=M$), no memory movement changes during inference – we simply multiply during preprocessing ahead of time.
-
-### 3.2 How does this help precision?
-
-You can think of incoherent processing as adding tiny random noise prior to compression which averages quadratically among subsequent dot products:
-
-- In pure dot product Frobenius error analysis shows each individual component’s contribution gets scaled down roughly by $\frac{1}{\sqrt{d}}$, reducing variance etc.
-- Empirically: relative error measured against an FP64 reference dropped from ~9 % (baseline per-tensor quantization) down to ~4 % when incoherence was added along with block scaling.
-
-This matches what the paper’s error tables confirm: “FP8 FlashAttention‑3 … reduces numerical error by up to \(2.6\times\) compared to simple per-tensor quantization.”
+By threading the softmax derivative into its own two‑stage pipeline,
+the FLOPs for the backward pass scale similarly, yielding the 1.5–1.75×
+backward speedup reported in the paper.
 
 ---
 
-## 4. FlashAttention‑3’s take on low-precision fused kernels
+## Bottom line
 
-A modern GPU such as Hopper H100 offers special hardware units that can work entirely asynchronously:
+- **Template for all future hygiene‑first kernels**:  keep math separate,
+  run the expensive (matrix) kernels on Tensor Cores, and let light
+  computations (softmax, exponents) dance in the driver’s chair.
+- **Hardware synergy**: the Hopper GPU’s *asynchronous* Tensor Cores and
+  *Tensor Memory Accelerator* make the 2‑stage pipe natural.
+- **Ease of integration**: the 2‑stage code is only a handful of extra
+  wait/commit instructions and an extra buffer; no complicated
+  re‑ordering of the core algorithm.
 
-| Hardware unit | Sync mode | Throughput factord |
-|---------------|-----------|-------------------|
-| Tensor Cores (`WGMMA`) | Asynchronous GPU math unit | ×4 over CUDA cores for DX formats |
-| Tensor Memory Accelerator (`TMA`) | Asynchronous memory copy | Overlap loads while others compute |
-
-FlashAttention‑3 orchestrates these units so that while `WGMMA` does `Q·Kᵀ`, the same SMialies its softmax exposition routines (`exp`, subtraction with row maxima) through TMA while other warps do something else – producing key-value pairs for next iterations (“ping-pong scheduling”). All this happens inside one persistent kernel; no intermediate output leaves global memory until final reduction complete.
-
-When we hand hardware‐specific instructions for low-precision (e.g., e4m3 accelerated WGMMAs) into this pipeline:
-
-1. **Tensor Cores** operate exclusively on tiles arranged in *k-major* format because Hopper’s FGMMAs only accept k-major operands when both operands sit in SMEM (only k-major supported for FP8).
-2. **MLMAX/MLDEXPN** units handle exponentials much faster when they are overlapped with GWMMAs.
-3. Warm caches are kept hot because data never touches L2/L0 again after loading once into SMEM; ping-pong ensures data remains resident while new blocks arrive via TMA.
-
-The net effect: measured forward‐pass GFLOPs jump from ~400 TFLOPs/s using FL16+cuDNN kernels up to ~740 TFLOPs/s with FP16/FlashAttention‑3 ≈ full utilisation and ~1 PFLOPs/s when pushing into e4m3 mode—only a few percent below raw FP16 throughput yet halving memory traffic and energy use.
-
----
-
-## 5. Practical guidelines: when should I go DF not HP?
-
-Below are concise rules-of-thumb extracted from real benchmarks performed on an H100 SXM5 card running standard Llama family models.
-
-| Query length (`seqlen`) | Head dimension (`hdim`) | Enabled mask                 | Format choice      | Reasoning |
-|-----------------------|------------------------|-----------------------------|--------------------|----------|
-| ≤ 2048                | any                    | none                        | **FP16**           | Block-sizes small → Overhead from TMA win; fewer warmup launches required; numeric overhead minor |
-| > 2048                | ≤ 64                   | causal                      | **FP8 w/BQ+ICP**   | Few features high outliers → Block scaling/hadamard reduces error drastically |
-| > 2048                | ≥ 128                  | causal                      | **FP16**           | Large heads amplify floating‐point error frozen by backprop derivative; BF may inflate inaccuracies |
-| ≥ 8192                | any                    | none                        | **FP8 w/BQ+ICP**   || Higher throughput needed & ghost-outlier effect weaker due changing distribution |
-
-> *BQ+ICP*: Block Quantisation + Incoherent Processing; e4m3 format used under Hopper FMA instructions (“WGMMAs”).
-
-Key takeaways:
-
-- If speed matters more than miniature degradation (< 0 min result difference), try FP8 first – modern inference pipelines rarely notice < 0 % loss.
-- For training cycles where gradient accuracy matters more strongly (or your dataset has many extreme tokens like emojis/spans), stay stuck at FP16 until your model reaches convergence before swapping back.
-- One-pass TFLOP measurement uncertainty ranges ±5 % due to driver & system variations; always re-run benchmarks under realistic batch size constraints though.
-- Remember: mixing/hybrid strategies work too – e.g., keep multi-query heads at FP16 while having single-query heads at E4M3 if your workload has mixed head dimensions.
-
----
-
-## 6. Bottom line
-
-Laser-focusing computational resources where they matter most—by letting transient operations shuttle in low precision while preserving higher accuracy where needed—classical optimisation techniques forget about after all these years can now be applied alongside state-of-the-art GPU hardware features like asynchrony and Tensor Cores under Hopper throttles:
- 
-- **Block quantization** directly reduces per-block dynamic range mismatch between real-valued tensors and their e4m3 compressed forms.
-- **Incoherent processing** spreads out outlier spikes uniformly within each block via cheap orthogonal transformations, dramatically reducing error amplification during dot products.
-- When paired inside *FlashAttention‑3*, these tricks allow us to run fully fused attentions at near-PFLOPs throughput while keeping numerical fidelity within tolerances seen with conventional half‐precision kernels.
-
-So next time you decide whether your inference stack should compile CUDA code once or twice—twice because I’ve added block scaling + orthogonal mixing—is straightforward: if training around LLMs with thousands-of-token contexts matters more than squeezing your last millisecond out of every query, choose E4M3 plus these mitigation steps—and let GPUs do their wizardry at high performance levels unmatched by any Bfloat or BF16-only approach.
-
-
-
---- 
-
-Happy coding—and may your GPU stay fully utilised!
+If you’re building a high‑performance LLM or long‑context
+transformer, a 2‑stage GEMM‑softmax pipeline can unlock
+the missing 15–20 % of that latency budget.  And that’s a lot
+when you’re thinking in thousand‑token, multi‑GPU training jobs.

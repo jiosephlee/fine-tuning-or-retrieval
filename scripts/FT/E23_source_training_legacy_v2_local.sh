@@ -18,7 +18,9 @@ LEARNING_RATE="${LEARNING_RATE:-4e-5}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
 CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E23_source_legacy_v2_all_domains_local}"
+PUSH_TO_HUB_CPT_ID="${PUSH_TO_HUB_CPT_ID:-}"
 KNOWLEDGE_PROBES_VERSION="${KNOWLEDGE_PROBES_VERSION:-v14}"
+KNOWLEDGE_PROBE_VARIANT="${KNOWLEDGE_PROBE_VARIANT:-short_targets}"
 PARAPHRASED_KNOWLEDGE_PROBES_VERSION="${PARAPHRASED_KNOWLEDGE_PROBES_VERSION:-v14}"
 MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v15}"
 MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
@@ -42,6 +44,9 @@ if [[ "$SAVE_LOCAL_MODEL" == "1" ]]; then
     EXTRA_ARGS+=(--save_local_model)
 else
     EXTRA_ARGS+=(--no-save_local_model)
+fi
+if [[ -n "$PUSH_TO_HUB_CPT_ID" ]]; then
+    EXTRA_ARGS+=(--push_to_hub_cpt_id "$PUSH_TO_HUB_CPT_ID")
 fi
 if [[ "$SPARSE_CALLBACKS" == "1" ]]; then
     EXTRA_ARGS+=(--no_callback_every_step)
@@ -70,6 +75,7 @@ fi
     --model_id "$MODEL_ID" \
     --include_sources arxiv legal medical \
     --knowledge_probes_version "$KNOWLEDGE_PROBES_VERSION" \
+    --knowledge_probe_variant "$KNOWLEDGE_PROBE_VARIANT" \
     --paraphrased_knowledge_probes \
     --paraphrased_knowledge_probes_version "$PARAPHRASED_KNOWLEDGE_PROBES_VERSION" \
     --paraphrased_knowledge_probe_filename_suffix _paraphrased \
