@@ -15,7 +15,7 @@ EFFECTIVE_BATCH_SIZE="${EFFECTIVE_BATCH_SIZE:-256}"
 LEARNING_RATE="${LEARNING_RATE:-4e-5}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
-CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E3_granular_explanations_textbooks_match_local}"
+CUSTOM_SUFFIX="${CUSTOM_SUFFIX:-E3_granular_explanations_textbooks_match_local_scale0_5}"
 PUSH_TO_HUB_CPT_ID="${PUSH_TO_HUB_CPT_ID:-e3-olmo2-7b-para9-expl-textbooks-match-20260522}"
 # Schedule shape matches the full textbooks+blogs+stackexchange explanation cadence,
 # but only the chosen subfolder is actually inserted into the matched track.
@@ -26,6 +26,8 @@ EXPLANATIONS_CYCLE="${EXPLANATIONS_CYCLE:-full}"
 EXPLANATIONS_NUM_TRACKS="${EXPLANATIONS_NUM_TRACKS:-1}"
 EXPLANATION_GRANULARITY="${EXPLANATION_GRANULARITY:-file}"
 EXPLANATION_TRACK_SIZE_BY_CHUNK="${EXPLANATION_TRACK_SIZE_BY_CHUNK:-4}"
+EXPLANATION_TRACK_SCALE="${EXPLANATION_TRACK_SCALE:-0.5}"
+EXPLANATION_MATCH_SCALE="${EXPLANATION_MATCH_SCALE:-0.5}"
 MCQA_PROBES_VERSION="${MCQA_PROBES_VERSION:-v14}"
 MCQA_PROMPT_COLUMN="${MCQA_PROMPT_COLUMN:-formatted_question_5shot}"
 USE_PARCC="${USE_PARCC:-0}"
@@ -58,6 +60,8 @@ EXPLANATION_SCHEDULE_ARGS=(
     --granular_explanations_cycle "$EXPLANATIONS_CYCLE"
     --explanation_granularity "$EXPLANATION_GRANULARITY"
     --explanation_track_size_by_chunk "$EXPLANATION_TRACK_SIZE_BY_CHUNK"
+    --explanation_track_scale "$EXPLANATION_TRACK_SCALE"
+    --explanation_match_scale "$EXPLANATION_MATCH_SCALE"
 )
 
 if [[ "${CONDA_DEFAULT_ENV:-}" == "$CONDA_ENV" ]]; then

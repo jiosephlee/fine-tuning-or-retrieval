@@ -224,11 +224,16 @@ def construct_experiment_name(args):
     ]
 
     # Add pretraining strategy if applicable
+    pretraining_label = (
+        os.path.splitext(os.path.basename(getattr(args, "pretraining_data_path", "")))[0]
+        if getattr(args, "pretraining_data_path", None)
+        else args.pretraining_data_type
+    )
     if args.separate_batches_with_pretraining > 0:
-        pretrain_info = f"sep_{args.separate_batches_with_pretraining}_{args.pretraining_data_type}"
+        pretrain_info = f"sep_{args.separate_batches_with_pretraining}_{pretraining_label}"
         path_parts.append(pretrain_info)
     elif args.fill_batches_with_pretraining:
-        pretrain_info = f"fill_{args.pretraining_data_type}"
+        pretrain_info = f"fill_{pretraining_label}"
         path_parts.append(pretrain_info)
 
     path_parts.extend([
@@ -315,6 +320,7 @@ def continue_pretraining(model, tokenizer, log, args):
             "fill_batches_with_pretraining": args.fill_batches_with_pretraining,
             "separate_batches_with_pretraining": args.separate_batches_with_pretraining,
             "pretraining_data_type": args.pretraining_data_type,
+            "pretraining_data_path": getattr(args, "pretraining_data_path", None),
             "test_script": args.test_script,
         }
         strategy_name = "PriorKnowledge"
@@ -330,6 +336,7 @@ def continue_pretraining(model, tokenizer, log, args):
             "fill_batches_with_pretraining": args.fill_batches_with_pretraining,
             "separate_batches_with_pretraining": args.separate_batches_with_pretraining,
             "pretraining_data_type": args.pretraining_data_type,
+            "pretraining_data_path": getattr(args, "pretraining_data_path", None),
             "test_script": args.test_script,
             "with_specific_explanation": args.with_specific_explanation,
             "times_explanations": args.times_explanations,
@@ -603,6 +610,7 @@ if __name__ == "__main__":
     parser.add_argument("--fill_batches_with_pretraining", default=False, action="store_true", help="Fill batches with pretraining data.")
     parser.add_argument("--separate_batches_with_pretraining", type=int, default=0, help="Number of pretraining batches to insert between unique document types.")
     parser.add_argument("--pretraining_data_type", type=str, default="dclm", help="Type of pretraining data to use ('dclm' or 'arxiv').")
+    parser.add_argument("--pretraining_data_path", type=str, default=None, help="Optional explicit replay path (takes precedence over --pretraining_data_type).")
     parser.add_argument("--effective_batch_size_for_cpt", type=int, default=8, help="The effective batch size for continued pretraining.")
     parser.add_argument("--effective_batch_size_for_lima", type=int, default=32, help="The effective batch size for LIMA training.")
     parser.add_argument("--device_batch_size", type=int, default=2, help="The batch size per device.")

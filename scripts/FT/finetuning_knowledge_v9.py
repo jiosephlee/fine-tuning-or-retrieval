@@ -680,6 +680,17 @@ def construct_experiment_name(args):
     eval_bundle = _construct_eval_bundle_name(args)
 
     # 5. Data Mix: e.g., 'source_only', 'para9', 'para9_expl'
+    def _scale_token(value: float) -> str:
+        text = f"{float(value):g}"
+        return text.replace(".", "_")
+
+    def _add_scale_suffix(base: str) -> str:
+        if args.explanation_track_scale != 1.0:
+            base += f"_scale{_scale_token(args.explanation_track_scale)}"
+        if args.explanation_match_scale != args.explanation_track_scale:
+            base += f"_matchscale{_scale_token(args.explanation_match_scale)}"
+        return base
+
     if args.num_paraphrased_texts > 0:
         data_mix_base = f"para{args.num_paraphrased_texts}"
         if args.with_specific_explanation:
@@ -718,8 +729,6 @@ def construct_experiment_name(args):
 
             if args.explanations_insertion_strategy == "whole":
                 data_mix += f"_every{args.whole_explanations_insert_every_n}"
-            if args.match_explanation_source_replay:
-                data_mix += "_srcmatch"
 
         if args.document_track_baseline:
             data_mix += "_docmatch_expl"
@@ -727,15 +736,19 @@ def construct_experiment_name(args):
                 data_mix += f"_insert{args.document_match_insert_content}"
             if args.explanation_granularity == "chunk":
                 data_mix += f"_granchunk{args.explanation_track_size_by_chunk}"
+            data_mix = _add_scale_suffix(data_mix)
+        elif args.with_specific_explanation:
+            data_mix = _add_scale_suffix(data_mix)
 
     else:
         data_mix = "source_only"
         if args.document_track_baseline:
             data_mix += "_docmatch_expl"
-            if args.document_match_insert_content != "document":
-                data_mix += f"_insert{args.document_match_insert_content}"
             if args.explanation_granularity == "chunk":
                 data_mix += f"_granchunk{args.explanation_track_size_by_chunk}"
+            if args.document_match_insert_content != "document":
+                data_mix += f"_insert{args.document_match_insert_content}"
+            data_mix = _add_scale_suffix(data_mix)
 
     # 6. Domains (per source): compact, avoids giant path names when "all" is used.
     selection_tags = []
@@ -772,11 +785,16 @@ def construct_experiment_name(args):
     ]
 
     # Add pretraining strategy if applicable
+    pretraining_label = (
+        os.path.splitext(os.path.basename(getattr(args, "pretraining_data_path", "")))[0]
+        if getattr(args, "pretraining_data_path", None)
+        else args.pretraining_data_type
+    )
     if args.separate_batches_with_pretraining > 0:
-        pretrain_info = f"sep_{args.separate_batches_with_pretraining}_{args.pretraining_data_type}"
+        pretrain_info = f"sep_{args.separate_batches_with_pretraining}_{pretraining_label}"
         path_parts.append(pretrain_info)
     elif args.fill_batches_with_pretraining:
-        pretrain_info = f"fill_{args.pretraining_data_type}"
+        pretrain_info = f"fill_{pretraining_label}"
         path_parts.append(pretrain_info)
 
     path_parts.extend([
@@ -882,6 +900,7 @@ def continue_pretraining(model, tokenizer, log, args, train: bool = True):
             "fill_batches_with_pretraining": args.fill_batches_with_pretraining,
             "separate_batches_with_pretraining": args.separate_batches_with_pretraining,
             "pretraining_data_type": args.pretraining_data_type,
+            "pretraining_data_path": getattr(args, "pretraining_data_path", None),
             "test_script": args.test_script,
         }
         strategy_name = "PriorKnowledge"
@@ -897,6 +916,7 @@ def continue_pretraining(model, tokenizer, log, args, train: bool = True):
             "fill_batches_with_pretraining": args.fill_batches_with_pretraining,
             "separate_batches_with_pretraining": args.separate_batches_with_pretraining,
             "pretraining_data_type": args.pretraining_data_type,
+            "pretraining_data_path": getattr(args, "pretraining_data_path", None),
             "test_script": args.test_script,
             "with_specific_explanation": args.with_specific_explanation,
             "times_explanations": args.times_explanations,
@@ -908,10 +928,11 @@ def continue_pretraining(model, tokenizer, log, args, train: bool = True):
             "granular_explanations_num_tracks": args.granular_explanations_num_tracks,
             "explanation_granularity": args.explanation_granularity,
             "explanation_track_size_by_chunk": args.explanation_track_size_by_chunk,
+            "explanation_track_scale": args.explanation_track_scale,
+            "explanation_match_scale": args.explanation_match_scale,
             "explanations_insertion_strategy": args.explanations_insertion_strategy,
             "whole_explanations_insert_every_n": args.whole_explanations_insert_every_n,
             "document_track_baseline": args.document_track_baseline,
-            "match_explanation_source_replay": args.match_explanation_source_replay,
             "document_match_specific_explanation": args.document_match_specific_explanation,
             "document_match_insert_content": args.document_match_insert_content,
             "with_prior_knowledge": args.with_prior_knowledge,
@@ -1089,8 +1110,7 @@ def lima_training(model, tokenizer, log, args, num_train_epochs=15):
         tokenizer.push_to_hub(args.push_to_hub_lima_id)
     return model, tokenizer
 
-if __name__ == "__main__":
-    # --- Parser ---
+def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--custom_suffix", type=str, default="", help="Custom text to append to experiment name")
     parser.add_argument("--override_experiment_name", type=str, default="", help="Override experiment name")
@@ -1414,12 +1434,20 @@ if __name__ == "__main__":
         help="When --explanation_granularity chunk is used, number of explanation chunks per track step.",
     )
     parser.add_argument(
-        "--match_explanation_source_replay",
-        action=argparse.BooleanOptionalAction,
-        default=False,
+        "--explanation_track_scale",
+        type=float,
+        default=1.0,
         help=(
-            "For granular explanation runs, append a matched source/paraphrase replay "
-            "track with the same per-domain, per-step chunk counts as the explanation track."
+            "Scale factor applied to granular explanation tracks (step-level). Valid values are in (0, 1]."
+        ),
+    )
+    parser.add_argument(
+        "--explanation_match_scale",
+        type=float,
+        default=None,
+        help=(
+            "Optional override for document track baseline scaling. Defaults to "
+            "--explanation_track_scale when unset."
         ),
     )
     parser.add_argument("--shuffled_papers", action="store_true", help="Legacy: use shuffled versions of papers (files ending with _shuffle.tex) when available.")
@@ -1466,6 +1494,7 @@ if __name__ == "__main__":
     parser.add_argument("--fill_batches_with_pretraining", default=False, action="store_true", help="Fill batches with pretraining data.")
     parser.add_argument("--separate_batches_with_pretraining", type=int, default=0, help="Number of pretraining batches to insert between unique document types.")
     parser.add_argument("--pretraining_data_type", type=str, default="dclm", help="Type of pretraining data to use ('dclm' or 'arxiv').")
+    parser.add_argument("--pretraining_data_path", type=str, default=None, help="Optional explicit replay path (takes precedence over --pretraining_data_type).")
     parser.add_argument("--effective_batch_size_for_cpt", type=int, default=8, help="The effective batch size for continued pretraining.")
     parser.add_argument("--effective_batch_size_for_lima", type=int, default=32, help="The effective batch size for LIMA training.")
     parser.add_argument("--device_batch_size", type=int, default=2, help="The batch size per device.")
@@ -1585,6 +1614,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--parcc", action="store_true", help="Use /vast/projects/myatskar/design-documents as cache directory for model and dataset loading operations")
 
+    return parser
+
+
+if __name__ == "__main__":
+    # --- Parser ---
+    parser = build_parser()
     args = parser.parse_args()
     apply_knowledge_probe_variant(args)
     apply_inference_probe_variant(args)
@@ -1656,6 +1691,40 @@ if __name__ == "__main__":
             "(set it to 1 for granular/granular_queue/legacy/legacy_v2/random_splice)."
         )
 
+    if not 0 < args.explanation_track_scale <= 1:
+        raise ValueError("--explanation_track_scale must be in (0, 1].")
+
+    match_scale_explicitly_set = args.explanation_match_scale is not None
+    if args.explanation_match_scale is None:
+        args.explanation_match_scale = args.explanation_track_scale
+    else:
+        args.explanation_match_scale = float(args.explanation_match_scale)
+        if not 0 < args.explanation_match_scale <= 1:
+            raise ValueError("--explanation_match_scale must be in (0, 1] when set.")
+
+    # Scale flags are only consumed by granular/granular_queue explanation tracks and
+    # the document-track baseline. Guard against silently ignoring a non-default scale
+    # (which would still leak into the experiment name) for the other strategies.
+    scale_supported = (
+        args.explanations_insertion_strategy in ("granular", "granular_queue")
+        or args.document_track_baseline
+    )
+    if args.explanation_track_scale != 1.0 and not scale_supported:
+        raise ValueError(
+            "--explanation_track_scale is only applied with "
+            "--explanations_insertion_strategy granular/granular_queue or "
+            "--document_track_baseline (leave it at the default 1.0 otherwise)."
+        )
+    if (
+        match_scale_explicitly_set
+        and not args.document_track_baseline
+        and args.explanation_match_scale != args.explanation_track_scale
+    ):
+        raise ValueError(
+            "--explanation_match_scale only affects --document_track_baseline; "
+            "set --explanation_track_scale instead for explanation-track scaling."
+        )
+
     if args.granular_explanations_num_tracks <= 0:
         raise ValueError("--granular_explanations_num_tracks must be a positive integer.")
 
@@ -1694,17 +1763,6 @@ if __name__ == "__main__":
             "--granular_explanations_cycle is only supported with --explanations_insertion_strategy granular. "
             "For granular_queue/whole/legacy/legacy_v2/random_splice, leave --granular_explanations_cycle at the default 0."
         )
-
-    if args.match_explanation_source_replay:
-        if args.document_track_baseline:
-            raise ValueError(
-                "--match_explanation_source_replay cannot be combined with --document_track_baseline; "
-                "the former is for real explanation runs, the latter is for no-explanation controls."
-            )
-        if not args.with_specific_explanation:
-            raise ValueError("--match_explanation_source_replay requires --with_specific_explanation.")
-        if args.explanations_insertion_strategy != "granular":
-            raise ValueError("--match_explanation_source_replay currently supports only granular insertion.")
 
     if args.parameter_delta_every_n_steps is not None and args.parameter_delta_every_n_steps <= 0:
         raise ValueError("--parameter_delta_every_n_steps must be a positive integer when set.")
