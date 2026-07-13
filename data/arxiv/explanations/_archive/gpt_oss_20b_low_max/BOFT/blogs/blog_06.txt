@@ -1,0 +1,344 @@
+\title{Blogs about the Paper: "Parameter-Efficient Orthogonal Finetuning via Factorization"}
+
+# Hands‑On: Implementing Orthogonal Butterfly Finetuning in PyTorch
+
+Orthogonal Butterfly Finetuning (BOFT) is a powerful, parameter‑efficient way to adapt huge foundation models—think GPT‑3, Vision Transformers, or diffusion backbones—without touching the backbone weights themselves. In this tutorial we’ll walk through a minimal PyTorch implementation, covering all the key ingredients that make BOFT work:
+
+1. **Cayley parameterization** of orthogonal matrices  
+2. **Butterfly factorization** to reduce trainable parameters  
+3. **Identity initialization** for minimal deviation from the pre‑trained model  
+4. **Multiplicative dropout** to guard against over‑fitting  
+5. Pinning BOFT into an existing transformer or vision encoder
+
+By the end of this post you’ll have a reusable `BOFTLayer` class that you can drop into any FFN or linear layer within a transformer or vision model.
+
+> **TL;DR**  
+> * BOFT factorizes a dense orthogonal matrix into a product of sparse butterfly blocks (≈ `O(d log d)` parameters) instead of the `d²` parameters of a full matrix.  
+> * The layer is implemented as `x → (R W₀)ᵀ x` where `W₀` is the frozen pre‑trained weight and `R` is learned via Cayley transforms on each butterfly block.
+
+---
+
+## 1. Why OBFT Looks Different
+
+Recall that standard fine‑tuning just updates all elements of a linear weight matrix \(W\). In **Orthogonal Finetuning (OFT)** we keep \(W\) frozen and learn an orthogonal transform \(R\):
+\[
+  \hat z = \bigl( R \; W^0 \bigr)^{\!\top} \! x .
+\]
+OFT simplifies to training \(R\) only, but \(R \in \mathbb{R}^{d\times d}\) has \(d^2\) entries—still too many for practical large‑scale models.
+
+BOFT replaces that single dense matrix with a product of \(\log_2 d\) sparse *butterfly* matrices:
+\[
+  R = B_{\log_2 d}\dots B_1 , \qquad B_i \in \mathbb{R}^{d\times d},
+\]
+each having only \(O(d)\) non‑zero elements. This brings the number of learnable scalars down to \(O(d\,\log d)\), while still retaining enough expressiveness to become any dense orthogonal matrix in theory (given enough stages).
+
+---
+
+## 2. Quick Overview of Key Ingredients
+
+| Step | What it does | Why it matters |
+|------|--------------|----------------|
+| **Cayley parametrization** | Encode each sparse block as an orthogonal matrix by using skew‑symmetric matrices: \( R = (I+Q)(I-Q)^{-1}\). | Guarantees orthogonality during training and allows differentiable updates. |
+| **Butterfly factorization** | Build each block as a recursion on smaller butterfly factors; num blocks = `log₂(d / b)` where `b` is block size (≥ 2). | Controls parameter budget; tiny block size yields more stages, thus more efficient but still expressive. |
+| **Identity init** | Set every skew‑symmetric component `Q=0`, so all blocks start as the identity matrix. | Ensures the model immediately behaves like the pre‑trained baseline and only shifts gradually during fine‑tune. |
+| **Multiplicative dropout** | Randomly replace whole skip connections (i.e., drop whole butterfly blocks or sub‑blocks within them) at zeroing time during training. | Regularizer tailored for multiplicative updates—much like dropout for additive LoRA updates, but keeps orthogonality intact for remaining blocks. |
+
+---
+
+## 3. Building Blocks in Code
+
+Below we implement a single butterfly factor as an orthogonal matrix using Cayley’s transform.
+
+```python
+import torch
+import torch.nn as nn
+import math
+
+# ------------------------------------------------------------
+# Helper: Cayley parameterization for a small 2×2 rotation
+# ------------------------------------------------------------
+def cayley_from_skew(Q):
+    """Return R = (I + Q)(I - Q)^{-1} where Q is skew-symmetric."""
+    I = torch.eye(Q.size(0), device=Q.device, dtype=Q.dtype)
+    # Avoid division by zero when Q is identity – not happening here.
+    return torch.linalg.solve(I - Q, I + Q)
+
+class ButterflyBlock(nn.Module):
+    """
+    A single butterfly component with batch-size‐independent parameters.
+    'size' must be even; we optimise 'b'×'b' sub‑blocks inside.
+    """
+    def __init__(self, size: int, block: int = 2):
+        super().__init__()
+        assert size % 2 == 0 and block <= size
+        self.size = size
+        self.block = block
+        
+        # Declare skew matrices for each b×b pair inside diag(b,b,…)
+        num_blocks = self.size // self.block
+        # Q will eventually be block-diagonal composed of num_blocks submatrices
+        # Each submatrix holds its own skew entries.
+        self.skews = nn.Parameter(torch.zeros(num_blocks, 
+                                              self.block,
+                                              self.block))
+        
+    def forward(self):
+        # Build full skew matrix from batch of small skews
+        # Shape -> num_blocks × block × block → batch × size × size
+        skew_full = torch.zeros(self.size, self.size,
+                                device=self.skews.device,
+                                dtype=self.skews.dtype)
+        
+        for i in range(self.size // self.block):
+            idx = slice(i*self.block, (i+1)*self.block)
+            sub = self.skews[i]
+            # Make it skew-symmetric: S - Sᵀ
+            skew_sub = sub - sub.t()
+            skew_full[idx,:][:,idx] = skew_sub
+        
+        return cayley_from_skew(skew_full)
+```
+
+### Why this design?
+- Each sub‐block `(block × block)` keeps calculations cheap.
+- `skews` are stored per block; this automatically gives us the desired sparsity pattern.
+- The forward call returns an *augmented* orthogonal matrix constructed from all subblocks.
+
+---
+
+## 4. Assembling the Whole BOFT Layer
+
+Now we chain multiple `ButterflyBlock`s together according to how many stages you want (`m`). Let us also expose an optional `block_size` hyperparameter (`b`).
+
+```python
+class BOFTLayer(nn.Module):
+    """
+    Implements R w^0 x where R is product of m butterfly blocks.
+    
+    Args:
+        orig_weight: Pretrained frozen weight matrix W^0     shape [out_dim, in_dim]
+                     – *Note*: we expect it transposed in usage!
+        m: number of butterfly stages (log₂(out_dim/block_size))
+           smaller m => larger blocks => fewer params.
+        block_size: b >= 2 – controls granularity inside each block.
+    """
+    
+    def __init__(self, orig_weight: torch.Tensor,
+                 m: int,
+                 block_size: int = 2,
+                 dropout_rate_block: float = 0.,
+                 dropout_rate_sub: float   = 0.):
+
+        super().__init__()
+        
+        out_dim, in_dim   = orig_weight.shape
+        assert out_dim % block_size == 0 and \
+               out_dim % (block_size * (2**m)) == 0
+        
+        self.orig_w   = nn.Parameter(orig_weight.clone(), requires_grad=False)
+        
+        # Create m butterfly layers (each has same size)
+        self.blocks   = nn.ModuleList(
+            [ButterflyBlock(size=out_dim,
+                            block=block_size)
+             for _ in range(m)]
+        )
+        
+        # Dropout hyperparams
+        self.drop_block      = dropout_rate_block
+        self.drop_subblock   = dropout_rate_sub
+    
+    def forward(self, x):
+        """
+        x shape [batch_size, out_dim] -- expecting pre-transformed activations
+        
+           if using GELU( W^T x ), call with x such that 
+           output shape is exactly [batch, out_dim].
+           
+           Useful when you want to replace only one linear layer inside MLP/FFN head.
+           
+           Returning y : [batch, in_dim] (since W^T acts).
+           But typical usage is y^T W^T → dropping dims symmetrically.
+           
+           Decision:
+               >>> z = BFT_layer(x.T).T 
+               Swaps dims appropriately.
+           
+           For clarity we keep y.shape same as input iff orig_w.transpose() used elsewhere.
+       
+       """
+       
+       # multiplicative dropout over whole blocks:
+       if self.training and self.drop_block > 0:
+           mask_block   = torch.bernoulli(
+               torch.full((len(self.blocks),),
+                          1 - self.drop_block,
+                          device=x.device))
+           active_blocks = [blk if m else IdentityBlock(blk.size)
+                            for blk,m in zip(self.blocks, mask_block)]
+       else:
+           active_blocks      = list(self.blocks)
+
+       # Apply blocks sequentially on the left side:
+       R_mat              = None
+       for blk in active_blocks[::-1]:   # rightmost first for stacking on left?
+           Xblk              = blk()     # orthogonal matrix from trainable params
+ 
+           # multiplicative dropout on subblocks:
+           if self.training and self.drop_subblock > 0:
+               mask_sb          = torch.bernoulli(
+                   torch.full((Xblk.shape[0]//blk.block,),
+                              1 - self.drop_subblock,
+                              device=Xblk.device))
+               Xblk              *= mask_sb[:, None]     # broadcast across rows
+   
+           R_mat              = Xblk if R_mat is None else Xblk @ R_mat
+        
+       # NOTE: Ruby's @ operator multiplies from left-to-right;
+       # Here we want R * Wᵀ; We compute Wᵀ first then multiply by R.
+       y                  = R_mat @ torch.transpose(self.orig_w, 0,1)
+       
+       return y @ x.T     # output shape [batch,in_dim]
+```
+
+> **Note** – Boilerplate above used an “IdentityBlock” util that simply returns an identity when a component is dropped out; you can implement it as:
+
+```python
+class IdentityBlock(nn.Module):
+    def __init__(self,size): super().__init__()
+    def forward(self): return torch.eye(size, device='cuda')
+```
+
+But easier you may simply bypass passing that component – see below.
+
+### Weight initialization (`identity_init`)
+
+Since all skews are zero at construction time (`nn.Parameter(zeros)`), every small subblock starts as an identity matrix (`Q=0 → R=I`). Thus the overall product starts as identity too—exactly what we want (`R=Wᵀ`). No special init procedure is required beyond the zero initialization already done by PyTorch on parameters.
+
+---
+
+## 5. Plugging BOFT Into an Existing Transformer Lens
+
+Below’s how you might replace one FFN linear layer inside a standard Vision Transformer or GPT architecture:
+
+```python
+# Example for Vision Transformer's MLP head (two linear layers)
+class MLPReplaced(nn.Module):
+    def __init__(self, cfg):
+         super().__init__()
+         d_model      = cfg.d_model
+        
+         # Original weights from pretrained checkpoint
+         w1_pretrained     :torch.Tensor   # shape [hidden_proj,in_features]
+         w2_pretrained     :torch.Tensor   # shape [out_features hidden_proj]
+      
+         # Replace second linear step with BOFT adaptation:
+         self.w1          = nn.Linear(in_features=d_model,
+                                      out_features=cfg.hidden_proj,
+                                      bias=False)
+         
+         self.boft_w2     :BOFTLayer      \
+            := BOFTLayer(orig_weight=w2_pretrained.t(),     \
+                         m=int(math.log(cfg.hidden_proj/4)), \
+                         block_size=4)
+         
+         self.act          : nn.GELU()
+         
+    def forward(self,x):
+         h   = self.act( x @ self.w1.weight.t() )      # *(equivalent BF?)
+         out :torch.Tensor   =
+                    h @ torch.transpose(
+                        self.boft_w2.orig_w.t(),0 ,1)
+                    )   #
+```
+
+### Few pointers:
+
+- The pretrained weights should be loaded into `w1.weight` and the Boft layer’s `.orig_w`.
+- Do NOT set `requires_grad=True` on `.orig_w`. It stays frozen.
+- Keep your optimizer target only `_parameters` that are part of `.boft_w2.blocks`. PyTorch will pick them up automatically if you pass `model.parameters()` to the optimizer.
+
+---
+
+## 6. Training Loop Snippet
+
+```python
+model          :nn.Module      .eval() ?
+optimizer      :torch.optim.SGD(model.parameters(), lr=3e-4)
+
+for epoch in range(num_epochs):
+      optimizer.zero_grad()
+      logits,_     :torch.Tensor , _   =
+                         model(x)[::], ...
+      loss          :torch.Tensor     =
+                       F.cross_entropy(logits,y_target)
+      
+      loss.backward()
+      optimizer.step()
+```
+
+No extra tricks beyond vanilla SGD/Adam are required – just keep learning rates low enough so that updates remain manageable; Boft gradients tend to be more compact because they’re confined to sparse structures.
+
+---
+
+## 7. Multiplicative Dropout Explained
+
+In additive fine‑tuning methods like LoRA people often set dropout masks on rank‑\(k\) matrices:
+
+```python
+mask_LORA_A   ~ Bernoulli(p_drop)
+mask_LORA_B   ~ Bernoulli(p_drop)
+A*=mask_A ; B*=mask_B ;
+```
+
+For multiplicative updates (`R · W⁰`) simply zeroing entries in \(R\) destroys orthogonality severely and tears off gradients everywhere it goes wrong.
+
+Instead we *replace whole butterfly components* with identities:
+
+```text
+If drop == True ⟶ Keep existing component → Identity reshaped connection.
+```
+
+In code:
+
+```python
+if training and drop_block>0:
+   mask_buckets=torch.bernoulli((1-drop_block)*ones(m))
+   active_blocks=[ blk if m else IdentityBlock(blk.size )
+                   for blk,m in zip(blocks , mask_buckets)]
+```
+
+This preserves the orthogonality constraints while partially turning off capacity where needed—exactly analogous to “DropConnect” but tailored for bilinear transformations.
+
+---
+
+## 8. How Many Parameters?
+
+Suppose our transformer has hidden dimension \(d=2048\).  
+With default parameters:
+
+| Parameter Choice | Effective Trainable Params |
+|-------------------|----------------------------|
+| BOFT(`m=11`, `b=4`) | ~\(d\,b/2 ≃ 2048·4/2 ≃ 4096\) |
+| Standard OFT (full)| ~\(d² ≃ 4M\) |
+| LoRA rank–32 (single rank)| ~\(32·(d+n)\approx80K\)|
+
+In practice BOFT sits comfortably between LoRA and standard OFT while offering superior stability due to strict orthogonality preservation.
+
+---
+
+## Optional Enhancements
+
+* **Adaptive regimes:** Increase `m` gradually during training via a warm‑up schedule so early epochs stay close to identity while later epochs explore more transformations.
+* **Mixed precision:** Since forward passes involve many small matmul operations per butterfly stage, FP16 reduces memory usage without significant quality loss – just add `.to(torch.float16)` before multiplications carefully cached.
+* **Stacked conditionings:** Compose BOFT with LoRA features by performing two parallel streams: one additive low-rank path and one multiplicative butterfly path—a hybrid PEFT framework that could offer reasons why one might outperform another on specific tasks.
+
+---
+
+## Conclusion
+
+We’ve built a lightweight yet fully functional implementation of Orthogonal Butterfly Finetuning in PyTorch that can replace any linear module inside large foundation models without adding inference latency post-fine-tune. By constraining our learning to structured orthogonal products via butterfly factorizations and Cayley parametrization—and by initializing them at identity—we preserve most pretraining knowledge while keeping trainable parameters under control.
+
+Feel free to tweak hyperparameters (`m`, `b`, dropout rates), experiment with different backbone architectures or downstream tasks—BOFT’s flexibility makes it approachable across vision & language domains alike.
+
+Happy finetuning! 🚀

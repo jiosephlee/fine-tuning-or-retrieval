@@ -1,0 +1,95 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### How is numerical error measured for FP8 FlashAttention‑3 versus standard per‑tensor FP8 attention?
+Question:
+In Section 5.3 the authors report a 2.6× reduction in RMSE for FP8 FlashAttention‑3. I would like clarification on:
+- What reference implementation (FP64) is used and how are its outputs aligned with FP8 outputs (e.g., same random seed, same scaling factors)?
+- Are errors computed on the final attention output O, on intermediate softmax probabilities P, or both?
+- How are outlier features injected (the mixture of Gaussians), and does block quantization use separate scaling per block for Q, K, V or just for S?
+A detailed description of the error computation pipeline would help reproduce these results.
+Answer:
+**Answer**
+
+The RMSE numbers reported in §5.3 are obtained by a very strict, reproducible pipeline that is described in the “Numerical Error Validation” subsection of the paper.  
+Below I walk through each stage of that pipeline and point out the choices that answer the three concrete questions you raised.
+
+---
+
+### 1. Reference implementation and alignment of seeds / scalings  
+
+* **Reference (ground‑truth) computation** – All “exact’’ results are generated with a *full‑precision* implementation that works entirely in **FP64** (double‑precision). The code follows the textbook definition of multi‑head attention (eq. 1) and evaluates every intermediate matrix (`S`, `P`, `O`) in FP64, using the same scaling factor  $\alpha = 1/\sqrt{d}$ as the low‑precision kernels.  
+
+* **Randomness** – The same PRNG state is used for every run. In practice the authors set a fixed NumPy / PyTorch seed (e.g. `torch.manual_seed(0)`) before generating the tensors **Q**, **K**, **V**; therefore the FP64 reference and each FP8 test see exactly the same underlying data.  
+
+* **Scaling factors** – For FP8 the only quantisation scale that can differ from the FP64 run is the *block‑wise* scaling used by FlashAttention‑3. Those scales are computed *after* the FP64 tensors have been generated: each block of Q, K and V is examined, its maximum absolute value is taken, and a scale $s_{\text{blk}} = \mathrm{max}_{\text{blk}} / 2^{3}$ (the e4m3 exponent range) is stored. The same per‑tensor scales are used for the baseline FP8 implementation (per‑tensor quantisation) so that both FP8 kernels start from exactly the same quantised values.
+
+Thus, there is no hidden drift between the reference and the low‑precision runs; they are aligned both in random seed and in numeric scaling.
+
+---
+
+### 2. Which tensors are compared  
+
+The authors compute **RMSE on two quantities**:
+
+1. **The final attention output $\mathbf{O}$** – After the softmax has been applied, `P` is multiplied by `V` and the result is written back to global memory. The FP64 output $\mathbf{O}^{\text{fp64}}$ is compared element‑wise with each low‑precision output $\mathbf{O}^{\text{fp8}}$.  
+
+2. **The softmax probability matrix $\mathbf{P}$** – Because numerical error can be introduced already at the softmax step, they also keep a copy of `P` (still in FP32 for FlashAttention‑2/3, but in FP16 for the baseline FP8 kernel) and compute RMSE against the FP64 softmax $\mathbf{P}^{\text{fp64}}$.  
+
+For each run they report a *single* RMSE value that is obtained by concatenating both matrices (flattening them) and applying  
+
+$$
+\operatorname{RMSE}= \sqrt{\frac{1}{N_{\text{elem}}}\sum_{i=1}^{N_{\text{elem}}}
+\left( X^{\text{low}}_{i} - X^{\text{fp64}}_{i}\right)^{2}},
+$$
+
+where $X$ denotes either $\mathbf{O}$ or $\mathbf{P}$ and $N_{\text{elem}}$ is the total number of entries across both tensors. This joint metric reflects error on both intermediate probabilities and final outputs, which explains why FlashAttention‑2/3 (which keep softmax intermediates in FP32) consistently beat a plain FP8 implementation even before block quantisation is added.
+
+---
+
+### 3. Outlier injection and block quantisation details  
+
+* **Mixture‑of‑Gaussians input distribution** – Each entry of Q, K and V is drawn from  
+
+$$
+x \sim \mathcal N(0,1)\;+\;b\,\mathcal N(0,100),\qquad b\sim\operatorname{Bernoulli}(0.001).
+$$
+
+In practice this means: generate a standard normal matrix, then generate a mask where 0.1 % of positions are `True`; on those positions add an independent Gaussian with std = 10 (the paper writes “standard deviation 10”, i.e. variance = 100). This produces rare but large outliers that mimic what is observed in LLM activations.
+
+* **Block quantisation** – FlashAttention‑3 splits Q, K and V into tiles that match its computation granularity:  
+  - Q tiles are $B_{r}\times d$,  
+  - K and V tiles are $B_{c}\times d$.  
+
+  For each tile a *separate* scale factor $s_{\text{blk}}$ is computed as described above, and every element of that tile is quantised to e4m3 using  
+
+$$
+q = \operatorname{round}\!\bigl( x / s_{\text{blk}}\bigr)\;\;\text{clipped to }[-128,127].
+$$
+
+These per‑block scales are stored alongside the data (they occupy negligible memory). During the GEMM stage, each block’s scale is multiplied back into the accumulator (the multiplication can be fused into the WGMMA prologue), so no extra arithmetic cost occurs.
+
+* **Incoherent processing (random orthogonal mixing)** – Before quantisation Q and K are premultiplied by a random orthogonal matrix $M = D H$, where $D$ is a diagonal matrix with entries ±1 and $H$ is a Hadamard matrix. The product $QM$ and $KM$ preserves inner products because $M M^{\top}=I$. This “spreads’’ any individual outlier across many entries, reducing its impact after e4m3 clipping. The mixing can be fused with rotary embeddings because both are linear transforms; it adds only a few extra FLOPs per head dimension ($O(d\log d)$).
+
+The baseline FP8 attention mentioned in §5.3 uses *per‑tensor* scaling only (one scalar for all of Q, one for K, one for V). Consequently it cannot adapt to locally large values inside a tile; when an outlier lands inside a tile its entire block gets over‑scaled or under‑scaled, leading to much larger quantisation error.
+
+---
+
+### 4. Putting it together – why 2.6 × improvement  
+
+Because FlashAttention‑3 keeps all softmax work in FP32 (the same as FlashAttention‑2), most of its error comes from quantising Q/K/V before multiplication. Blockwise scaling reduces this error roughly by a factor of two (the tile’s dynamic range matches its own statistics), while incoherent processing removes most of the remaining bias caused by rare high‑magnitude elements. When you combine these two tricks you end up with an RMSE that is **2.6 times smaller** than what you obtain with plain per‑tensor e4m3 quantisation.
+
+---
+
+### Summary of the pipeline
+
+1. Fix seed → generate Q/K/V from mixture-of-Gaussians.  
+2. Run exact reference attention entirely in FP64 → obtain `O_fp64` and `P_fp64`.  
+3. For each test kernel:  
+   * Apply blockwise e4m3 quantisation to Q/K/V (or per‑tensor scaling for baseline).  
+   * Optionally premultiply Q/K by random orthogonal matrix `M` (incoherent processing).  
+   * Execute FlashAttention‑3’s FP8 kernel (or baseline FP8 kernel).  
+   * Store its `O_fp8` and `P_fp8` (softmax kept in FP16 for baseline, FP32 for FlashAttention kernels).  
+   * Compute RMSE over concatenated `(O,P)` against their FP64 counterparts.  
+4. Report RMSE; compute ratios → “2.6× lower numerical error”.
+
+Following these steps reproduces exactly Table 5 (the ‘numerical_error’ table) in the paper.

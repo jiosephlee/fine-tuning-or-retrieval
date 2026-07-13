@@ -1,0 +1,149 @@
+\title{A Textbook about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+Chapter 5: # Paged Optimizers and Managing Memory Spikes
+
+Training large language models (LLMs) on a single GPU is often limited not by the size of the model parameters themselves but by the auxiliary memory required for the optimizer.  When a model processes long sequences, the gradients that must be stored for back‑propagation can exceed the capacity of even a modern high‑end GPU.  The **QLoRA** framework mitigates this bottleneck through **Paged Optimizers**, a technique that leverages NVIDIA’s Unified Memory system to automatically page optimizer state tensors between GPU and host memory.  This chapter explains why optimizer state dominates memory consumption during long‑sequence training, contrasts unified‑memory paging with manual gradient checkpointing, describes the practical implementation of paged optimizers (including CUDA kernels and integration with PyTorch), and evaluates the performance impact of paging while providing guidelines for effective use.
+
+---
+
+## Why Optimizer State Memory Dominates During Long Sequences
+
+During supervised fine‑tuning, each trainable parameter requires an associated set of optimizer states.  For Adam‑style optimizers, two additional tensors (the first‑order moment **m** and second‑order moment **v**) are maintained per weight.  Even though LoRA adapters contribute only a few megabytes of trainable weights, the optimizer must still allocate these auxiliary tensors for *every* parameter that participates in gradient computation.
+
+When a model processes a mini‑batch containing a long input sequence, the **activation gradients**—the intermediate tensors needed to compute the derivative of the loss with respect to each weight—become extremely large.  In practice, the memory footprint of these activation gradients grows roughly linearly with sequence length and batch size.  For a 65 B‑parameter LLM quantized to 4 bits (requiring ≈ 5 GB for the base model), the activation gradients for a single batch of length 2 048 tokens can consume several tens of gigabytes, dwarfing the memory needed for both the quantized weights and their LoRA adapters.
+
+The optimizer states themselves are not the dominant factor *per se*, but they become problematic when combined with the already large activation gradient buffers.  In vanilla training pipelines this leads to **memory spikes**: temporary peaks where total GPU memory usage exceeds the physical capacity, causing out‑of‑memory (OOM) crashes.  Gradient checkpointing can reduce activation memory by recomputing certain forward activations during back‑propagation, yet it does not eliminate the need to store optimizer states, which must remain resident for the entire training step.  Consequently, for very deep models or very long sequences, optimizer state memory becomes a hard wall.
+
+---
+
+## Unified Memory vs. Manual Checkpointing
+
+### Manual Gradient Checkpointing
+
+Gradient checkpointing is a software strategy wherein only a subset of forward activations is saved; the rest are recomputed on‑the‑fly during back‑propagation.  This reduces peak activation memory at the cost of additional compute time.  However, checkpointing does not address optimizer state storage because those tensors must be available throughout the update step regardless of whether activations are recomputed.
+
+In practice, researchers often combine checkpointing with aggressive reduction of LoRA adapter size, hoping that fewer trainable parameters will shrink optimizer memory.  Empirical analysis in QLoRA shows that even when LoRA adapters constitute merely **0.2 %** of model parameters, their associated gradients occupy about **567 MB** (for a 7 B model with batch size 1), while gradient checkpointing reduces this to an average **18 MB** per sequence.  The base model’s quantized parameters already consume ~**5 GB**, leaving optimizer memory as the next sizable contributor—especially when scaling to 33 B or 65 B models.
+
+### NVIDIA Unified Memory Paging
+
+Unified Memory provides a hardware‑driven mechanism that abstracts away explicit data movement between host (CPU) RAM and device (GPU) VRAM.  When a tensor exceeds available GPU memory, the driver automatically pages out portions of that tensor to host memory, bringing them back (“faulting in”) only when accessed.  From an algorithmic perspective this works like an infinite virtual address space where physical GPU pages are allocated on demand.
+
+Applying Unified Memory to optimizer states yields two critical benefits:
+
+1. **Automatic Spike Mitigation** – When processing a long sequence triggers a temporary surge in required optimizer memory, Unified Memory silently pages out rarely accessed portions (e.g., moments for weights that are not being updated in this step), preventing OOM failures.
+2. **Zero Code Overhead** – Unlike manual checkpointing where developers must restructure computation graphs or insert explicit `torch.cuda.empty_cache()` calls, paging requires only allocating optimizer tensors with `torch.cuda.memory_format=torch.contiguous_format` and setting an appropriate `cudaMallocManaged` flag.
+
+From QLoRA’s perspective, paging is used *only* for optimizer states; all model weights remain quantized on‑device (NF4) and are dequantized on demand during forward/backward passes.  This separation ensures that paging does not interfere with high‑throughput matrix multiplications: computations still occur entirely in BFloat16 on GPU-resident data; only when an optimizer step needs to read or write moments does Unified Memory potentially trigger a page fault.
+
+---
+
+## Implementation: CUDA Kernels and PyTorch Integration
+
+### Core Data Types
+
+QLoRA stores quantized weights using **4‑bit NormalFloat (NF4)** and stores quantization constants via **double quantization** (FP8).  During training these tensors are dequantized on‑the‑fly into BFloat16 before matrix multiplication.  The optimizer itself operates exclusively on BFloat16 tensors—the dequantized representations and LoRA adapters.
+
+### Paged Optimizer Class
+
+QLoRA introduces a thin wrapper around PyTorch’s standard AdamW optimizer:
+
+```python
+class PagedAdamW(torch.optim.AdamW):
+    def __init__(self, params, lr=1e-4, betas=(0.9,0.999), eps=1e-8,
+                 weight_decay=0., amsgrad=False):
+        super().__init__(params, lr=lr, betas=betas,
+                         eps=eps, weight_decay=weight_decay,
+                         amsgrad=amsgrad)
+        # Allocate moments in unified memory
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.requires_grad:
+                    # Allocate m and v as managed tensors
+                    state = self.state[p]
+                    state['exp_avg'] = torch.empty_like(p,
+                        device='cpu', pin_memory=True).cuda()
+                    state['exp_avg_sq'] = torch.empty_like(p,
+                        device='cpu', pin_memory=True).cuda()
+```
+
+The key line is `pin_memory=True` combined with `.cuda()`, which tells PyTorch to allocate those buffers as *managed* (`cudaMallocManaged`).  Internally this invokes NVIDIA’s driver to map the allocation into Unified Memory.
+
+### Custom CUDA Kernels
+
+While most operations (Adam update rule) are already implemented efficiently in cuDNN/torch.cuda kernels, QLoRA adds two lightweight kernels to improve paging latency:
+
+1. **Prefetch Kernel** – Before each optimizer step, QLoRA issues a prefetch call (`cudaMemPrefetchAsync`) for all moments expected to be accessed soon (typically those belonging to LoRA adapters). This proactively pulls those pages into GPU memory, reducing page‑fault stalls.
+2. **Lazy Deallocation Kernel** – After completing an update step, pages corresponding to moments that will not be used in subsequent steps are released back to host RAM via `cudaMemAdvise` with `cudaMemAdviseSetPreferredLocation`.
+
+These kernels are compiled as part of QLoRA’s CUDA extension module (`qlora/optim/paged_adam.cu`) and exposed through a small Python API:
+
+```python
+from qlora.optim import prefetch_moments
+prefetch_moments(optimizer.state_dict())
+```
+
+The kernel code is intentionally minimal; it merely iterates over tensor pointers and calls driver functions; thus it incurs negligible overhead compared to the overall training time.
+
+### Integration Workflow
+
+A typical QLoRA training script consists of three steps:
+
+1️⃣ Load the pretrained LLM weights and quantize them using NF4 + double quantization (handled by `bitsandbytes`).  
+2️⃣ Attach LoRA adapters at every linear layer (ensuring sufficient capacity to recover full precision performance).  
+3️⃣ Instantiate `PagedAdamW` as the optimizer and optionally call `prefetch_moments` at each epoch start.
+
+Because paging is transparent to higher‑level PyTorch code, existing training loops require no modification beyond swapping out `torch.optim.AdamW` for `qlora.optim.PagedAdamW`.
+
+---
+
+## Performance Impact Analysis and Best‑Practice Settings
+
+### Empirical Measurements
+
+QLoRA authors evaluated paged optimizers on LLaMA models ranging from 7 B to 65 B parameters under two regimes:
+
+| Model | Batch Size | Sequence Length | Peak GPU Mem (GB) | Baseline Optimizer | Paged Optimizer |
+|-------|------------|----------------|-------------------|-------------------|-----------------|
+| LLaMA‑7B   | 1          | 2 048          | ~7                | OOM               | 6.8 (no OOM)    |
+| LLaMA‑33B  | 1          | 1 024          | ~45               | OOM               | 44 (stable)     |
+| LLaMA‑65B  | 1          | 512            | ~48               | OOM               | 48 (stable)     |
+
+In all cases where standard AdamW crashed due to OOM during gradient accumulation, paged AdamW completed without error. Importantly, runtime overhead was minimal: measured wall‑clock time per training step increased by less than **2 %**, well within experimental noise.   The authors also note that “paged optimizers provide the same training speed as regular optimizers” when processing mini‑batches with typical sequence lengths (< 512 tokens), confirming that paging rarely incurs latency unless spikes occur.
+
+### Trade‑offs
+
+| Aspect                     | Standard Optimizer                     | Paged Optimizer                           |
+|----------------------------|----------------------------------------|-------------------------------------------|
+| Memory safety              | Prone to OOM on long sequences        | Automatic spill/recover                   |
+| Throughput                | Slightly higher when no spills          | ≤ 2 % slower under heavy paging           |
+| Implementation effort      | None                                   | Minimal wrapper + optional prefetch      |
+| Portability                | Works on any GPU                       | Requires NVIDIA GPUs supporting Unified Memory |
+| Debugging                  | Straightforward                        | Need to monitor page fault statistics (`nvprof --print-gpu-trace`) |
+
+Given these observations, paged optimizers are most beneficial when:
+
+- Training sequence lengths exceed ~1k tokens.
+- Model scale is ≥ 33 B parameters.
+- The hardware has sufficient host RAM (≥ 2×GPU memory) so that spilled pages do not saturate system memory.
+- Training budgets tolerate a marginal (~1–2 %) slowdown for guaranteeing safety.
+
+### Recommended Settings
+
+1. **Blocksize Selection** – Use NF4 blocksize = **64** for weight quantization; use FP8 blocksize = **256** for double quantization constants. These choices minimize per‑parameter overhead while preserving accuracy.
+2. **Learning Rate Scaling** – When moving from a 7 B to a larger model (33 B / 65 B), halve the base learning rate (e.g., from `5e-5` → `2.5e-5`) while doubling batch size if GPU memory permits.
+3. **Prefetch Frequency** – Call `prefetch_moments` once per epoch or whenever you change LoRA adapter configuration; excessive prefetching may nullify its advantage.
+4. **Host Memory Reservation** – Reserve at least **1–2×** GPU VRAM in system RAM; this ensures that even worst‑case spills will not trigger OS swapping.
+5. **Monitoring** – Use `torch.cuda.memory_stats()` and NVIDIA’s `nvidia-smi dmon` to watch managed allocations (`managed_memory`). Spikes > 0 indicate paging activity; if spikes dominate runtime (> 10 % of iteration time), consider reducing sequence length or increasing batch size.
+
+---
+
+### Summary
+
+Paged Optimizers constitute a pivotal component of QLoRA’s ability to fine‑tune massive LLMs on modest hardware:
+
+- The dominant memory pressure during long‐sequence fine‐tuning derives from activation gradients combined with immutable optimizer state tensors.
+- Manual gradient checkpointing reduces activations but cannot alleviate optimizer state spikes; Unified Memory offers an elegant solution by automatically paging these tensors between GPU and host.
+- A lightweight PyTorch wrapper (`PagedAdamW`) together with tiny CUDA kernels provides seamless integration without altering existing training loops.
+- Empirical results demonstrate near‑zero performance penalty while eliminating OOM failures across models up to 65 B parameters.
+
+By following the best practices outlined above—choosing appropriate block sizes, scaling learning rates appropriately, prefetching judiciously, and ensuring ample host RAM—researchers can reliably train instruction‐tuned chatbots such as Guanaco on a single consumer-grade GPU or professional workstation, opening up large‐scale LLM experimentation to far broader communities.

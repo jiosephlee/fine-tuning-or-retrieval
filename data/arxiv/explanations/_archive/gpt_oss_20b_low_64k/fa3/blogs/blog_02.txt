@@ -1,0 +1,166 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# Asynchrony 101: How Hopper GPUs Make Attention Run Faster
+
+Large‑language models (LLMs) and many other deep‑learning systems rely on *attention* as the dominant compute kernel.  
+The cost grows quadratically with sequence length, so every improvement counts.  
+NVIDIA’s Hopper architecture introduced a host of new hardware features that, when wired correctly, can make attention’s inner loop run faster, more efficiently, and even *more accurately* in low‑precision.  
+
+In this post we unpack three key Hopper concepts:
+
+* The **Tensor Cores** – a specialized matrix‑multiply engine that can now be called asynchronously.
+* The **Tensor Memory Accelerator (TMA)** – a fast, dedicat­ed data mover that talks directly to shared memory.
+* **Asynchronous execution** – the ability of the GPU to run independent work streams in parallel.
+
+We will also see how the FlashAttention‑3 algorithm turns those hardware goodies into an everyday speed‑up for inference and training.
+
+---
+
+## 1. A Quick Primer on Hopper’s Memory Hierarchy
+
+| Layer                    | Capacity per SM | Bandwidth per SM | Typical latency |
+|--------------------------|------------------|------------------|-----------------|
+| Registers (RMEM)         | 256 bytes        | ~600 GB/s        | 0 ns            |
+| Warp‑level shared memory (SMEM) | < 100 KB      | ~104 GB/s        | 5–10 ns         |
+| L2 cache                 | ~1 MB           | 16–32 GB/s       | ~20–50 ns       |
+| Global memory (HBM)      | ∞               | ~10–12 TB/s      | ~200–400 ns     |
+
+On Hopper the key point is that *any* register or shared‑memory resident value can be read by the Tensor Core without a round‑trip to global memory. That means the kernel can work purely in hardware‐resident memory, avoiding expensive IO hops.
+
+---
+
+## 2. The Certified “Factory” – A Usable Analogy
+
+Think of a transformer layer as a factory line:
+
+* **Workers** = GPU threads/warps.
+* **Raw material** = input tensors (`Q`, `K`, `V`).
+* **Tools** = matrix multiplication kernels (Tensor Cores).
+* **Packer** = softmax routine (`exp`, sum, scale).
+
+Two ideas allow the factory to operate more smoothly:
+
+1. **Producer‑Consumer Specialization**  
+   Certain workers only fetch raw material (“producers”), while others only perform transformations (“consumers”). This is akin to having *workers on different stations* who never step on each other’s toes.
+
+2. **Ping‑Pong Scheduling**  
+   The workers that pack the output take turns passing their processed goods to the next worker while the other workers are busy with something else. This keeps every station busy most of the time.
+
+These two ideas together give us an *asynchronous pipeline*: data flows in, transforms happen in parallel, and nothing sits idle.
+
+---
+
+## 3. Producer‑Consumer With Warp Specialization
+
+In Proton’s tables above, you see a “warpgroup”: clumps of 32 threads that orchestrate one part of the algorithm.
+
+### Producer Warpgroup  
+* Calls TMA to move one block of `Q` or one `(K,V)` pair from global memory into shared memory.  
+* Uses very few registers (much less than a full consumer would).  
+
+### Consumer Warpgroup  
+* Awaits for the required blocks in shared memory.  
+* Runs WGMMA (warpgroup GEMM) operators and local softmax on them.  
+
+Because TMA and WGMMA are *asynchronous*, the producers keep CPU + GPU “pipes” full while consumers can work independently. We call this operator “flush” or “commit”: once a block has landed in SMEM, it tells consumers it’s ready.
+
+### Circular Buffering  
+The GPU has only a handful of SMEM banks; we therefore dole out spots in a circular queue (`stage 0`, `stage 1`, …). When a producer finishes loading a block into stage `s`, it signals its completion and marks stage `s` as “full”. The consumer then reads from that stage before it becomes empty again.
+
+This simple producer‑consumer dance removes data stalls: while one block is being multiplied, another is being fetched downstream.
+
+---
+
+## 4. Ping‑Pong Scheduling Between GEMM & Softmax
+
+The heart of attention involves two GEMM calls plus an exponentiation:
+
+```
+S = Q x Kᵀ          # first MVM
+P = softmax(S)      # compute probabilities
+O = P x V            # second MVM
+```
+
+On Hopper, GEMM runs on Tensor Cores at gigaflops speed; softmax (`exp`, addition) runs on general CUDA cores at far lower throughput (≈30× slower). To keep all cores busy we overlap them across *iterations*, not within an iteration:
+
+```
+Iteration j :   GEMM0 (Q x Kᵀ[j])     ────────►
+Iteration j+1 :              GEMM1 (P[j] × V[j]) ──►
+          ↔ softmax merging between iterations
+```
+
+So while warpgroup A is busy completing `GEMM0` for block `j+1`, warpgroup B is already slicing `exp` off block `j`. Whenever one warpgroup finishes its work it "pings" back to resume with the next job – hence **ping‑pong** scheduling.
+
+The practitioner can think of this like two factory shifts alternating: while shift A shut down its equipment for cleaning, shift B has already started producing and shipping finished goods.
+
+---
+
+## 5. Leveraging Low Precision: FP8 Tensor Cores
+
+Hopper added support for **FP8** tensor cores (`e4m3`). They pull GFLOPs from each dot product by roughly twice what FP16 does but with less precision:
+
+| Format | Mantissa bits | Exponent bits | Range |
+|--------|---------------|---------------|-------|
+| FP16   | 10            | 5             | ±65504|
+| FP8    |   3           |   4           | ±24   |
+
+WGMMA works best if its operands are laid out as *k‑major*: contiguous along the inner dimension (`K`). This rules out naïve layouts and forces us to:
+
+1. **Transpose V lazily in kernel** – using warp‑wide load/store instructions (`ldmatrix`/`stmatrix`) to swap rows/cols as they move into SMEM.
+2. **Reorder FP32 accumulators after multiplication** – i.e., permute registers so that later involving `P x V` sees operand in expected form.
+
+FlashAttention‑3 does both without incurring extra memory traffic:
+- The transpose occurs during tile load;  
+- The register permutation uses byte‑permutation operations (`bytePerm`) cheap relative to tearing down another inthe-tkn matrix mul.
+
+Because we keep all intermediate results (softmax scales, partial sums) in full precision (`FP32`) even when inputs are FP8, we reduce error dramatically — 2–3× better than per-tensor quantization alone.
+
+---
+
+## 6. Block Quantization + Incoherent Processing
+
+Quantizing across entire tensors leads to huge outliers swamp others; both highly frequent steps exacerbate rounding errors:
+
+1. **Block Quantization**: each `(B_r × d)` tile has its own scale factor; we only have to correct it locally when forming `S`. Since FlashAttention already operates on tiles, no extra shuffles needed.
+2. **Incoherent Processing**: We multiply both `Q` and `K` by a random orthogonal matrix before quantization:
+   
+   ```
+   Q' = Q × M    ;   K' = K × M
+   ```
+
+  Since `M Mᵀ = I`, attention result is preserved (`Q' K'^T = Q K^T`). But now each entry is roughly an average over many contributions → fewer extreme values → smaller quantization error ("spreading out" outliers).
+
+The combination gives FP8 error ≈ as low as FP16 but with almost double throughput on Hopper H100’s tensor cores (~1 PFLOPs vs <600 TFLOPs).
+
+---
+
+## 7. Benchmarks & Takeaways
+
+Using the same TPU/H100 identical workloads throughout our tests, FlashAttention‑3 demonstrates:
+
+| Precision / Mode        | Speedup over FlashAttention‑2 |
+|------------------------|--------------------------------|
+| FP16 Forward           | ×1.5 – ×2.0                    |
+| FP16 Backward          | ×1.5 – ×1.75                   |
+| FP8 Forward            | ≈ ×2 (near PFLOPs with FP8 WGMMA)|
+| Accuracy               | ≤ 0.45x RMSE vs standard FP8; identical FP16 accuracy |
+
+Up until now standard libraries achieved only about 35% Tensor Core utilization on Hopper for attention; FlashAttention 3 climbs close to publisher rates (∼70–75% Utilisation on H100).
+
+---
+
+## 8. Bottom Line
+
+Asynchrony isn’t just a fancy buzzword—it reflects how modern GPUs orchestrate huge workloads by overlapping many independent operations behind each other:
+
+* Load data → Compute → Store results  
+with *no waiting*: every thread group does exactly what it was scheduled for while something else keeps feeding it fresh data.
+
+FlashAttention‐3 exploits these overlaps via:
+- Warp specialization,
+- Ping–pong scheduling,
+- Low‐precision tiler alignment,
+
+to push attention under many billions of queries per second—while keeping error levels pristine.
+
+If you’re building LLM inference engines or training pipelines on Hopper-based GPUs, give FlashAttention‑3 a try: you’ll get real performance gains without changing your model code or precision beyond what you already use!

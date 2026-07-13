@@ -1,0 +1,70 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### What limits prevent FlashAttention‑3 from achieving >80% utilization on H100 like cuDNN GEMM kernels?
+Question:
+The authors note that FlashAttention‑2 gets only ~35% utilization on H100 and FlashAttention‑3 improves to ~75%. Yet cuDNN GEMM reaches 80–90%. Is the remaining gap due to kernel launch overhead, register pressure from pipelining, or inherent algorithmic constraints (e.g., needing to keep intermediate results in FP32)? Any insight into what parts of FlashAttention‑3 could be further optimized would be helpful.
+Answer:
+**Answer**
+
+The 75 % sustained TFLOP/s that FlashAttention‑3 reports on an H100 is already a huge improvement over the 35 % of FlashAttention‑2, but it still falls short of the 80–90 % utilisation that cuDNN’s GEMM kernels can reach.  
+The paper identifies three concrete sources of the remaining head‑room and explains why they are not “free” to eliminate.
+
+---
+
+### 1. Where the extra work lives
+
+Both FlashAttention‑2 and FlashAttention‑3 are *single‑kernel* fusions of three logical phases:
+
+1. **Block‑wise Q·Kᵀ (SS‑GEMM)** – a matrix‑multiply that feeds the softmax.  
+2. **Softmax & rescaling** – a row‑wise exponential, max/subtract, and a row sum.  
+3. **Block‑wise P·V (RS‑GEMM)** – the second matrix‑multiply that produces the output.
+
+In a pure GEMM kernel (cuDNN) the only work is phase 1 (or phase 3), performed by the Tensor Cores at their peak rate; all other instructions are either independent or hidden inside the micro‑kernel. In attention we must also execute phase 2, which on Hopper is carried out by the *multi‑function unit* (MFU) and is roughly two orders of magnitude slower than the Tensor Cores ($\approx\,4\,\text{TFLOP/s}$ for exp vs $\approx\,1000\,\text{TFLOP/s}$ for FP16 WMMA). Consequently, even if the Tensor Cores were kept busy 100 % of the time, the MFU would still occupy a non‑trivial fraction of each cycle.
+
+FlashAttention‑3’s main contribution is to **overlap** phase 2 with phase 1/3 of a different iteration using *producer–consumer warp specialization* and a *two‑stage pipeline* (Algorithm 2). This hides most of the MFU latency, but it cannot hide **all** of it because:
+
+* The softmax for a given block depends on the *complete* Q·Kᵀ result of that block; therefore at least one cycle must wait for the WMMA result before starting its exponential.  
+* The pipeline depth is limited to two stages by practical register availability (see below). Adding another stage would let one MFU operation run in parallel with both WMMA calls, but would also require keeping two pending Q·Kᵀ tiles in registers.
+
+Thus a small fraction of cycles remains dedicated solely to softmax, which caps utilisation around 75 %.
+
+---
+
+### 2. Register pressure and pipeline depth
+
+The two‑stage pipeline needs an extra copy of the “next” Q·Kᵀ tile (`S_next`) in registers while the current softmax is being computed. For a typical block size ($B_r = B_c = 128$) this adds roughly
+
+$$
+B_r \times B_c \times \text{sizeof}(\text{float}) \approx 128\times128\times4 \approx 64\text{ KB}
+$$
+
+of register storage per CTA. On Hopper each SM has only 256 KB of registers per warpgroup, and many of those are already consumed by the WGMMA operand loading logic, shared‑memory pointers, and the per‑thread accumulators for `O`. When we push beyond this budget the compiler spills to shared memory or even global memory, which incurs additional latency and destroys any extra overlap we might have gained.
+
+The authors therefore chose a *two‑stage* pipeline as the sweet spot: it gives a noticeable boost ($\approx\,10\text{–}15\,\%$ more TFLOP/s) while staying within the register budget for block sizes that give good occupancy. A *three‑stage* pipeline was investigated (Section C), but its extra registers forced them to shrink `$B_r$`/`$B_c$`, which reduced overall arithmetic intensity and cancelled out any theoretical utilisation gain.
+
+Because register pressure is an architecture‑level constraint, it is not something that can be solved by tweaking launch parameters alone; it requires either more on‑chip register file (future GPU generations) or a redesign that reduces per‑tile data volume (e.g., using lower‑precision accumulators).
+
+---
+
+### 3. FP32 accumulation in FP8 mode
+
+When FlashAttention‑3 runs in FP8 it still accumulates each GEMM into **FP32** to keep numerical error low (Section 4.3). The FP32 accumulator layout differs from the k‑major layout required by FP8 WGMMA, so a small register permutation is inserted between the two GEMMs. This permutation itself costs a few instructions per tile and prevents perfect overlap of the two WGMMAs: after `Q·Kᵀ` finishes we must first rearrange registers before launching `P·V`. The extra latency is modest (the paper reports $\approx\,5\text{–}6\,\%$ loss compared with an ideal FP8‑only pipeline) but contributes to why FP8 FlashAttention‑3 does not quite reach 100 % utilisation despite having twice as many Tensor‑Core FLOPs available.
+
+Moreover, FP8 kernels cannot use *persistent kernels* yet (the authors note this in Section 6), so each launch incurs kernel‑startup overhead that becomes visible at short sequence lengths or when causal masking halves the work. cuDNN’s GEMM kernels are fully persistent and thus avoid this overhead entirely.
+
+---
+
+### 4. What could be tuned further?
+
+| Bottleneck | What would help | Why it is not trivial |
+|------------|----------------|-----------------------|
+| **Softmax latency** | Move softmax onto dedicated Tensor Core instructions once Hopper adds them (future hardware) | Currently only MFU handles `exp`, limiting throughput |
+| **Register budget** | Larger register file or smarter tiling that reduces per‑tile state (e.g., compressing `S_next` with half precision) | Compression would introduce extra conversion steps and harm numerical stability |
+| **FP8 accumulator layout** | Native FP8→FP32 accumulator support in WGMMA (no permutation) | Requires hardware redesign; current workaround already adds only a few cycles |
+| **Kernel launch overhead** | Persistent kernel for FP8 path + dynamic load balancing | Needs redesign of block‑dispatch logic; authors already plan this as future work |
+
+In short, the remaining gap to cuDNN’s 80–90 % utilisation comes from *algorithmic dependencies* that force at least one non‑Tensor‑Core operation per iteration, together with *hardware constraints* on registers and accumulator layout that limit how deep an asynchronous pipeline can be built. The authors have already extracted most of the easily exploitable parallelism; closing the final few percent will likely require either new Hopper instructions (e.g., Tensor Core exponentials) or architectural changes that increase on‑chip storage.
+
+--- 
+
+**Bottom line:** FlashAttention‑3’s 75 % utilisation is limited by unavoidable softmax work, register pressure that caps pipeline depth to two stages, and extra bookkeeping needed for FP8 accumulation. These factors are inherent to the current Hopper design rather than mere implementation overhead, which explains why cuDNN GEMM—pure matrix multiplication—can still achieve higher utilisation.

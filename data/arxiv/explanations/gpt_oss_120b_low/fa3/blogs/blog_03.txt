@@ -1,0 +1,96 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# Why Softmax Was Holding Back Attention Kernels—and How FlashAttention‑3 Fixed It  
+
+*In the world of Transformers, the softmax step has become a silent performance thief.  FlashAttention‑3 introduces a clever “ping‑pong” scheduling that hides the expensive exponential work behind Tensor‑Core GEMMs, regaining lost throughput. In this post we unpack the bottleneck, walk through the two‑stage pipeline, and show why the new design matters for long‑context models.*  
+
+---  
+
+## The hidden cost inside attention  
+
+The multi‑head attention (MHA) formula is simple on paper:  
+
+\[
+\mathbf{S}= \alpha \mathbf{Q}\mathbf{K}^\top,\qquad 
+\mathbf{P}= \operatorname{softmax}(\mathbf{S}),\qquad 
+\mathbf{O}= \mathbf{P}\mathbf{V}.
+\]
+
+When we translate this into a GPU kernel, the matrix‑multiply \(\mathbf{Q}\mathbf{K}^\top\) and the final multiply \(\mathbf{P}\mathbf{V}\) can be executed on **Tensor Cores**, which on Hopper deliver up to **989 TFLOPs/s** for FP16 GEMM.  
+
+The softmax, however, is not a GEMM. It needs row‑wise max‑subtraction, exponentiation, and a division by the row sum. All of these are implemented by the **special‑function unit (SFU)** and have a theoretical throughput of only **≈3.9 TFLOPs/s** on the same GPU.  
+
+Even though exponentials are a tiny fraction of FLOPs (for head dimension 128 they are ≈1/512 of the work), their *throughput* is ~256× lower than that of Tensor Cores. The result? On a realistic workload up to **50 % of the clock cycles** are spent waiting for the softmax pipeline, dramatically dragging down overall utilization (FlashAttention‑2 was stuck around 35 % on an H100).  
+
+## Turning softmax into background work  
+
+The key insight behind FlashAttention‑3 is that **softmax does not have to run strictly after each GEMM**. If we can start computing the next block of \(\mathbf{Q}\mathbf{K}^\top\) while we are still finishing the exponential for the current block, we can keep the Tensor Cores busy all the time and let the SFU work in parallel.  
+
+To achieve this we need two hardware tricks that Hopper provides:  
+
+1. **Asynchronous Tensor‑Core GEMM (WGMMA)** – launches a matrix multiplication that reads its inputs from shared memory but returns control to the warp immediately; completion can be waited on later.  
+2. **Tensor Memory Accelerator (TMA)** – moves data between global memory and shared memory without stalling compute warps.  
+
+With these asynchronous primitives we can split each CTA (cooperative thread array) into two *warp groups*: a **producer** that only issues TMAs, and a **consumer** that issues WGMMAs and does the softmax arithmetic. This is called **warp‑specialization**.
+
+### The two‑stage “ping‑pong” pipeline  
+
+Consider processing a query tile \(\mathbf{Q}_i\) against a sequence of key/value tiles \(\{\mathbf{K}_j,\mathbf{V}_j\}\). The classic FlashAttention loop looks like this for every \(j\):
+
+```
+S = Q_i * K_j^T          // GEMM 1
+softmax(S)               // exp, row-sum, etc.
+O += P * V_j            // GEMM 2
+```
+
+All three steps are forced to finish before moving to \(j+1\). In FlashAttention‑3 we restructure it into a *two‑stage pipeline*:
+
+```
+# Stage A (already computed for j-1)
+O += P_{prev} * V_{j-1}   // GEMM 2   ← runs while ...
+
+# Stage B (starts for j)
+S = Q_i * K_j^T           // GEMM 1   ← runs while ...
+
+# After both launches finish:
+softmax(S)                // now cheap because it overlaps with next GEMM
+```
+
+Visually, think of two warp groups alternating roles:
+
+| Time → | Warp‑Group A (consumer) | Warp‑Group B (producer) |
+|--------|------------------------|--------------------------|
+| t0     | —                      | load K₀,V₀ (TMA) |
+| t1     | GEMM₁(Q,K₀)            | — |
+| t2     | softmax(S₀)            | load K₁,V₁ |
+| t3     | GEMM₂(P₀,V₀)           | GEMM₁(Q,K₁) |
+| t4     | softmax(S₁)            | … |
+
+The **softmax of block \(j\)** executes while **GEMM 1 of block \(j+1\)** is already running on Tensor Cores. When we finish GEMM 1 for block \(j+1\), we already have its softmax ready to feed into GEMM 2 of block \(j+1\). The pattern resembles a ping‑pong ball bouncing between two warp groups – hence the name.
+
+### Why it works  
+
+* **Latency hiding:** The latency of a TMA load or an SFU exponential is completely masked by the much longer GEMM latency (~30–40 µs versus ~0.1 µs for an exponent).  
+* **Higher occupancy:** By dedicating whole warps to either data movement or compute, each SM can keep its registers and shared memory fully utilized without context switches.  
+* **No extra memory traffic:** The algorithm still fuses all intermediate matrices (`S` and `P`) into registers/shared memory; nothing is written back to global memory until the final output tile `O_i` is ready.
+
+Empirically, this schedule pushes sustained TFLOPs from ≈570 TFLOPs (FlashAttention‑2) up to **620–640 TFLOPs** for FP16 forward passes with head dimension 128—roughly a **12 % jump** just from overlapping softmax. Combined with other optimizations (warp specialization, larger tile sizes), FlashAttention‑3 reaches **740 TFLOPs/s**, about **75 %** of the theoretical H100 peak.
+
+## When does “ping‑pong” matter most?  
+
+The benefit grows with longer sequences because more blocks mean more opportunities to overlap work. For short sequences (e.g., 512 tokens) the pipeline depth is shallow and the overhead of synchronization dominates; you’ll see modest gains. As soon as you hit 4k–8k tokens—the regime where many LLMs operate—the pipeline stays full and you see close to **2× speedup** over FlashAttention‑2.
+
+Another subtlety: causal masking halves the number of `K` tiles that each `Q` sees, slightly reducing overlap opportunities; nevertheless FlashAttention‑3 still outperforms prior kernels even in causal mode.
+
+## Extending the idea to FP8  
+
+FP8 Tensor Cores double raw matrix‑multiply throughput but keep SFU bandwidth unchanged. That makes softmax an even larger proportion of total time. The same ping‑pong schedule applies unchanged; you simply launch FP8 WGMMAs instead of FP16 ones. With block quantization and incoherent processing (techniques described in the paper), FlashAttention‑3 with FP8 reaches close to **1.2 PFLOPs/s**, while preserving numerical fidelity—thanks in part to keeping softmax in higher precision and still overlapping it with fast GEMMs.
+
+## Takeaways  
+
+* The softmax step was silently throttling attention kernels because SFU throughput cannot keep up with Tensor Core speed.  
+* By decoupling data movement from computation (warp specialization) and by pipelining softmax behind successive GEMMs (“ping‑pong” scheduling), FlashAttention‑3 hides this bottleneck almost completely.  
+* The result is a dramatic utilization jump on Hopper GPUs—up to 75 % of peak TFLOPs for FP16 and near‐PFLOP performance for FP8—without sacrificing exactness (intermediate results stay in FP32).  
+* This technique is generic: any attention implementation that can be expressed as blockwise `QKᵀ → softmax → PV` and that runs on hardware supporting asynchronous tensor cores can adopt it.
+
+If you’re building long‑context models or serving large LLMs on modern GPUs, swapping your attention kernel for FlashAttention‑3 could give you immediately noticeable speedups—especially when you enable low‑precision inference with FP8. The “softmax was holding us back” story shows how even a tiny fraction of work can dominate performance when hardware imbalances are ignored, and how thoughtful pipeline design can turn that hidden cost into free compute cycles.

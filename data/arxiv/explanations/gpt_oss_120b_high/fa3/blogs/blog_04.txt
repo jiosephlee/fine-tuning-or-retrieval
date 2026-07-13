@@ -1,0 +1,190 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# Pipelining GEMM and Softmax: The Ping‑Pong Scheduler Behind FlashAttention‑3  
+
+Transformer models spend most of their time in the attention layer.  
+A naïve implementation first computes the score matrix  
+
+\[
+\mathbf{S}= \alpha \,\mathbf{Q}\mathbf{K}^{\top}\in\mathbb{R}^{N\times N},
+\qquad 
+\alpha = \frac{1}{\sqrt{d}},
+\]
+
+applies a row‑wise softmax  
+
+\[
+\mathbf{P}= \operatorname{softmax}(\mathbf{S}),
+\]
+
+and finally multiplies by the values  
+
+\[
+\mathbf{O}= \mathbf{P}\mathbf{V}.
+\]
+
+Both matrix multiplications (often called **GEMMs**) are dominated by Tensor Core work,
+while the softmax step consists of a row‑wise maximum, an exponential, and a sum.
+On modern Hopper GPUs these two phases have wildly different throughputs:
+
+* FP16 GEMM on an H100 SXM5 can sustain ≈ 989 TFLOP/s.
+* Special‑function units that perform `exp` deliver only ≈ 3.9 TFLOP/s.
+
+Even though GEMMs account for most floating‑point operations, the low‑throughput softmax can occupy a *large fraction* of the wall‑clock time once the matrix multiply is fully pipelined.  
+FlashAttention‑2 already removed the cost of writing intermediate matrices back to global memory,
+but it still performed each block’s GEMM **before** its own softmax, leaving the two phases strictly serial.
+The result was only about 35 % Tensor Core utilisation on an H100 GPU.
+
+FlashAttention‑3 changes that picture by **overlapping** GEMMs with softmax using a two‑stage “ping‑pong” pipeline.
+Below we walk through how this works and why it translates into a measurable boost in FLOPs per second.
+
+
+
+## 1️⃣ From serial to asynchronous execution  
+
+### The classic forward loop  
+
+In the original FlashAttention design each iteration looks like this:
+
+1. Load a tile \(\mathbf{K}_j,\mathbf{V}_j\) from global memory into shared memory.
+2. Compute \(\mathbf{S}^{(j)} = \mathbf{Q}_i\mathbf{K}_j^{\top}\) (first GEMM).
+3. Perform row‑wise max/subtraction → `exp` → row sums → assemble \(\widetilde{\mathbf{P}}^{(j)} = \exp(\mathbf{S}^{(j)} - m_i)\) (softmax).
+4. Multiply \(\widetilde{\mathbf{P}}^{(j)}\) by \(\mathbf{V}_j\) (second GEMM).
+5. Accumulate into the output tile \(\mathbf{O}_i\).
+
+Steps 2–5 are **strictly ordered** because step 3 needs the result of step 2,
+and step 4 needs the result of step 3.  
+Even though steps 2 and 4 are both massive GEMMs, they cannot run concurrently,
+so half of each iteration is spent waiting for low‑throughput softmax work.
+
+
+
+### Asynchrony primitives on Hopper  
+
+Hopper introduces two hardware mechanisms that make overlapping possible:
+
+* **Tensor Memory Accelerator (TMA)** – an asynchronous DMA engine that moves data
+  between global memory (HBM) and shared memory without stalling CUDA cores.
+* **Warpgroup‑wide Matrix Multiply Accumulate (WGMMA)** – an asynchronous Tensor Core instruction that reads directly from shared memory
+  and writes its result to registers or accumulator registers.
+  
+Both units operate independently from the regular scalar pipelines,
+so a kernel can issue a TMA copy or a WGMMA instruction and continue executing other instructions.
+If we split a CTA’s warps into *producer* warps (only issuing TMA) and *consumer* warps
+(only issuing WGMMA or scalar ops), each side can run at its own pace –
+exactly what we need for a producer–consumer pipeline.
+
+
+
+## 2️⃣ The two‑stage ping‑pong pipeline
+
+The core idea is simple: **while one block’s softmax is running, start the GEMM for the next block**.
+To achieve this we keep one “current” score tile (\(\mathbf{S}_{\mathrm{cur}}\))
+and one “next” score tile (\(\mathbf{S}_{\mathrm{next}}\)) in registers across iterations.
+The execution order inside one consumer warpgroup becomes:
+
+| Iteration \(j\) | What happens now? |
+|-----------------|-------------------|
+| **Start** – assume \(\mathbf{K}_0,\mathbf{V}_0\) already loaded | Compute \(\mathbf{S}_{\mathrm{cur}} = \mathbf{Q}_i\,\mathbf{K}_0^{\!\top}\) via WGMMA (asynchronous). |
+| **Softmax** | When \(\mathbf{S}_{\mathrm{cur}}\) finishes, compute `rowmax`, `exp`, `rowsum` → produce \(\widetilde{\mathbf{P}}_{\mathrm{cur}}\). |
+| **Overlap #1** | Issue *next* GEMM \(\mathbf{S}_{\mathrm{next}} = \mathbf{Q}_i\,\mathbf{K}_{1}^{\!\top}\) **without waiting** for the current softmax to finish. |
+| **Overlap #2** | While \(\mathbf{S}_{\mathrm{next}}\) runs, multiply \(\widetilde{\mathbf{P}}_{\mathrm{cur}}\) by \(\mathbf{V}_0\) (second GEMM), again asynchronously. |
+| **Finish iteration** | After both async GEMMs complete we rescale/accumulate the partial output,
+   release shared‑memory buffers for \(\mathbf{K}_1,\mathbf{V}_0\), then advance indices:
+   - replace \(\mathbf{S}_{\mathrm{cur}} \gets \mathbf{S}_{\mathrm {next}}\),
+   - set \(j \gets j+1\), repeat until all key/value blocks are consumed. |
+
+Visually this looks like two waves passing each other—one wave carries heavy Tensor Core work,
+the other carries light scalar work—hence *ping‑pong*.  
+
+The key point is that **softmax never stalls Tensor Cores** because its data (`S_cur`) has already been produced,
+and **Tensor Cores never idle** because they always have another block (`K_{j+1}`) ready to multiply.
+All coordination is done with cheap `bar.sync` barriers that guarantee correct ordering only when necessary.
+
+
+
+### Minimal code sketch
+
+Below is a heavily simplified version of Algorithm 2 from the paper,
+showing exactly where the overlap occurs:
+
+```python
+# Assume Q_i tile already in SMEM
+load(K_0); load(V_0)
+S_cur = wgmma(Q_i, K_0.T)               # async GEMM
+wait_for(S_cur)
+softmax(S_cur) -> P_cur                  # row‑wise max/exp/rowsum
+
+for j in range(1, T_c):
+    load(K_j); load(V_{j-1})
+    S_next = wgmma(Q_i, K_j.T)           # async – start next GEMM
+    O_i   += wgmma(P_cur, V_{j-1})       # async second GEMM
+    wait_for(S_next)
+    softmax(S_next) -> P_next             # now safe: uses S_next
+    # swap variables for next loop iteration
+    S_cur = S_next; P_cur = P_next
+```
+
+All `wait_for` calls are just barrier synchronizations (`bar.sync`);
+the actual GPU hardware runs `wgmma` and scalar code concurrently.
+
+
+
+## 3️⃣ Why it works – performance numbers
+
+When running FP16 attention with head dimension 128 on an H100 GPU,
+the raw Tensor Core capacity is ≈ 989 TFLOP/s.
+FlashAttention‑2 reaches only about 570–590 TFLOP/s because every iteration spends ~50 % of cycles servicing exponentials and sums.
+After introducing the ping‑pong scheduler:
+
+* Effective utilisation rises to **≈ 620–640 TFLOP/s**, a **~10–12 % absolute jump**.
+* For longer sequences (e.g., \(N=8192\)) FP16 throughput climbs up to **740 TFLOP/s**, i.e., ~75 % of peak.
+* Overall wall‑time improves by **1.5–2×** compared with FlashAttention‑2 across sequence lengths ranging from 1k to 16k tokens.
+* Even when moving to FP8 precision—where gemm throughput doubles—the same overlapping principle yields close to **1.2 PFLOP/s**, because now Tensor Cores dominate even more strongly while softmax stays at its old rate.
+
+These results demonstrate that simply “making more Tensor Core work happen” isn’t enough;
+we must also keep those cores busy *while* other units work.
+
+
+
+## 4️⃣ Practical considerations  
+
+### Register pressure  
+The pipeline keeps both \(S_{\text​{{cur}}}\) and \(S_{\text​{{next}}}\) live across an iteration,
+plus temporary vectors for `rowmax`/`rowsum`.  
+On Hopper each SM has ≈ 256 registers per thread; excessive tiling would spill to local memory,
+undoing any performance gain. In practice FlashAttention‑3 selects block sizes (\(B_r,B_c\)) that balance register usage against shared‐memory bandwidth.
+
+
+
+### Synchronization overhead  
+Only two lightweight barriers are required per iteration:
+one after launching `S_next` and another after completing `P_cur·V_{j-1}`.
+The cost is negligible compared to tens of thousands of cycles spent inside WGMMA or `exp`,
+but forgetting these barriers would corrupt numerics because `softmax` must see a fully computed score tile.
+
+
+
+### Extending beyond two stages  
+The authors experimented with a three‑stage version where even more work overlapped,
+but register demands grew sharply (an extra `S_{next}` buffer).  
+Thus most deployments settle on the clean two‑stage ping‑pong pipeline as it gives most of the benefit with modest resource usage.
+
+
+
+## 5️⃣ Takeaways  
+
+* **Asynchrony is free** on Hopper when you use TMA + WGMMA together; you just have to structure your kernel so that producers and consumers never fight for resources.
+* By reorganizing attention’s classic “GEMM → softmax → GEMM” chain into a *two‐stage pipeline*, non‑GEMM work gets hidden under Tensor Core execution.
+* The resulting *ping‑pong scheduler* lifts effective FLOPs from ~570 TFLOP/s up toward 740 TFLOP/s in FP16—roughly double what you get from naïve flash attention on older GPUs.
+* This technique is not limited to Transformers; any workload that interleaves large matrix multiplies with cheap elementwise transforms can benefit from similar producer–consumer pipelining.
+
+FlashAttention‑3’s open­source implementation (<https://github.com/Dao-AILab/flash-attention>) already exposes this scheduler via PyTorch/HuggingFace wrappers, so you can try it out on any Hopper GPU today.
+If you’re working on long‐context language models or high‐resolution vision Transformers,
+adding this pipelined attention kernel may be one of the simplest ways to shave off measurable latency without sacrificing numerical fidelity.
+
+
+
+---  
+
+*FlashAttention‑3 shows what you can achieve when software finally catches up with hardware—by coaxing every unit on a GPU to do useful work at once.*

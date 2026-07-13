@@ -1,0 +1,169 @@
+\title{A Textbook about the Paper: "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"}
+
+Chapter 9: batch    – list[(input_ids,x_vec,w_seq,l_seq)] where all tensors live on GPU
+
+@torch.no_grad()
+def gather_logprobs(seq_ids):
+    """Compute cumulative log probability under a fixed policy."""
+    logits = model(input_ids=seq_ids,
+                   attention_mask=attention_mask,
+                   return_dict=True).__dict__['logits']            # shape [L,T]
+    probs   = torch.log_softmax(logits[..., :-1], dim=-1)      # pre-softmax ignoring cls token
+    return torch.sum(torch.gather(probs.view(-1,-1),
+                                  dim=-1,
+                                  index=seq_ids[:, :-1].reshape(-1,-1)),
+                      dim=-1)
+
+for inp_vec,wpr,lpr in batch:
+    # Forward pass through both policies once per concrete sequence.
+    LOGP_THRW     = gather_logprobs(inp_vec + wpr)     # statement structure irrelevant sample combos fetched + 
+    LOGP_THRL     = gather_logprobs(inp_vec + lpr)
+    LOGP_REF_W     = gather_logprobs(inp_vec + wpr,
+                                    ref=True)
+    LOGP_REF_L     = gather_logprobs(inp_vec + lpr,
+                                    ref=True)
+
+    diff = beta * ((LOGP_THRW   - LOGP_REF_W)
+                 -(LOGP_THRL   - LOGP_REF_L))          # == beta*(r̂_w−r̂_l)
+
+    loss += torch.nn.functional.binary_cross_entropy_with_logits(
+                diff.unsqueeze(-1),
+                label=torch.tensor([1], device=diff.device))
+```
+
+Mathematically this is exactly **Equation (\ref{chap6:eq:dpo-loss})**,
+
+\[
+\mathcal L^{(\mathrm{DPO})}
+=
+-\frac{1}{|\mathcal B|}
+\sum_{(x,y_{w},y_{l}) \in \mathcal B}
+   \log\sigma \!\Bigl(
+       \beta\, 
+       \bigl[\, 
+          \underbrace{\!\!\!\!\!\! 
+             \log \frac{\pi_\theta(y_{w}\mid x)}{\pi_{\mathrm ref}(y_{w}\mid x)}
+          }_
+          {\hat r_\theta(x,y_{w})}
+             -
+           \underbrace{\!\!
+             \log \frac{\pi_\theta(y_{l}\mid x)}{\pi_{\mathrm ref}(y_{l}\mid x)}
+           }_
+          {\hat r_\theta(x,y_{l})}
+       \bigr]
+   \Bigr)\!,
+\]
+where \(σ(z)=1/(1+e^{-z})\).  
+The network parameters θ receive gradients solely through this single BCEloss, meaning all optimization collapses down to a vanilla Adam update identical to standard supervised fine‑tuning except for the extra “difference” term carried inside the logits’ arguments.
+
+
+
+#### Why does this work?
+
+The exponentiated reward ratio \(e^{\,r/\beta} =
+  e^{\,z}=e^\Delta/\beta?\)
+cancels when substituted back into the Bradley–Terry choice probability,
+so optimizing over θ directly yields exactly the same Bayesian posterior over preferences that would have been obtained after first fitting \(r_\phi(x,y)\) then running an actor–critic algorithm over it.
+Consequently there is no separate “reward head”, no critic network,
+and no need for importance sampling or trajectory replay buffers.
+
+
+
+---
+
+### Choosing \( \pi_{\rm ref} ⊂ HΨ∼SFT ∪ MLE‐fit**
+
+A key requirement of any DPO run is access to a **reference distribution** against which rewards are expressed relative.
+Two situations occur most often:
+
+| Situation | Recommended choice | Practical steps |
+|-----------|--------------------|----------------|
+| You possess an “off–the–shelf” instruction‑tuned LM | Drop its weights verbatim into \( π_{\rm ref}\). | Load the checkpoint into your wrapper class without applying gradient updates during subsequent finetuning (`freeze=True`). |
+| No ready instruction baseline exists | Train a lightweight likelihood estimator on positive completions alone.|  
+```
+model_lrfc = copy.deepcopy(model_sft)
+optimizer_freeze = torch.optim.Adam([p for p in model_lrfc.parameters() if torch.is_floating_point(p)], lr=2e-5)
+for epoch in range(EPOCHS):
+    batches = DataLoader([((w,id,w_seq)) …], batch_size=BATCHSIZE,…)
+    ...
+```
+Equivalent closed-form solutions exist – simply maximize ∑ ln π̂(y_sup | x).
+Once trained set `model_lrfc.requires_grad_(False)`.*
+
+The tuning set may also change mid‑training if one wishes to adapt the “teacher” distribution implicitly based on ongoing rewards.
+In practice however keeping \( π_{\rm ref}\) fixed requires far fewer resources than re‑sampling thousands of prompts every epoch.
+
+
+
+### Hyper‑parameter Grid Control \( β ≈ 0 < β ≤ 10 § ⇒ Exploring KL vs Reward Trade‐Off**
+
+It is tempting after reading theoretical expositions to treat β as an exact trade‑off knob mediating cubic-divergence regularisation against reward maximisation.
+In practice ∴ we recommend sweeping small fractions first then stochastically expanding axis until tolerable KL levels appear:
+ 
+* Very small betas (<0.01): Model barely changes from prior — no improvement over SFT,
+
+* Medium betas (~0–5): Model edits are constrained enough to prevent mode collapse yet allow quality jumps —
+
+* Large betas (>10): Training becomes numerically unstable because entropy‐regularised optimum pushes ratios toward near‐degenerate distributions  
+
+A concise search pattern *(β,t)* often starts with  
+Beta list =[0.05, 0.10,  0.50, 1⋆]  
+Temperature list=[0⋆ , .25 , .5 , .75],
+where “⋆” denotes points at which perceptual improvements peak consistently across several runs.
+
+
+
+#### Relation With Loss Coefficient cβ
+
+Recall from Eq.\,\eqref{chap4:eqdppo_theory}  
+that **cβ ≈ β** multiplies every occurrence of `log[p_θ/p_ref]` inside the loss:
+\(L^{DPO}=−∑σ(cβ·Δ)\).
+Thus changing β directly rescales how aggressively winners replace losers,
+exactively controlling how far out parameters may drift from their reference values when all else held equal.
+
+
+
+### Temperature Management `t` at Inference Time
+
+Cooling temperatures downwards limits token variability therefore curbing reproducibility issues common when changing suffix following long prompts.
+During *sampling*, all models use standard softmax scaled by `t` after decoding each next token:
+
+```python
+def next_token(logits):
+     probs = torch.softmax(logits/t_fltm , dim=-1)
+     return torch.multinomial(probs , num_samples=1)
+```
+
+In contrast **the optimiser never touches `t`** – the entire objective strictly depends on precomputed cumulative probability ratios under fixed temperatures produced when assembling your preference pairs.
+
+
+
+---
+
+### GPU Memory Savings Compared Against PPO Sampling Loops
+
+One self‑contained measure differentiating DPO from reinforcement learning approaches is **workspace consumption** on GPUs.
+Below we outline roughly why PPO requires far more RAM than it does not — even though both ends aim at maximizing similar expectation objectives:
+
+| Factor | PPO‐RLHF | Direct Preference Optimization |
+|--------|----------|--------------------------------|
+| Number of decodes per minibatch | *batchsize × λ × N* many *trajectory samples* (\(\lambda≈10–20,\ N≈32–64\)) | Only *batchsize* retries along two already stored continuations                                                                                                |
+| On‑device activation cache | Every time step must hold hidden states required for next expansion (`k×h×d`) repeatedly – sliding window grows linearly w.r.t generating *prefix+trajectory*. | Each whole continuation’s logits are computed once and discarded afterwards; vectors never accumulate beyond maxima lengths (~50–100 tokens apply.) |
+| Extra critic head & value estimators | Extra paramater stack += ~10–20 % vs baseline plus additional KL terms requiring adapter rank calculations | No extra head needed – unchanged transformer stack |
+| Gradient accumulation windows | Mini-batch size limited (<8 due slip) forcing huge reassignment stampers otherwise increasing RAM usage | Fluid batch sizes allowed up-to>32 without hitting segmentation faults |
+
+Topology-wise expanding each possible action dimension is forbidden since language can easily reach thousands per token position:
+reinforcement learning needs an *artificial* inner loop generating ~16 trajectories per prompt layer itself, consuming extra tens–of–GB unless heavily batched across seedlings./░  
+
+Empirically measured consumptions confirm:
+an offline dataset containing 20K preference pairs fed into either algorithm yields <7 GB RAM entry usage under Adam baseline while PPO systematically spikes past 15 GB before process jumps abnormally whenever an episode finished early.*
+
+
+
+### Final Thoughts
+
+Following these guidelines isolates an implementation strictly bound within a controlled PyTorch/JAX environment,
+ensures reproducibility with built-in sanity checks (*score must exceed null baseline density),
+and allows your team’s computational budget rose only gradually toward higher capacity models:
+the same succinct architecture works cleanly up to six billion parameters —
+overwhelmingly out-weighing any “extra overhead” heuristic derived from game‑style RL gamblers who remembered rewards far too well.*

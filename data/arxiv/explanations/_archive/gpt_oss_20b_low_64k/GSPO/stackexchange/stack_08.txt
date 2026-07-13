@@ -1,0 +1,101 @@
+\title{Stack Exchange of the Paper: "Group Sequence Policy Optimization"}
+
+### Why is using inference engine probabilities safe for GSPO but not for GRPO or PPO?
+Question:
+"GSPO is more tolerant of precision discrepancies between training and inference engines, so we can reuse inference logits".
+Could you elaborate on what kinds of precision errors would break token‑level algorithms but leave GSPO unaffected? Are there edge cases where even GSPO would still be vulnerable?
+Answer:
+**Why token‑level importance ratios are brittle to precision mismatches, while GSPO’s sequence‑level ratios tolerate them, and when even GSPO can still fail**
+
+---
+
+### 1. What “precision discrepancy” means in practice
+
+When a policy is rolled out with a fast inference engine (e.g., VLLM, SGLang) and its likelihoods are computed later with a training engine (e.g., Megatron‑LM), two kinds of numerical differences arise:
+
+| Source | How it manifests | Effect on a *token‑level* ratio | Effect on a *sequence‑level* ratio |
+|--------|------------------|---------------------------------|-----------------------------------|
+| **Floating‑point format** (FP16 vs FP32 vs bfloat16) | Truncation / rounding of logits | The numerator = `softmax(logits_FP16)` will be slightly different from the denominator computed in FP32, even for the *same* token. The ratio fluctuates by dozens of percent in some edge cases. | The product of all token ratios is exponentiated; small per‑token differences are damped after length normalisation. |
+| **Kernels / libraries** (different GPU kernels or CPU implementations) | Slightly different numerical rounding paths, fused operations, TensorRT optimisations | Token probabilities change in a non‑uniform, hard‑to‑predict way per timestep. The resulting ratio is highly erratic. | The entire sequence probability is obtained by the same kernel (often just a logsumexp over logits). Small per‑token variations aggregate slowly and stay bounded. |
+| **Model replication / sharding** (different replica assignments or expert routing) | A token’s probability may be evaluated on a slightly different set of columns/experts | Since RL uses *old* policy token probabilities for the denominator, any rotation in which experts are active changes that denominator sharply; the numerator is untouched. This causes violent swings in the ratio when experts change activation patterns across updates. | The sequence likelihood involves the product over all tokens; the relative change caused by one expert turning on/off is proportionally reduced by `1/|y|` scaling. |
+
+In practice these discrepancies are tiny at the numerical level (< 10⁻⁵ relative error), but when embedded inside an **importance ratio that drives gradient scaling**, they can have an outsized consequence.
+
+---
+
+### 2. Why token‑level ratios break RL training
+
+Token‑level ratios appear inside GRPO as
+
+\[
+w_{i,t}(\theta)=\frac{\pi_{\theta}(y_{i,t}\mid x,y_{i,<t})}{\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,<t})}.
+\]
+
+For every \(t\) we multiply a *scalar* \(w_{i,t}(\theta)\) with \(\widehat A_i\). If one token’s ratio is off by 5 % because of precision noise, the whole gradient contribution of that token changes by 5 %. Over a long response (hundreds of tokens) these small per‑token deviations accumulate linearly in the sum within the objective:
+
+\[
+\sum_t w_{i,t}(\theta)\widehat A_i .
+\]
+
+Consequently:
+
+1. **Variance inflation** – A single outlier token can dominate the sum because its ratio deviates enough to become the largest weight.
+2. **Clipping instability** – GSPO’s clipping range for \(s_i\) is on the order of \(10^{-4}\). Token ratios can fluctuate far outside this window simply because a logit was rounded differently, causing many tokens to be clipped unevenly across different runs.
+3. **Exponentiation effect in MoE** – When expert activation changes between \(\pi_{\theta}\) and \(\pi_{\theta_{\text{old}}}\), any token whose probability is evaluated under a different set of experts will have its denominator drastically altered, producing huge spikes or near zeros in \(w_{i,t}\).
+
+Because GRPO optimises under an off‑policy setting, it relies on *all* of these weighted tokens to estimate an expectation under \(\pi_\theta\). If a single ratio becomes unreliable due to precision noise, that expectation is biased—leading to gradients that push the policy in the wrong direction and ultimately causing *catastrophic collapse*.
+
+---
+
+### 3. Why GSPO is tolerant
+
+GSPO replaces every per‑token weight with a single **sequence–level weight**
+
+\[
+s_i(\theta)=\left(\frac{\pi_\theta(y_i \mid x)}{\pi_{\theta_{\text{old}}}(y_i \mid x)}\right)^{1/|y_i|}
+=\exp\!\Bigl(\frac1{|y_i|}\sum_{t=1}^{|y_i|}
+      \log \frac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}
+                {\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,<t})}
+           \Bigr).
+\]
+
+All tokens contribute equally to the same scalar;  comparatively small errors at any individual timestep are *averaged away*. Length normalisation further suppresses magnitude differences across responses of different lengths.
+
+Concretely:
+
+- A 5 % error on one logit contributes only \((1/|y|-5\,%)\) to \(s_i(\theta)\). For typical lengths (\(|y|\approx200\)), this translates to less than \(0.3\,%\).
+- Across all 200+ tokens, random rounding noise tends to cancel out; systematic bias becomes visible only if every token has been rounded way off in the same direction—a much less likely event.
+- Even if expert routing changes for one particular token, its effect on \(s_i(\theta)\) is diluted by all other tokens that stay stable.
+
+Thus GSPO’s objective remains well‐behaved even when inference and training engines disagree at FP16 levels or use slightly different kernels.
+
+---
+
+### 4. Edge cases where GSPO can still fail
+
+While GSPO handles ordinary numeric noise gracefully, there exist situations where it can become vulnerable:
+
+1. **Systematic bias across many tokens**  
+   If inference engine systematically inflates or deflates logits for a whole response—e.g., due to quantisation or batching artefacts—then every term inside `log()` shifts similarly. The cumulative shift has an exponential effect on \(s_i(\theta)\), potentially pushing it far outside its clipping window.
+
+2. **Very long responses**  
+   Although length normalisation reduces variance linearly with length, extremely long generations (thousands of tokens) may reduce sensitivity too much: tiny systematic errors compound into noticeable distortion after exponentiation.
+
+3. **Sparse expert activation swings**  
+   While GSPO does not rely on per–token expert alignment, if *both* numerator and denominator experience large swings because many experts toggle for different early tokens but not for later ones, cancellations may not occur exactly at `log` level—leading to variance that scales as `sqrt(n)` rather than `n`.
+
+4. **Inference engine using deterministic sampling strategies**  
+   If an inference engine deterministically samples from top‑k or nucleus search with hard cutoffs while training uses full softmax sampling, the exact likelihood under $\pi_{\text{old}}$ will differ significantly from what was actually sampled (non–probabilistic path). GSPO assumes that $\pi_{\text{old}}$ correctly models how data were generated; violating this assumption introduces bias no amount of numerical tolerance can fix.
+
+In practice these edge cases are rare once you use consistent decoding modes (e.g., both engines use temperature=1 softmax), keep model precision stable (FP32 vs FP16), and avoid aggressive quantisation during RL rollouts.
+
+---
+
+### 5. Bottom line
+
+- **Token‐level importance ratios** amplify any precision mismatch between old & new policy evaluations because each token contributes independently; small numeric errors become large gradient perturbations.
+- **Sequence‐level ratios**, by aggregating over entire responses and applying length normalisation, average out such discrepancies so deeply entrenched per‑token noises become almost invisible.
+- When using inference engines that differ only marginally from training engines—typical in practice—GSPO safely reuses inference logits for RL without recomputation.
+- Only systematic or very large discrepancies across many tokens can still destabilise GSPO; these stem from decoder configuration mismatches rather than simple floating‑point errors.
+
+Thus GSPO’s design makes it intrinsically resilient to common precision artefacts while retaining full reward fidelity at the sequence level—a key reason why it delivers stable Mixture–of–Experts RL without extra infrastructure such as Routing Replay.*

@@ -1,0 +1,119 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# FP8 vs FP16: Low‑Precision Magic in Transformer Attention
+
+Transformers have become the de‑facto workhorse for natural language, vision and multimodal AI. The transformer’s attention layer, however, remains the main computational bottleneck—especially when we ask models to read documents that are several tens of thousands of tokens long. One of the most promising ways to speed this up without hurting model quality is **low‑precision arithmetic**. In this post we’ll dig into why lower precision matters, the specific hurdles that arise with *FP8* on NVIDIA’s Hopper GPUs, and how **FlashAttention‑3** overcomes them with *block quantization* and *incoherent processing*. We’ll also touch on the subtleties of tensor layout (k‑major vs mn‑major) and why doing an **in‑kernel transpose** is a key trick.
+
+---
+
+## Why Low‑Precision Matters for Attention
+
+| Precision | Throughput (H100) | Memory Footprint | Typical Use |
+|-----------|-------------------|------------------|-------------|
+| FP16      | 1× baseline       | 50 % of FP32     | Standard Y |
+| BF16      | 1× baseline       | 50 % of FP32     | NVIDIA 2020+ |
+| **FP8**   | **≈2× baseline**  | **25 % of FP32** | Emerging in Hopper |
+
+The Hopper H100 GPU ships a dedicated “Tensor Core” that can multiply two FP8 numbers and accumulate in FP32 with roughly twice the throughput of an FP16 Tensor Core. That means you can pump twice as many FLOPs through a single SM while all you need to do is keep your data in 8 bits instead of 16. For an attention layer that already does ~\(4\,N^2\,d\) FLOPs, the savings are huge: more tokens per second and lower power consumption.
+
+But there’s a catch: when you dip down from 16 bits to 8 bits you lose:
+
+* **Dynamic range** – The exponent field shrinks from four bits (BF16) to just one byte (FP8.e4m3), so large values get clipped or overflow.
+* **Accuracy** – The mantissa is only three bits, so small numbers get rounded.
+* **Layout constraints** – FP8 must be laid out *k‑major* for the GPU Tensor Cores (GPUs require the inner dimension to be contiguous), while most libraries assume *mn‑major*.
+
+If you throw an out-of-the-box FP8 implementation at transformer attention, you’ll see outliers explode and performance degrade dramatically.
+
+---
+
+## The Layout Problem
+
+### mn‑Major vs k‑Major
+
+Consider a matrix \(A \in \mathbb{R}^{M \times K}\). Two common memory layouts are:
+
+| Layout | Contiguity |
+|--------|------------|
+| **mn‑Major** | Items are contiguous along \(M\) (the outer dimension). |
+| **k‑Major**  | Items are contiguous along \(K\) (the inner dimension). |
+
+On Hopper, a WGMMA instruction (“warp‑wide matrix multiply”) accepts both layouts for *FP16*, but for *FP8* it requires *k‑major* operands only. That’s why a naïve transpose will break your kernel.
+
+In transformer attention we usually have:
+```
+Q : [B_r x d]   - query block
+K : [B_c x d]   - key block
+V : [B_c x d]   - value block
+```
+with `d` typically equal to the head dimension.
+
+`Q` and `K` can stay mn‑major because your multiply is \(\mathbf{Q}_i \mathbf{K}_j^\top\). But `V`, which participates in \(\widetilde{\mathbf{P}}_i^{(j)} \mathbf{V}_j\), must be k‑major so that its rows become contiguous when viewed by the Tensor Core. 
+
+### In‑Kernel Transpose: The Quick Fix
+
+Instead of paying a separate one–time cost to transpose all values in global memory (`GMEM`), FlashAttention‑3 does an *in‑kernel transpose*:
+
+1. Load a tile of `V` from GMEM into shared memory (`SMEM`) using `TMA` (tensor memory accelerator).  
+2. Use PTX’s `ldmatrix` / `stmatrix` instructions to copy that tile LDSM/StSM—each handles an 8×8 submatrix packed into registers at 128 bytes per warp thread block.  
+3. While transferring the next tile of `V`, compute a GEMM on the previous tile’s values.  
+
+Because LDSM/StSM operate at register granularity, no extra shuffles or bank conflicts occur; you simply reorder rows and columns on the fly. This keeps `V` k‑major exactly where it needs to be for the subsequent GPU Tensor Core call.
+
+---
+
+## Block Quantization: Less Error Per Block
+
+With per‑tensor scaling (one scalar per entire Q/K/V tensor), outlier values—those that appear rarely but are very large—dominate quantization error. FlashAttention‑3 instead scales by **block**:
+
+```text
+For each block B_r x d (or B_c x d):
+    compute mean μ_B and max σ_B
+    store scalar s_B = scale(B)
+    quantize block with s_B
+```
+
+Because transformer attention naturally processes submatrices (blocks) as it streams data from global memory, adding this local scale doesn’t add overhead: you already have padded copies sitting in SMEM, so multiplying by a scalar or dividing by it is trivial.
+
+Moreover, when these per–block scalars are applied during softmax computation (`exp(S - m)`), they automatically account for any scaling differences introduced by quantizing each block independently.
+
+---
+
+## Incoherent Processing: Injecting Randomness
+
+Even with block quantization, some blocks still contain large values that oversaturate the limited mantissa bits of FP8.e4m3. A clever workaround is to **mix up the data before quantizing**:
+
+1. Pick a random orthogonal matrix \(M\).  
+2. Multiply both Q and K by M: \(Q' = Q M,\; K' = K M\).  
+3. Perform attention on Q', K' – nothing changes mathematically because \(M M^\top = I\):
+\[
+(Q M)(K M)^\top = Q M M^\top K^\top = Q K^\top.
+\]
+4. Quantize Q' and K' using Block Quantization (now each element is an random mix of many original entries).
+
+Why does this help? Think of each entry as being replaced by a weighted sum of nearby entries; outliers are “spread” over many elements, shrinking their impact per element after quantization. When you unmix at inference time no extra cost is needed because multiplying by an orthogonal matrix is lossless.
+
+In practice, FlashAttention‑3 uses an orthogonal matrix made from random diagonals ±1 multiplied by a Hadamard transform – fast (\(O(d \log d)\)) and easy to fuse with existing processing like rotary embeddings.
+
+---
+
+## Putting It All Together: FlashAttention‑3
+
+- **Asynchronous Producer–Consumer Pipelines** – Warps split into “loader” warps that fetch tiles using TMA while others compute GEMMs using WGMMA asynchronously.
+- **Ping–Pong Softmax Overlap** – One warp group computes one softmax while another concurrently performs its next GEMM; they interleave via synchronization barriers.
+- **FP8 Efficient KGMMAs** – Smart register permutations bridge mismatched accumulator layouts between successive FP8 WGMMAs.
+- **Block Quantization + Incoherent Processing** – Keeps numerical error low (~2.6× better than naïve per- tensor FP8), even for outlier data.
+
+The result? On an H100 SXM5 GPU FlashAttention‑3 reaches up to 740 TFLOPs/s at FP16 and nearly \(1\times10^{15}\) FLOPs/s at fp8—good enough for modern large language model inference pipelines reaching beyond 10k token contexts with minimal quality loss.
+
+---
+
+## Takeaway Messages
+
+1. **Lower precision gives huge throughput upsides**, but you must satisfy hardware layout constraints (k-major for FP8).
+2. Performing **in-kernel transposes** with LDSM/STSM instructions lets you keep the good layout without an extra pass over data.
+3. To avoid explosive errors from outliers:
+   * Quantize per block instead of per whole tensor.
+   * Add random orthogonal mixing before quantizing—this spreads statistical mass across many elements without changing final attention output.
+4. Python developers may just need to call the open-source library now available under Apache 2 license on GitHub; real-world speedups climb nearly twofold over FlashAttention‑2 for typical long-context workloads.
+
+Low-precision arithmetic isn’t just about squeezing more FLOPs onto an SM — with clever engineering tricks it can also provide higher quality results than naive hand-tuned kernels. As GPUs evolve toward more exotic formats like FP4 or BFLOAT4/6, following these design patterns will help future builders stay ahead in efficient transformer deployment.\n

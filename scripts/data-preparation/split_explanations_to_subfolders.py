@@ -38,20 +38,38 @@ def load_outline_titles(explanations_dir, outline_filename, key, title_key):
         outline_data = json.load(f)
     if isinstance(outline_data, dict):
         outline_data = outline_data.get(key, [])
-    return [item.get(title_key) for item in outline_data if item.get(title_key)]
+    # Some generated outlines contain stray non-dict items (generation artifacts);
+    # only dict entries can carry a usable title.
+    return [
+        item.get(title_key)
+        for item in outline_data
+        if isinstance(item, dict) and item.get(title_key)
+    ]
 
 
-def split_by_outline_titles(content, titles):
+def split_by_outline_titles(content, titles, min_prefix_chars=200):
     boundaries = []
     for title in titles:
         pattern = r'\n(?:#{1,6}\s+)?' + title_pattern(title) + r'\s*\n'
         match = re.search(pattern, content, flags=re.IGNORECASE)
         if match:
             boundaries.append(match.start() + 1)
+    boundaries.sort()
     chunks = []
     for i, start in enumerate(boundaries):
         end = boundaries[i + 1] if i + 1 < len(boundaries) else len(content)
         chunks.append(content[start:end].strip())
+    # If the first outline title never matched (e.g. the generator wrote its own
+    # headings), the content before the first matched boundary would be silently
+    # dropped. Recover it as a leading chunk when it is substantial.
+    if boundaries:
+        prefix = content[:boundaries[0]]
+        prefix_lines = prefix.split("\n")
+        if prefix_lines and (prefix_lines[0].startswith("\\title{") or prefix_lines[0].startswith("Title:")):
+            prefix = "\n".join(prefix_lines[1:])
+        prefix = prefix.strip()
+        if len(prefix) >= min_prefix_chars:
+            chunks.insert(0, prefix)
     return chunks
 
 
@@ -77,11 +95,13 @@ def split_textbook(explanations_dir):
     if not chapter_titles:
         chapter_titles = load_outline_titles(explanations_dir, "textbook_outline.json", "sections", "section_title")
 
-    if chapter_titles:
-        chapter_contents = split_by_outline_titles(content, chapter_titles)
-    else:
-        print(f"  No outline found, skipping textbook split")
-        return
+    chapter_contents = split_by_outline_titles(content, chapter_titles) if chapter_titles else []
+    if not chapter_contents:
+        # Fallback for corpora whose generator wrote its own chapter headings
+        # (outline titles absent from the text): split on markdown h1 headers,
+        # mirroring the blogs fallback.
+        h1_parts = re.split(r'\n(?=# )', content)
+        chapter_contents = [p.strip() for p in h1_parts if p.strip().startswith("# ")]
 
     if not chapter_contents:
         print(f"  Could not find chapter boundaries, skipping")
@@ -93,6 +113,9 @@ def split_textbook(explanations_dir):
     os.makedirs(out_dir, exist_ok=True)
     for i, ch in enumerate(chapter_contents):
         ch = ch.strip()
+        # Some corpora (e.g. glm) format chapter titles as markdown headings;
+        # drop the leading hashes so files read "Chapter N: Title" like the rest.
+        ch = re.sub(r"^#{1,6}\s+", "", ch)
         if title_line:
             chapter_text = f"{title_line}\n\nChapter {i+1}: {ch}"
         else:
@@ -161,13 +184,20 @@ def split_stackexchange(explanations_dir):
     lines = content.split("\n")
     title_line = lines[0] if (lines[0].startswith("\\title{") or lines[0].startswith("Title:")) else ""
 
-    # Q&A blocks start with "### Question Title"
+    # Q&A blocks start with "### Question Title". Some corpora (e.g. gpt_oss) also
+    # use "### " for section headers inside answers; a real Q&A block is identified
+    # by containing a top-level "Question:" line, and header-only blocks are folded
+    # back into the preceding Q&A.
     parts = re.split(r'\n(?=### )', content)
     qas = []
     for part in parts:
         part = part.strip()
-        if part.startswith("### "):
+        if not part.startswith("### "):
+            continue
+        if re.search(r'(?m)^Question:', part) or not qas:
             qas.append(part)
+        else:
+            qas[-1] = qas[-1] + "\n\n" + part
 
     if not qas:
         print(f"  No Q&A blocks found in stackexchange.txt, skipping")

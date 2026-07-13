@@ -1,0 +1,115 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### What is incoherent processing and why does multiplying Q and K by a random orthogonal matrix not affect attention?
+Question:
+The authors introduce "incoherent processing" where Q and K are multiplied by a random orthogonal matrix M before FP8 quantization. They claim $(Q M)(K M)^\top = Q K^\top$ because $M M^\top = I$. I am confused about:
+1) How is M generated efficiently (product of diagonal \(\pm1\) and Hadamard matrices)?
+2) Does this multiplication happen on‑the‑fly during TMA load or as a separate kernel?
+3) Does applying M change the statistical distribution of Q and K in a way that reduces FP8 quantization error? Please explain both mathematically and practically.
+Answer:
+**Incoherent processing** is the trick that the authors use to make FP‑8 quantisation of the \(Q\) and \(K\) matrices less harmful.  
+The idea is simply to premultiply both matrices by the same random orthogonal matrix  
+
+$$
+M\in\mathbb{R}^{d\times d},\qquad M M^{\top}=I .
+$$
+
+Because the attention score matrix is a *bilinear* form,
+$$
+S = QK^{\top} \;\;\Longrightarrow\;\; (QM)(KM)^{\top}=QM\,M^{\top}K^{\top}=QK^{\top}=S,
+$$
+the scores – and therefore the final output – are unchanged.  What changes, however, is the *distribution* of the entries of \(Q\) and \(K\) before they are quantised to FP‑8.
+
+---
+
+### 1.  How is \(M\) generated efficiently?
+
+The paper follows the construction used in QUIP [Chee et al., 2024] and Tseng et al. (2024).  
+An orthogonal matrix can be built as  
+
+$$
+M = D_1 H D_2 H \cdots D_{\ell} H ,
+$$
+
+where each \(D_i\) is a diagonal matrix whose diagonal entries are independent Rademacher variables
+(\(\pm 1\) with equal probability) and \(H\) is the (unnormalised) Hadamard matrix of size \(d\times d\).  
+
+* **Hadamard transform**: Multiplication by \(H\) can be performed in‑place with the fast Walsh‑Hadamard transform (FWHT), which costs \(O(d\log d)\) arithmetic operations instead of the naïve \(O(d^{2})\).  The FWHT is just a sequence of butterfly additions/subtractions and fits naturally on GPU warps – each warp can process a block of the vector with only shared‑memory shuffles.
+
+* **Diagonal signs**: Applying a diagonal \(D_i\) amounts to flipping the sign of selected elements, which is a single XOR with a bit‑mask per thread; this costs virtually nothing.
+
+Because we need only a *few* such factors (the authors use \(\ell=2\) or 3 in practice), constructing \(M\) on‑the‑fly is cheap: for each block of \(Q\) or \(K\) we run the FWHT, interleaved with sign flips.  No explicit dense matrix ever materialises, so memory bandwidth is untouched.
+
+---
+
+### 2.  When is the multiplication applied – on‑the‑fly or as a separate kernel?
+
+In FlashAttention‑3 the whole attention kernel already works block‑wise: a CTA loads a tile of \(Q\), then iterates over tiles of \(K,V\).  
+The authors embed the incoherent processing *inside* that same kernel:
+
+1. **Load** a tile of \(Q\) (or \(K\)) from global memory into shared memory via TMA.
+2. **Immediately** apply the sequence “sign flip → Hadamard → sign flip → …” while the data sit in registers/shared memory.  
+   Because the operations are element‑wise (sign flips) and involve only butterfly adds/subtracts (Hadamard), they can be fused with the existing arithmetic instructions that already occupy the warp.
+3. **Quantise** the transformed tile to FP‑8 and feed it to the FP‑8 WGMMA GEMM.
+
+Thus there is **no extra launch**; the extra work occupies only a few extra GPU cycles per element and does not require an additional memory round‑trip.  In practice it is implemented as a small inline routine that runs on each warp before issuing the GEMM instruction.
+
+---
+
+### 3.  Why does multiplying by \(M\) reduce quantisation error?
+
+#### Intuition  
+
+Quantising to FP‑8 uses a shared scaling factor (per tensor or per block).  If an input tensor contains *outliers* – entries that are many standard deviations larger than typical values – a single scale will have to be chosen large enough to accommodate those outliers. Consequently most “regular” entries fall into a much coarser region of the FP‑8 mantissa and suffer larger rounding error.
+
+Multiplying by a random orthogonal matrix spreads each outlier over all coordinates of the transformed vector:
+
+*Each entry of \(QM\) (or \(KM\)) is a signed sum of many original entries.*  
+If one original component was an outlier, its contribution gets diluted by adding with many non‑outlier components whose signs are random. By the Central Limit Theorem, after a few Hadamard layers each coordinate looks roughly Gaussian with variance equal to the average variance of all original coordinates, regardless of whether one entry was huge.
+
+Hence:
+
+* The *dynamic range* of each transformed tile shrinks dramatically.
+* The per‑block scaling factor can be set much closer to the typical magnitude, giving finer mantissa resolution for most values.
+* Rounding error after FP‑8 quantisation becomes smaller overall, especially for those entries that would otherwise be far from the scale.
+
+#### Formal view  
+
+Let \(\mathbf{x}\in \mathbb{R}^{d}\) be one row of \(Q\). After applying
+\(M = DH_1DH_2D \dots DH_{\ell}\),
+
+$$
+y = \mathbf{x}M = \mathbf{x}DH_1DH_2\dots H_{\ell} .
+$$
+
+Because each Hadamard matrix satisfies \(H^{2}=d I\), after normalising by \(\frac{1}{\sqrt{d}}\) each application mixes all components uniformly. The variance of any component of \(y\) becomes
+
+$$
+{\rm Var}(y_j)= \frac{1}{d}\sum_{i=1}^{d}{\rm Var}(x_i),
+$$
+
+independent of any particularly large \({\rm Var}(x_{i^\star})\). Consequently,
+the maximum absolute value in a block satisfies
+
+$$
+ \max_j |y_j| \;\leqslant \; O(\sqrt{\log d})\, \sigma_{\rm block},
+$$
+
+where \(\sigma_{\rm block}\) is the typical standard deviation inside that block, while before transformation an isolated outlier could be arbitrarily larger.  
+Since FP‑8 quantisation chooses a scale proportional to \(\max|\,.\,|\), this bound directly translates into a smaller scale and therefore lower quantisation error.
+
+#### Practical effect  
+
+Empirically (Section 5.3 of the paper), applying block quantisation *alone* reduces RMSE modestly, but once incoherent processing is added together with block quantisation, RMSE drops by **2.6×** compared with naïve per‑tensor FP‑8 quantisation.  This demonstrates that merely redistributing magnitude does not hurt accuracy: because
+
+*the product* \((QM)(KM)^{\top}\) equals \(QK^{\top}\), all downstream computations (softmax, weighted sum with V) see exactly the same scores as in the unmodified model.
+
+---
+
+### Summary
+
+* **Generation:** \(M=D_1HD_2H\dots D_{\ell}H\); both diagonal sign flips and Hadamard transforms are cheap (\(O(d\log d)\)) and implemented with warp‑level shuffles.
+* **Placement:** The transformation is fused into the same attention kernel that already loads each tile; no extra kernel launch or memory movement is required.
+* **Benefit:** By randomising and mixing coordinates, outlier magnitudes are diluted across all dimensions, allowing tighter per‑block scaling for FP‑8 and therefore substantially lower quantisation error while leaving attention scores mathematically unchanged.
+
+This combination—cheap orthogonal mixing plus blockwise scaling—is what the authors call **incoherent processing**, and it underlies their claim that FP‑8 FlashAttention‑3 attains “2.6× lower numerical error than a baseline FP8 attention”.

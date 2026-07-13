@@ -1,0 +1,140 @@
+\title{Blogs about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+# Double‑Quantisation And Paged Optimisers: How QLoRA Keeps GPU Memory in Check
+
+Fine‑tuning a 65 B‑parameter language model on a single 48 GB GPU would normally be impossible: standard 16‑bit training needs more than 780 GB of VRAM.  
+**QLoRA** turns this into a realistic workflow by squeezing the model into four bits *and* keeping the training backbone stable.  Three orthogonal tricks make this possible:
+
+1. **Double‑Quantisation** – compresses the per‑block scaling constants.
+2. **4‑bit NormalFloat (NF4)** – an optimal binning scheme for normally distributed weights.
+3. **Paged Optimisers** – uses NVIDIA Unified Memory to swap optimizer states to host RAM on demand.
+
+This article explains *how* each trick works, why it matters, and gives a ready‑to‑use checklist for your own fine‑tuning jobs.
+
+---
+
+## 1. The Block‑wise Quantisation “Constant” Problem
+
+When quantising a tensor block \( \mathbf{X} \in \mathbb{R}^{B}\) into \(k\) bits, we normally store one *scale* \(c\) per block:
+
+\[
+\mathbf{X}^{(k)} = \text{round}\!\left( c\,\mathbf{X} \right), \qquad
+c = \frac{2^{k-1}-1}{\max |\,\mathbf{X}\,|}.
+\]
+
+For a 4‑bit weight matrix the block size is typically \(B=64\).  
+The scale itself is stored in FP32, which means **\(32/64 = 0.5\) additional bits per parameter** purely for bookkeeping—a non‑negligible cost when you have billions of weights.
+
+### Why it hurts
+
+- The extra 0.5 bits raise the average footprint from ~4 bits → ~4.5 bits/weight.
+- For a 65 B model this becomes an extra **≈3 GB** of memory that has to fit in VRAM or be streamed.
+
+---
+
+## 2. Double Quantisation – Compressing the Scales
+
+**Idea:** Treat the block scales \(c_{2}^{\mathrm{FP32}}\) as data and quantise them again.
+
+1. **First level** – We keep the low‑bit weight matrix stored as NF4 (four‑bit).
+2. **Second level** – Each block’s FP32 scale is re‑quantised into FP8 (`c₂`), then another small-scale `c₁` items are stored in FP32 only for the *easiest* way to reconstruct `c₂`.
+
+Mathematically:
+\[
+W_{\text{deq}} = 
+    \underbrace{
+      \text{dequant}_{BF16}
+      \Big(
+        c_{1}^{FP32},
+        c_{2}^{k{-}bit},
+        W^{NF4}
+      \Big)
+    }_{\text{reconstruct value}}
+\]
+where `doubleDequant` chains two dequant steps.
+
+**Result:**  
+For block size \(B=64\) the memory per weight drops from
+
+\[
+0.5=\frac{32}{64}\;\text{bits}
+\]
+to
+
+\[
+0.127=\frac{8}{64}+\frac{32}{64\times256}\;\text{bits},
+\]
+a reduction of **≈0.37 bits/parameter** – roughly 3 GB saved on a 65 B model.
+
+The authors verify experimentally that *this extra compression does not hurt accuracy* on downstream benchmarks such as MMLU.
+
+---
+
+## 3. NormalFloat (NF4) – Optimal Binning for Weight Distributions
+
+Most pretrained LLM weights are approximately zero‑centered Gaussians with standard deviation \(\sigma\). NF4 exploits this property:
+
+1. Compute quantiles of a standard normal distribution \(N(0,1)\):
+   \[
+   q_i = \frac12\!\left(
+     Q_{N(0,1)}\!\!\left(\frac{i}{2^k+1}\right)
+     +Q_{N(0,1)}\!\!\left(\frac{i+1}{2^k+1}\right)
+   \right).
+   \]
+2. Scale all weights so that their variance matches the target range \([-1,\,1]\).  
+   This rescaling aligns *exactly* with the theoretical quantile boundaries.
+3. Quantise with an **asymmetric** scheme that guarantees an *exact zero* code (important for padding).
+
+Compared to plain INT4 or FP4 bins, NF4 places equal probability mass into each bin—an information‐theoretically optimal assignment for normal data—yielding **a few percentage points lower perplexity and higher instruction‐following scores**, as shown in Table 3 of the paper.
+
+---
+
+## 4. Paged Optimisers – Taming Activation Spikes
+
+Even with small weight precision, training large models still requires gradients over huge activation tensors (the “spikes” that appear during backprop with long prompts). Standard optimizer states can explode those spikes into an OOM hit.
+
+QLoRA leverages NVIDIA's Unified Memory:
+
+- Allocate optimizer buffers (Adam moments, etc.) on unified memory.
+- If VRAM fills up during training, GPU automatically streams that part out to host RAM and brings it back when needed.
+
+Because gradients are the dominant cost (they must be recomputed via checkpointing), moving only the optimizer state off‐device means minimal runtime penalty but constant memory caps—verified in Section 6 where paged optimisers allow training up to 65 B on a single RTX 8000 (48 GB).
+
+---
+
+## 5. Concrete Checklist for Your Own Finetune Jobs
+
+| Step | What you need | Why? | Reference |
+|------|---------------|------|-----------|
+| 1 | Choose NF4 for weights | Optimal for normal-distributed LLM kernels | Sec 3 |
+| 2 | Set block size \(B=64\) and use Double Quantisation | Saves ~0.37 bits/param; scales well with large models | Sec 3 |
+| 3 | Use FP8 (`c₂`) and small `c₁` FP32 scales | Keeps re‑quantisation overhead trivial | Sec 3 |
+| 4 | Enable **Paged Optimiser** in your training engine | Avoids OOM spikes from optimizer states | Sec 3 |
+| 5 | Ensure your framework stores tensor blocks contiguously (e.g., bit packing libraries in `bitsandbytes`) | Needed for efficient dequant‐backpropagation | Repo: `https://github.com/TimDettmers/bitsandbytes` |
+| 6 | Run a short sanity finetune on a small dataset (e.g., Alpaca) to check loss curves vs vanilla LoRA | Detect any implementation bugs early | Appendix A |
+
+#### Quick sanity check example
+
+```python
+import torch
+from bitsandbytes.optim import PagedAdamW
+from qlora import NF4Quantizer # pseudo import shown in repo docs
+
+model = load_llama('llama_65b')
+model.quantize(NF4Quantizer(block_size=64))
+
+optimizer = PagedAdamW(params=model.lora_params(), lr=3e-5)
+```
+
+If your launch script prints “OOM while allocating optimizer state” even with batch size `1`, you likely didn't enable paged memory correctly.
+
+---
+
+## 6. Takeaway: Cutting Costs Without Cutting Quality
+
+- **Memory:** QLoRA’s trio reduces peak VRAM from >780 GB → <48 GB for a 65 B model.
+- **Speed:** Training stays near full precision speed; paged optimisers add <10 % overhead.
+- **Quality:** On Vicuna-style benchmarks Guanaco (QLoRA fine‑tuned on OASST1) achieves >99 % relative performance to ChatGPT while requiring only ~12–24 h on a single consumer GPU.
+- **Reproducibility:** All components—including double quantization kernels—are open source (`bitsandbytes`, HuggingFace integration).
+
+So next time you’re stuck wanting to finetune a massive model but only have a single RTX 3090 / RTX 4090, remember: pack those scales twice, pick NF4 wisely, and let NVIDIA’s unified memory do its paging dance. You’ll get state‑of‐the-art instruction finetuning with half the VRAM usage—and no performance loss!

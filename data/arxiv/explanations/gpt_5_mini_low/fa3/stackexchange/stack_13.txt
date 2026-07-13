@@ -1,0 +1,74 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### What determines the choice of block sizes B_r and B_c under register and SMEM constraints?
+Question:
+Choosing B_r (rows of Q per CTA) and B_c (K,V tiles) affects register pressure (e.g., storing S_next of size B_r x B_c) and SMEM usage (circular buffers of size s). How do you practically pick B_r and B_c on H100 to balance: (a) WGMMA tile efficiency, (b) space for multiple stages s in SMEM, (c) register headroom for the 2-stage pipeline without spills, and (d) occupancy? Any recommended heuristics or rules of thumb for head dimensions d in {64, 128, 256}?
+Answer:
+Short answer: there is no single “magic” $B_r$, $B_c$ — pick tiles so that the WGMMA/TMA-friendly tile shapes are respected, the per-CTA SMEM used by the s-stage circular buffer fits the SMEM allowance, and the per-CTA register footprint (including the extra $S_{\text{next}}$ buffer for the 2‑stage pipeline) fits without spilling while leaving enough registers to retain useful occupancy. Do this by writing the resource constraints as simple capacity inequalities and using them to pick $B_r$ and $B_c$; then verify with a quick compile/run to confirm no spills and reasonable SM occupancy. Below I give the intuition, the concrete capacity formulas you should use, and practical heuristics for head sizes $d \in \{64,128,256\}$.
+
+Intuition and trade-offs
+The four constraints in your question interact in obvious ways:
+
+- WGMMA tile efficiency wants $B_r$ and $B_c$ aligned to the Warp/warpgroup tile shapes the Tensor Cores prefer (multiples of the thread/TMA/WGMMA sub-tile shapes, typically powers-of-two or multiples of 8/16/32 depending on the WGMMA primitive). Choosing incompatible tile shapes wastes Tensor Core utilization.
+- SMEM (circular buffer of $s$ stages) requires $s$ copies (or staged storage) of the $K/V$ tiles (and some $Q$ scratch). Larger $B_c$ or larger $s$ increases SMEM per CTA and can force fewer concurrent CTAs per SM (lower occupancy).
+- Registers: the 2-stage pipeline requires holding an extra score tile $S_{\text{next}}$ (size $B_r \times B_c$ in FP32/FP16) in registers (or at least partial rows/columns), plus the usual per-thread accumulators and $P/V$ fragments. Larger $B_r$ and $B_c$ therefore increase register pressure and cause spills if you exceed per-thread or per-warp register budget.
+- Occupancy: occupancy is set by the least plentiful resource (SMEM, registers, or threadblock count). Lower occupancy hurts the ability to cover latency, but on Hopper some of the latency hiding is handled by asynchrony; still, you want some headroom.
+
+Formulas to guide choices (use these to test candidates)
+Write down the two resource inequalities and one WGMMA constraint you must satisfy.
+
+1) SMEM constraint (per-CTA):
+Let $\text{bytes}(x)$ be the storage in bytes for matrix of shape $x$ in the kernel’s working precision ($Q/K/V$ usually FP16/FP8; softmax accumulators often FP32). A safe upper bound for SMEM per CTA is:
+SMEM_per_CTA ≈ $s \cdot (\text{bytes}(B_c \times d \text{ for } K) + \text{bytes}(B_c \times d \text{ for } V)) + \text{bytes}(B_r \times d \text{ for } Q \text{ buffer}) + \text{small overhead}$
+So
+$s \cdot 2 \cdot B_c \cdot d \cdot \text{sizeof(elem)} + B_r \cdot d \cdot \text{sizeof(elem)} + \text{overhead} \le \text{SMEM\_available\_per\_CTA}$
+You must ensure this fits the SMEM you intend to reserve per CTA (and also consider the SMEM per-SM divided by CTA count if you want multiple CTAs per SM).
+
+2) Register constraint (per-CTA / per-thread):
+The register impact from the 2-stage pipeline is dominated by storing $S_{\text{next}}$. If you store the entire $S_{\text{next}}$ in registers per CTA (often partitioned across threads), the byte cost is:
+$\text{Regs\_bytes\_for\_Snext} \approx B_r \cdot B_c \cdot \text{sizeof(accum)}$  (accum usually FP32)
+Convert to registers by dividing by sizeof(register value, e.g., 4 bytes for 32-bit). Also add registers needed for accumulators, loaded tile fragments, and local control. The general constraint is:
+$\text{Total\_regs\_per\_thread} \le \text{target\_regs\_per\_thread}$ (so the compiler will not spill)
+or, equivalently,
+$\text{Total\_regs\_per\_CTA} \le \text{num\_threads\_per\_CTA} \cdot \text{target\_regs\_per\_thread}$
+On Hopper you can tune setmaxnreg to reallocate between warpgroups; still aim to keep per-thread registers under the compiler’s spilling threshold (experimentally check; spilling shows up in SASS/ptx or profiling).
+
+3) WGMMA / layout constraint:
+Choose $B_c$ (and $B_r$) that match WGMMA operand layout expectations: for FP8 WGMMA the K/V operand must be k-major; for FP16 WGMMA more layouts are allowed. Also choose block dimensions that are multiples of the WGMMA micro-tile (commonly multiples of 8/16/32). Using these multiples avoids extra permutations or padding.
+
+Practical recipe (step-by-step)
+1. Start from WGMMA-friendly block granularity. Pick $B_c \in \{64, 128, 256\}$ or multiples of 32/64 compatible with the WGMMA micro-tile. Pick $B_r$ as a smaller multiple of the warp tile in the row direction (e.g., 16, 32, 64). The goal: $B_r \times B_c$ should be divisible by the warp/warpgroup tile so each thread has a consistent portion.
+
+2. Pick $s$ (stages) small: $s = 2$ or $3$. The paper uses a circular SMEM buffer and notes practical choices of $s$ are small (filling first $s$ iterations and then streaming), and the 2‑stage pipeline is described as the working default. Higher $s$ gives more temporal buffering but directly multiplies SMEM cost for K/V tiles.
+
+3. Enforce SMEM: compute $s \cdot 2 \cdot B_c \cdot d \cdot \text{sizeof(elem)} + B_r \cdot d \cdot \text{sizeof(elem)}$ and ensure it fits within the SMEM you will allocate to a CTA. If you want multiple CTAs per SM, divide $\text{SMEM\_per\_SM}$ by $\text{target\_CTAs\_per\_SM}$. If it doesn’t fit, lower $B_c$ or $s$.
+
+4. Enforce registers: estimate $S_{\text{next}}$ size $= B_r \cdot B_c \cdot \text{sizeof(accum)}$. Divide among threads ($S_{\text{next}}$ is partitioned across threads/warps). Check the per-thread register count budget (aim for comfortable headroom below the per-thread maximum to avoid spills and to allow setmaxnreg reallocation between producer/consumer warps). If the estimated register use is too high, reduce $B_r$ or $B_c$, or reduce pipeline depth (e.g., fall back to single-stage or 2-stage rather than 3-stage).
+
+5. Validate occupancy: based on the final SMEM and register usage, compute how many CTAs can reside on an SM. If only 1 CTA/SM results, that may be acceptable on Hopper because WGMMA/TMA asynchrony plus high Tensor Core throughput can still keep the hardware busy, but if you see low measured utilization, try to increase occupancy by reducing per-CTA SMEM/registers.
+
+6. Empirically verify: compile and run and check (a) SASS register spill indicators, (b) achieved TFLOPs and tensor core utilization, and (c) runtime. The paper emphasizes empirical profiling — the best tile often depends on head dimension, sequence length, and mask (causal vs non-causal).
+
+Heuristics specifically for $d \in \{64, 128, 256\}$
+- $d = 64$: smaller head dimension means each K/V row is shorter, so $B_c$ can be larger without exploding SMEM, and storing $S_{\text{next}}$ costs fewer registers for the same $B_r \times B_c$. Practical starting point: try $B_c = 128$, $B_r = 32$, $s = 2$. This gives good WGMMA packing and small register penalty for the 2‑stage pipeline. If you want even higher throughput with FP8, $B_c = 256$ can be tried as long as SMEM fits.
+
+- $d = 128$: the paper uses many examples with head dim 128 and obtains good results. A conservative starting tile is $B_c = 128$ and $B_r = 32$. If you want to push GEMM utilization, try $B_c = 128$–$256$ but watch SMEM and registers; for the 2‑stage pipeline $B_r = 16$–$32$ is often a good compromise so that $S_{\text{next}}$ ($B_r\times B_c$) stays modest.
+
+- $d = 256$: bigger head dimension increases per-tile memory and compute, so choose a smaller $B_r$ to keep $S_{\text{next}}$ and per-thread load down. Start with $B_c = 128$, $B_r = 16$, $s = 2$. This keeps the register footprint of $S_{\text{next}}$ controllable. If you need more arithmetic intensity, prefer increasing $B_c$ moderately rather than $B_r$.
+
+Why prefer these patterns? Increasing $B_c$ raises the k-dimension of the inner GEMM, which is good for Tensor Core throughput (more matmul work per softmax), while increasing $B_r$ increases the number of output rows per CTA and directly scales $S_{\text{next}}$ and register pressure. Because the 2‑stage pipeline stores a whole $S_{\text{next}}$, it is safer to make $B_r$ the smaller of the two tile dims.
+
+Other practical tips from the paper’s approach
+- Use setmaxnreg to allocate more registers to the warps doing WGMMA and fewer to producer warps that only issue TMA/ldmatrix instructions. This lets you squeeze a larger pipeline register budget where it matters.
+- For FP8, be aware of k-major constraints on WGMMA and the need to transpose V tiles in-kernel (the paper recommends in-kernel transpose via LDSM/STSM rather than expensive GMEM pre-transpose). These layout transformations can change the SMEM/reg trade-off and should be included in your budget.
+- If you see compiler reordering upsetting your pipelining, examine generated SASS; small code changes (barriers, commit/wait ordering) may be necessary to ensure the intended schedule.
+- Keep $s$ small (2–3) in practice; the paper shows good gains from 2-stage pipelining and uses ping-pong warp specialization to overlap softmax with GEMMs across warpgroups — that helps hide the low throughput of exponentials without requiring large $s$.
+
+Summary checklist
+1. Pick $B_c$ that matches WGMMA micro-tile multiples; pick $B_r$ smaller (multiple of warp tile).
+2. Ensure $s \cdot 2 \cdot B_c \cdot d \cdot \text{bytes} + B_r \cdot d \cdot \text{bytes} \le \text{SMEM budget per CTA}$.
+3. Ensure $B_r \cdot B_c \cdot \text{sizeof(accum)}$ partitioned across threads fits within available registers per thread (no spills) when added to other register needs.
+4. Tune $s = 2$ (or $3$) and reduce $B_r$ if register pressure is the limiting factor; reduce $B_c$ if SMEM is the limiting factor.
+5. Empirically profile for spills, SMEM usage, and TFLOPs; iterate.
+
+If you want, tell me the exact SMEM-per-SM you plan to target and your threadblock (CTA) size (threads per CTA) and I can run the above formulas numerically and give a small table of candidate $(B_r, B_c, s)$ for each $d \in \{64,128,256\}$.

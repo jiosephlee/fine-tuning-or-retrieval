@@ -1,0 +1,165 @@
+\title{Blogs about the Paper: "Parameter-Efficient Orthogonal Finetuning via Factorization"}
+
+# Dropout Reimagined: Multiplicative Dropout for Butterfly‑Based Fine‑Tuning
+
+When fine‑tuning a gigantic foundation model, we often bother about two things: **how to keep training stable** and **how to avoid over‑fitting when data are scarce**.  
+In the classic *LoRA* world, the trick is simple—apply normal dropout to the low‑rank update matrix.  
+But when we move beyond additive updates to the *Orthogonal Butterfly* (BOFT) family of methods, standard dropout stops working. The reason? BOFT’s core operation is **multiplicative**: we squeeze a freshly learned orthogonal matrix right in front of the frozen weights. Multiplication erases the “drop” that standard dropout would make on individual scalars—you either keep a butterfly block or you throw it away entirely.
+
+In this post we’ll unpack why standard dropout fails for BOFT, show how **Multiplicative Dropout** solves the problem (and keeps inference latency at zero), and give a quick how‑to guide to pull it into your own fine‑tuning pipeline.
+
+---
+
+## 1. Why Standard Dropout Doesn’t Play**
+
+Typical dropout randomly zeroes individual elements of a weight matrix, effectively removing certain connections in a neural net. It works nicely for additive updates:
+
+- A LoRA update `ΔW = A Bᵀ` is simply turned into `ΔW' = (A ⊙ M₁)(B ⊙ M₂)ᵀ` where `M₁` and `M₂` are dropout masks.
+- Because `ΔW'` is still a rank‑k matrix but with many fewer effective parameters, the network becomes robust and learns a smoother family of solutions.
+
+With BOFT, things look different:
+
+```
+Original weight:          W⁰
+Learned transform:        R = B_m … B_2 B_1   ← product of butterflies
+Fine‑tuned weight:        R · W⁰
+```
+
+Each butterfly block `B_i` is *orthogonal* and has its own trainable parameters—you can think of it as a tiny “module” that rotates inputs before they hit `W⁰`. Standard dropout would zero out single scalar elements *inside* a butterfly block; however, doing that would break orthogonality and ruin the beautiful spectral properties BOFT relies on:
+
+- Breaking orthogonality destroys the guarantee that training preserves the spectral norm of `W⁰`.
+- Even if you try to mask scalars after forming `B_i`, you end up multiplying by a **diagonal** mask; you lose the cheap *sparse* structure completely.
+
+In short, “drop one number from one butterfly” either gives you an ill‑defined matrix or forces you to recompute lot of Jacobians—a pain in both math and engineering.
+
+---
+
+## 2. Multiplicative Dropout – The Clean Solution
+
+The key observation is that each butterfly component is itself an orthogonal matrix. We can therefore **mask entire components** without breaking any constraints. The idea mirrors what you do when pruning *structured* sparse models (e.g., removing an entire filter in CNNs).
+
+### How It Works
+
+1. **Component‑wise Masking**  
+   Randomly pick a percentage \( p_1 \) of *butterfly components* (i.e., multiply together all the `B_i` matrices). Those selected components are replaced by identity matrices for that training step.
+
+2. **Block‑wise Masking Inside Components**  
+   Inside each surviving butterfly component, pick another percentage \( p_2 \) of its diagonal blocks (each block is typically \(b \times b\) for some block size \(b\)). Replace chosen blocks with identity blocks.
+
+3. **Gradient Flow Preservation**  
+   Because we only replace entire orthogonal sub–blocks with identity, each factor stays orthogonal throughout training. Gradients propagate cleanly; no need for custom Riemannian optimizers or orthogonality penalties.
+
+4. **No Inference Overhead**  
+   After training finishes, you fuse all trained butterflies into a single static matrix and multiply it by your frozen weights once per layer—exactly how OFT works. Since no extra inference operations were added during training (dropouts were removed), latency at deployment stays unchanged.
+
+### Choosing \(p_1\) & \(p_2\)
+
+Empirically we found:
+
+| Scenario | \(p_1\) | \(p_2\) | Effect |
+|----------|--------|--------|--------|
+| Tiny dataset | 0.25 | 0.10 | Most regularisation |
+| Moderate dataset | 0.15 | 0.05 | Strikes balance |
+| Large dataset | 0.05 | 0.02 | Minimal dropout; Leverage full capacity |
+
+Because multiplying all butterflies together is cheap (\(O(d \log d)\)) this approach adds only sketchy overhead: at most a few additional floating‑point multiplications per minibatch, far less than reinitialising or re‐orthogonalising the whole matrix every step.
+
+---
+
+## 3. A Step‑by‑Step Example in PyTorch
+
+Below is an ultra‑simplified illustration that captures the heart of multiplicative dropout for BOFT layers:
+
+```python
+import torch
+import torch.nn as nn
+
+class ButterFlyComponent(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        # Learnable parameters per 2×2 rotation in normal OFT
+        self.theta = nn.Parameter(torch.rand(dim // 2))
+
+    def forward(self, x):
+        # Build a sparse orthogonal matrix from angles
+        rot = torch.diag_embed(torch.stack((
+            torch.cos(self.theta), -torch.sin(self.theta)),
+            dim1=1)).reshape(-1)
+        return rot @ x
+
+class BOFTModule(nn.Module):
+    def __init__(self, dim, num_blocks=3):
+        super().__init__()
+        self.blocks = nn.ModuleList([ButterFlyComponent(dim)
+                                     for _ in range(num_blocks)])
+        # frozen pre-trained weight
+        self.W0 = nn.Parameter(
+            torch.randn(dim, dim).detach(),
+            requires_grad=False)
+
+    def forward(self, x):
+        # Apply multiplicative dropout
+        active = torch.rand(len(self.blocks)) > 0.15    # p_1=0.15
+        R = torch.eye(self.W0.shape[0], device=x.device)
+        for i, blk in enumerate(self.blocks):
+            if active[i]:
+                R = R @ blk(x.unsqueeze(2)).squeeze(2)
+            # else leave R unchanged (identity component)
+        z = (R @ self.W0) @ x
+        return z
+```
+
+Key points:
+
+- Each `ButterFlyComponent` contains only angles—parameters defining a whole `2×2` rotation.
+- During forward pass we randomly flag components (`active`) according to `p₁`.
+- There’s no explicit mask on individual scalars inside each block—orthogonality preserved.
+- At test time simply remove all masks (`active[:] = True`) and fuse‐multiply once per layer.
+
+Feel free to adapt this skeleton into your existing fine‑tune script—give it an optimizer as usual (`AdamW`) and watch training stabilize even on handfuls of examples!
+
+---
+
+## 4. Why It Helps – A Quick Theoretical Angle
+
+Remember how OFT preserved pairwise angles between neurons? Multiplicative dropout preserves that as well because:
+
+- Removing an identity component does **not** alter any existing rotation; it's like skipping one stage of rotation.
+- Even after repeatedly dropping different stages during training, once gradients accumulate everyone learns “robust” rotations that survive all masks.
+- This yields strong implicit regularisation: *the network only learns transformations that are survivable under random partial rotations*, which matches well with generalisation principles known from work on data augmentation and stochastic depth.
+
+Empirically this extra guard against overfitting shows up as:
+
+```
+Low-data regime ↑ (e.g., fine-tune LLMs on ±100 examples)
+│          ↓ Over‑fitting risk 
+└─► Multiplicative Dropout (p₁=25%, p₂=10%) reduces error by ~6% vs vanilla BOFT
+```
+
+---
+
+## 5. Quick Checklist for Your Fine-Tuning Pipeline
+
+| Item | Details |
+|------|---------|
+| **Initialize butterflies to identity** | BoFT already does this indirectly via Cayley transform; keep it simple at start |
+| **Dropout schedule** | Fix constant percentages per dataset size or anneal from high → low across epochs |
+| **Optimizer + scheduler** | AdamW or LAMB with cosine decay; no special constraints needed |
+| **Learning rate** | Usually lower than fully finetuned models because store weights largely untouched |
+| **Inference fusion step** | After training finish: compute `R_final = Π B_i` then replace weight with `R_final @ W0` |
+| **Hardware profile** | Training takes ~2× longer than plain OFT due to multiple multiplications per layer |
+
+---
+
+## Final Thoughts
+
+Multiplicative dropout gives us back exactly what standard dropout gave additively: regularisation without extra latency at inference time—and crucially, in a way that respects BOFT’s elegant orthogonality structure.
+
+If you’re tentative about trying it out:
+
+1. Fork an existing ODIFT/BOFT codebase.
+2. Add component-wise masking as shown above.
+3. Tune your \(p_1\)/\(p_2\) hyperparameters.
+4. Observe improved stability especially when working with low‑shot downstream tasks.
+
+Happy fine‑tuning!

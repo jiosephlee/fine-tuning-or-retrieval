@@ -1,0 +1,266 @@
+\title{A Textbook about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+Chapter 3: # 3. The QLoRA Architecture  
+
+## Chapter Description  
+
+Large language models (LLMs) are ubiquitous but training or finetuning them remains an engineering challenge: the sheer size of the weight tensors, combined with the need for gradient accumulation and checkpointing, pushes the memory footprint far beyond the limits of most GPUs.  
+\textsc{QLoRA} (Quantized LoRA) breaks this wall by 1) turning the *storage* of the frozen pretrained weights into a highly compressed, information‑theoretically optimal 4‑bit format, 2) keeping the *computation* in a stable 16‑bit float format, and 3) augmenting every trainable linear projection with a low‑rank LoRA adapter. In addition, two innovative memory‑saving tricks—*Double Quantization* of the quantization constants and *Paged Optimizers* using NVIDIA unified memory—allow full‑gradient back‑propagation through the 4‑bit base model without ever exceeding the GPU memory budget.  
+
+The following sections develop the mathematical and algorithmic rigor behind each component, illustrate how they fit together into a single forward‑backward pass, and discuss how to turn theory into practice with CUDA kernels and Hugging Face integration.
+
+---
+
+## Storage vs. Computation Data Types: 4‑bit NF4 vs. BF16  
+
+A key design principle of \textsc{QLoRA} is separating **storage precision** from **computational precision**.  
+
+### Storage Precision
+
+- **NF4 (NormalFloat 4‑bit):**  
+  - The frozen base model weights are quantized to an *information‑theoretical* 4‑bit representation that is tailored to the statistical distribution of the weights.  
+  - Unlike generic 4‑bit integers or floats, NF4 represents each weight as one of 16 discrete levels that align with the quantiles of a zero‑centered Gaussian distribution (the typical shape of pretrained LLM weight histograms).  
+  - These 16 values can be stored in a single byte, but the *effective* precision is nominally 4 bits because each entry contributes only a single 4‑bit index to the lookup table.
+
+### Computational Precision
+
+- **BF16 (BrainFloat 16‑bit):**  
+  - All arithmetic—including matrix multiplications, bias additions, and RELUs—is performed in BF16, which offers 16‑bit precision with a 16‑bit mantissa and 8‑bit exponent.  
+  - BF16 provides enough dynamic range and stability to propagate gradients reliably during back‑propagation, while still keeping the compute cost close to FP16.
+
+The storage/computation split means that the *forward* and *backward* passes never operate directly on the low‑precision NF4 tensor. Instead, NF4 is *dequantized* into BF16 on‑the‑fly, and all subsequent operations use the high‑precision BF16 representation. Only the learnable LoRA parameters are stored in BF16; the frozen 4‑bit base weights never have any trainable gradients.
+
+---
+
+## NormalFloat (NF4) Construction and Its Information‑Theoretic Optimality  
+
+### Why NF4?
+
+A natural first attempt to quantize a random variable is to pad its range with uniformly spaced bins. However, for a zero‑mean Gaussian with variance $\sigma^2$, most masses concentrate near zero while the tails are extremely sparse. A uniform binning wastes representation bits on the tail and leaves the high‑density region under‑represented.  
+
+NF4 tackles this by using **quantile‑based** bins: each bin receives *exactly one‑sixteenth* of the probability mass. This ensures that each stored 4‑bit code is statistically equally informative—hence the name “NormalFloat” (NF). The construction is information‑theoretic because it matches the histogram of the input to the discrete alphabet in an optimal way.
+
+### Step‑by‑Step Construction  
+
+Let $X$ denote a set of weights drawn from a Gaussian distribution $\mathcal{N}(0,\sigma^2)$.
+
+1. **Normalize variance to unity.**  
+   Compute $\hat{X} = X / \sigma$. Now $\hat{X} \sim \mathcal{N}(0,1)$.
+
+2. **Compute the $2^k+1$ quantiles of $N(0,1)$.**  
+   For $k=4$ we have $2^4+1 = 17$ quantiles. Denote them by  
+   \[
+   q_i = Q\!\left(\frac{i}{2^k+1}\right),\quad i=0,\dots,16,
+   \]
+   where $Q(\cdot)$ is the inverse CDF of the standard normal.  
+
+3. **Obtain mid‑points of adjacent quantiles.**  
+   For $i=0,\dots,15$ define
+   \[
+   \tilde{q}_i = \tfrac{1}{2}\!\bigl(q_i + q_{i+1}\bigr). 
+   \]
+   These 16 mid‑points are the *discrete levels* of NF4.
+
+4. **Asymmetric zero‑centered representation.**  
+   Because the Gaussian is symmetric we can enforce a *single exact zero* code.  
+   Let $z$ be the zero code.  
+   Allocate the first $2^{3}=8$ codes to the negative side, the last 8 codes to the positive side, and discard one duplicate zero that would otherwise arise.  
+   The final NF4 levels are thus
+   \[
+   \text{NF4}\! = \{\tilde{q}_{-8},\dots,\tilde{q}_{-1},z,\tilde{q}_{+1},\dots,\tilde{q}_{+8}\}.
+   \]  
+
+5. **Quantization.**  
+   For each weight $x$ we compute its *index* $i$:
+   \[
+   i = \operatorname{argmin}_{j}\bigl|\,x-\tilde{q}_j\,\bigr| .
+   \]
+   The index $i\in\{0,\dots,15\}$ is stored in 4 bits.
+
+6. **Dequantization.**  
+   During computation, read the stored index $i$ and look up the corresponding $\tilde{q}_i$; multiply by $\sigma$ back to restore the scale:
+   \[
+   \hat{w} = \tilde{q}_i\times\sigma .
+   \]
+   The result $\hat{w}$ is converted to BF16 for the forward pass.
+
+The key is that, after step 1, the distribution of $\hat{X}$ is perfectly matched to the NF4 bins: each bin covers the same probability mass. This guarantees that the expected quantization error is minimal for a 4‑bit representation of a Gaussian.
+
+---
+
+## Double Quantization: Compressing the Quantization Constants  
+
+Every 4‑bit quantized tensor is normally accompanied by a *block‑wise* scaling factor (“quantization constant”) that maps the 4‑bit codes back into the original range.  
+If a block $B$ of size $B_s$ contains $n=B_s$ weights, we normally store one 32‑bit float constant $c_B$ per block.  
+For a 65B‑parameter LLM with block size 64, this overhead amounts to $0.5$ bits per parameter—significant when multiplied by billions.
+
+### Idea
+
+The constants $c_B$ themselves are *highly compressible*: they tend to be positive, smooth, and normally distributed around a global mean because the base model was trained with weight decay.  
+If we quantize the constants again, we halve the memory again while incurring surprisingly little error.
+
+### Double Quantization Process
+
+1. **First Quantization (NF4).**  
+   Each block $B$ contains a 4‑bit weight matrix $W_B^{\text{NF4}} \in \mathbb{R}^{b\times h}$ and a 32‑bit constant $c_B^{\text{FP32}}$.  
+   The dequantization formula is
+   \[
+   W_B^{\text{BF16}}
+   = \frac{W_B^{\text{NF4}}}{c_B^{\text{FP32}}}.
+   \]
+
+2. **Second Quantization of Constants.**  
+   - Flatten all block constants into a 1‑D array, \(\{c_B^{\text{FP32}}\}\).  
+   - Compute their *mean* $\mu_c$ to center them around zero (symmetry helps compression).  
+   - Subtract $\mu_c$: \(\tilde{c}_B = c_B^{\text{FP32}} - \mu_c\).  
+   - Quantize \(\tilde{c}_B\) using an 8‑bit raw float format (FP8) with block size 256.  
+   - Save two things per original block:  
+     1. The 8‑bit float quantized constant, \(c_{B}^{\text{FP8}}\).  
+     2. The *parity* constant $\mu_c$ (a single 32‑bit float that is shared across many blocks, e.g. one per layer).  
+   The double‑dequantization is
+   \[
+   c_B^{\text{FP32}} = \mu_c + \text{dequant}(c_B^{\text{FP8}}).
+   \]
+
+### Memory Saving Analysis  
+
+- **Original constant storage:** \(32 \text{ bits} / B_s = 0.5\) bits/param.  
+- **After DQ:**  
+  \[
+  \underbrace{8/256}_{\text{FP8 per block}}
+  + \underbrace{32/(B_s\times 256)}_{\text{parity per layer}}
+  \approx 0.127\text{ bits/param}.
+  \]
+  The savings per parameter is $0.373$ bits—amounting to roughly 3 GB for a 65B‑parameter net.
+
+Empirically, Double Quantization shrinks the memory budget without measurable loss in downstream accuracy.
+
+---
+
+## Paged Optimizers: Leveraging NVIDIA Unified Memory  
+
+The main source of *memory spikes* during training is gradient checkpointing: forward activations are discarded and later re‑computed during backward.  
+When working with a very long prompt—e.g., 12 k tokens—the backward pass inflates the temporary activation size beyond the GPU capacity, causing OOM.  
+
+NVIDIA’s Unified Memory (UM) transparently swaps pages of memory between the GPU and host. A *paged optimizer* stores its state—optimizer moments, Adam biases, etc.—in UM and only pins the part that is actively used. When a spike occurs, the optimizer state that is not needed is evicted to host memory; once the spike resolves, the data is moved back.
+
+Key practical aspects:
+
+- Use `torch.cuda.UnifiedMemory` for optimizer buffers rather than standard CUDA tensors.  
+- Set `torch.backends.cuda.allow_oob_runtime=False` to avoid accidental OOM.  
+- The runtime overhead is negligible for typical batch sizes; only extreme cases (sequence lengths > 8000) show slight slowness.
+
+Paged Optimizers allow the entire training pipeline—including gradient accumulation— to fit in a single 48‑GB GPU, even for 65‑B models.
+
+---
+
+## Formal Definition of a QLoRA Layer and its Forward / Backward Equations  
+
+Consider a single linear projection in the LLM:
+\[
+\mathbf{Y} = \mathbf{X}\mathbf{W} ,
+\]
+where $\mathbf{X}\in\mathbb{R}^{b\times h}$ is the input, $\mathbf{W}\in\mathbb{R}^{h\times o}$ is the weight matrix.
+
+**QLoRA augments this with a low‑rank LoRA adapter**:
+\[
+\mathbf{Y} = \mathbf{X}\mathbf{W} + s\, \mathbf{X} \mathbf{L}_1 \mathbf{L}_2 ,
+\]
+where  
+- $\mathbf{L}_1\in\mathbb{R}^{h\times r}$ and $\mathbf{L}_2\in\mathbb{R}^{r\times o}$ are the LoRA matrices,  
+- $s$ is a scaling scalar (typically set to $s=1$).
+
+### Storage
+
+- $\mathbf{W}$ is stored as a 4‑bit NF4 tensor, $\mathbf{W}^{\text{NF4}}$, with block‑wise scalars $c_1$ (outer block) and $c_2$ (inner block) that are Double‑Quantized (FP8 for $c_2$).  
+- $\mathbf{L}_1$, $\mathbf{L}_2$ are stored in BF16.
+
+### Forward Pass  
+
+1. **Dequantization of Base Weights**  
+   \[
+   \mathbf{W}^{\text{BF16}}
+   = \text{doubleDequant}(c_1^{\text{FP32}},\, c_2^{\text{k‑bit}},\, \mathbf{W}^{\text{NF4}}).
+   \]
+2. **Matrix Multiplications**  
+   \[
+   \mathbf{Y}_1 = \mathbf{X}^{\text{BF16}}\mathbf{W}^{\text{BF16}}, \quad
+   \mathbf{Y}_2 = \mathbf{X}^{\text{BF16}}\mathbf{L}_1^{\text{BF16}}\mathbf{L}_2^{\text{BF16}}.
+   \]
+3. **Add**  
+   \[
+   \mathbf{Y}^{\text{BF16}} = \mathbf{Y}_1 + s\,\mathbf{Y}_2 .
+   \]
+
+All operations are in BF16; only the storage of $\mathbf{W}$ is 4‑bit.
+
+### Backward Pass  
+
+Because $\mathbf{W}$ is frozen, gradients with respect to $\mathbf{W}$ are discarded. However, computing $\partial \mathbf{X}/\partial \mathbf{W}$ is still needed to propagate the gradient through $\mathbf{Y}_1$ to higher layers.  
+
+1. **Gradient of LoRA Outputs**  
+   \[
+   \frac{\partial \mathcal{L}}{\partial \mathbf{L}_1} = 
+   \left( \frac{\partial \mathcal{L}}{\partial \mathbf{Y}_2}\right)^{\!\!\top}\!\mathbf{X}^{\text{BF16}},\qquad
+   \frac{\partial \mathcal{L}}{\partial \mathbf{L}_2} = 
+   \mathbf{L}_1^{\!\!\top}\!\left( \frac{\partial \mathcal{L}}{\partial \mathbf{Y}_2}\right).
+   \]
+2. **Backpropagation through the Base Weights**  
+   \[
+   \frac{\partial \mathcal{L}}{\partial \mathbf{X}} = 
+   \frac{\partial \mathcal{L}}{\partial \mathbf{Y}_1}\mathbf{W}^{\!\top} 
+   + \frac{\partial \mathcal{L}}{\partial \mathbf{Y}_2}\mathbf{L}_1^{\!\top}.
+   \]
+   Here $\mathbf{W}$ is used in BF16 because we have dequantized it.  
+3. **Drop Gradients w.r.t. $\mathbf{W}$.**  
+   Since $\mathbf{W}$ is frozen, we simply zero out $\partial \mathcal{L}/\partial \mathbf{W}$.
+
+Thus the only learnable parameters are $\mathbf{L}_1$ and $\mathbf{L}_2$, and the optimizer processes only these in BF16. The heavy backward computation through $\mathbf{W}$ is done just by matrix multiplication on BF16 matrices that were temporarily dequantized from the NF4 representation.
+
+---
+
+## Practical Implementation Notes  
+
+### CUDA Kernels  
+
+- The dequantization itself is a heavily‐vectorized kernel:  
+  1. Read the 4‑bit indices as bytes,  
+  2. Look up the pre‑computed NF4 table (a 256‑entry *float* array).  
+  3. Multiply by the block’s combined scale factor ($c_1 c_2$).  
+- The kernel is fused with the GEMM: after dequantization we immediately feed the resulting BF16 matrix to cuBLASLt’s BF16 GEMM.  
+- Custom kernels for Double Quantization were implemented in *bitsandbytes*: they pack the 8‑bit FP8 constants into 32‑bit words and unpack them on‑the‑fly during dequantization.
+
+### Hugging Face Integration  
+
+- A lightweight *QLoRA* layer implements PyTorch’s `nn.Module` interface.  
+- The weights are stored in a Hugging Face `torch.nn.Parameter` of dtype `torch.uint4`.  
+- The library exposes:
+
+```python
+from qlora import QLoRALayer
+
+layer = QLoRALayer(
+    weight_size=(hidden_dim, out_dim),
+    block_size=64,                # can be tuned
+    r=8,                          # rank of LoRA
+    device='cuda'
+)
+# Load quantized weight from checkpoint
+layer.load_quantized("qlora_llama65q.pt")
+```
+
+- The integration is fully transparent to downstream code: calling `model(input_ids)` behaves exactly like a normal LLM.  
+- Optional hooks allow the user to enable or disable *Paged Optimizers*.
+
+---
+
+### Summary  
+
+A QLoRA‑enabled LLM consists of:  
+
+1. **Frozen base weights** stored as 4‑bit NF4, Double‑Quantized by a 2‑level scalar.  
+2. **LoRA adapters** everywhere (query, value, dense projections) with learnable ranks.  
+3. **BF16 computation** throughout training, only dequantizing the base weights when needed.  
+4. **Paged Optimizers** to absorb unexpected memory spikes.  
+
+With this architecture, a 65‑B parameter LLaMA model can be finetuned on one 48‑GB GPU in under 24 hours, while matching the performance of a full 16‑bit finetune on the same task. The physics of the design—capturing distributional structure in NF4, compressing the scaling constants, and carefully deferring memory usage—permits these dramatic savings without sacrificing model quality.

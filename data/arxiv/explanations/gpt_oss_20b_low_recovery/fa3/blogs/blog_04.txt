@@ -1,0 +1,157 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# Low‑Precision Attentions: Why FP8 Matters and How FlashAttention‑3 Keeps Accuracy
+
+## The Long‑Context Problem
+
+Attention is the heart of every transformer‑style model, from GPT to Stable Diffusion.  
+Its cost grows quadratically with the length of the input: a 4,096‑token sentence is already 16× more expensive than a 512‑token one.  For “long‑context” tasks—chatting over a full book, analyzing a whole codebase, or generating frame‑by‑frame video—reducing the per‑token cost becomes a necessity.
+
+The latest NVIDIA Hopper GPUs (H100) can run the 4‑GEMM cascade of attention with astonishing raw throughput—over 9 TFLOPs per SM for FP16 matrix multiplication—and even a *quadruple* speed‑up for FP8, thanks to the new Tensor Core “WGMMA” instruction.  The barrier, however, is **numerical error**: when you crank the precision down to FP8, the arithmetic starts to drift, and the soft‑max that follows the dot product can amplify tiny mistakes into huge mistakes.
+
+**FlashAttention‑3** tackles that drift head‑on, leveraging two new trick pairs:
+
+1. **Block quantization** – quantise *per‑block* instead of *per‑tensor*.
+2. **Incoherent processing** – shuffle the data with a random orthogonal matrix before quantisation to spread out extreme values.
+
+Together, they cut FP8 error by more than a factor of **2.6** compared to naïve FP8 scaling.  Below we walk through why FP8 matters on Hopper, what the layout hurdles look like, and how the two tricks stack up.
+
+---
+
+## 1. Why FP8 Is a Game‑Changer on Hopper
+
+### 1.1 The Hopper Premium: Asynchrony + Low‑Precision
+
+Hopper GPUs aren’t just a faster version of Ampere; they expose two separate accelerators that can run in concert:
+
+- **Tensor Cores (TMA‑friendly)**: GPU‑wide floating‑point matrix multipliers that can use FP8 operands, yielding roughly double throughput per SM relative to FP16 or BF16.
+- **Tensor Memory Accelerator (TMA)**: a dedicated copy engine that streams data from global memory into shared memory without touching the instruction scheduler.
+
+Because the two units act independently, *asynchronous* programming – overlapping data movement with computation – lets you hide almost all memory‑latency.  If you can keep the Tensor Cores busy, you can burst you right into the 9 TFLOPs FP16 speed‑up or the 18 TFLOPs FP8 speed‑up that Hopper offers.
+
+### 1.2 Layout Constraints for FP8 WGMMA
+
+The catch with FP8 is that the WGMMA instruction has a **strict operand layout**:
+
+| Operand | Requires “mn‑major” (outer dimension contiguous) | Requires “k‑major” (inner dimension contiguous) |
+|--------|-----------------|-----------------|
+| FP8 input | ❌ | ✅ |
+| FP32 accumulator | ✅ | ❌ |
+
+In plain language: the first operand can come from shared memory if it’s laid out by rows (the outer dimension), but the *second* operand has to be laid out by columns (k‑major).  Your standard after‑embedding matrices `Q`, `K`, and `V` are usually laid out “head‑first” (i.e., contiguous along the head dimension).  That layout satisfies FP16 VMMAs but not the FP8 rule.
+
+Concretely:
+
+- `K`: For the `Q x Kᵀ` belief calculation, you want `K` in `k‑major` because you’re dot‑producting row‑by‑row with `Q`.  In FP8, that means you have to reverse the stride in the sequence‑length dimension.
+- `V`: In the second GEMM `P x V`, `V` must again be column‑major.  Unfortunately, the FP32 accumulator produced by the first FP8 GEMM isn't in a layout that’s compatible with the second one.
+
+So the algorithm designers had to **transpose** tile‑wise inside the kernel, not globally (because a global transpose would require a separate pass and would kill throughput).
+
+---
+
+## 2. In‑Kernel Transpose Magic
+
+### 2.1 Using LDSM/STSM
+
+Hopper includes **LDMatrix (LDSM)** and **STMatrix (STSM)** – tiny instructions that let an entire warp read a 128‑byte sub‑matrix from shared memory into registers, or write it back.  By arranging the warp’s load and store pattern cleverly, you can *transpose* a tile on the fly:
+
+```
+warp loads 8×8 block of V (row‑oriented)  → registers
+warp stores 8×8 block transposed (column‑oriented) → shared memory
+```
+
+This in‑kernel transpose satisfies the FP8 layout requirement *without* touching global memory again.  It also frees up the PGMMA instruction to feed the next block while the transpose runs in another warp, which is the basis for the “ping‑pong” overlapping trick later (section 4).
+
+### 2.2 Register‑Level Re‑Ordering of the Accumulator
+
+The second FP8 GEMM needs the FP32 accumulator from the first GEMM in a different *register* layout.  The pack-of-8 logic in WGMMA stores an 8‑element tile in a quirky order.  By hashing the registers using `shfl` or `byte permute` (in PTX parlance), you can reorder them to the format expected by the next WGMMA call.  No extra memory traffic, no extra kernel launches.
+
+---
+
+## 3. Why the Number is Small – Quantisation Errors
+
+FP8 (e4m3) uses only 3 mantissa bits and 4 exponent bits.  That gives **≈ 256 discrete values** compared to 65536 for FP16.  When you multiply two 256‑valued numbers you lose a lot of fidelity; it’s not just a rounding error – the range’s *dynamic* shift can dramatically mis‑scale the dot products.
+
+What becomes noticeable is **out‑of‑range** or **outlier** values.  In large language models, hidden states sometimes shoot off into the 20‑plus range; a single outlier can dominate the soft‑max numerator and skew the entire attention distribution.
+
+---
+
+## 4. Two Layers of Protection
+
+### 4.1 Block Quantization
+
+Instead of a single scaling factor for an entire tensor, think of the tensor as a grid of *tiles* and give each tile its own scale.  Operationally:
+
+1. When `Q`, `K`, and `V` are loaded, we *immediately* compute a per‑tile maximum absolute value.
+2. Divide the tile by that value to fit it into FP8’s representable range.
+3. Store the *scale* (one 32‑bit float per tile) alongside the quantised tile.
+
+Because FlashAttention‑3 processes data block‑by‑block, this extra per‑tile scaling doesn’t add any kernel launch or memory traffic.  The soft‑max routine internally *remembers* the scale and adjusts when it recomputes the dot product, so the mathematical result stays the same.  The net effect is that large and small numbers get a fair chance to be represented.
+
+### 4.2 Incoherent Processing (Random Rotation)
+
+A better way to dampen outliers is to **randomly mix** the entries of `Q` and `K` *before* quantisation.  Let
+
+```
+Q' = Q × M          // M is an orthogonal matrix
+K' = K × M
+```
+
+Since `M` is orthogonal (`M Mᵀ = I`), the dot product `Q' K'ᵀ` equals `Q Kᵀ`.  But the entries of `Q'` and `K'` become *weighted sums* of many original entries.  In practice we build `M` cheaply:
+
+- Take a Hadamard matrix (cheap, `O(d log d)`).
+- Randomly flip signs with a diagonal matrix of ±1.
+- Multiply: `M = D × H`, so `Q' = (Q × H) ⊙ D`.
+
+The Hadamard transform simply re‑orders and flips signs; the sign flips further randomise.  This operation is exercised by the same memory‑bandwidth stall as the rotary embedding, so it doesn’t cost extra compute.
+
+The net result is a *more uniform* distribution of values in `Q'` and `K'`.  Consequently, fewer outliers survive quantisation, reducing the number of “large‑error” tokens that would otherwise dominate the soft‑max numerator.
+
+### 4.3 Quantitative Impact
+
+In the FlashAttention‑3 paper, the authors measured root‑mean‑squared error (RMSE) against a FP64 reference on synthetic tensors that mirrored LLM outlier distributions.  Benchmarks:
+
+| Variant | FP8 RMSE | Relative to naive per‑tensor FP8 |
+|--------|--------|-----------------------------------|
+| Naïve FP8 | X | baseline |
+| Block quantisation + incoherent processing | X / 2.6 | 2.6× better |
+
+That means you can comfortably chatter in FP8 and still trust the outputs to be within a couple of percent of the FP16/FP32 reference.
+
+---
+
+## 5. Putting It All Together – The FlashAttention‑3 Flow
+
+Below is a high‑level sketch of the forward pass for a single head:
+
+```
+for each Q‑block Q_i:
+    load Q_i into shared mem
+
+    for each K‑block K_j, V_j:
+        // 1. No‑block quantise Q_i, K_j, V_j as needed
+        // 2. Asynchronous: launch WGMMA Q_i × K_jᵀ  (FP8)
+        // 3. While WGMMA running, compute exp() of previous score block in FP16
+        // 4. When WGMMA completes, normalise scores, multiply with V_j (FP8)
+        // 5. Accumulate the partial result O_i
+```
+
+By running the *two* most expensive FP8 GEMMs in parallel (thanks to asynchronous Tensor Cores) and overlapping the *slower* exp() calls, the kernel keeps the Ratios well‑balanced.
+
+At the end of the loop, a final FP32 rescaling restores the soft‑max scale (the `ℓ` term in the algorithm) so you get a *valid* attention output.
+
+---
+
+## 6. Bottom‑Line Takeaways
+
+| Question | Answer |
+|----------|--------|
+| Does FP8 hurt accuracy? | Yes, if you just drop FP16 scaling. |
+| How does FlashAttention‑3 solve it? | 1) Do block‑wise scaling; 2) Apply a cheap random orthogonal transform before quantisation. |
+| Why FP8 on Hopper? | Hopper’s Tensor Cores double throughput for FP8, and the TMA engine lets you hide all memory movement. |
+| What about memory layout? | Use in‑kernel transpose with LDSM/STSM and register‑level re‑ordering to satisfy FP8 WGMMA. |
+| Resulting throughput? | 740 TFLOPs/s FP16, 1.2 PFLOPs/s FP8, with 80–90 % GPU utilisation. |
+
+**FlashAttention‑3** proves that you can trade half the memory bandwidth (by dropping to FP8) without a substantial loss in numerical correctness—thanks to clever layout handling and a couple of inexpensive preprocessing steps.  As long‑context workloads grow, this is a recipe for faster, cheaper inference and training.  
+
+Want to try it out?  The implementation is open‑source on GitHub, and it integrates cleanly with PyTorch and Hugging Face pipelines.  Drop in the `flash_attention` module, set `dtype="fp8"` or `"fp16"`, and watch the quadratic slowdown shrink dramatically.

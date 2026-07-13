@@ -1,0 +1,148 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# Overlapping Softmax with Matrix Multiplications:
+## A 2‑Stage Pipeline Explained
+
+Attention is the workhorse of every contemporary Transformer.  
+The forward pass of single‑head self‑attention looks like this:
+
+1. **Score matrix** –  \(S = QK^{\top}\)  
+2. **Softmax** –  \(P = \text{softmax}(S)\)  
+3. **Output** –  \(O = PV\)
+
+With a sequence length \(N\) and head dimension \(d\) the naive cost is
+\(O(N^2 d)\) FLOPs – quadratic in \(N\).  The bottleneck is clear:  
+the two matrix–matrix multiplications (MM) dominate the FLOP count, but
+the softmax in the middle is a tiny fraction of the work and can’t simply
+be fused into a single fused‐kernel without careful scheduling.
+
+---
+
+## The traditional approach
+
+The original **FlashAttention** algorithm reduces memory traffic by:
+- fusing the two MM and the softmax into one kernel,
+- materializing intermediate tiles on‑chip,
+- and keeping all intermediate results in 32‑bit precision.
+
+While that removes memory stalls, the implementation still follows a *strictly synchronous* execution order:
+
+```
+for each key block j:
+    S_j = Q · K_j^T        # MM 1
+    P_j = softmax(S_j)     # softmax
+    O  += P_j · V_j        # MM 2
+```
+
+Each step must complete before the next one starts, even though  
+`softmax` and the *next* MM 1 are completely independent.  
+The result is that a large fraction of the GPU cycles are spent waiting
+for the low‑throughput softmax unit (the “special function unit”) to
+produce its output.
+
+---
+
+## What the 2‑stage pipeline changes
+
+### 1. **Warp‑specialisation + ping‑pong buffering**
+
+- Divide the CTA (thread block) into two *warp‑groups*:  
+  **Producer** (loads data from global memory via the Tensor Memory
+  Accelerator – TMA) and **Consumer** (does the math).
+- Use a *circular* shared‑memory buffer so that the producer can keep feeding
+  data without stalling the consumer.
+
+### 2. **Overlap the two மெ ≥×
+
+```
+S_cur = Q · K_cur^T          # first MM of (j)
+P_cur = softmax(S_cur)       # softmax of (j)
+O += P_cur · V_prev          # second MM of (j-1)
+
+# while the above two kernels run, start the next MM:
+S_next = Q · K_next^T
+```
+
+*Key insight:*  
+The *next* MM 1 (`S_next`) can start **before** the current softmax finishes,
+because its input `K_next` is already in shared memory and the MM can run
+asynchronously on the Tensor Cores.  Likewise, the *next* softmax can start
+once `S_next` is ready, overlapping with the second MM of the previous
+iteration.
+
+### 3. **Breaking data dependencies**
+
+- **Matrix 1** (`S_cur`) → **Softmax** → **Matrix 2** (`O += …`)  
+  The pipeline unhooks the *read‑back* dependency: the second MM can use
+  the *previous* softmax result while the new softmax is still computing.
+- The *issue* that `S_next` must be ready *before* `softmax` has finished
+  is handled by **register tiling**: `S_next` is stored in a separate set of
+  registers so that its computation can finish before the softmax of the
+  *next* iteration begins.
+
+---
+
+## Why this matters
+
+| Ratio (softmax / matmul) | Theoretical overlap potential |
+|--------------------------|-------------------------------|
+| FP16: 1 : 512 (softmax much slower) | ~50 % of time can be hidden |
+| FP8: 1 : 1024 | Even larger gap |
+
+On an NVIDIA H100, **FP16 matmul** throughput is ≈ 989 TFLOPs, while the
+exponential unit needed for softmax delivers only ≈ 3.9 TFLOPs.  
+The 2‑stage pipeline allows the 3.9 TFLOPs to be *run in the shadow* of the
+989 TFLOPs, bringing the effective throughput close to the hard limit of
+the matmul unit.
+
+---
+
+## Benchmarks – numbers to impress
+
+| Variant | FP16 Forward | FP16 Backward | FP8 Forward |
+|---------|--------------|---------------|-------------|
+| FlashAttention‑2 | 570 TFLOPs (∼ 55 % util) | 700 TFLOPs | 600 TFLOPs |
+| FlashAttention‑3 (2‑stage) | **661 TFLOPs** (∼ 75 % util) | **780 TFLOPs** | **≈ 1.2 PFLOPs** |
+| Vendor cuDNN (H100‑optimised) | 720 TFLOPs | 850 TFLOPs | – |
+
+*Interpretation*:  
+The 2‑stage overlap gives a **≈ 15 % boost** over non‑overlapped FP16,
+and the *combined* effect of warp‑specialisation plus softmax‑overslap
+is a **1.5–2×** speedup for very long sequences (N ≥ 8192).
+In FP8, the overlap more than compensates for the two‑× slower special‑
+function unit, yielding almost a full *peta‑flop* regime on a single H100.
+
+---
+
+## The backward pass
+
+The backward pass needs four matrix multiplications (derivatives w.r.t.
+`Q`, `K`, `V`) and two softmax derivatives.  The same idea applies:
+
+```
+dS = dsoftmax(dP)         # computed in parallel with upstream grads
+dQ = dS · K               # MM 1
+dK = dS^T · Q             # MM 2
+```
+
+By threading the softmax derivative into its own two‑stage pipeline,
+the FLOPs for the backward pass scale similarly, yielding the 1.5–1.75×
+backward speedup reported in the paper.
+
+---
+
+## Bottom line
+
+- **Template for all future hygiene‑first kernels**:  keep math separate,
+  run the expensive (matrix) kernels on Tensor Cores, and let light
+  computations (softmax, exponents) dance in the driver’s chair.
+- **Hardware synergy**: the Hopper GPU’s *asynchronous* Tensor Cores and
+  *Tensor Memory Accelerator* make the 2‑stage pipe natural.
+- **Ease of integration**: the 2‑stage code is only a handful of extra
+  wait/commit instructions and an extra buffer; no complicated
+  re‑ordering of the core algorithm.
+
+If you’re building a high‑performance LLM or long‑context
+transformer, a 2‑stage GEMM‑softmax pipeline can unlock
+the missing 15–20 % of that latency budget.  And that’s a lot
+when you’re thinking in thousand‑token, multi‑GPU training jobs.

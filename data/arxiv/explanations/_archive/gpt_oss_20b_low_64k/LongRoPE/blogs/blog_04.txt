@@ -1,0 +1,280 @@
+\title{Blogs about the Paper: "LongRoPE: Extending LLM Context Window Beyond 2 Million Tokens"}
+
+# From 4 k to 2 M: A Step‑by‑Step Blueprint for Progressive LLM Extension
+
+Large‑language models (LLMs) have made it possible to generate high‑quality text at scale, but they still struggle when the input exceeds the handful of thousand tokens that most pre‑trained checkpoints were trained on.  
+LongRoPE, a recent method from Microsoft, shows that you can take a standard RoPE‑based model (e.g., LLaMA 2 or Mistral) and stretch its context window past **2 million tokens**—without changing the architecture or incurring massive GPU budgets.  
+Below is a practical guide that walks through the entire pipeline: start with a 4 k checkpoint, fine‑tune at 128 k and 256 k, run two quick evolutionary searches for RoPE rescaling, and end up with a 2.048 M model that still speaks well in the original 4 k regime.
+
+
+
+## Why This Matters
+
+* **In‑Context Learning & Retrieval** – Agents can now keep an entire novel or technical document in memory, instead of truncating or chunking.
+* **Long‑Document Summaries** – Summarize books, papers or legal contracts in one pass.
+* **Few‑Shot Prompting** – Stack multiple few‑shot examples plus a long prompt without hitting token limits.
+
+The key innovation is *non‑uniform positional interpolation*: instead of linearly squeezing every rotation angle by the same factor, LongRoPE learns a different rescale for every RoPE dimension and decides whether to leave the first few tokens untouched.  This keeps high‑frequency dimensions where they belong and eases extrapolation on low‑frequency ones—exactly what the Transformer needs when it suddenly sees millions of new positions.
+
+
+
+## 1. Prerequisites
+
+| Item | Recommendation |
+|------|----------------|
+| **Hardware** | One or two A100 GPUs (13–24 GB each). The fine‑tuning stages need only a handful of steps each. |
+| **Software** | PyTorch 2.x, 🤗 Transformers ≥4.40, fairscale (for checkpoint sharding). |
+| **Codebase** | The official Release are at <https://github.com/microsoft/LongRoPE>. Copy the `longrope.py` and `search.py` modules into your repo. |
+| **Base Model** | LLaMA 2‑7B (or Mistral‑7B). The code supports any RoPE‐based transformer. |
+
+*Tip*: If you do not own GPT‑like weights, try Pull requests from community models hosted on huggingface / huggingface.co.
+
+
+
+## 2. Stage 0 – Setup & Baseline
+
+1. **Download the checkpoint**  
+   ```bash
+   wget https://huggingface.co/meta-llama/Llama-2-7b-hf/resolve/main/pytorch_model.bin
+   ```
+2. **Verify baseline perplexity at 4 k**  
+   Load `llama-2-7b-hf`, use a tokeniser that matches the training data (e.g., `LlamaTokenizerFast`), and evaluate *perplexity* on a small PG19 fragment (≈2000 tokens).  
+   You’ll see ~15–17 perplexity: this will be our reference.
+
+3. **Record settings** – Put them in a YAML file (`config.yaml`):
+   ```yaml
+   base_tokenizer: "meta-llama/Llama-2-7b-hf"
+   base_model: "meta-llama/Llama-2-7b-hf"
+   seed: 42
+   devices: ["cuda:0","cuda:1"]
+   ```
+
+Keep this exact configuration; reproducibility hinges on it.
+
+
+
+## 3. Stage 1 – Search for 128k & 256k Rescaling Factors
+
+LongRoPE turns the interpolation problem into an *evolutionary search* over two spaces:
+
+*A vector of λ_i for each RoPE dimension*  
+*(i ranges from 0 ‑ d/2−1)*  
+
+*A scalar \hat n determining how many initial tokens skip rescaling*
+
+### Parameters
+
+| Symbol | Meaning | Default |
+|--------|---------|--------|
+| `s`    | Extension ratio (`L' / L`) | 32x for 128k; 64x for 256k |
+| λ_i     | Rescale factor for dimension i | Search range [1.0, s×1.25], step 0.01 |
+| \hat n | Position threshold | Search set {0,1,2,4,…,256} |
+| PopSize `P` | Population size per iteration | 64 |
+| MutSize `N1` | Mutation size per individual | 16 |
+| CrossSize `N2` | Crossover size per individual | 16 |
+| MaxIter `T`    | Max evolutionary iterations | 40 |
+| KeepTop k      | Braches evolved to next step | top–32 |
+
+### Execution Script (`search_rope.py`)
+
+```python
+from longrope.search import EvolutionSearch
+import yaml, torch
+
+cfg = yaml.safe_load(open('config.yaml'))
+model = AutoModelForCausalLM.from_pretrained(cfg['base_model'], device_map="auto")
+tokenizer = AutoTokenizer.from_pretrained(cfg['base_tokenizer'])
+
+search = EvolutionSearch(
+    model=model,
+    tokenizer=tokenizer,
+    extension_ratio=32,           # first run for 128k
+    population=64,
+    mutation_size=16,
+    crossover_size=16,
+    max_iter=40,
+    keep_top=32,
+)
+res_128 = search.run()            # {: 'lambda': [...], 'n_hat': ...}
+print("Best λ vec:", res_128['lambda'])
+print("Hat n:", res_128['n_hat'])
+```
+
+Run this twice—once with `extension_ratio=32`, then again with `extension_ratio=64`.  
+The script will:
+
+1. Initialize population (including PI, NTK and YaRN seeds).
+2. Enforce monotonic λ_i constraint (`λ_i ≤ λ_{i+1}`) – in line with NTK theory.
+3. Evaluate perplexity on five randomly chosen PG19 samples whose lengths exceed \(L'\) (e.g., >128 k).
+4. Return the best λ vector & \hat n.
+
+Keep the two results; we’ll plug them into fine‐tuning later.
+
+
+
+## 4. Stage 2 – Fine‐Tune to 128 k
+
+With our λ vector ready:
+
+```python
+from transformers import Trainer, TrainingArguments
+
+args = TrainingArguments(
+    output_dir="./llama_128k",
+    per_device_train_batch_size=8,
+    gradient_accumulation_steps=8,
+    num_train_epochs=0,           # we’ll use step‑based scheduler
+    learning_rate=2e-5,
+    warmup_steps=200,
+    logging_steps=50,
+)
+trainer = Trainer(
+    model=model,
+    args=args,
+    train_dataset=my_dataset_128k(λ=res_128['lambda'], n_hat=res_128['n_hat']),
+)
+trainer.train(resume_from_checkpoint=False)
+```
+
+### Dataset Preparation
+
+Use any large book corpus that contains ≥128 k tokens per document:
+
+```python
+def my_dataset_128k(λ, n_hat):
+    return BookDataset(
+        path="path/to/pg19/train",               # <5M size okay
+        tokenizer=tokenizer,
+        block_size=128000 + tokenizer.model_max_length,
+        rope_lambda=λ,
+        hat_n=n_hat
+    )
+```
+
+The custom dataset re‑initialises the RoPE embedding with your λs before truncation/streaming so that training truly sees “long” contexts.
+
+Fine‑tune **400 steps** here; this proves enough to adapt hidden layers to new positional patterns.
+
+
+
+## 5. Stage 3 – Fine‐Tune Further to 256 k
+
+Use *the same λ vector* computed for 128 k as a warm start:
+
+```bash
+cd ./llama_128k
+# Load checkpoint
+model.load_state_dict(torch.load("pytorch_model.bin"))
+```
+
+Now perform another round of fine‑tune but change block size:
+
+```python
+# New block size:
+blocksize = int(256000 + tokenizer.model_max_length)
+
+trainer = Trainer(
+    model=model,
+    args=args.apply(blocksize),
+    train_dataset=my_dataset_256k(...),      # uses updated blocksize & same λ provider 
+)
+trainer.train(num_steps=600)               # ~10 minutes on A100
+```
+
+At this point you have a *256 k fine‐tuned adapter* ready.
+
+
+
+## 6. Stage 4 – Second Evolutionary Search (Optional)
+
+Because the positional distribution now looks different after finetuning on longer sequences we may want to reoptimise λs once more:
+
+```python
+search = EvolutionSearch(
+    model=model.clone(),                    # copy from last checkpoint 
+    tokenizer=tokenizer,
+    extension_ratio=8,                      # we extend by extra factor of eight again 
+)
+res_256p8 = search.run()                    # returns best λ vector adapted to fine-tuned weights 
+```
+
+Many practitioners skip this step; if you’re targeting an *exact* final length of \(32\,\text{k}\times8^3 =2048\,\text{k}\), keeping the original cross summary improves perplexity by ~0.5–1 point.
+
+
+
+## 7. Stage 5 – Final Model Export
+
+When training is done:
+
+```bash
+torch.save(model.state_dict(), "llama_2048k.pth")
+# Optional: merge rotary embeddings back into base config:
+from longrope import apply_rope_factors
+apply_rope_factors(model.config, lambda_vector=res_256p8['lambda'], hat_n=res_256p8['n_hat'])
+```
+
+Your export now contains all necessary RoPE rescale tables; at inference you simply feed them as part of model config.
+
+
+
+## 🔧 Inference Template
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("path/to/exported/llama_2048k.pth")
+tokenizer = AutoTokenizer.from_pretrained(cfg['base_tokenizer'])
+
+context_length = len(tokenizer.encode(mylongdoc))
+if context_length > tokenizer.model_max_length:
+      raise ValueError("context too long")
+
+inputs = tokenizer(mylongdoc, return_tensors="pt").to('cuda')
+generated_ids = model.generate(**inputs,max_new_tokens=100)
+print(tokenizer.decode(generated_ids[0], skip_special_tokens=True))
+```
+
+Remember: when your prompt is <8 k tokens you can simply ask the model to reload the *original* RoPE factors (`hat_n=None`). The implementation will swap automatically during inference.
+
+
+
+## 📊 Runtime & Cost Summary
+
+| Stage                         | GPU Hours (A100) | Approximate Cost ($USD) |
+|------------------------------|-----------------|--------------------------|
+| Init + baseline evaluation   | <0.1            | <1                      |
+| Search for λ at 128 k         | ~0.5            | $30–40                  |
+| Fine-tune at 128 k            | ~0.\*\*\*        | $10–20                  |
+| Search for λ at 256 k         | ~0.\*\*\*        | $30–40                  |
+| Fine-tune at 256 k            | ~0.\*\*\*        | $10–20                  |
+| Final search (optional)      | ≤0.\*\*\*        | <$20                    |
+| Total                         | ≈3 h total     |\~$110                   |
+
+\*\*\*: Each fine-tuning phase uses only ~10 minutes per stage because we fix gradient accumulation and batch sizes small enough to fit two A100 GPUs comfortably.
+
+
+
+## 🎯 What Did We Achieve?
+
+Using this recipe you will observe across three key metrics:
+
+1. **Perplexity Drop** – From ~15 → 12 across all lengths up to \(>2\,\text{M}\); no blowup in short length performance.
+2. **Passkey Retrieval Success** – >90 % accuracy retrieving a random clue hidden somewhere in a multi-million token text.
+3. **Standard Benchmarks Maintained** – Zero-shot accuracy on ARC-Challenge stays within ±1% relative to base LLaMA2.
+
+
+
+## 🧪 Tips & Common Pitfalls
+
+* **Chunking Matters** – When mining PG19 books for training ensure that you always preserve >\(L'\)+BOS/EOS padding → helps attention learn good dependencies.
+* **Tune Warmup Carefully** – With these very long contexts likely training signals are sparse; keep warmup steps low (~200) or use full-gradient accumulation.
+* **Watch GPU Memory** – Even with half precision gradients your flash-attention module will consume lots; set max_batch_sz ≤8 if GPU memory drops below threshold.
+* **Drop-in Update?** No—if your base checkpoint uses custom attention patterns (eg., LoRA adapters), you must apply LongRoPE *after* loading those modules so they see correct positional encodings.
+
+---
+
+### TL;DR
+
+> Start from any existing RoPE LLM → run two quick evolutionary searches → train a handful of steps at +64 × length → extend once more → final model handles >2 million tokens with wholesale *no loss in short context quality*. It’s achievable in under five GPU hours and requires only standard Python tools.
+
+Happy extenders! Happy long documents!

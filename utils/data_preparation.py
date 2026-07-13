@@ -484,6 +484,35 @@ def prepare_training_mix(
     times_explanations = strategy_args.get("times_explanations", 1)
     semi_cleaned_version = strategy_args.get("semi_cleaned", None)
     use_raw = strategy_args.get("use_raw", False)
+    # Generator-model namespacing: synthetic texts live under
+    # data/{source}/{explanations|paraphrased}/{model_slug}/{domain}/. Default to the
+    # migrated 'gpt_5_mini_custom' bucket; fall back to the legacy flat path if the slugged
+    # directory is absent so pre-migration data still loads.
+    explanation_model_slug = strategy_args.get("explanation_model") or "gpt_5_mini_custom"
+    paraphrase_model_slug = strategy_args.get("paraphrase_model") or "gpt_5_mini_custom"
+
+    def _synthetic_dir(
+        kind: str,
+        slug: str,
+        source: str,
+        domain: str,
+        *,
+        allow_legacy: bool = True,
+    ) -> str:
+        # A single all-domain training run may use generator directories whose
+        # slugs include the high-level source (for example
+        # gemma_4_12b_it_arxiv_w16).  ``{source}`` lets one CLI value resolve to
+        # the arxiv/medical/legal directory selected by the current loop.
+        resolved_slug = slug.replace("{source}", source)
+        slugged = f'../../data/{source}/{kind}/{resolved_slug}/{domain}/'
+        if os.path.isdir(slugged):
+            return slugged
+        if not allow_legacy:
+            raise FileNotFoundError(
+                f"Requested {kind} generator corpus does not exist: {slugged} "
+                f"(template={slug!r}, source={source!r}, domain={domain!r})"
+            )
+        return f'../../data/{source}/{kind}/{domain}/'  # legacy flat layout
     shuffle_chunks_flag = strategy_args.get("shuffle_chunks", False)
     shuffle_seed = strategy_args.get("shuffle_seed", 42)
     granular_explanations_cycle = strategy_args.get(
@@ -546,12 +575,13 @@ def prepare_training_mix(
     document_track_baseline = bool(strategy_args.get("document_track_baseline", False))
     document_match_specific_explanation = strategy_args.get("document_match_specific_explanation", None)
     document_match_insert_content = strategy_args.get("document_match_insert_content", "document")
+    document_match_insert_explanation_model = strategy_args.get("document_match_insert_explanation_model", None)
     if isinstance(document_match_specific_explanation, list) and len(document_match_specific_explanation) == 1:
         document_match_specific_explanation = document_match_specific_explanation[0]
-    if document_match_insert_content not in {"document", "cited_works", "prior_knowledge", "textbooks", "blogs", "stackexchange"}:
+    if document_match_insert_content not in {"document", "cited_works", "prior_knowledge", "textbooks", "blogs", "stackexchange", "explanations"}:
         raise ValueError(
             "--document_match_insert_content must be one of: document, cited_works, prior_knowledge, "
-            "textbooks, blogs, stackexchange; "
+            "textbooks, blogs, stackexchange, explanations; "
             f"got {document_match_insert_content!r}"
         )
 
@@ -716,7 +746,7 @@ def prepare_training_mix(
         # Load Paraphrases
         paraphrased_chunks_by_doc = []
         if num_paraphrased_texts > 0:
-            paraphrased_dir = f'../../data/{domain_source}/paraphrased/{domain}/'
+            paraphrased_dir = _synthetic_dir('paraphrased', paraphrase_model_slug, domain_source, domain)
             if os.path.isdir(paraphrased_dir):
                 for i in range(num_paraphrased_texts):
                     para_path = _find_shuffled_paraphrase_path(domain_source, domain, i, paraphrased_dir)
@@ -740,11 +770,12 @@ def prepare_training_mix(
         current_domain_document_match_tracks = [] # Document baseline only
         current_domain_whole_batch = [] # Whole strategy only
 
-        def _resolve_explanation_subfolder(expl_type: str):
+        def _resolve_explanation_subfolder(expl_type: str, base_dir: str = None):
             """Return (subfolder_abs_path, sorted_filenames) for an explanation type.
 
             Special-cases 'prior_knowledge' to read from data/{source}/prior_knowledge/{domain}/
             with chapter_*.txt files sorted numerically by chapter index.
+            base_dir overrides the enclosing explanation_dir (e.g. an alternate generator slug).
             """
             if expl_type == "prior_knowledge":
                 subfolder_path = os.path.abspath(f'../../data/{domain_source}/prior_knowledge/{domain}/')
@@ -760,7 +791,7 @@ def prepare_training_mix(
                     key=_chapter_index,
                 )
                 return subfolder_path, files
-            subfolder_path = os.path.join(explanation_dir, expl_type)
+            subfolder_path = os.path.join(base_dir if base_dir is not None else explanation_dir, expl_type)
             if not os.path.isdir(subfolder_path):
                 return None, []
             files = sorted([f for f in os.listdir(subfolder_path) if f.endswith('.txt')])
@@ -862,6 +893,73 @@ def prepare_training_mix(
                         chunks.extend(para_chunks)
                 return chunks
 
+            # Insert content may come from a different generator slug than the sizing corpus.
+            if document_match_insert_explanation_model:
+                insert_dir = _synthetic_dir(
+                    'explanations', document_match_insert_explanation_model,
+                    domain_source, domain, allow_legacy=False,
+                )
+                insert_label = f"{document_match_insert_content}[{document_match_insert_explanation_model}]"
+            else:
+                insert_dir = explanation_dir
+                insert_label = document_match_insert_content
+
+            def _load_type_chunks(expl_type: str) -> List[str]:
+                """Load one explanation type from insert_dir, preferring the granular
+                subfolder and falling back to the flat file (e.g. textbooks -> textbook.txt)."""
+                subfolder_path, files = _resolve_explanation_subfolder(expl_type, base_dir=insert_dir)
+                if subfolder_path is not None and files:
+                    type_chunks: List[str] = []
+                    for filename in files:
+                        with open(os.path.join(subfolder_path, filename), 'r', encoding='utf-8') as f:
+                            type_chunks.extend(_chunk_explanation(f.read()))
+                    log.info(
+                        f"Domain {domain}: matched insert type {expl_type} loaded from subfolder "
+                        f"({len(files)} files, {len(type_chunks)} chunks)."
+                    )
+                    return type_chunks
+                alias_to_flat = {
+                    "textbook": "textbook",
+                    "textbooks": "textbook",
+                    "blog": "blogs",
+                    "blogs": "blogs",
+                    "stackexchange": "stackexchange",
+                    "stack": "stackexchange",
+                }
+                key = alias_to_flat.get(expl_type, expl_type)
+                flat_path = os.path.join(insert_dir, f"{key}.txt")
+                if os.path.isfile(flat_path):
+                    with open(flat_path, 'r', encoding='utf-8') as f:
+                        type_chunks = _chunk_explanation(f.read())
+                    log.info(
+                        f"Domain {domain}: matched insert type {expl_type} loaded from flat file "
+                        f"{key}.txt ({len(type_chunks)} chunks)."
+                    )
+                    return type_chunks
+                log.warning(
+                    f"Domain {domain}: matched insert type {expl_type} not found under {insert_dir} "
+                    f"(no subfolder or {key}.txt)."
+                )
+                return []
+
+            if document_match_insert_content == "explanations":
+                insert_types = document_match_specific_explanation or ["textbooks", "stackexchange", "blogs"]
+                if not isinstance(insert_types, list):
+                    insert_types = [insert_types]
+                chunks: List[str] = []
+                for expl_type in insert_types:
+                    chunks.extend(_load_type_chunks(expl_type))
+                if not chunks:
+                    log.warning(
+                        f"Domain {domain}: --document_match_insert_content=explanations requested, but no "
+                        f"explanation files found under {insert_dir}; skipping matched insert track."
+                    )
+                    return []
+                log.info(
+                    f"Domain {domain}: using {insert_label} as matched insert content ({len(chunks)} chunks)."
+                )
+                return chunks
+
             insert_type = {
                 "cited_works": "cited_textbooks",
                 "prior_knowledge": "prior_knowledge",
@@ -869,7 +967,7 @@ def prepare_training_mix(
                 "blogs": "blogs",
                 "stackexchange": "stackexchange",
             }[document_match_insert_content]
-            subfolder_path, files = _resolve_explanation_subfolder(insert_type)
+            subfolder_path, files = _resolve_explanation_subfolder(insert_type, base_dir=insert_dir)
             if subfolder_path is None or not files:
                 log.warning(
                     f"Domain {domain}: --document_match_insert_content={document_match_insert_content} "
@@ -883,13 +981,13 @@ def prepare_training_mix(
                 with open(os.path.join(subfolder_path, filename), 'r', encoding='utf-8') as f:
                     chunks.extend(_chunk_explanation(f.read(), title_prefix=title_prefix))
             log.info(
-                f"Domain {domain}: using {document_match_insert_content} as matched insert content "
+                f"Domain {domain}: using {insert_label} as matched insert content "
                 f"({len(files)} files, {len(chunks)} chunks)."
             )
             return chunks
 
         if document_track_baseline:
-            explanation_dir = f'../../data/{domain_source}/explanations/{domain}/'
+            explanation_dir = _synthetic_dir('explanations', explanation_model_slug, domain_source, domain)
             files_to_load = _select_granular_explanation_files(
                 explanation_dir,
                 document_match_specific_explanation,
@@ -944,7 +1042,7 @@ def prepare_training_mix(
                 )
         
         if include_explanations:
-            explanation_dir = f'../../data/{domain_source}/explanations/{domain}/'
+            explanation_dir = _synthetic_dir('explanations', explanation_model_slug, domain_source, domain)
             files_to_load = {}
             use_subfolder_loading = explanations_insertion_strategy in ("granular", "granular_queue", "legacy_v2")
 

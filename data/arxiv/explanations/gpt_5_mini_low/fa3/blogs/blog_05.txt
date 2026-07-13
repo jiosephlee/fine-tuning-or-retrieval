@@ -1,0 +1,85 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# From Layouts to Throughput: The Kernel Engineering Behind FP8 FlashAttention-3
+
+Modern GPUs give huge raw matrix‑multiply throughput in low precision, but extracting that peak for a fused operator like attention requires careful kernel-level engineering. FlashAttention-3 shows how micro‑choices around layout, shared‑memory transfers and register organisation let you actually use the FP8 Tensor Cores (WGMMA) and sustain the pipeline — nearly doubling GEMM throughput versus FP16 and reaching close to 1.2 PFLOP/s on H100.
+
+This post walks through the practical kernel techniques the paper uses to make FP8 attention fast and accurate on Hopper-class GPUs: satisfying the k‑major constraint, doing in‑kernel transposes with LDSM/STSM, permuting accumulators into operand formats in registers, and avoiding expensive pre/post transpose kernels. I keep the discussion focused and actionable for practitioners who write attention kernels or optimise fused operators.
+
+## Why FP8 is tempting — and tricky
+
+Hopper’s WGMMA exposes FP8 Tensor Cores that can double matmul throughput versus FP16/BF16. That’s an enormous win for attention, which is dominated by GEMMs.
+
+But two related constraints make naive FP8 usage fail:
+
+- The hardware requires FP8 input operands in a k‑major layout when supplied from shared memory (SMEM). This means the innermost stride must be the feature/k dimension rather than the sequence/head dimension. In attention, tiles are typically contiguous in the head dimension (d), not in the sequence length (N).
+- FP8 WGMMA also expects a particular layout for the FP32 accumulator produced by one WGMMA if that accumulator is to be reused as input to another WGMMA in the same kernel. The accumulator register ordering can clash with the register/SMEM ordering used for the next operand.
+
+If you ignore these, you either must insert costly pre/post transpose kernels (moving data through HBM), or you are forced to fall back to FP16—losing the FP8 speedup.
+
+FlashAttention-3 solves this with three micro‑engineering moves that keep work entirely in-kernel and keep the Tensor Cores fed.
+
+## 1) Satisfy the k-major constraint with in-kernel V transposes (LDSM / STSM)
+
+Goal: make the tile of V that participates in the second GEMM be contiguous along the k (feature) dimension in SMEM, as required by FP8 WGMMA.
+
+Options considered:
+- Pre-transpose V in HBM before calling attention (standalone kernel or fused to previous op). This is either awkward to integrate into libraries or too expensive for memory-bound inference.
+- Transpose tiles after loading into SMEM inside the attention kernel. FlashAttention-3 chooses this.
+
+How they do it:
+- Use the LDSM (ldmatrix) and STSM (stmatrix) instructions. These warp‑level instructions move blocks between SMEM and registers at a fine granularity (used as 8×8 of 16‑bit entries in PTX docs, but repurposed here to pack FP8 entries).
+- The producer warpgroup performs a tile load from GMEM to SMEM and then uses LDSM/STSM to perform the tile transpose in-register and write the transposed tile back to SMEM in the k‑major layout required by FP8 WGMMA.
+- Because LDSM/STSM are register‑efficient and warp cooperative, they can be scheduled inside the kernel without causing register-shuffle across threads and with low overhead.
+- Crucially, the transpose of the next V tile can be executed “in the shadow” of GEMM work on the current tiles. That is, transpose work is overlapped with asynchronous WGMMA and TMA activity so the extra cost is hidden by already-scheduled operations.
+
+Net effect: no global pre/post‑transpose kernels, no extra HBM traffic, and V tiles arrive in SMEM in the required k‑major layout for FP8 WGMMA.
+
+## 2) Bridge accumulator vs operand layouts via register permutations
+
+Problem: the register layout of an FP32 accumulator emitted by an FP8 WGMMA does not match the layout that the next FP8 WGMMA expects for its FP8 operand when that operand is assembled from registers. For fused attention you often want to feed a computed block directly into another WGMMA without round‑tripping through SMEM in a different layout.
+
+What FlashAttention-3 does:
+- Inspect the ordering of accumulator registers produced by the first WGMMA and identify a deterministic byte/element permutation that will transform that accumulator ordering into the operand ordering expected by the subsequent WGMMA.
+- Implement that permutation with byte‑permute instructions (cheap register-only instructions) replicated at the necessary granularity (they describe applying a permutation pattern like {d0 d1 d4 d5 d2 d3 d6 d7} repeated over 8‑byte groups).
+- Combine this register permutation with the in-kernel transpose of V so the logical column/row permutations line up: the permuted accumulator columns and the transposed V rows agree, so the second WGMMA computes the correct output tile without additional reshuffles.
+
+Why this matters:
+- Register-only permutations are far cheaper than spilling to SMEM or issuing global transposes.
+- This lets multiple GEMMs be fused in-kernel while still using FP8 WGMMA paths for both, preserving the high FP8 throughput end-to-end.
+
+## 3) Avoid costly pre/post kernels — keep everything in-kernel and overlapped
+
+The two techniques above enable feeding FP8 WGMTAs directly from on-chip buffers and registers. But to actually exploit the available throughput you must also keep the pipeline filled and hide the relatively slow non-GEMM work (exponentials, softmax reductions).
+
+FlashAttention-3 ties this together with asynchrony-aware scheduling:
+
+- Use warp‑specialization (producer warps for TMA/loads and consumer warps for WGMMA) and a circular SMEM buffer so loads and transposes happen asynchronously relative to Tensor Core execution.
+- Overlap the in-kernel V transpose (LDSM/STSM) with WGMMA activity on other tiles — that hides the transpose latency under matmuls.
+- Overlap softmax and GEMMs with a 2‑stage (or optionally 3‑stage) pipeline so special-function units (exponentials) run while Tensor Cores execute. This is critical because special functions have orders of magnitude lower throughput than GEMMs; if they run sequentially they become a bottleneck.
+- Use register-space tricks (setmaxnreg) to give more registers to warps doing WGMMA and fewer to warps doing TMA/transposes, balancing resource use.
+
+Together these micro choices mean:
+- No extra HBM passes to re-layout tensors;
+- The FP8 Tensor Cores are actually saturated much more of the time (paper reports FP8 reaching close to 1.2 PFLOP/s and FP16 up to 740 TFLOP/s, ~75% utilization for FP16);
+- The kernel remains a single fused operator (no pre/post kernels) so latency and memory pressure are lower.
+
+## Accuracy-side considerations (how FP8 stays useful)
+
+The kernel engineering above unlocks FP8 throughput, but FP8 quantization accuracy must be managed. FlashAttention-3 applies two algorithmic measures that fit naturally with the block-based kernel:
+
+- Block quantization: quantize per tile/block (one scale per block) instead of a single scale per tensor. The algorithm already processes Q/K/V in blocks (B_r × d or B_c × d), so keeping one scale per block is cheap to compute and reduces quantization error for tiles with differing dynamic ranges.
+- Incoherent processing: pre-multiply Q and K by a cheap structured orthogonal random transform (Hadamard times random diagonal signs). This spreads out outlier values so quantization error is more uniform and smaller. The Hadamard transform can be fused with existing pre-attention ops (e.g., rotary embeddings) with O(d log d) cost and little overhead.
+
+Those accuracy techniques are orthogonal to the layout engineering but essential to make FP8 attention numerically acceptable. The paper reports FP8 FlashAttention-3 with block quantization + incoherent processing is ~2.6× more accurate than a baseline per-tensor FP8 attention implementation under simulated outliers.
+
+## Practical takeaways for kernel authors
+
+- If you want to use FP8 WGMMA in a fused operator, don’t accept a global pre/post transpose. Instead, plan for in-kernel tile transposes using warp-level matrix load/store primitives (LDSM/STSM) and overlap them with other asynchronous work.
+- Inspect the exact register ordering the hardware generates for accumulators. Often a small deterministic register permutation implemented with byte/element permutes will let you reuse accumulators as operands to the next WGMMA without spilling.
+- Use warp‑specialization and asynchronous copies (TMA) plus a circular SMEM buffer to keep TCs fed and hide special-function latency (softmax/exponentials).
+- Combine these low-level layout tricks with block quantization and inexpensive orthogonal transforms to keep FP8 errors under control, especially in the presence of outliers.
+
+These micro‑choices may seem small individually, but together they convert theoretical FP8 peak throughput into sustained throughput for fused attention kernels. FlashAttention-3 demonstrates that paying attention to layout constraints and register-level data movement is a practical route to unlocking near‑2× speedups on modern GPUs — without adding off‑kernel pre/post steps that would kill the memory advantage of fused attention.
+
+If you implement these ideas, profile carefully: register pressure, occupancy, and instruction scheduling matter. The right balance of tile sizes, pipeline depth, and register allocation is what turns those register permutations and LDSM/STSM transposes into real TFLOPs on the wire.

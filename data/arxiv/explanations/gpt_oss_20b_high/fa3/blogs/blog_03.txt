@@ -1,0 +1,167 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# Overlapping Softmax and Matrix Multiplication
+## Turbocharged Attention on Hopper GPUs
+
+Attention is the workhorse that makes Transformers model text, code, images and more.  
+On a modern GPU that work boils down mainly to two stages:
+
+1. **A gigantic matrix multiplication** – compute the dot‑product scores  
+   $$\mathbf{S}= \alpha\, \mathbf{Q}\,\mathbf{K}^{\top},$$  
+   where $\mathbf{Q}$ and $\mathbf{K}$ are $N\times d$ query/key matrices,
+   $N$ being the sequence length.
+2. **A lightweight softmax** – row‑wise exponentials followed by normalisation  
+   $$\mathbf{P}=\operatorname{softmax}(\mathbf{S}).$$  
+
+Even though $\mathbf{S}$ contains $N^{2}$ entries, all those exponentials are
+handy little float operations; they just sit idle while huge GEMMs fire through
+the Tensor Cores. On an H100 Diamond back‑end this imbalance turns the
+single micro‑NVIDIA kernel into a “put your feet on ice” stall at every
+iteration — an opportunity the FlashAttention family has been chasing
+for years.
+
+
+
+--------------------------------------------------------------------
+
+## Why      The Softmax Stalls Us
+
+* GPU kernels run at millions of clock cycles per second,
+  but **softmax exponentials** run at only *a few thousand* FLOPS per SM.
+* Matrices come fast — Hopper’s Tensor Cores can crunch billions of
+  operations per second when fed from shared memory,
+  whereas **exponential units** are a single special function unit per SM
+  that perform only ~10 op / clock cycle.
+* In ordinary “run‑once” code you do:
+   ```
+   S = Q × Kᵀ      // Matrix multiply (hot)
+   P = exp(S-max)   // Exponentials (cold)
+   ```
+   The GPU executes `S` efficiently, but then idles while it waits
+   for `exp()`.
+
+
+
+--------------------------------------------------------------------
+
+## Tape Warp‑Specialization + Asynchrony
+
+FlashAttention‑3 takes advantage of Hopper’s *asynchronous* execution:
+* **Tensor Memory Accelerator (TMA)** wires giant DRAM blits straight onto
+  shared memory without stalling.
+* **Warpgroup Matrix Multiply (`WGMMA`)** is every bit as efficient as it gets,
+  but runs independently of instruction flow—so you keep itself busy doing GLAs
+  even if other threads are still waiting on older ones.
+* By **dividing each thread block into producer warps** (loading data)
+and **consumer warps** (doing multiplies + softmax),
+the producer never blocks the consumer – data movement stays behind,
+and every cycle sees work.
+
+
+
+--------------------------------------------------------------------
+
+## Exchange Runners – The Two‑Stage Pipeline
+
+The trick lies inside *one* consumer warpgroup where there are two ordersable
+operations:
+
+| Stage | What it does                      | Where it must finish-before… |
+|-------|-----------------------------------|------------------------------|
+| **GEMM 0** | Compute $S_{\text{cur}}=\mathbf{Q}\,\mathbf{K}_{\text{cur}}^{\top}$ |       |
+| **Softmax** | Turn $S_{\text{cur}}$ into $\tilde{\mathbf{P}}_{\text{cur}}:=e^{S_{\text{cur}}-m_{\text{cur}}}$ |          |
+| **GEMM 1** | Update output $\mathbf{O}\gets \tilde{\mathbf{P}}_{\text{cur}}\mathbf{V}_{\text{cur}}\,$ |           |
+
+In a naïve kernel each iteration would have hard waits right after  
+`GEMM 0` before entering `Softmax`, then wait again before launching `GEMM 1`.  
+This serialises almost all useful work – only one multiply feeds one softmax,
+then one more multiply heads off – leaving huge portions of the Tensor Core idle.
+
+
+### How FlashAttention‑3 changes everything
+
+1. **Double buffers inside registers** – Save `S_{\text{next}}` immediately after...
+   ```cpp
+   S_next = Q × K_nextᵀ           // start multiplication
+   // leave it running while …
+   ```
+2. **Overlap ‘Softmax’ + next ‘GEMM 0’**
+   ```cpp
+   wait for GWMMA( Q × K_curᵀ )    // finish current multiply
+   m_cur , P_cur = softmax(S_cur)
+   X += P_prev × V_prev            // GRAPES row-col product already started earlier!
+   ```
+3. A simpler picture is a **relay race**:
+   
+   *Team A:* feeds block $j$ into Tensor Core.
+   
+   *Team B:* runs the cheap `softmax` on block $j−1`.
+   
+   While Team B pushes its baton off, Team A still burns full energy threading block $j+1`.  
+   
+In pseudo code you sketch it as “commit WGMMA1 but don’t wait;
+then commit WGMMA2 but don’t wait; finish whichever finishes first”, exactly what line 23–27 in Algorithm 4 describe.
+
+
+
+--------------------------------------------------------------------
+
+## Ping–Ping Across Warpgroups
+
+Adding another layer modulo simple “one warp produces everything” you put
+the whole CTA underground:
+
+* **Producer group** keeps filling a circular shared‑mem buffer with new Key / Value blocks via TMA.
+* **Consumer group #0** processes blocks [0..t] using the two‑stage pipe above.
+* While #0 is doing its slow exponentials,
+**consumer group #1** can start its own GWMMA giving an extra dive of parallelism—
+effectively you have *two places hard at work concurrently*, which inner‐loop scheduling tells CUDA’s scheduler exactly how many instruction cycles stay behind.
+This “ping–pong” arises because both groups happenstance share diverging start times –
+harder than copy/paste theory but good enough to lift device utilisation from roughly *35 %* up close to *75 %* on Hopper.
+
+
+
+--------------------------------------------------------------------
+
+## Why It Really Matters
+
+The paper’s timing tables back up the intuition:
+
+| Repeated Kernel Strategy | Speedup over FlashAttention‑2 |
+|--------------------------|------------------------------|
+| Simple producer / consumer without overlap | ~ 570 TFLOPs |
+| With Two‑Stage Pipeline alone | ~ 620–640 TFLOPs |
+| Two‑Stage + Ping–Ping (`Warpgroup` scheme) | Up-to 740 TFLOPs over H100 ×FAK |
+| FP8 version adds layout tricks → ~“Close to 1 PFLOPs” |
+
+So you go from *suboptimal Tensor Core utilisation* (~33%) all yours gain:
+a *≈30–40 % increase* simply by letting your lane carry “softmaximum”
+while another lane spins through matrix multiplication.
+
+
+--------------------------------------------------------------------
+
+## Recap & Bottom Line
+
+FlashAttention‑3 turns an otherwise clumsy look at attention –
+do-multiply-and-hurry–through-softmax–
+into a carefully choreographed dance where every SWENO swim slot is occupied:
+> **Pipeline State:**  
+> - Producer Warps → TMA Loads → Water carried over buffer until needed  
+> - Consumer Warps → WGMMA queueing pieces → SoftMax peel – all racing simultaneously  
+
+Thereafter each head no longer waits passively between two intensive ops,
+but stays strapped tight as early blooming timers keep raw multiply engines hot.
+The result? An accelerator routine that reaches near sweet spot performance –
+stopping Cubic‑time attention from taking longer than your eye can follow.
+
+
+
+--------------------------------------------------------------------
+
+> For deeper dives into code or instruction fragments produced by NVIDIA’s PTX/DAG,
+> see Franki’s official open‑source FlashAttention‐3 implementation on GitHub–the very kernel that ships these gains onto production LLM clusters.
+
+
+
+---

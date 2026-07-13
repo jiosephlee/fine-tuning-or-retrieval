@@ -1,0 +1,168 @@
+\title{Stack Exchange of the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+### How does back‑propagation work through the 4‑bit NF4 quantized weights in QLoRA?
+Question:
+In the QLoRA method the base model weights are stored in 4‑bit NormalFloat (NF4) and are kept frozen during finetuning. The paper says that gradients are back‑propagated through these quantized weights to compute updates for the LoRA adapters, but only the LoRA parameters receive gradients. I am confused about the exact computational graph:
+
+1. When computing \(\frac{\partial E}{\partial \mathbf{L}_i}\), does the chain rule require the derivative \(\frac{\partial \mathbf{X}}{\partial \mathbf{W}}\) where \(\mathbf{W}\) is the NF4 tensor?
+2. How is the dequantization step incorporated into this derivative? Is the dequantization considered a linear operation with a simple scaling factor, or does it involve non‑linear quantile mappings that affect the gradient?
+3. Are the gradients with respect to \(\mathbf{W}\) ever materialized, or are they implicitly accounted for by using the dequantized \(\mathbf{W}^{\text{BF16}}\) in the forward pass?
+
+A step‑by‑step description (or a small toy example) of forward and backward passes would help me understand how QLoRA can keep the 4‑bit weights frozen yet still propagate useful gradients to the adapters.
+
+Answer:
+**Answer**
+
+In QLoRA the pretrained model is *stored* as a 4‑bit NF4 tensor **W** together with per‑block scale factors (the double‑quantized constants).  
+During the forward pass the tensor is **de‑quantised** to a 16‑bit compute type (bfloat16, denoted **$\\hat{W}$**) and then used in the usual matrix‑multiply
+
+$$
+Y = X\,\\hat{W} \;+\; X\,L_{1}L_{2},
+\\qquad 
+\\hat{W} =\\operatorname{dequant}\\bigl(\\operatorname{dequant}(c_{1},c_{2}),W\\bigr) .
+$$
+
+Only the LoRA matrices $L_{1},L_{2}$ are declared `requires_grad`; the NF4 weights are kept frozen.  
+Nevertheless, the loss gradient that reaches the LoRA adapters must be propagated **through** the frozen weight matrix, because the gradient of the loss w.r.t. a LoRA parameter contains a term of the form
+
+$$
+\\frac{\\partial E}{\\partial L_{i}}
+   = \\frac{\\partial E}{\\partial Y}\\;
+     \\frac{\\partial Y}{\\partial (X\\,L_{i})}
+   = \\frac{\\partial E}{\\partial Y}\\;
+     X^{\\top},
+$$
+
+and $X^{\\top}$ is obtained from the *activations* that were computed using the de‑quantised base weight **$\\hat{W}$**.  The chain‑rule therefore implicitly depends on  
+
+$$
+\\frac{\\partial Y}{\\partial \\hat{W}}
+   = X .
+$$
+
+Because **$\\hat{W}$** itself is a deterministic (and differentiable) function of the stored NF4 tensor **W**, we can write
+
+$$
+\\frac{\\partial E}{\\partial L_{i}}
+ = \\frac{\\partial E}{\\partial Y}\\,
+   \\underbrace{\\Bigl(
+      X\\,\\frac{\\partial \\hat{W}}{\\partial W}
+   \\Bigr)}_{\\text{appears only as a constant during adapter update}} .
+$$
+
+Below we unpack each piece and show why no gradients for **W** have to be materialised.
+
+---
+
+### 1.  Derivative w.r.t. the quantised weight  
+
+The forward de‑quantisation of a block $b$ of size $B$ is
+
+$$
+\\hat{W}_b = \\frac{W_b}{c^{(b)}_2}\\,\\frac{1}{c^{(b)}_1},
+\\qquad 
+c^{(b)}_2 = \\operatorname{dequant}(c^{(b)}_1,c^{(b)}_2).
+$$
+
+Both $c^{(b)}_1$ (the 32‑bit per‑block scale) and $c^{(b)}_2$ (the 8‑bit double‑quantised scale) are *constants* during training – they are stored together with **W** and are not updated.  Consequently, for any element $w_{jk}$ inside a block we have
+
+$$
+\\frac{\\partial \\hat{W}_{jk}}{\\partial w_{jk}} 
+   = \\frac{1}{c^{(b)}_2 c^{(b)}_1},
+   \\qquad
+   \\frac{\\partial \\hat{W}_{pq}}{\\partial w_{jk}} = 0 \\;(p,q)\\neq(j,k).
+$$
+
+Thus de‑quantisation is simply a **linear scaling** operation; there is no non‑linear quantile mapping involved at run time because all quantile information has been baked into the NF4 lookup table when the model was originally quantised.  The lookup itself is a table of 16 floating‑point values, and fetching an entry and multiplying by the two constants is fully differentiable.
+
+---
+
+### 2.  Back‑propagation through the linear scaling  
+
+When autograd traverses the graph it encounters:
+
+```python
+Ŵ = dequant(c1, c2, W)          # linear scaling
+Y  = X @ Ŵ + X @ L1 @ L2        # matmul
+```
+
+The gradient of the loss `E` w.r.t. `W` is therefore
+
+$$
+\\frac{\\partial E}{\\partial W}
+   = \\frac{\\partial E}{\\partial Y}
+     \\; \\underbrace{
+        X^{\\top}
+        \\,\\frac{1}{c^{(b)}_2 c^{(b)}_1}
+       }_{\\text{same shape as }W}.
+$$
+\tag{1}
+
+Notice that **Equation (1)** looks exactly like an ordinary weight gradient, except for the extra constant factor `$1/(c_1 c_2)$`.  In QLoRA we *do not keep* this gradient – we do not update **W** – but autograd still computes it internally because it is needed to propagate the signal further back to earlier layers (the same signal that would have been used to update W in a normal full‑finetuning run).
+
+Because `$c₁$` and `$c₂$` are stored as tensors of size *number_of_blocks*, they can be broadcast efficiently, and no extra memory is incurred beyond what would already be required for a normal back‑propagation through a full‑precision weight matrix.
+
+---
+
+### 3.  Why gradients w.r.t **W** never get materialised  
+
+The key practical trick in QLoRA is that after Autograd finishes computing (1) it immediately discards it – only the gradients that belong to tensors marked `requires_grad=True` are retained.  
+The adapters `$L₁$` and `$L₂$` are such tensors, so their gradients are kept:
+
+```python
+grad_L2 = (X @ L1).T @ dE/dY          # standard LoRA rule
+grad_L1 = dE/dY @ (L2).T @ X.T       # symmetric
+```
+
+All intermediate products involving `dE/dY` and `X` have already been materialised while processing the forward pass; they are reused for both (i) computing `(X @ Ŵ)`’s backward contribution and (ii) updating LoRA parameters.  Because the scaling factor between **Ŵ** and **W** is constant, there is no need to allocate a separate buffer for `∂E/∂W`. Autograd simply multiplies by that factor on‑the‑fly and throws away the result.
+
+In implementation terms (see `bitsandbytes` kernels shipped with QLoRA), de‑quantisation and its backward pass are fused into one CUDA kernel:
+
+```cpp
+// forward:   out = dequantize(W_nf4, c1, c2);
+ // backward: dW_nf4 = grad_out * (1/(c1*c2));
+```
+
+The kernel writes `dW_nf4` into a *temporary* buffer that lives only for the duration of that backward call; it never becomes part of an optimizer state because `optimizer.step()` never sees it.
+
+---
+
+### 4.  A tiny toy example  
+
+Consider a single linear layer with input dimension 2, output dimension 2, blocksize = 4 (so all four weights lie in one block).
+
+| stored NF4 value | de‑quantised (`c₁=0.8`, `c₂=0.5`) |
+|------------------|-----------------------------------|
+|   3 (encoded)    | $3/(0.8·0.5)=7.5$               |
+|   −2             | $-2/(0.8·0.5)= -5.0$            |
+|   …              | …                                 |
+
+Forward:
+```python
+W_hat = dequant(W_nf4, c1, c2)          # → [[7.5, -5.0],
+                                        #    [ … , … ]]
+Y     = X @ W_hat + X @ L1 @ L2
+loss  = criterion(Y, target)
+```
+
+Backward:
+```python
+grad_Y      = loss.backward()          # dE/dY
+grad_W_hat  = X.T @ grad_Y              # ordinary weight gradient
+grad_W_nf4  = grad_W_hat / (c1*c2)      # scaled by 1/(0.8*0.5)=2.5
+# grad_W_nf4 is discarded; only grad_L1/L2 are kept.
+```
+
+Even though we never store or update `W_hat` or `W_nf4`, Autograd has traversed through them exactly as it would with full precision – only the *final* gradient for those tensors is omitted.
+
+---
+
+### 5.  Summary of what happens in QLoRA  
+
+* The NF4 storage format plus double quantisation gives you a tiny lookup table plus two per‑block scalars.
+* De‑quantisation is a pure linear scaling (`divide by c₂`, then by `c₁`). Hence its Jacobian is just another diagonal scaling matrix.
+* During back‑propagation PyTorch/autograd computes the usual weight gradient through this linear transformation; that gradient exists mathematically but is never materialised because the base weights are frozen (`requires_grad=False`).
+* The only gradients that survive are those of the LoRA matrices; they receive exactly the same upstream signal they would have received if full‑precision weights had been trainable.
+* The whole process incurs essentially no extra memory beyond what normal back‑prop through an unfrozen layer would need, which explains how QLoRA can keep a 65 B model on < 48 GB while still “back‑propagating through” its quantised parameters.
+
+Thus, although we speak of “back‑propagating through frozen NF4 weights”, in practice this means *using* those weights in the computational graph so that their linear scaling factor participates in gradient flow, while *dropping* any gradient intended for updating them. The adapters get fully informed gradients, and training proceeds exactly as in ordinary LoRA fine‑tuning, just with a dramatically smaller memory footprint thanks to NF4 storage.*

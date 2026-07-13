@@ -1,0 +1,88 @@
+\title{Stack Exchange of the Paper: "The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits"}
+
+### How would a 1‑bit mixture‑of‑experts (MoE) workflow look like with BitNet b1.58?
+Question:
+The paper suggests that 1.58‑bit models could reduce the memory overhead of MoE deployments. Could someone outline a possible MoE architecture that uses BitNet b1.58 experts? Specifically, how would router weights and gating functions be quantised, and what would the per‑token communication cost be compared to a standard FP16 MoE?
+Answer:
+**Short answer**  
+A 1‑bit MoE with BitNet b1.58 would look like a standard router‑based MoE where every weight matrix (both the experts and the router) is *ternary* (‑1, 0, +1) and the activations are 8‑bit signed integers.  
+The router outputs are first quantised to a small integer (“top‑k” or “load‑balance” mask) and the resulting sparse matrix‑vector products are executed with *integer‑only* GEMMs (typical implementations such as Skydance, TensorRT‑INT8, or the 2‑bit kernels used for BitNet).  
+Per‑token communication drops from the FP16‑to‑FP16 data traffic of a conventional MoE (≈ 2×(🚫 expert weights + activation bytes)) to roughly **½ the bytes**: each expert’s weight slice is now 1.58 bits on‑chip, and the gating vector, once quantised to a small integer, needs only a few bits per token. The savings in bandwidth can be more dramatic if you pack several tokens’ routing decisions into a single network packet.
+
+---
+
+## 1.  What the architecture looks like
+
+| Component | Classic FP16 MoE | BitNet b1.58 MoE |
+|-----------|-----------------|-------------------|
+| **Experts** | Linear layers with ≥ 16‑bit weights | `BitLinear` layers with ternary weights (‒1, 0, +1) |
+| **Router** | Small dense 2‑layer MLP → softmax → top‑k | Same MLP, but all its weights are ternary. The output logits are 16‑bit, but the final *gate values* (the top‑k mask) are **quantised to 1‑byte integers** (e.g. 0–31) and then used to multiply the expert outputs. |
+| **Activations** | FP16 (or BF16) | INT8 (signed), scaled per token to ‑128…127 |
+| **Communication** | Host↔GPU or inter‑chip: weight + activation tensors in FP16 (2 bytes per scalar) | Host↔GPU or inter‑chip: only the *load‑balance mask* (≈ 1 bit per expert per token) plus a small delta‑code for the selected expert indices; weights stay on‑chip. |
+
+The key insight is that **the router itself can be an integer‑only module**. In the BitNet paper, the authors quantise *all* trainable parameters to a ternary set using the absmean rounding. Carrying that over to MoE, each router weight is pushed through that same quantisation function, yielding a matrix that can be stored with 1.58 bits per entry. The 8‑bit activations make sure that the explainability of vector‑wise gating (e.g., via  
+\[
+g_i = \mathrm{softmax}(W_{\text{router}}\;x)
+\]
+) stays numerically stable while keeping the data‑movement cheap.
+
+---
+
+## 2.  Quantising router weights & gating
+
+1. **Router weights**  
+   The router for token *t* is a small MLP:
+   \[
+   r_t = \mathrm{RoundClip}\!\left(\frac{W_r\,x_t + b_r}{\gamma_r + \epsilon}, -1, 1\right),
+   \]
+   where \(W_r\) and \(b_r\) are ternary.  
+   \(x_t\) is the 8‑bit token activation. The division by \(\gamma_r\) (average absolute value) keeps the dynamic range manageable.
+
+2. **Routing score**  
+   The rollout is traditionally a softmax over \(K\) experts. With integer‑only weights the logits stay 16‑bit (or even 8‑bit after scaling). The softmax is *approximated* by a *top‑k* selection:  
+   \[
+   \mathcal{I}_t = \operatorname{argsort}(score_t)_{[:k]}.
+   \]
+   Rather than sending a soft probability vector, we only send the indices \(\mathcal{I}_t\). If the router mask is stored as a 1‑bit “active/inactive” flag per expert, the communication cost is \(k\) bits per token for the mask, plus a few bits for the indices (e.g. 5 bits for up to 32 experts).
+
+3. **Expert outputs**  
+   Each expert’s output is a linear transformation using its ternary weight matrix. The result is a vector of 8‑bit signed integers. The sum of locally activated experts is then performed on the same chip, avoiding any inter‑chip traffic for raw activations.
+
+---
+
+## 3.  Per‑token communication cost compared to FP16 MoE
+
+| Item | Classic FP16 MoE | BitNet b1.58 MoE | Ratio |
+|------|-----------------|------------------|-------|
+| **Expert weight slice** | 16 bits | 1.58 bits | 0.099 |
+| **Router mask** | 1 bit per expert (if full soft‑gating) | 1 bit per expert (for active / inactive) | 1 |
+| **Activator / gating logits** | 16 bits (if shipped) | 8 bits after scaling | 0.5 |
+| **Expert activation vector** | 16 bits | 8 bits | 0.5 |
+
+Assume a MoE with 32 experts and *k = 2* experts activated per token.  
+- Classic MoE needs to send 32 × 16 = 512 bits of router logits + 2 × buffer (say 128 bits, 16 bits × 8‑token window) ≈ 640 bits per token.  
+- BitNet b1.58 sends 32 × 1.58 ≈ 50 bits of router mask (if encoded sparsely) + 2 × 8 = 16 bits for the chosen activations ≈ 66 bits per token.
+
+So **the communication cost drops by roughly a factor of 10**, with the majority of savings coming from storing the router weights and expert weights in ternary form and packing the routing decisions into a sparse bit‑mask rather than a dense probability vector.
+
+---
+
+## 4.  Practical considerations
+
+1. **Hardware support** – The 2‑bit kernels shown in BitNet (e.g. the Ladder kernel) can be extended to a *ternary* kernel. The major bottleneck shifts from *floating‑point multiplication* to *integer multiplication* and *adder tree* operations, which are significantly cheaper on GPUs or dedicated ASICs.
+
+2. **Dynamic load balancing** – Since the routing operation is integer‑only, it can be moved to a lightweight micro‑controller or a small dedicated “router arbiter” that keeps track of expert utilisation in real time, emitting a sparse bit‑mask that is instantly consumable by the expert matrix‑multiply units.
+
+3. **Compression of the router** – The ternary weights of the router can be *entirely stored on‑chip*, eliminating the need to fetch them over a PCI‑e bus. In a multi‑chip MoE environment, each chip would only need to stream the 1‑bit routing decisions for its own slice of experts, further reducing inter‑chip traffic.
+
+4. **End‑to‑end latency** – On the GPU, the cost of a ternary matrix multiply is roughly the **same** as a 16‑bit integer multiply minus the cost of the multiplier itself. Because the BitNet paper reports a 2.7× speed‑up for a 3.9 B model, replacing the linear layers in the MoE experts with BitLinear would preserve this speed‑up while eliminating the 4× memory traffic that is typical for FP16 MoE.
+
+---
+
+## 5.  Bottom line
+
+* A 1‑bit MoE using BitNet b1.58 would keep the traditional “top‑k” MoE design but replace every dense matrix (experts and router) with a ternary one, and every float activation with an 8‑bit integer.  
+* The **router** is quantised to ternary; its logits become 8‑bit integers and only the sparse selection indices are transmitted.  
+* Per token, the communication cost is reduced **≈ 10×** compared to FP16 MoE, because we no longer need to stream large 16‑bit weight matrices or dense gating vectors across the network.  
+
+This opens the door to *fully‑on‑chip* MoE with negligible inter‑chip traffic—exactly the advantage the paper predicts for moving a large MoE to a single accelerator.

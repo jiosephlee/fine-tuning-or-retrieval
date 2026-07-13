@@ -1,0 +1,343 @@
+\title{Blogs about the Paper: "Parameter-Efficient Orthogonal Finetuning via Factorization"}
+
+# Practical Guide: Adding BOFT to Your Model Adaptation Toolbox  
+
+*If you’re already familiar with LoRA or adapter tuning and wonder how Orthogonal Butterfly Finetuning (BOFT) fits into the picture, this post walks you through a ready‑to‑use implementation in PyTorch/🤗 Transformers, key initialization tricks, a multiplicative dropout recipe, and practical guidance on when BOFT is the right choice.*
+
+---
+
+## 1️⃣ Why Orthogonal Butterfly Finetuning?
+
+Large foundation models (LLMs, ViTs, diffusion models) are often too costly to train from scratch, so **parameter‑efficient finetuning** has become the de‑facto standard. Three popular families are:
+
+| Method | What changes? | Inference cost |
+|--------|---------------|----------------|
+| **Adapters** | Insert tiny MLPs between layers | Extra forward passes |
+| **LoRA** | Add low‑rank matrices \( \Delta W = A B^\top \) | Small extra mat‑vec ops |
+| **Orthogonal Finetuning (OFT)** | Multiply each layer by an orthogonal matrix \( \mathbf{R} \) | No extra ops if folded |
+
+OFT preserves pairwise neuron angles and the spectral norm of pretrained weights – properties that improve training stability and generalization \[[qiu2023controlling]\]. The downside? A full dense orthogonal matrix costs \(\mathcal{O}(d^2)\) trainable parameters for a layer of dimension \(d\).
+
+**BOFT** solves that bottleneck by representing \(\mathbf{R}\) as a *product of sparse orthogonal factors* arranged in a *butterfly* topology (the same pattern that powers the Fast Fourier Transform). The result:
+
+\[
+\mathbf{R}(m,b)=\prod_{i=1}^{m}\tilde{\mathbf B}^{\,b}_{(d,i)},
+\qquad 
+\text{with } 
+\underbrace{\tilde{\mathbf B}^{\,b\top}_{(d,i)}\tilde{\mathbf B}^{\,b}_{(d,i)}}_{=\mathbf I_d}
+\]
+
+* Each factor \(\tilde{\mathbf B}^{\,b}_{(d,i)}\) is a block‑diagonal matrix whose blocks are tiny \(b\times b\) orthogonal pieces.
+* With \(m=\log_2(d/b)+1\) factors we obtain a **dense** orthogonal transform while only storing  
+  \(\displaystyle \frac12(b-1)\,d\,m=\mathcal O(d\log d)\) parameters.
+* Setting \(m=1\) recovers the original block‑diagonal OFT; setting \(b=d\) recovers full OFT.
+
+Thus we get *dense expressivity* **and** *parameter efficiency* – a sweet spot that conventional adapters or LoRA do not guarantee.
+
+---
+
+## 2️⃣ Building BOFT from Scratch (PyTorch)
+
+Below is a minimal but complete implementation that you can drop into any transformer‑style model. The code follows the paper’s formulation closely – notice the use of the **Cayley transform** for exact orthogonality and an optional **multiplicative dropout** layer later on.
+
+### 2.1 Core Building Block – A Skew‑Symmetric Parameter → Orthogonal Matrix
+
+```python
+import torch
+import torch.nn as nn
+import math
+
+def cayley_transform(Q):
+    """Cayley map: R = (I + Q)(I - Q)^(-1), Q must be skew‑symmetric."""
+    I = torch.eye(Q.size(-1), device=Q.device, dtype=Q.dtype)
+    # Solve (I - Q) X = I + Q efficiently with autograd support
+    return torch.linalg.solve(I - Q, I + Q)
+```
+
+A skew‑symmetric matrix for size `b` has only `b*(b-1)//2` free entries:
+
+```python
+class SkewSymmetric(nn.Module):
+    def __init__(self, b):
+        super().__init__()
+        # Parameter vector holds upper‑triangle entries (i < j)
+        self.b = b
+        self.num_params = b * (b - 1) // 2
+        # Initialise at zero → identity after Cayley
+        self.p = nn.Parameter(torch.zeros(self.num_params))
+
+    def forward(self):
+        # Build full skew‑symmetric matrix
+        Q = torch.zeros(self.b, self.b,
+                        device=self.p.device,
+                        dtype=self.p.dtype)
+        idx = torch.triu_indices(self.b, self.b, offset=1)
+        Q[idx[0], idx[1]] = self.p            # upper triangle
+        Q[idx[1], idx[0]] = -self.p           # lower triangle (negated)
+        return cayley_transform(Q)
+```
+
+*Zero initialisation means every block starts as the identity – exactly what the paper recommends (“identity initialization”).*
+
+### 2.2 A Single Butterfly Component
+
+```python
+class ButterflyComponent(nn.Module):
+    """
+    One factor \tilde{B}^{b}_{(d,i)}.
+    Arguments:
+        d   – input dimension of the layer.
+        b   – block size (>=2). Must divide d.
+    """
+    def __init__(self, d, b):
+        super().__init__()
+        assert d % b == 0
+        self.d   = d
+        self.b   = b
+        self.n_blocks = d // b   # number of independent blocks along diagonal
+
+        # One SkewSymmetric per block
+        self.blocks = nn.ModuleList([SkewSymmetric(b) for _ in range(self.n_blocks)])
+
+    def forward(self):
+        # Build block‑diagonal orthogonal matrix
+        orth_blocks = [blk() for blk in self.blocks]          # each shape (b,b)
+        return torch.block_diag(*orth_blocks)                 # shape (d,d)
+```
+
+If you want a *permutation* between consecutive components (the canonical FFT “butterfly” mixing), simply pre‑multiply by a fixed permutation matrix before feeding the next component – this costs no trainable parameters and matches the construction described in Section 4 of the paper.
+
+### 2.3 Stacking Components → Full Orthogonal Matrix
+
+```python
+class OrthogonalButterfly(nn.Module):
+    """
+    Implements R(m,b)=Π_i tilde{B}^{b}_{(d,i)} .
+    Args:
+        d   – input dimension.
+        b   – block size.
+        m   – number of factors (default ≈ log₂(d/b)+1).
+    """
+    def __init__(self, d, b=2, m=None):
+        super().__init__()
+        assert d % b == 0
+        self.d = d
+        self.b = b
+        if m is None:
+            m = int(math.log2(d // b)) + 1   # sufficient for dense connectivity
+        self.m = m
+
+        # List of butterfly components at different scales.
+        # Following Eq.(3)-(4), scale shrinks by factor 2 each step.
+        self.factors = nn.ModuleList()
+        cur_dim = d
+        cur_b   = b * (2 ** (m - 1))   # first factor works on larger blocks
+        for i in range(m):
+            comp_b = max(b, cur_b // (2 ** i))
+            comp_b = int(comp_b)
+            self.factors.append(ButterflyComponent(d=self.d,
+                                                   b=comp_b))
+
+    def forward(self):
+        R = torch.eye(self.d,
+                      device=self.factors[0].blocks[0].p.device,
+                      dtype=self.factors[0].blocks[0].p.dtype)
+        for comp in self.factors:
+            R = comp() @ R      # left multiplication matches OFT formulation
+        return R                # shape (d,d), still orthogonal by construction
+```
+
+**Parameter count check:** Each factor contributes \((b_i-1)d/2\) trainable scalars (`SkewSymmetric`). Summing over all factors gives exactly  
+\(\frac12(b_{\text{first}}-1)d\,m=\mathcal O(d \log d)\).
+
+### 2.4 Injecting BOFT into a Linear Layer  
+
+Suppose `linear` is a frozen pretrained `nn.Linear` module (`weight` shape `[out_dim, in_dim]`). We wrap it:
+
+```python
+class BoftLinear(nn.Module):
+    def __init__(self, linear_module,
+                 block_size=2,
+                 num_factors=None,
+                 dropout_pcomp=0.0,
+                 dropout_pblock=0.0):
+        super().__init__()
+        self.W0     = linear_module.weight.detach().clone()   # frozen pretrained W⁰
+        self.bias   = linear_module.bias       # keep bias unchanged (optional)
+        d          = linear_module.in_features
+
+        self.boft   = OrthogonalButterfly(d,
+                                          b=block_size,
+                                          m=num_factors)
+
+        # dropout settings used only during training
+        self.p_comp   = dropout_pcomp     # e.g., 0.15 → drop whole factors
+        self.p_block  = dropout_pblock    # e.g., 0.10 → drop random blocks inside factors
+
+    def _apply_dropout(self):
+       """Return an orthogonal mask matching current training mode."""
+       if not self.training or max(self.p_comp,self.p_block)==0:
+           return None
+
+       masks = []
+       for comp in self.boft.factors:
+           mask_mat = torch.eye(comp.d,
+                               device=self.W0.device,
+                               dtype=self.W0.dtype)
+
+           # ----- Component‑level dropout -----
+           if torch.rand(1).item() < self.p_comp:
+               masks.append(mask_mat)               # identity → skip this comp.
+               continue
+
+           # ----- Block‑level dropout -----
+           n_blk      = comp.n_blocks
+           drop_mask  = torch.ones(n_blk,
+                                   device=self.W0.device,
+                                   dtype=self.W0.dtype)
+
+           drop_idx   = torch.rand(n_blk) < self.p_block
+           drop_mask[drop_idx] = 0.0                # replace selected blocks by I_b
+
+           block_masks =[torch.eye(comp.b,
+                                  device=self.W0.device,
+                                  dtype=self.W0.dtype) if drop_mask[i]==0 else None 
+                         for i in range(n_blk)]
+
+           masks.append((comp.blocks, block_masks)) # will be handled downstream
+
+       return masks
+
+    def forward(self, x):
+       R_full = self.boft()
+       
+       ## --- Multiplicative Dropout -------------------------------------------------
+       masks=_apply_dropout()
+       if masks is not None:
+           # Apply masks on-the-fly without breaking gradient flow.
+           R_tmp=torch.eye(R_full.size(0),
+                           device=R_full.device,
+                           dtype=R_full.dtype)
+           for i,(comp_mask_or_blocks) in enumerate(masks):
+               if isinstance(comp_mask_or_blocks, torch.Tensor):   # whole comp dropped → I_d    
+                   continue   
+               else:
+                   blocks,module_masks=comp_mask_or_blocks    
+                   comp_mat=torch.block_diag(*[
+                       bm if bm is not None else blk()
+                       for blk,bm in zip(blocks,module_masks)])
+                   R_tmp=comp_mat @ R_tmp       
+           R_full=R_tmp @ R_full
+        
+       ## --- Forward pass ---------------------------------------------------------
+       W_new=(R_full @ self.W0).t()          # shape [in_dim , out_dim]
+       return F.linear(x,W_new,bias=self.bias)
+```
+
+A few remarks:
+
+* **Zero init → Identity:** All `SkewSymmetric` start at zero → each factor begins as an identity matrix → overall `R ≈ I`. This mirrors OFT’s “zero‑initialisation” philosophy and guarantees no sudden drift at epoch 0.
+* **Training loop:** Nothing special beyond calling `.to(device)` and feeding `BoftLinear` instead of the original `nn.Linear`. Any optimizer works out‑of‑the‑box because gradients flow through both the Cayley solve and the product chain.
+* **Inference speed:** After finetuning you can fuse `R @ W⁰` once (`torch.mm(R,W⁰)`), replace `weight.data` with it and discard the extra modules—no extra latency compared with vanilla finetuning.
+
+---
+
+## 3️⃣ Multiplicative Dropout – Why & How  
+
+Standard Dropout works on additive updates (`ΔW`) but harms multiplicative schemes because randomly zeroing entries inside an orthogonal product can break its unitary property entirely. The paper proposes **multiplicative dropout**, which drops *whole factors* or *whole inner blocks*, replacing them temporarily by identity matrices while preserving overall orthogonality:
+
+| What gets dropped | Effect during forward |
+|-------------------|-----------------------|
+| A fraction `p₁` of factors (`tilde B`) | Treat those factors as ∈ 𝕀ₙ → skip their multiplication |
+| Within each kept factor: fraction `p₂` of its diagonal blocks | Replace those blocks by \( \mathbf I_b\); other blocks remain learned |
+
+Implementation wise this is just “masking” as illustrated above—no extra parameters are introduced and gradients still flow through non‑masked parts. Empirically this regularizer helps avoid overfitting when the downstream task is small relative to model capacity.
+
+Typical values used in experimental sections were `(p₁,p₂)=(.15,.10)`—feel free to tune them analogously to classic Dropout rates.
+
+---
+
+## 4️⃣ When Should You Pick BOFT?
+
+Below is a quick decision chart that positions BOFT among adapters & LoRA:
+
+| Scenario | Preferred method | Reasoning |
+|----------|------------------|-----------|
+| **Ultra‑tight budget (< few hundred params per layer)** | LoRA with rank ≤ 4 | Low‑rank additive updates are cheapest |
+| **Moderate budget (~\(d \log d\) per large layer)** | **BOFT** | Achieves dense expressive transform while staying far below \(d^2\); preserves angles & spectral norm |
+| **Need strict inference latency budget** | Adapter / LoRA *(if they add cheap ops)* OR **BOFT after folding** | After training you can fold \(R @ W⁰\); inference identical to vanilla base model |
+| **Training stability matters** (e.g., diffusion fine‑tuning or long language sequences) | **BOFT** or OFT | Orthogonality guarantees spectral norm preservation → smoother gradients |
+| **Desire strong inductive bias toward classic transforms** (FFT‐like patterns benefit vision/language cross‐modal tasks) | **BOFT** | Butterfly topology encodes FFT/Hadamard structures inherently |
+| **You already use adapters extensively and want “plug‐and‐play” modules without touching core weights** | Adapters | Adapters keep original weights untouched—useful when you cannot alter saved checkpoints |
+
+In practice many users start with LoRA because it’s simplest to plug into 🤗 Transformers via `peft`. If you encounter instability or notice that increasing LoRA rank eats all your parameter budget without improving accuracy, swapping to BOFT often recovers performance without inflating storage—especially on vision transformers where hidden dimensions (`d≈1024`) make \(d \log d ≈10K\) parameters very cheap compared with full fine‑tuning (`≈M`).
+
+---
+
+## 5️⃣ Plugging BOFF into 🤗 Transformers – Minimal Example  
+
+```python
+from transformers import AutoModelForSeq2SeqLM, Trainer, TrainingArguments
+
+# Load pretrained checkpoint (e.g., T5 base)
+model      = AutoModelForSeq2SeqLM.from_pretrained('t5-base')
+target_layers=['encoder.block.*.layer.*.SelfAttention.q','decoder.block.*...']
+
+# Replace chosen Linear layers with BoftLinear wrappers.
+for name,module in model.named_modules():
+    if isinstance(module, nn.Linear) and any(re.fullmatch(p,name)!=None for p in target_layers):
+         setattr(model,
+                 name.split('.')[-1],
+                 BoftLinear(module,
+                            block_size=4,
+                            num_factors=None,
+                            dropout_pcomp=0.15,
+                            dropout_pblock=0.10))
+
+# Standard Trainer pipeline follows…
+args      = TrainingArguments(... )          # usual args  
+trainer   = Trainer(model=model,
+                    args=args,
+                    train_dataset=train_ds,
+                    eval_dataset=val_ds)
+
+trainer.train()
+# After training collapse R@W⁰ once:
+for name,module in model.named_modules():
+    if isinstance(module,BoftLinear):
+         fused_weight=(module.boft().detach() @ module.W0).t()
+         module.W0.copy_(fused_weight);      # replace underlying weight 
+         del module.boft                     # clean up extra parameters 
+```
+
+A few notes:
+
+* The regex list `target_layers` lets you pick exactly which projection matrices should receive a BOFT transformation—common choices are query/key/value/project weights inside attention heads and feed-forward projection layers.
+* After training you may optionally delete `module.boft`; the fused weight becomes part of the standard state dict so downstream serving pipelines stay untouched.
+* Because BOFT uses only linear algebraic ops supported by Torch’s autograd (`torch.linalg.solve`, matrix multiplication), it runs efficiently on both GPU and CPU without needing custom kernels.
+
+---
+
+## 6️⃣ Practical Tips & Common Pitfalls  
+
+- **Numerical stability:** The Cayley solve `(I−Q)^−¹` can become ill‑conditioned if eigenvalues approach ±1. In practice keeping learning rates modest (`≤ 5e−4`) coupled with identity init prevents divergence.
+- **GPU memory:** Each factor adds an intermediate `(d,d)` temporary during forward pass (`R@W⁰`). For very large layers (`d>4096`) consider computing `R@W⁰` incrementally or storing one factor at a time using `torch.no_grad()` while accumulating gradients manually—a bit more engineering effort but manageable.
+- **Permutation handling:** The classic FFT butterfly includes fixed permutations between stages (`bit-reversal`). You can implement these efficiently via index reordering (`torch.reshape(...).transpose(...)`). They don’t consume parameters yet improve mixing across dimensions.
+- **Hyperparameters:**  
+   * Block size `b`: smaller values give more expressive factorizations at slightly higher compute cost (`O(d log d)` vs `O(d)` multiplications). The authors show that even `b=2` works well—start there!  
+   * Number of factors `m`: default set automatically as `⌈log₂(d/b)+1⌉`. Reducing `m` yields something akin to block-diagonal OFT; increasing it beyond this point offers marginal gains but more runtime overhead.
+- **Dropout schedule:** You may decay `(p₁,p₂)` toward zero during later epochs; similar heuristics apply as with standard Dropout schedules.
+- **Compatibility with PEFT libs:** If you already use HuggingFace’s PEFT wrapper for LoRA/adapters you can create a custom “PEFjord” class inheriting from `BasePEFTModel`. Only need to implement `_get_delta_weights()` that returns `(R@W⁰)-W⁰`.
+
+---
+
+## 📌 TL;DR  
+
+*BOFT gives you dense orthogonal finetuning without paying quadratic parameter costs.* By stacking a handful of butterfly‐structured sparse orthogonal matrices—each built from cheap skew‐symmetric parameters—you obtain:
+
+* **Parameter count:** \( \mathcal O(d\,\log d)\), dramatically smaller than full OFT (\(\mathcal O(d^2)\)).
+* **Zero inference overhead:** after finetuning collapse into a single weight matrix.
+* **Strong regularization:** angle preservation + inductive bias toward classic fast transforms ⇒ stable training on vision–language tasks.
+* **Dropout-friendly design:** multiplicative dropout respects orthogonality while reducing overfit risk.
+
+The code snippets above translate directly from the theory presented in *Parameter-Efficient Orthogonal Finetuning via Factorization*. Plug them into any PyTorch/Transformers model — replace selected linear layers — and you’ll have another powerful tool alongside adapters and LoRA ready for your next downstream challenge! Happy finetuning! 🚀

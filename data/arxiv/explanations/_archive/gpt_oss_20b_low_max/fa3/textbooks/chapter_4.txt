@@ -1,0 +1,191 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 4: # “Standard” Attention versus FlashAttention: The Baseline Approach  
+
+Large‑scale sequence models such as the transformer rely on a single, computationally intensive operation: the *attention* mechanism.  In a typical GPU implementation, this mechanism is split into multiple passes over the data, each of which incurs a round‑trip to host‑side (HBM) memory.  The advent of *FlashAttention* changed that picture by carefully fusing all of the sub‑operations into a single launch.  This chapter explains, step by step, why the naïve pipeline is costly and how FlashAttention’s tiling strategy eliminates that cost while preserving exactness.
+
+## Conventional Attention Pipeline with Intermediate Reads/Writes to HBM  
+
+The forward pass of multi‑head attention can be written in matrix form as  
+
+\[
+\mathbf{S} = \alpha \,\mathbf{Q}\,\mathbf{K}^\top ,\qquad
+\mathbf{P} = \operatorname{softmax}(\mathbf{S}) ,\qquad
+\mathbf{O} = \mathbf{P}\,\mathbf{V}.
+\]
+
+Each of these three symbols is an \(N\times N\), \(N\times N\), or \(N\times d\) matrix, where  
+\(N\) is the sequence length and \(d\) the head dimension.  
+
+In a “standard” GPU implementation:
+
+1. **First matrix multiplication**  
+   The product \(\mathbf{S}\) is computed with a GEMM kernel that streams \(\mathbf{Q}\) and \(\mathbf{K}\) from global memory (HBM), performs the multiply–accumulate, and writes the *entire* score matrix \(\mathbf{S}\) back to HBM.  
+   The HBM traffic for this step alone is  
+   \[
+   2N^2d\,B_f,
+   \]
+   where \(B_f\) denotes the byte width of the data type (e.g., 16 or 8 bytes).
+
+2. **Softmax transformation**  
+   A second pass loads \(\mathbf{S}\) from HBM again, applies a row–wise softmax (requiring max reduction followed by exponentiation), and writes the normalized matrix \(\mathbf{P}\) back to HBM.
+
+3. **Second matrix multiplication**  
+   Finally, a third GEMM reads \(\mathbf{P}\) and \(\mathbf{V}\) from HBM and writes the result \(\mathbf{O}\).  
+
+Each pass also incurs a backward layout change (row‑major vs column‑major accesses), synchronisation barriers, and must respect GPU occupancy constraints.  Because HBM bandwidth on modern GPUs far exceeds on‑chip shared memory bandwidth, the overall speed is dominated by these three memory traffic bursts.  Empirically one finds that even state‑of‑the‑art GEMM kernels consume only ~35 % of peak throughput on Hopper H100 GPUs when used for attention; the remainder is idle waiting for data to arrive.
+
+In short, conventional attention reasons about *data* rather than computation: it pays for every entry it reads or writes with global memory traffic even if only a small coop­ment of that data is needed in subsequent stages.
+
+## “FlashAttention” Tiling Strategy and Local Softmax Reduction  
+
+FlashAttention replaces this pipeline with a *windowed* approach that eliminates all but one block of global memory traffic per attention block.  The key insights are:
+
+1. **Tiling across sequence length**  
+   The sequence dimension is partitioned into tiles of size \(B_r \times B_c\).  Instead of consuming whole matrices at once, each thread block processes only a small window: one block of queries (\(B_r\times d\)) against all blocks of keys/values (\(B_c\times d\)).  This allows all intermediates to live in shared memory or registers.
+
+2. **Local softmax within tiles**  
+   Consider a single tile pair: after computing 
+   \[
+   \tilde{\mathbf{S}} = \alpha\,\mathbf{Q}_i\,\mathbf{K}_j^\top,
+   \]
+   we can normalise row–wise using only values inside that tile plus an auxiliary scalar per row that aggregates results across all other tiles processed so far.  Mathematically  
+   let
+   \[
+       m_i = \max_{k} S_{ik},\qquad 
+       l_i = e^{m_{\text{old}}-m_i}l_{\text{old}} + 
+              \sum_j e^{S_{ij}-m_i},
+   \]
+   where \(m_{\text{old}}\) and \(l_{\text{old}}\) store the maximum and summed exponentials from previous tiles.  These equations exactly preserve the softmax output because they implement *log‑sum–exp* recurrence:
+   \[
+       S_{ij}' = S_{ij} - m_i,\qquad
+       P_{ij} = e^{S_{ij}'} / l_i .
+   \]
+   Thus after iterating over all key/value tiles we obtain
+   \(P_{\text{full}}\) without ever materialising it in global memory.
+
+3. **Fused compute kernel**  
+   Within each thread block:
+   
+   - Load a query tile (\(B_r\times d\)) once from HBM into shared memory.
+   - For each key/value tile:
+     - Load key tile (\(B_c\times d\)) and value tile (\(B_c\times d\)) from HBM into shared memory.
+     - Compute S via GEMM using WGMMA (Tensor Core instruction).
+     - Update running maxima \(m_i\) and summed exponentials \(l_i\).
+     - Compute *unscaled* probability tensor `tilde_P = exp(S-m_i)` on chip.
+     - Update running output `O += tilde_P × V` using another GEMM.
+   
+   All intermediate tensors—`S`, `tilde_P`, partial `O`—are kept in registers or shared memory; only `O` for the final tile flips out to HBM once per query block.
+
+4. **Avoiding global reductions**  
+   Traditional attention would perform an extra reduction for softmax – summing all exponentials across rows – which would require an additional kernel launch or at least an extra write to HBM to gather partial sums from all blocks.  FlashAttention incorporates this reduction inside each tile’s prefix by maintaining two scalars per query row (`m_i` and `l_i`).  At launch exit the entries are rescaded by dividing by `l_i`.  The mathematics shows that combining partial sums in this way results in exactly the same final probabilities as performing softmax on full matrices.
+
+Because every query vector engages with every key/value vector exactly once but never moves the large matrices outside L1/L2 caches or registers, FlashAttention reduces global traffic by roughly an order of magnitude: instead of writing four full-scale tensors (`Q`, `K`, `V`, `S`) it writes only two (`O`, auxiliary scalar vector).  
+
+Operations that are inherently serial—like max reductions within rows—still dominate latency slightly; however they execute on specialized functional units (e.g., `__max()` with atomic combination).  Because these operations involve far fewer elements than GEMMs, they no longer become bottlenecks even on modern GPUs.
+
+## Theoretical Justification That Fused Kernel Yields Exact Same Result as Separate Ops
+
+The central claim behind FlashAttention is that its *windowed* local-softmax algorithm converges to exactly the same output as standard attention when performed in floating point arithmetic *with sufficient precision*.  We sketch why this holds:
+
+1. **Associativity of exponentials in max+sum recurrence**  
+   
+    Let `row_ip` denote one row of `S` formed by concatenating partial scores from each key block:
+    \[
+       (\alpha\,q^\top k_0,\dots,\alpha\,q^\top k_m).
+    \]
+    For any real numbers \(x_k = S_{ik_k}\),
+    define recursively
+    \[
+      m_0 = x_0,\quad l_0 = e^{x_0-m_0}=1,
+    \]
+    then for \(k>0\):
+    \[
+      m_k = \max(m_{k-1}, x_k),\\
+      l_k = e^{m_{k-1}-m_k} l_{k-1} + e^{x_k-m_k}.
+    \]
+    By induction,
+    if we write
+    ```
+    M_k := max{x_0,...,x_k}
+    L_k := sum_{i=0}^{k} exp(x_i-M_k)
+         = (sum_{i=0}^{k-1} exp(x_i-M_{k-1}))·exp(M_{k-1}-M_k)
+           + exp(x_k-M_k)
+         = L_{k-1}·exp(M_{k-1}-M_k)+exp(x_k-M_k),
+    ```
+    i.e., precisely our recurrence updates.
+   
+2. **Softmax invariant**  
+   
+    For each row,
+    ```
+        p_j = exp(x_j)/sum(exp(x))
+            => p_j ∝ exp(x_j-M)/L,
+          where M=max(x), L=sum(exp(x-M)).
+    ```
+   
+    At completion (`k=m`) we have computed:
+   
+    - `m_m` equal to `M` (overall max).
+    - `l_m` equal to `L`.
+    
+    Then recalculating probabilities using these scalars,
+    
+    ```
+       p̂_j = exp(x_j-m_m)/l_m .
+       
+       Since m_m=M && l_m=L => p̂_j=p_j .
+    ```
+   
+3. **Matrix form**  
+   
+    Transcribing back to tensors:
+    
+    For each query block index \(i\),
+    
+    - After iterating over all key blocks we have scalar arrays
+      \(m_i^{[Nt]}\in\mathbb R^{B_r}\)
+      and
+      \(l_i^{[Nt]}\in\mathbb R^{B_r}\)
+      derived by accumulated updates.
+      
+      These satisfy 
+      \(m_i^{[Nt]}=\max_{\textall k}(s_{ik})=\operatorname{rowmax}(S)\),
+      \(l_i^{[Nt]}=\sum_{\textall k}\exp(s_{ik}-m_i^{[Nt]})=e^{-\operatorname{rowmax}(S)}\,\,{\trianglelefteq }\!\!\bigoplus e^{{s}_{ik}}.\)
+
+    - For any visited key/value tile pair we compute intermediate 
+      ```
+         tilde_P ≔ exp(S−m_cell)
+         O_local += tilde_P × V .
+      ```
+      
+      After rescaling at end with replicated\(l_i^{[Nt]}\),
+      
+      ```
+         O_final ≔ O_local / l_i,
+      ``$
+      
+      which recovers 
+      
+      ```
+        O_final[i,:] =
+        sum_over(k) softmax(S[i,k]) * V[k,:].
+       
+       because λ::∀i,j O_final[i,j]
+         = sum_over(k)(exp(S[i,k]-m)*V[k,j]) / l
+         = sum_over(k)(softmax(S[i,k])V[k,j]).
+     ```
+
+Thus every numeric step performed inside a tile follows exactly the rules used by separate attention kernels. No rounding error beyond what standard matrix multiplication already introduces occurs – except possibly due to reduced precision on lower‑precision FP8 modes – because:
+
+- Each scalar update (`m`, `l`) uses exclusive OR operations which are associative if implemented correctly.
+- Each exponential and division occurs after all accumulations within a row have been completed.
+- Unity scaling factors preserve no additional error.
+
+Consequently FlashAttention produces *exactly* the same tensor as naively executing three distinct kernels: first draw scores, next normalise them globally via row‑wise softmax, finally weight values.
+
+## Summary
+
+A naïve GPU implementation of transformer attention pays an expensive penalty for copying large intermediate matrices between global memory and registers/SME repeatedly.  FlashAttention’s innovation is judicious tiling coupled with a mathematically sound local softmax reduction that allows every intermediate value to remain resident on-chip until it is fully consumed. By fusing, quantizing potential variance across tiles stays minimal – rendering its result numerically identical to separate operations down to machine precision.\n
+
+This baseline understanding not only explains why FlashAttention can match FP32 implementations while operating in FP16/FP8 but also sets up later chapters for more advanced optimisations—such as pipelining across warp groups and exploiting Tensor Core asynchrony—that further squeeze performance out of modern GPU hardware.

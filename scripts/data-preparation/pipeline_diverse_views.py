@@ -135,7 +135,7 @@ def refine_content(paper_content, generated_content, content_type):
 
 def generate_summaries(paper_name, paper_content, paper_title):
     """Generates two types of summaries for a paper."""
-    OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
+    OUTPUT_DIR = utils.explanations_dir('arxiv', 'gpt_5_mini_custom', paper_name)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # --- 1. Full Paper Summary ---
@@ -209,7 +209,7 @@ def generate_summaries(paper_name, paper_content, paper_title):
 
 def generate_contextualized_facts(paper_name, paper_content, paper_title):
     """Generates contextualized facts from the paper."""
-    OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
+    OUTPUT_DIR = utils.explanations_dir('arxiv', 'gpt_5_mini_custom', paper_name)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     print(f"Generating contextualized facts for {paper_name}...")
@@ -263,7 +263,7 @@ def generate_contextualized_facts(paper_name, paper_content, paper_title):
 
 def generate_podcast_monologue(paper_name, paper_content, paper_title):
     """Generates three podcast monologues about the paper in parallel."""
-    OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
+    OUTPUT_DIR = utils.explanations_dir('arxiv', 'gpt_5_mini_custom', paper_name)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     def generate_single_monologue(i):
@@ -299,7 +299,7 @@ def generate_podcast_monologue(paper_name, paper_content, paper_title):
 
 def generate_socratic_dialogue(paper_name, paper_content, paper_title):
     """Generates three Socratic dialogues about the paper in parallel."""
-    OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
+    OUTPUT_DIR = utils.explanations_dir('arxiv', 'gpt_5_mini_custom', paper_name)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     def generate_single_dialogue(i):
@@ -340,7 +340,7 @@ def generate_socratic_dialogue(paper_name, paper_content, paper_title):
 
 def generate_annotated_paper(paper_name, paper_content, paper_title):
     """Generates an annotated version of the paper with explanations for each paragraph."""
-    OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
+    OUTPUT_DIR = utils.explanations_dir('arxiv', 'gpt_5_mini_custom', paper_name)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     print(f"Generating annotated paper for {paper_name}...")

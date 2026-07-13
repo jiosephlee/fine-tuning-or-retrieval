@@ -1,0 +1,143 @@
+\title{A Textbook about the Paper: "Group Sequence Policy Optimization"}
+
+Chapter 11: # 11. Practical Deployment: RL Infrastructure Simplification
+
+Large‑scale reinforcement learning (RL) of language models is a multi‑stage engineering endeavor. In practice, a model is first trained with a **training engine**—typically a distributed transformer training framework such as Megatron‑LM—then rounded off with **inference engines** like SGLang or vLLM that facilitate efficient sampling of responses. This division introduces subtle but critical **precision discrepancies** between the two engines. In the context of *Group Sequence Policy Optimization* (GSPO), these discrepancies are largely benign because GSPO only relies on **sequence‑level likelihoods**. Understanding this compatibility unlocks significant simplifications in the RL infrastructure, especially for edge workloads such as partial rollouts or multi‑turn interactions, and paves the way for more scalable distributed or federated training pipelines.
+
+In this chapter we dissect the key differences between training and inference engines, explain why current practice recomputes old‑policy likelihoods, and then illustrate how GSPO’s tolerance to precision variations allows us to reuse inference‑engine likelihoods. We also discuss edge cases and the broader implications for distributed and federated training.
+
+---
+
+## 1. Training vs. Inference Engine Precision Differences
+
+Training engines and inference engines are typically built with different goals in mind, and this divergence manifests in precision, architectural, and runtime characteristics that impact RL algorithms.
+
+### 1.1 Floating‑Point Formats
+
+A training engine is engineered to **maximise throughput** on GPUs by exploiting mixed‑precision arithmetic. For example, Megatron‑LM often runs with **FP16** (half‑precision) or **BF16** (bfloat16) formats for the majority of its operations. These lower‑precision formats reduce memory consumption and latency but inevitably introduce **rounding errors** at each arithmetic step. In contrast, inference engines, especially those aimed at **low‑latency serving**, routinely work with **FP32** or **INT8** quantised tensors to preserve accuracy during token generation.
+
+Since GSPO’s objective needs the likelihood of a sampled sequence under the *old* policy, the value of $\pi_{\theta_{\text{old}}}(y | x)$ is computed. When this likelihood is obtained from the training engine at FP16, the value may differ slightly from the one computed at inference time in FP32. The differences are typically small (`≈ 10⁻⁴` to `10⁻⁶` relative) yet can accumulate over very long token sequences.
+
+### 1.2 Model Invocation and Routing
+
+Large language models frequently incorporate **model‑time dynamic routing**: dense layers, sparse MoE gates, or other attention‑based tricks that change the computation graph per input token. In training, the engine may perform **dynamic buffer allocation** and **in‑place optimisations** that differ from the static or partially‑compiled graph used in inference. Consequently, the exact *per‑token* probabilities reported by the inference engine may differ from those that the training engine would produce.
+
+### 1.3 Tokenization and Post‑Processing
+
+During inference, tokenisation is usually performed by the deployment framework, possibly using a **frozen** tokenizer that may differ from the training tokenizer if the model has undergone fine‑tuning or lexicon expansion. For RL, where the policy is updated continuously, any mismatch in the mapping from string to ID can propagate erroneous likelihoods.
+
+---
+
+## 2. Recomputing Old‑Policy Likelihoods: The Current Practice
+
+In traditional PPO‑style RL algorithms, the **Importance Ratio** for a token is defined as:
+
+\[
+w_{t}(\theta) \;=\; \frac{\pi_{\theta}(y_t \mid x, y_{<t})}{\pi_{\theta_{\text{old}}}(y_t \mid x, y_{<t})}.
+\]
+
+This requires that *both* the current policy $\pi_{\theta}$ **and** the old policy $\pi_{\theta_{\text{old}}}$ compute the probability of the same token under the same context. When these two policies are instantiated in **different engines** (training vs. inference), the mismatch in precision or routing leads to **noisy ratios** that may misalign the policy gradient.
+
+To counteract this, many implementations re‑use the **training engine** to compute $\pi_{\theta_{\text{old}}}(y_t \mid x, y_{<t})$ during the RL update. The workflow typically is:
+
+1. **Rollout**: Run the current policy $\pi_{\theta}$ in the inference engine to obtain a batch of query‑response pairs.
+2. **Recompute Old Likelihoods**: Feed each sampled response $y$ back into the training engine (possibly with the old checkpoint $\theta_{\text{old}}$) to recompute $\pi_{\theta_{\text{old}}}(y \mid x)$ or per‑token probabilities.
+3. **Compute Ratios**: Use the recomputed values to calculate the importance ratios and perform clipping, then back‑propagate through the training engine.
+
+Recomputing the old‑policy likelihoods ensures that the ratios are computed in the *same precision* and *exact invariants* (e.g., same routing) as the current policy’s forward pass. However, this process carries several costs:
+
+- **GPU Memory**: Holding two copies of the model (current and old) compounds memory usage.
+- **Communication Overheads**: In a distributed setting, synchronising the old checkpoint across workers incurs network traffic.
+- **Latency**: Re‑executing the forward pass for each sample introduces additional runtime, which is particularly expensive for long responses.
+
+These practical overheads motivate a more elegant solution that eliminates the need for recomputation.
+
+---
+
+## 3. GSPO’s Sequence‑Level Likelihood Reuse
+
+GSPO’s objective redefines the importance ratio as a *sequence‑level* quantity:
+
+\[
+s_{i}(\theta) \;=\;\left(\frac{\pi_{\theta}(y_i \mid x)}{\pi_{\theta_{\text{old}}}(y_i \mid x)}\right)^{1/|y_i|},
+\]
+\[
+\text{or equivalently}\quad
+\log s_{i}(\theta) \;=\;\frac{1}{|y_i|}\sum_{t=1}^{|y_i|} \log \frac{\pi_{\theta}(y_{i,t}\mid x, y_{i,<t})}
+                                          {\pi_{\theta_{\text{old}}}(y_{i,t}\mid x, y_{i,<t})}.
+\]
+
+The following properties of this definition enable the reuse of inference‑engine likelihoods:
+
+### 3.1 Limited Sensitivity to Per‑Token Precision
+
+Because **$s_{i}(\theta)$ is an average of log‑ratios** across *all* tokens in a sequence, the impact of a noisy per‑token probability is diluted. If $\pi_{\theta_{\text{old}}}(y_{i,t} \mid \cdot)$ suffers a small absolute error $\epsilon_t$ due to precision differences, the corresponding log‑ratio error is $\log(1+\epsilon_t) \approx \epsilon_t$ (for small $\epsilon_t$). Summing over $|y_i|$ tokens and dividing by $|y_i|$ yields an *average* error roughly $\frac{1}{|y_i|}\sum \epsilon_t$, which typically shrinks with longer sequences. Hence GSPO is robust to **uniform or bounded** precision noise.
+
+### 3.2 Avoids Probabilistic Rounding Drift
+
+In many inference engines, token probabilities are **clipped** or **rounded** to prevent underflow or to maintain a fixed precision. Absolute discrepancies at the **sequence level** are far less consequential because the likelihood is a product of probabilities; small relative changes in each factor cause only a multiplicative factor in the final likelihood. By working with the *geometric mean* of these ratios, GSPO neutralises the effect of occasional rounding drifts.
+
+### 3.3 Compatibility with Inference‑Engine Likelihood Computation
+
+When the inference engine computes $\pi_{\theta_{\text{old}}}(y_i \mid x)$ during rollout, it can simply **store** this value for later use. Because GSPO only *needs* the ratio between that stored sequence likelihood and the corresponding likelihood under the current policy (which can also be computed directly in the inference engine at the forward pass), there is **no requirement** to invoke the training engine during the RL update. In practice, the workflow becomes:
+
+1. **Rollout**: Inference engine samples $\{y_i\}$ and records $\pi_{\theta_{\text{old}}}(y_i \mid x)$.
+2. **Forward under current policy**: Compute $\pi_{\theta}(y_i \mid x)$ (or log‑probabilities) for each sample *in‑place* using the inference engine’s current weights.
+3. **Compute $s_{i}(\theta)$**: Use the two likelihoods to obtain the sequence‑level importance ratio.
+4. **Clip, reward, update**: Proceed with the GSPO loss and back‑propagation directly in the inference engine’s framework or a lightweight wrapper.
+
+Because the inference engine is typically optimized for **forward passes** and has a lightweight gradient engine (e.g., PyTorch JIT or vLLM’s autograd), this workflow is not only simpler but also more efficient.
+
+---
+
+## 4. Edge Cases: Partial Rollout and Multi‑Turn RL
+
+GSPO’s tolerance to precision differences is especially valuable in scenarios where the **full rollout** cannot be performed through a single inference request. Two such edge cases are **partial rollout** and **multi‑turn RL**.
+
+### 4.1 Partial Rollout
+
+In partial rollout, the model generates a *prefix* of a response, and the RL reward is computed on the *completion* of that prefix. The RL objective often requires the likelihood of the *partial* sequence under both current and old policies. Because the partial sequence is shorter, the **random rounding errors** in each token probability have a larger relative impact—yet GSPO’s averaging over the sequence (albeit a shorter one) still provides a more stable ratio than token‑by‑token importance ratios. Additionally, because the inference engine can **store** the partial likelihoods at the time of generation, there is no need to port these values back to a training engine for recomputation.
+
+### 4.2 Multi‑Turn RL
+
+Multi‑turn RL involves interacting with a user or environment over several turns, potentially with dialogue history. The state at a given turn may contain tokens from earlier turns, and the likelihood of the *entire dialogue* under $\pi_{\theta_{\text{old}}}$ is needed. The sheer length of the dialogue amplifies rounding error problems in per‑token scoring. GSPO’s sequence‑level approach, applied to each **dialogue segment** or **utterance**, mitigates this. Moreover, the **inference engine** routinely accumulates the total log‑probability of a dialogue when responding, which can be reused directly in GSPO.
+
+---
+
+## 5. Impacts on Distributed and Federated Training
+
+When scaling RL across multiple machines or even across parties in a federated setting, the overhead of maintaining or synchronising **old checkpoints** becomes non‑trivial. GSPO’s design offers several crucial advantages.
+
+### 5.1 Reduced Communication Footprint
+
+Because GSPO no longer requires sending the old checkpoint to each worker for likelihood recomputation, the **communication volume** drops dramatically. Each worker needs only to hold its *current* policy parameters. The *old* likelihoods are already embedded in the sampled data (via inference). Thus, the communication pattern simplifies to a **parameter sharding** or **optimizer state shuffle** per gradient update, standard in distributed training frameworks like DeepSpeed.
+
+### 5.2 Lower Memory Overhead
+
+In federated training, devices (e.g., edge servers) may have limited memory. Re‑computing old likelihoods in the training engine implies that each device must store **two copies** of the model (old + current). GSPO sidesteps this by offloading the heavy-lifting of computing old likelihoods to the inference engine; the latter can maintain only a **single** model snapshot. Consequently, devices can operate in a *lightweight inference* mode during the rollout and switch to a **training** mode only when aggregating gradients.
+
+### 5.3 Simplified Federated Aggregation
+
+In a classic federated scenario, each client computes a gradient and sends it to a central server. GSPO’s sequence‑level importance ratios can be pre‑computed on each client before gradient calculation, keeping the gradient dimensions identical to those used in standard distributed training. As a result, the server can aggregate gradients without caring about per‑token significance or the route of token selection, which simplifies privacy‑preserving or compression schemes.
+
+---
+
+## 6. Practical Implementation Tips
+
+While GSPO’s design reduces infrastructure complexity, practitioners should still be mindful of a few practicalities:
+
+1. **Deterministic Logging**: Store the *log‑likelihood* of each sampled sequence under $\pi_{\theta_{\text{old}}}$ for reproducibility. The numerical stability of the stored value can be ensured by clipping very small probabilities to a lower bound (e.g., $1e-12$).
+2. **Length Normalisation**: GSPO already incorporates a per‑token length normalisation in its importance ratio. In federated settings, enforce the same normalisation across nodes to avoid systematic bias.
+3. **Precision Consistency**: If the inference engine supports **mixed‑precision inference**, ensure that the likelihoods are computed with the *same* precision as the forward pass of the current policy to avoid hidden rounding asymmetries.
+4. **Edge‑Case Missing Tokens**: In multi‑turn RL, if a user truncates a reply or the inference engine drops low‑probability tokens for efficiency, LS‑level GSPO remains valid because the likelihoods (of the *observed* tokens) are still defined.
+
+---
+
+## 7. Summary
+
+The key takeaway is that *Group Sequence Policy Optimization* simplifies RL infrastructure in two fundamental ways:
+
+- **End-to-end Likelihood Reuse**: Since GSPO works on sequence‑level ratios, we can safely reuse inference‑engine likelihoods, eliminating the expensive step of recomputing old‑policy probabilities in the training engine.
+- **Precision Robustness**: The geometry‑mean normalisation embedded in GSPO dampens the effect of precision errors, making it tolerant to the typical FP16 vs. FP32 discrepancies between training and inference engines.
+
+These properties break down classical bottlenecks—memory, compute, and communication—that otherwise hinder large‑scale RL of language models, especially when scaling to **Mixture‑of‑Experts** architectures or deploying in **federated** or **edge** environments. By removing the need for elaborate routing‑replay or lightweight replay buffers, GSPO paves the way for a cleaner, more maintainable RL pipeline, letting researchers and engineers focus on higher‑level design choices rather than low‑level engineering gymnastics.

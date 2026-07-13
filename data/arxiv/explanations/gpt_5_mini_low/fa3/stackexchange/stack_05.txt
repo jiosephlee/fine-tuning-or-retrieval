@@ -1,0 +1,42 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### Why does FP8 WGMMA require k-major operands in SMEM, and how does that constrain V tiling?
+Question:
+Section 2.2 says FP8 WGMMA only accepts k-major in SMEM for operands, while FP16 WGMMA is more flexible. For the second GEMM involving V, this implies V tiles in SMEM must be contiguous in the K dimension. Could someone explain the hardware reason for this FP8 constraint, and concretely how it affects the tile shapes and strides chosen for V in the attention kernel? A small example with M, N, K and the resulting SMEM tile strides would help.
+Answer:
+Short answer: FP8 WGMMA on Hopper requires $k$-major operands because the FP8 tensor-core path implements operand loads and lane-to-byte packing that assume the inner ($K$) dimension is the contiguous memory axis so that each warp can read packed 8-bit words efficiently into the tensor-core microtiles. That hardware restriction forces you to store the $V$ tiles in shared memory so that elements that are adjacent along the GEMM's $K$ dimension are also adjacent in SMEM; for attention this means the $V$ tile must be contiguous in the sequence-length ($K$) direction rather than the usual head-dimension ($d$) direction. Concretely, that mandates an in-kernel transpose (or a pre-transpose) of $V$ tiles and constrains which $B_c$ ($K$-block) sizes and SMEM strides you choose, because the tensor core micro-tiles (and the LDSM/STSM load granularity) determine the legal contiguous layout and alignment.
+
+Why the hardware requires $k$-major (intuitive + technical):
+- The WGMMA instruction implements a pipeline where many threads collectively load operand tiles into registers in a packing that assumes 8-bit lanes are stored contiguously along the $K$ dimension. For FP8 the hardware uses packed byte loads/permutes and a particular thread-to-byte mapping that only works if the inner dimension ($K$) is the contiguous axis in SMEM. In other words, the tensor core expects to fetch $K$-consecutive bytes for its micro-GEMM panels.
+- FP16 WGMMA can accept both $mn$-major and $k$-major because the 16-bit operand alignment and load pattern are more flexible (the microtile packing and instruction support more layouts). The FP8 path is more constrained because of the packing of 8-bit values into the 128-byte LDSM/STSM blocks and because the accumulator/operand register layouts are different and require specific byte permutations.
+- Practically this means the GEMM that multiplies $P$ by $V$ (the second GEMM in the attention inner loop) must see the $V$ tile in SMEM with $K$ as the contiguous stride so the WGMMA FP8 load works without additional costly shuffles.
+
+How this affects $V$ tiling and SMEM strides (concrete, small example)
+Take the usual attention inner-block shapes and translate them to a small numeric example so you can see memory layout/stride consequences. Pick:
+- $B_r$ (query block height) = $M = 4$
+- $B_c$ (key/value block length) = $K = 8$
+- head dimension ($d$) = $N = 16$
+
+We will consider the second GEMM in the consumer: $P$ ($M \times K$) times $V_j$ ($K \times N$) $\to$ $O$ contribution ($M \times N$).
+
+Typical (default) layout coming from many frameworks is row-major with the head ($N = d$) contiguous inside each sequence element: so in global memory $V$ is indexed as $V[\text{seq\_index}][\text{head\_index}]$ and the $\text{head\_index}$ ($d$) is the fastest-varying address. If we TMA-load a $K \times N$ tile naively into SMEM preserving that layout, the contiguous addresses vary with $\text{head\_index}$ ($N$), not with $K$. WGMMA-FP8, however, wants contiguous variation along $K$.
+
+Two concrete memory-index formulas to compare:
+- Default (head-contiguous) SMEM address of element $V[k,n]$ ($k \in \{0,\dots,7\}$, $n \in \{0,\dots,15\}$): $addr = base + k \times N + n$. Here consecutive addresses when increasing $n$ are adjacent; consecutive $k$ are separated by stride $N = 16$.
+- Required $k$-major SMEM address ($K$-contiguous) of element $V[k,n]$: $addr = base + n \times K + k$. Here consecutive $k$ are adjacent (stride $1$) and consecutive $n$ are separated by stride $K = 8$.
+
+So when WGMMA-FP8 tries to load the microtile it will expect, say, 8 consecutive bytes corresponding to consecutive $k$ values for a fixed micro-column. If the layout is head-contiguous (stride-16 for $K$), the load pattern is wrong: tensor core will fetch bytes that jump by 16 and the packing into registers becomes incorrect (and the instruction is not defined for that layout).
+
+Therefore you must present $V_j$ in SMEM in the $k$-major form ($addr = base + n \times K + k$). In practice you achieve that by doing an in-kernel transpose after loading the tile from GMEM into SMEM (or by pre-transposing $V$ in GMEM). The authors choose an in-kernel transpose using LDSM/STSM so the transpose can be done efficiently and overlapped with other work.
+
+Concrete SMEM stride numbers for the example:
+- With $K$-major layout required, the SMEM stride between successive $K$ entries is $1$ (adjacent addresses), and the stride between successive head elements is $K = 8$.
+- If you keep the head-major layout, the stride between $K$ entries would be $N = 16$, which the FP8 WGMMA cannot accept.
+
+Practical constraints and consequences for tile shapes and scheduling:
+- $B_c$ (the $K$ block) must align with the tensor-core microtile granularity (e.g., multiples of $8$ in the example) so LDSM/STSM and WGMMA loads can be used efficiently. Picking $B_c$ that is not compatible adds padding/complicated permutes and hurts performance.
+- Because you must transpose each $V$ tile into $K$-major in SMEM, you pay a small extra cost and require SMEM and register capacity for the transpose buffers. FlashAttention-3 overlaps this transpose with the two adjacent WGMMAs so its cost is largely hidden, but it still constrains how many stages and how large $B_c$ you can pick before register/SMEM pressure hurts the pipeline.
+- The accumulator/operand register layouts for FP8 WGMMA also differ from FP32 accumulator layouts; FlashAttention-3 inserts a byte-permute step on the FP32 accumulator (after the first WGMMA) to make it compatible with the order used by the second WGMMA and with the permuted $V$ tile layout. This further constrains how you order columns/rows inside the physical tile; in practice you pick tile shapes that (a) match the WGMMA microtile, (b) allow efficient LDSM/STSM transpose, and (c) keep register pressure acceptable.
+
+Summary (one-paragraph):
+FP8 WGMMA requires $k$-major operands because the FP8 tensor-core load/packing semantics and the LDSM/STSM microtile loads assume the inner ($K$) dimension is contiguous in SMEM to collect packed 8-bit lanes correctly. For attention that forces the $V$ tiles in SMEM to be contiguous along the sequence-length ($K$) axis rather than the head axis, so you must transpose $V$ tiles (in-kernel or beforehand). This restriction fixes the SMEM stride (stride-$1$ across $K$, stride=$B_c$ across heads) and pushes you to choose $B_c$ and microtile sizes that align to tensor-core granularity and to balance SMEM/register pressure so that the transpose and the required byte-permute on accumulators can be overlapped and hidden by the pipeline.

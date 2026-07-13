@@ -1,0 +1,112 @@
+\title{Stack Exchange of the Paper: "Group Sequence Policy Optimization"}
+
+### How can inference‑engine likelihoods be used directly in GSPO without recomputation?
+Question:
+The paper claims that sequence‑level likelihoods are tolerant to precision differences between training and inference engines, allowing us to skip recomputing \( π_{old}(y|x) \). What are the practical steps to retrieve these likelihoods from an inference engine like vLLM, and what precision issues might still affect the importance ratio?
+Answer:
+**Answer**
+
+The paper’s claim that *sequence‑level* likelihoods are “tolerant to precision differences between training and inference engines” rests on two observations made in the GSPO derivation:
+
+1. **GSPO only needs the scalar $\pi_{\theta_{\text{old}}}(y\mid x)$ for each sampled response** (the product of token probabilities, or equivalently the sum of log‑probabilities).  
+2. **The importance ratio that GSPO uses is length‑normalised**  
+
+$$
+s_i(\theta)=\Bigl(\frac{\pi_{\theta}(y_i\mid x)}{\pi_{\theta_{\text{old}}}(y_i\mid x)}\Bigr)^{\!1/|y_i|}
+   =\exp\!\Bigl(\frac{1}{|y_i|}\sum_{t}\log\frac{\pi_{\theta}(y_{i,t}\mid x,y_{i,<t})}
+                                            {\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,<t})}\Bigr).
+$$
+
+Because the ratio is taken **after averaging over the whole sequence**, a small per‑token numerical error (e.g. a few bits of floating‑point difference) is diluted by the division by $|y_i|$. Consequently the final scalar $s_i(\theta)$ is much less sensitive to the exact 16‑bit or 32‑bit representation used in the inference engine than the token‑level weights $w_{i,t}(\theta)$ that GRPO employs.
+
+Below is a concrete recipe for extracting $\pi_{\theta_{\text{old}}}(y\mid x)$ from a typical inference service such as **vLLM** and an outline of the residual precision concerns that may still affect the importance ratio.
+
+---
+
+### 1. How to retrieve sequence‑level likelihoods from vLLM
+
+vLLM (and similar serving stacks such as SGLang) expose two useful APIs:
+
+| API | What it returns | When to use |
+|-----|----------------|-------------|
+| `logprobs=True` (or `return_logprobs`) | For a given prompt and generated token list, returns a list of per‑token log‑probabilities under the *current* model parameters. | When you need the *old* policy’s log‑likelihood for a rollout that was generated with exactly those parameters. |
+| `loglikelihood(prompt, continuation)` | Directly returns $\log \pi_{\theta_{\text{old}}}(y\mid x)$ for an arbitrary continuation `y`. Some forks expose this as a separate endpoint; otherwise you can simulate it by feeding the full `(x, y)` pair and masking the prompt part. | Useful when you have stored rollouts (prompt + generated response) and want to recompute $\log$‑likelihood later, possibly after a checkpoint reload. |
+
+The practical steps are:
+
+1. **Keep a copy of the old checkpoint** (`θ_old`) that was used to generate each batch of rollouts.  
+   - In a distributed RL loop you typically snapshot `θ_old` once per PPO epoch; store its identifier together with each mini‑batch.
+
+2. **Load `θ_old` into the inference engine** (vLLM can hot‑swap model weights without restarting).  
+   - vLLM’s `engine.reload_model(checkpoint_path)` is sufficient; it reinitialises the KV cache but leaves serving infrastructure untouched.
+
+3. **Request log‑probabilities for each rollout**:  
+
+   ```python
+   # pseudo‑code
+   engine = VLLMEngine(model_path=checkpoint_path)
+   # x is the query string, y is the sampled response tokens
+   request = {
+       "prompt": x,
+       "generated_text": y,
+       "logprobs": True,           # ask for per‑token logprob list
+       "max_tokens": 0             # we already have all tokens
+   }
+   resp = engine.generate(request)
+   logprobs = resp["logprobs"]    # list of float32 values
+   seq_logprob = sum(logprobs)    # this equals log π_old(y|x)
+   ```
+
+   - The server returns **float32** values regardless of its internal tensor precision (vLLM may run in FP16/BF16 for speed). The conversion to float32 happens on the CPU side before sending over RPC, so you obtain a consistent numerical format.
+
+4. **Store `seq_logprob` together with the sample** (or compute $s_i(\theta)$ on‑the‑fly after loading the *new* policy).  
+   - In GSPO you also need $|y|$, which is just `len(y)`.
+
+5. **During training**, when you have both `θ_old` (loglikelihood already cached) and `θ_new` (the current policy being updated), compute  
+
+   $$
+   s_i(\theta)=\exp\bigl((\log \pi_{\theta}(y_i|x)-\log \pi_{\theta_{\text{old}}}(y_i|x))/|y_i|\bigr).
+   $$
+
+   The log‑likelihood under `θ_new` can be obtained in exactly the same way as step 3, but now using the *current* checkpoint (which typically lives in your training process anyway).
+
+**Why this avoids recomputation?**  
+If you keep `seq_logprob` from step 3, you never need to feed each token through the *training* forward pass again merely to obtain $\pi_{\theta_{\text{old}}}(y)$. The only forward passes required during an update are those needed for $\pi_{\theta}(y)$, which you already compute for gradient estimation anyway.
+
+---
+
+### 2. Precision issues that may still matter
+
+Even though GSPO’s importance ratio damps per‑token noise, a few practical sources of discrepancy remain:
+
+1. **Log‑prob rounding when converting from FP16/BF16 to float32**  
+   - vLLM typically computes logits in FP16/BF16, applies softmax, then takes a log. The conversion from reduced precision to float32 introduces at most a few units in the last place (ULP). Because we sum many token log‑probs, these errors accumulate linearly with sequence length, but after division by $|y|$ they become roughly constant magnitude ($\approx$ ULP of a single token). In practice this error is < $10^{-5}$, far below typical clipping thresholds ($3\times10^{-4}$–$4\times10^{-4}$) used in GSPO.
+
+2. **Numerical stability of softmax in low precision**  
+   - When logits have very large magnitude differences, FP16 softmax may underflow/overflow for very low/high probability tokens, yielding exact 0 or 1 probabilities and thus $-\infty$ or 0 log‑probs. vLLM mitigates this with log‑softmax tricks (subtracting max logit), but pathological prompts can still expose slight bias. The effect shows up as an occasional NaN or $-\infty$; you should filter out such samples or replace their likelihood with a large negative constant before exponentiation.
+
+3. **Different tokenizers or token IDs across engines**  
+   - The paper assumes identical tokenisation between training and inference; mismatched vocabularies would produce completely different likelihood values. Ensure that both engines use exactly the same tokenizer version and special tokens handling.
+
+4. **Batch‑wise scaling factors**  
+   - Some serving stacks apply *temperature* or *top‑k/p* sampling at generation time, which changes the effective distribution from which samples are drawn but does not affect logged probabilities if you request raw logits (`temperature=1`). If temperature ≠ 1 is applied during generation *and* kept when querying log‑probs, then $\pi_{\theta_{\text{old}}}$ no longer matches the true behaviour distribution used for sampling, violating the importance sampling assumption. The safe practice is: generate with temperature = 1 (or record temperature), then query log‑probs with temperature = 1.
+
+5. **Sequence truncation / padding mismatch**  
+   - When storing rollouts you may truncate long responses for memory reasons but later request log‑probs on a padded version; make sure that the exact token sequence fed to vLLM matches what was originally sampled (including eos tokens).
+
+Overall, these residual issues are *much smaller* than those encountered by GRPO because they affect only an aggregated scalar rather than every token weight individually. Empirically, as shown in Figure 5 of the paper, using inference‐engine likelihoods directly does not degrade performance and considerably simplifies infrastructure.
+
+---
+
+### 3. Summary checklist
+
+1. **Snapshot `θ_old`, load it into vLLM, request per‑token log‑probs (`logprobs=True`).**  
+2. **Sum them to obtain $\log \pi_{\theta_{\text{old}}}(y|x)$; store together with each rollout record (`seq_logprob`, length).**  
+3. During each GSPO update, compute new log‑likelihoods under `θ_new` (already needed for gradient).  
+4. Form $s_i(\theta)=\exp((\log \pi_{new} - \log \pi_{old})/|y|)$ and plug into Eq.(4).  
+5. Verify that:  
+   - Both engines use identical tokenizer & vocab.  
+   - Generation and log‑prob queries use temperature = 1 (or consistent).  
+   - No NaNs appear; filter pathological samples if necessary.
+
+By following these steps you can take full advantage of GSPO’s tolerance to precision differences and skip any costly re‑evaluation of old logits on the training engine, freeing GPU memory and pipeline bandwidth especially in large MoE or multi‑turn RL setups.

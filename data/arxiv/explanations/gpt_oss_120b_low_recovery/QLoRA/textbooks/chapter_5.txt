@@ -1,0 +1,126 @@
+\title{A Textbook about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+Chapter 5: # Paged Optimizers and Gradient Checkpointing  
+
+In modern large‐language‑model (LLM) research, the sheer number of parameters—tens of billions in the case of models such as LLaMA‑65B—creates a fundamental obstacle: training on a single GPU often exhausts the available memory.  The QLoRA paper resolves this problem by combining **gradient checkpointing** with a novel **paged optimizer** that exploits NVIDIA Unified Memory.  This chapter explains the underlying mechanisms, describes how the authors integrated them into the PyTorch / BitsAndBytes stack, and discusses the resulting performance trade‑offs and practical guidance for practitioners.
+
+---
+
+## 1. Gradient Checkpointing and Its Memory Spike  
+
+### 1.1 Why Gradient Checkpointing Is Needed  
+
+During the forward pass of a transformer‑style model, each layer produces an activation tensor that is later required for the backward pass.  Storing all intermediate activations costs roughly the same amount of memory as the model parameters themselves.  For a 65‑billion‑parameter LLM, the activation memory can easily exceed 700 GB, which is far beyond the capacity of any single GPU.  
+
+Gradient checkpointing (also called **activation recomputation**) reduces this footprint by deliberately discarding a subset of activations after they have been used in the forward computation.  When the backward pass later requires a discarded activation, the forward computation for the corresponding segment is **re‑executed** on‑the‑fly, reconstructing the missing tensor.  The net effect is a reduction in peak memory usage at the expense of extra compute.
+
+### 1.2 The Source of Memory Spikes  
+
+Even with checkpointing, certain phases of training still create temporary memory peaks.  The most prominent spike occurs when a mini‑batch contains a **long sequence** (e.g., 2 k‑token context).  In order to recompute a checkpointed block, the implementation must retain the **input activations** of that block together with the **gradient buffers** that accumulate during back‑propagation.  Because the backward pass processes the sequence in reverse order, these buffers are held simultaneously for all layers that belong to the same recomputation segment.  
+
+Consequently, for a long sequence the optimizer must allocate temporary tensors that can be several gigabytes larger than the baseline checkpointed memory.  When the GPU’s resident memory budget is already near its limit (the paper reports < 48 GB for a 65 B model using QLoRA), these spikes cause an **out‑of‑memory (OOM)** error, aborting training.
+
+---
+
+## 2. Unified Memory and Automatic CPU‑GPU Paging  
+
+### 2​.1 NVIDIA Unified Memory Overview  
+
+NVIDIA’s **Unified Memory** (UM) is a hardware‑driven virtual memory subsystem that presents a single address space shared between the CPU and GPU.  When a kernel accesses a page that resides on the CPU, the driver transparently migrates that page to GPU DRAM; conversely, when GPU memory becomes scarce, pages may be evicted back to system RAM.  The programmer sees no explicit copy operations—paging is handled automatically by the driver.
+
+### 2​.2 Leveraging UM for Optimizer States  
+
+In QLoRA, the authors observed that the **optimizer state** (e.g., Adam moments) constitutes the majority of memory that is **static** throughout a training step: the states are allocated once at the beginning of training and are only read‑modified‑written each iteration.  By allocating these buffers in Unified Memory, the optimizer can keep the most‑used portions (the current minibatch’s moments) resident on the GPU, while the rest resides on the CPU.  When a memory spike occurs during gradient checkpointing, the driver evicts the least‑recently‑used optimizer pages, freeing GPU memory for the temporary activation buffers.  Once the spike passes, the evicted pages are paged back in for the next optimizer update.
+
+Thus, **Paged Optimizers** are nothing more than standard optimizers (Adam, Lion, etc.) whose internal buffers are created with `torch.cuda.memory_allocated(..., device='unified')` (or the equivalent BitsAndBytes API).  The rest of the training loop remains unchanged; the paging occurs silently under the driver.
+
+---
+
+## 3. Implementation in PyTorch / BitsAndBytes  
+
+### 3​.1 Minimal API Changes  
+
+The QLoRA codebase builds on the **bitsandbytes** library, which already provides 4‑bit quantized linear layers and efficient dequantization kernels.  To turn a conventional optimizer into a **paged optimizer**, the authors added a thin wrapper:
+
+```python
+class PagedAdam(optim.Optimizer):
+    def __init__(self, params, lr=1e-3, **kw):
+        # Allocate moments in unified memory
+        self.state = collections.defaultdict(dict)
+        for p in params:
+            self.state[p]['exp_avg'] = torch.empty_like(p, device='cuda', memory_format=torch.preserve_format, dtype=torch.float32).to('cpu')
+            self.state[p]['exp_avg_sq'] = torch.empty_like(p, device='cuda', memory_format=torch.preserve_format, dtype=torch.float32).to('cpu')
+            # Pin the tensors to unified memory; BitsAndBytes does this internally.
+            self.state[p]['exp_avg'] = self.state[p]['exp_avg'].cuda()  # triggers unified allocation
+            self.state[p]['exp_avg_sq'] = self.state[p]['exp_avg_sq'].cuda()
+        super().__init__(params, dict(lr=lr, **kw))
+```
+
+The crucial line is the call to `.cuda()` **after** the tensor has been created on the CPU; the underlying driver interprets this as a request for a unified allocation.  The rest of the optimizer logic (bias correction, weight decay) is untouched, guaranteeing that the mathematical behavior is identical to the standard Adam implementation.
+
+### 3​.2 Integration with Gradient Checkpointing  
+
+When using PyTorch’s `torch.utils.checkpoint.checkpoint()` API, the forward function of a transformer block is wrapped so that its outputs are not stored.  The backward pass triggers a recompute, allocating temporary activations.  The training script simply replaces the optimizer:
+
+```python
+optimizer = PagedAdam(model.parameters(), lr=2e-5, betas=(0.9, 0.999))
+```
+
+No additional code is required to coordinate paging; the driver’s scheduler sees the temporary allocation request and, if needed, evicts optimizer pages.  The authors verified that this mechanism eliminates OOM crashes even for the **longest** sequences they tested (up to 4 k tokens) on a 48 GB V100‑like GPU.
+
+---
+
+## 4. Performance Trade‑offs and When Paging Becomes a Bottleneck  
+
+### 4​.1 Overhead of Page Faults  
+
+Paging incurs two primary costs:
+
+1. **Latency of page migration** – moving a 4 KB page from CPU RAM to GPU DRAM typically takes on the order of microseconds.  When many pages are evicted during a single spike (tens of megabytes), the cumulative latency can become measurable.  
+2. **Reduced GPU bandwidth** – while a page is being transferred, the GPU may stall, leading to a dip in FLOPs per second.
+
+Empirically, the QLoRA authors report **no measurable slowdown** for a batch size of 16 on a 65 B model when using paged optimizers, because the amount of optimizer state that needs to be evicted during a spike is modest (the per‑parameter Adam moments occupy ~0.5 bits per weight after double quantization).  The dominant cost remains the recomputation work of gradient checkpointing.
+
+### 4​.2 Scenarios Where Paging May Become a Bottleneck  
+
+Paging can become limiting under the following conditions:
+
+| Condition | Reason |
+|-----------|--------|
+| **Very small blocksize** (e.g., < 16) for 4‑bit quantization | Leads to a larger number of quantization constants, increasing the optimizer‑state size that competes for GPU memory. |
+| **Excessively long sequences** (≥ 8 k tokens) | The temporary activation buffer may exceed the capacity that Unified Memory can sustain without aggressive eviction, causing many page faults per backward step. |
+| **High‑throughput training** (many steps per second) | The steady‑state paging rate may not keep up with the required refresh of optimizer moments, leading to a pipeline stall. |
+| **GPU with limited unified‑memory bandwidth** (older architectures) | The PCIe‑based transfer path becomes the bottleneck. |
+
+In these regimes the authors suggest either reducing the sequence length, increasing the per‑GPU batch size (which reduces the number of recompute steps per token), or moving to a higher‑precision optimizer state (e.g., 16‑bit Adam) to reduce the number of pages that must be migrated.
+
+---
+
+## 5. Practical Guidelines for Batch Size and Sequence Length  
+
+### 5​.1 Choosing a Batch Size  
+
+- **Start with batch = 1** for the largest models (33 B, 65 B) to stay well within the 48 GB limit.  
+- **Double the batch size** when moving to a smaller model (13 B or 7 B) or when the sequence length is shortened.  The QLoRA experiments showed that halving the learning rate while doubling the batch size kept training stability while improving throughput.  
+
+Because the optimizer state is stored in Unified Memory, increasing the batch size does **not** linearly increase GPU memory usage; each additional sample only adds temporary activation buffers, which are reclaimed after the backward pass.
+
+### 5​.2 Managing Sequence Length  
+
+- **Prefer blocksize = 64** for the 4‑bit NF4 quantization; this yields the smallest quantization error while keeping quantization‑constant memory modest.  
+- **Limit the context window** to ≤ 2 k tokens for 65 B models when using a single 48 GB GPU; this bound keeps the peak activation memory (including recomputation) below the point where paging would need to evict a large fraction of the optimizer state.  
+- If a task requires longer contexts, **split the input** into overlapping windows and aggregate the outputs, or use a larger GPU with more VRAM.
+
+### 5​.3 Monitoring and Debugging  
+
+- Use `torch.cuda.memory_summary()` to verify that most of the memory is allocated as *unified* rather than *device* memory.  
+- Enable the CUDA profiler (`CUDA_LAUNCH_BLOCKING=1`) for a few steps to see page‑fault events in the timeline.  
+- If OOM persists, inspect the **maximum resident set size** of the optimizer via `optimizer.state[p]['exp_avg'].element_size() * optimizer.state[p]['exp_avg'].numel()`; a sudden increase indicates that too many optimizer pages are staying resident.
+
+---
+
+## 6. Summary  
+
+Paged Optimizers form a cornerstone of the QLoRA methodology, allowing researchers to fine‑tune 65‑billion‑parameter LLMs on a single 48 GB GPU.  By allocating optimizer moments in NVIDIA Unified Memory, the system can **dynamically page** these relatively static buffers out of GPU memory whenever gradient checkpointing creates temporary spikes.  The implementation is minimal—a thin wrapper around existing PyTorch optimizers—yet the effect is profound: OOM crashes disappear without any appreciable slowdown for typical batch‑size/sequence‑length configurations.
+
+Practitioners should combine paged optimizers with **gradient checkpointing**, select sensible block sizes for 4‑bit NF4 quantization, and respect the recommended limits on sequence length.  When these guidelines are followed, the trade‑off between memory savings and computational overhead remains favorable, opening the door to efficient, high‑quality fine‑tuning of the largest publicly available language models.

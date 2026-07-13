@@ -1,0 +1,128 @@
+\title{Stack Exchange of the Paper: "The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits"}
+
+### How does BitLinear replace nn.Linear while avoiding multiplications?
+Question:
+The architecture replaces every \texttt{nn.Linear} with a custom \texttt{BitLinear}. I would like to see a concrete description of how matrix multiplication is carried out with ternary weights and 8‑bit activations using only integer additions. Does it involve separate add‑only kernels for positive and negative weights, or some form of popcount operation?
+Answer:
+**Answer**
+
+`BitLinear` is the thin‑layer that replaces the usual `nn.Linear` in the BitNet b1.58 transformer.  
+Its purpose is to perform the matrix‑vector (or matrix‑matrix) product  
+
+\[
+Y = X\,W^{\mathsf T},
+\]
+
+where  
+
+* \(X\in\mathbb{Z}^{B\times K}\) are 8‑bit integer activations (already centred in \([{-Q_b},\,Q_b]\)),  
+* \(W\in\{-1,0,+1\}^{N\times K}\) are *ternary* weights,  
+* \(Y\in\mathbb{Z}^{B\times N}\) is the integer output that is later de‑quantised.
+
+Because each entry of \(W\) can only be \(-1,0,+1\), a multiplication can be replaced by a **signed addition**:
+
+* if \(W_{ij}=+1\) we add the activation \(X_{bj}\),
+* if \(W_{ij}= -1\) we subtract the activation,
+* if \(W_{ij}=0\) we do nothing.
+
+Consequently the whole GEMM becomes a sequence of additions and subtractions, i.e. an **add‑only kernel**.  The implementation used in the paper follows two practical tricks that make this operation both fast and memory‑friendly.
+
+---
+
+### 1. Packing the ternary weight matrix
+
+The ternary matrix is stored as two bit‑planes rather than as three separate values:
+
+| bit‑plane | meaning |
+|----------|----------|
+| `P`      | bits set where \(W=+1\) |
+| `N`      | bits set where \(W=-1\) |
+
+The value “0’’ is implicit: a position where neither `P` nor `N` has a bit set corresponds to a weight of zero.  
+Both planes are packed into 32‑ or 64‑bit words, so a whole block of 32 (or 64) weight elements can be loaded with a single memory transaction.
+
+---
+
+### 2. Add‑only GEMM kernel
+
+For each output column (i.e. each neuron) the kernel proceeds as follows:
+
+```
+for each block of 32 (or 64) weight bits:
+    load word P   // +1 mask
+    load word N   // -1 mask
+    // fetch the same block of activations once
+    act = X[ :, block_start : block_end ]   // shape (B, block)
+
+    // contributions from +1 weights
+    pos = popcount(P & act_nonzero_mask)   // number of active +1 entries per row
+    // contributions from -1 weights
+    neg = popcount(N & act_nonzero_mask)
+
+    // because activations are signed 8‑bit we cannot use ordinary popcount.
+    // Instead we treat each activation as an int8 and perform a vectorized
+    // multiply‑add with a sign derived from P,N.
+```
+
+In practice the kernel uses **SIMD integer instructions** (e.g. AVX2/AVX‑512 `vpaddb`, `vpsubb`, `vpmaddubsw`) to compute
+
+\[
+Y_{bn} \;+=\; \sum_{j \in \mathcal{P}_n} X_{bj} \;-\; \sum_{j \in \mathcal{N}_n} X_{bj},
+\]
+
+where \(\mathcal{P}_n=\{j\,|\,W_{nj}=+1\}\) and \(\mathcal{N}_n=\{j\,|\,W_{nj}=-1\}\).  
+Because the two masks are known at compile time for a given layer, they can be fused into *masked add* instructions that ignore the zero entries completely; no explicit “if‑statement’’ per weight is required.
+
+---
+
+### 3. Why no multiplication is needed
+
+Multiplication by ±1 is mathematically identical to sign inversion, which can be implemented as an addition of the *two’s‑complement* value or as a subtraction. GPUs/CPUs have dedicated “add with sign’’ instructions that are far cheaper (both in latency and energy) than a full 8‑bit multiply. Consequently every element of the product is obtained by at most one integer addition (or subtraction), never by an integer multiply.
+
+---
+
+### 4. From integer accumulators to floating point
+
+After the add‑only accumulation, each output element is an int32 accumulator that represents
+
+\[
+Y_{bn}= \sum_j X_{bj} W_{nj}.
+\]
+
+The paper applies the same scale factor that was used for weight quantisation (\(\gamma^{-1}\), see Eq. (2) in the paper). In code this is just a single FP16/Fp32 multiplication performed once per output column, i.e.
+
+```python
+Y = Y_int32 * gamma   # broadcasted over the column
+```
+
+Because this scaling occurs after the whole GEMM, it does not re‑introduce any per‑element multiplication inside the inner loop.
+
+---
+
+### 5. Connection to popcount kernels
+
+The underlying idea is similar to binary‐network kernels that use **XNOR‑popcount** for \(\{-1,+1\}\) weights: there one computes  
+
+\[
+x \odot w = \operatorname{popcnt}(\text{XNOR}(x,w)) - \frac{k}{2},
+\]
+
+which reduces a dot product to a popcount. In BitNet b1.58 we have an extra “zero’’ value, so we cannot rely purely on XNOR; instead we keep two masks (`P` and `N`). The final dot product can still be expressed as
+
+\[
+x\cdot w = \operatorname{popcnt}(P \land x_{\text{pos}}) -
+           \operatorname{popcnt}(N \land x_{\text{pos}}),
+\]
+
+where \(x_{\text{pos}}\) denotes the bits where the activation’s magnitude contributes positively (the sign is handled separately). This formulation explains why many implementations reuse highly optimised popcount primitives combined with SIMD adds.
+
+---
+
+### Summary
+
+* **Ternary weights** are stored as two packed bit‑planes (`P` for +1, `N` for –1).  
+* **8‑bit activations** are loaded once per block; their values remain integer throughout the GEMM.  
+* The kernel performs **signed additions only**: for each ‘+1’ mask it adds the corresponding activation, for each ‘–1’ mask it subtracts it, and ignores positions where both masks are zero.  
+* Because addition/subtraction is far cheaper than multiplication, the whole linear layer executes using only integer adds and SIMD masked‑add instructions; any required scaling happens after accumulation as a single FP16/Fp32 multiply per output column.  
+
+Thus `BitLinear` removes all per‑element multiplications from `nn.Linear` while still computing exact dot products with ternary weights and 8‑bit activations. The approach can be seen as a natural extension of binary XNOR‑popcount kernels to ternary weights, with the “zero’’ entry simply realised by having no contribution in either mask.

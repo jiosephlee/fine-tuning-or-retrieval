@@ -1,0 +1,136 @@
+\title{Blogs about the Paper: "xLSTM: Extended Long Short-Term Memory"}
+
+# Practical Trade‑offs: Speed, Memory, and Parallelism in xLSTM Implementations  
+
+## Introduction  
+
+The recent **xLSTM** paper revisits the classic LSTM architecture and pushes it to the scale of modern large language models (LLMs). By introducing **exponential gating**, a **scalar‑memory sLSTM**, and a **matrix‑memory mLSTM**, the authors demonstrate that recurrent networks can close the gap with Transformers and State‑Space Models (SSMs) on perplexity, scaling, and long‑context performance.  
+
+However, moving from a research prototype to a production‑ready model brings a very different set of questions: how fast does inference run, how much GPU memory does it consume, and can the operations be parallelized efficiently? This post walks through the engineering trade‑offs highlighted in the paper, focusing on three practical aspects:
+
+1. **CUDA kernel optimizations** – custom kernels for sLSTM and mLSTM.  
+2. **Matrix‑memory compute costs** – the $d \times d$ state in mLSTM.  
+3. **Inference speed and throughput** – head‑to‑head comparison with popular Transformers (Llama) and SSMs (Mamba).  
+
+All numbers are taken directly from the authors’ experiments; no external speculation is added.
+
+---
+
+## 1. CUDA Kernels: From Theory to Practice  
+
+### 1.1 Why custom kernels are needed  
+
+Both sLSTM and mLSTM add operations that are absent in vanilla LSTMs:
+
+* **Exponential gating** – gates are computed with $\exp(\cdot)$ instead of a sigmoid. This can lead to overflow, so a stabilizer state $m_t$ (Eq. (6)) must be maintained across timesteps.
+* **Normaliser state** – $n_t$ accumulates weighted gate products and appears in the hidden‐state division (Eq. (5) for sLSTM, Eq. (9) for mLSTM).
+* **Matrix memory updates** – mLSTM performs $\mathbf{C}_t = f_t \mathbf{C}_{t-1} + i_t \mathbf{v}_t \mathbf{k}_t^\top$, a rank‑1 outer product addition on a $d \times d$ matrix.
+
+These operations cannot be expressed efficiently with standard PyTorch primitives alone; they require fused kernels that keep intermediate values in registers, minimize memory traffic, and avoid unnecessary synchronizations.
+
+### 1.2 sLSTM kernel  
+
+The sLSTM kernel is *sequential* because of **memory mixing** (hidden‑to‑hidden recurrence). The authors implemented a CUDA kernel that:
+
+* Loads the previous cell $c_{t-1}$, normaliser $n_{t-1}$, and stabilizer $m_{t-1}$ into registers.
+* Computes $\tilde{i}_t$, $\tilde{f}_t$, $\tilde{o}_t$, $\tilde{z}_t$ from the input $x_t$ and previous hidden state $h_{t-1}$.
+* Applies exponential activation (or sigmoid for $f_t$) and updates $m_t$, $i'_t$, $f'_t$ via Eq. (6).  
+* Updates $c_t$ and $n_t$, then divides to obtain $\tilde{h}_t = c_t / n_t$.
+
+Because every timestep depends on the previous hidden state, the kernel essentially performs a *scan* across time. The implementation is highly optimized—register reuse cuts down global memory accesses—and runs **≤ 2× slower** than the fully parallel mLSTM kernel (see Section 7 of the paper).
+
+### 1.3 mLSTM kernel  
+
+The matrix memory eliminates hidden‑to‑hidden connections, enabling full parallelization across timesteps using a *prefix‑sum* style scan on the matrix $\mathbf{C}$:
+
+* The outer product $\mathbf{v}_t \mathbf{k}_t^\top$ is computed with a single GEMM call (`torch.bmm`), which GPUs handle exceptionally well.
+* The forget gate acts as a decay factor; an elementwise multiplication $f_t \mathbf{C}_{t-1}$ is again a GEMM.
+* The normaliser $\mathbf{n}_t$ follows the same scan pattern but with vectors instead of matrices.
+
+Although the algorithmic complexity is $O(d^2)$ per step (because of the matrix update), modern GPUs execute these dense linear algebra ops at near‑peak throughput. The authors note that with their current kernel **mLSTM is ≈ 4× slower** than FlashAttention or Mamba’s scan implementation—not because of algorithmic inefficiency but because the kernel still lacks low‑level optimizations (e.g., tiling, shared‑memory caching). A future “FlashAttention‑style” implementation could close this gap.
+
+---
+
+## 2. Matrix‑Memory Compute Costs  
+
+### 2.1 Memory capacity vs. compute  
+
+The key novelty of mLSTM is its **matrix memory** $\mathbf{C} \in \mathbb{R}^{d\times d}$, which replaces the scalar cell in a traditional LSTM. This brings two practical consequences:
+
+| Aspect | Effect |
+|--------|--------|
+| **Storage capacity** | Quadratic increase in representational power; enables associative recall of up to thousands of key–value pairs (Fig. 3). |
+| **Compute** | Each timestep requires a rank‑1 outer product ($\mathbf{v}_t\mathbf{k}_t^\top$) and an elementwise scaling of $\mathbf{C}_{t-1}$. Both are $O(d^2)$. |
+
+In practice, for models with hidden dimension $d=1024$, a single update touches more than one million floating‑point numbers per token—a nontrivial load compared with the elementwise gates of an LSTM or RNN.
+
+### 2.2 Mitigating overhead  
+
+The authors adopt several tricks to keep wall‑clock time reasonable:
+
+* **LayerNorm before projection** ensures keys/values have zero mean, stabilizing the outer product without additional clipping.
+* The denominator $\max\{| \mathbf{n}_t^\top \mathbf{q}_t|, 1\}$ avoids division by tiny numbers, preventing numeric spikes that would otherwise force extra safety checks.
+* All matrix ops are batched across heads when multiple heads are used; this allows CuBLAS to fuse kernels automatically.
+
+Even with these measures, mLSTM’s raw FLOP count remains higher than that of a comparable Transformer block. Nonetheless, because memory grows linearly with sequence length (the matrix is *constant w.r.t.* time), inference on long contexts stays feasible—a stark contrast to attention’s quadratic cost.
+
+---
+
+## 3. Inference Speed & Throughput  
+
+The paper presents an extensive benchmark on **1.3 B‑parameter models**, measuring both per-token generation time (single batch) and maximal decoding throughput (varying batch size). The results are summarized below.
+
+### 3.1 Generation time (single token)  
+
+| Model | Architecture | Generation time (ms/token) |
+|-------|--------------|----------------------------|
+| xLSTM[1:0] (mLSTM only) | Recurrent + matrix memory | ~3 ms |
+| xLSTM[7:1] (mostly mLSTM) | Mixed s/m blocks | ~3–4 ms |
+| Mamba | SSM | ~4 ms |
+| RWKV‑4 | RNN | ~3 ms |
+| Llama (7B style) | Transformer + KV cache | ~12 ms |
+
+*Transformers show quadratic scaling*: even with a static key‑value cache they are roughly **four times slower** than any recurrent variant at batch size 1 because each new token requires attention over all previous positions.
+
+### 3.2 Decoding throughput (tokens/s)  
+
+Throughput was measured by increasing batch size while keeping prefill length fixed at 16 tokens:
+
+| Batch size | xLSTM[1:0] | Mamba | RWKV‑4 | Llama |
+|------------|-----------|-------|--------|-------|
+| 1          | ~300 t/s  | ~250 t/s | ~310 t/s | ~80 t/s |
+| 8          | ~2400 t/s | ~2000 t/s | ~2500 t/s | ~300 t/s |
+| 16         | ~4500 t/s | ~3800 t/s | > 5000 t/s | ~550 t/s |
+
+Because both xLSTM variants have *constant memory* w.r.t. sequence length, they can scale batch size almost linearly until GPU memory becomes saturated. In contrast, Llama’s quadratic attention quickly hits a memory wall beyond batch 8.
+
+### 3.3 Trade‑off summary  
+
+| Dimension | Transformers (e.g., Llama) | SSMs (e.g., Mamba) | xLSTM (s/m mix) |
+|-----------|----------------------------|--------------------|-----------------|
+| **Parallelism** | Highly parallelizable across tokens via self‑attention; limited by quadratic memory/compute for long contexts. | Parallelizable via state scans; still linear in length but cheaper than attention. | mLSTM fully parallelizable; sLSTM requires sequential scan → ≤ 2× slower than mLSTM but still faster than attention for long contexts. |
+| **GPU Memory**   | $O(L^2)$ where $L$=context length → prohibitive beyond 4–8k tokens without cache tricks. | $O(1)$ per layer → modest growth with depth only. | Same as SSMs; matrix memory adds constant overhead ($d^2$ floats). |
+| **Compute per token** | $O(d^2 L)$ due to attention matrix multiplication; heavy for large $L$. | $O(d^2)$ per layer thanks to linear recursions; modest constant factor. | mLSTM: $O(d^2)$ + outer product; sLSTM: $O(d)$ but sequential scan → slightly higher latency per token.|
+
+Overall, for applications that require *very long context windows* or *low latency generation*, xLSTM offers an attractive middle ground: better scaling than pure Transformers while delivering comparable or better perplexity.
+
+---
+
+## 4. Takeaways for Practitioners  
+
+1. **Choose the right block mix** – If maximal speed matters more than squeezing every last bit of perplexity, lean toward an xLSTM[7:1] configuration (mostly mLSTM). Adding occasional sLSTM blocks improves expressive power on tasks needing state tracking without dramatically hurting throughput.
+2. **Expect higher GPU FLOPs** – The matrix update costs dominate compute budgets; plan for larger TFLOP budgets or use mixed precision (`tf32`/`float16`) to keep power consumption reasonable.
+3. **Kernel maturity matters** – The current implementation is already competitive but still lags behind highly tuned FlashAttention kernels by about ×4 for mLSTM and ≤ 2× for sLSTM. Investing in custom kernels (shared‐memory tiling, warp‐level reductions) will yield immediate speed gains.
+4. **Scalability remains promising** – Scaling law plots (Fig. 13 & Fig. 16 in the paper) show that xLSTM retains its advantage as model size grows from 125 M to > 10 B parameters, suggesting that engineering improvements will only amplify its practicality.
+
+---
+
+## Conclusion  
+
+xLSTM demonstrates that extending classic recurrent architectures can rival Transformers not only in predictive quality but also in scalability to billions of parameters. From an engineering perspective, however, there are concrete trade‑offs:
+
+* **sLSTM** offers richer state mixing at the cost of sequential execution; custom CUDA kernels keep this penalty modest.
+* **mLSTM** delivers full parallelism but incurs quadratic compute per step due to its matrix memory; careful kernel design can close the current performance gap.
+* Inference speed and throughput favor recurrent designs for long contexts, while Transformers still excel on short sequences where attention’s parallelism shines.
+
+As GPU software stacks evolve—especially around optimized scan/fuse primitives—the remaining gaps will shrink further, making xLSTM a compelling choice for anyone building large language models that need both *long context awareness* and *efficient inference*.

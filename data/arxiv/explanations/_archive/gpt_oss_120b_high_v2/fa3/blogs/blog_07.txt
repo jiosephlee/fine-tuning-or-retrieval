@@ -1,0 +1,311 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# A Beginner’s Guide to Building Faster Transformers with FlashAttention‑3  
+
+*Quickly get your PyTorch or Hugging Face models running on NVIDIA Hopper GPUs with the new FlashAttention‑3 kernel.*
+
+---
+
+## Why FlashAttention‑3?
+
+Self‑attention is the heavy‑weight operation in every Transformer model:
+
+\[
+S = \alpha\, QK^\top,\qquad 
+P = \operatorname{softmax}(S),\qquad 
+O = PV,
+\]
+
+with $\alpha=1/\sqrt{d}$ (the head dimension).  
+For a sequence of length $N$, the quadratic cost of $QK^\top$ dominates both training and inference—especially when $N$ reaches several thousand tokens.
+
+FlashAttention‑2 already eliminated most global‑memory traffic by fusing the three steps into a single kernel.  
+FlashAttention‑3 goes further by exploiting **Hopper‑specific hardware features**:
+
+| Feature | What it does | Benefit |
+|---|---|---|
+| **Producer–consumer asynchrony + warp specialization** | Separate warps handle data movement (TMA) and matrix multiplication (WGMMA) so that memory loads never stall compute | ≥ 75 % TFLOP utilization on H100 |
+| **GEMM–softmax pipelining (“ping‑pong”)** | While one warpgroup computes a block of $QK^\top$, another warpgroup simultaneously runs the softmax of the previous block | 1.5–2× speed‑up over FlashAttention‑2 |
+| **Hardware‑accelerated FP8 + block quantization + incoherent processing** | Uses FP8 Tensor Cores (≈ 2× higher matmul throughput) together with per‑tile scaling and a random orthogonal “mixing” matrix to keep quantisation error low | Up to **1.2 PFLOP/s** compute and **2.6×** lower numerical error than naïve FP8 |
+
+In practice you get:
+
+* **FP16**: up to **740 TFLOP/s** (≈ 75 % of H100 peak) → 1.5–2× faster than FlashAttention‑2.
+* **FP8**: close to **1.2 PFLOP/s** → roughly double the raw matmul throughput while staying accurate thanks to block quantisation.
+* Same exact‐attention results as the full‐precision baseline because intermediate softmax values are kept in FP32 internally.
+
+All of this lives in an easy‑to‑install Python library that plugs directly into PyTorch or Hugging Face Transformers.
+
+
+---
+
+## 1️⃣ Hardware you need
+
+FlashAttention‑3 is built around two Hopper primitives:
+
+* **Tensor Memory Accelerator (TMA)** – asynchronous HBM→SMEM copies.
+* **Warp‑group wide Matrix Multiply‑Accumulate (WGMMA)** – asynchronous Tensor Core GEMM that works on shared memory directly (including an FP8 mode).
+
+Therefore you need an NVIDIA GPU that implements Hopper’s SM architecture (**SM90**) – e.g.:
+
+| GPU | Compute capability | Peak FP16 / FP8 TFLOP |
+|---|---|---|
+| H100 SXM5 / PCIe 80 GB | sm_90 | ≈ 989 TFLOP/s (FP16) / ≈ 1.98 PFLOP/s (FP8) |
+
+Older GPUs still run the library but will fall back to the slower Ampere‐style kernels and won’t see the full speed gains.
+
+
+---
+
+## 2️⃣ Installing FlashAttention‑3
+
+The authors ship FlashAttention‑3 under the same repository used for earlier versions:
+
+```bash
+# 1️⃣ Clone the repo
+git clone https://github.com/Dao-AILab/flash-attention.git
+cd flash-attention
+
+# 2️⃣ Make sure you have CUDA ≥12.0 (required for TMA / WGMMA)
+#    Verify with `nvcc --version`.
+
+# 3️⃣ Build for Hopper (sm_90). Setting TORCH_CUDA_ARCH_LIST forces compilation against Hopper ISA.
+export TORCH_CUDA_ARCH_LIST="90"
+
+# 4️⃣ Install – this compiles a custom Torch extension.
+pip install -e .   # editable install; replace with `pip install .` for a regular install
+```
+
+If you just want a binary wheel and are already on a Hopper system:
+
+```bash
+pip install flash-attn   # picks up the prebuilt sm_90 wheels when they exist
+```
+
+> **Tip:** The build will automatically enable *fp8* support when it detects SM90 hardware. No extra flags are needed.
+
+
+---
+
+## 3️⃣ Using FlashAttention‑3 in pure PyTorch
+
+### 3.1 The low‑level API (`flash_attn_func`)
+
+FlashAttention‑3 ships a thin wrapper around the kernel:
+
+```python
+from flash_attn import flash_attn_func
+
+# Q,K,V shapes expected by the kernel:
+#   [batch * nheads , seqlen , head_dim]   -> float16 or float8_e4m3fn
+def fast_attention(Q, K, V, causal=False):
+    """
+    Returns O ∈ ℝ^{B·H × T × d} where B=batch size,
+    H=num heads, T=seq_len, d=head_dim.
+    """
+    return flash_attn_func(Q,
+                           K,
+                           V,
+                           dropout_p=0.0,
+                           softmax_scale=None,
+                           causal=causal)
+```
+
+The function does exactly what you wrote out above (`QKᵀ → softmax → PV`) **without ever materialising** the $N\times N$ score matrix in global memory.
+
+
+### 3.2 A drop‑in multi‑head attention module
+
+Below is a minimal MHA implementation that swaps out the naïve matmul–softmax sequence for `flash_attn_func`. The code works both in FP16 and FP8 – just change the dtype of your inputs.
+
+```python
+import torch
+import torch.nn as nn
+from flash_attn import flash_attn_func
+
+class FlashMHA(nn.Module):
+    """
+    Multi‑head attention based on FlashAttention‑3.
+    """
+    def __init__(self,
+                 embed_dim: int,
+                 num_heads: int,
+                 dropout: float = 0.,
+                 dtype=torch.float16):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim   = embed_dim // num_heads
+        self.dtype     = dtype
+
+        # QKV projection + output projection – bias omitted for simplicity.
+        self.qkv_proj = nn.Linear(embed_dim,
+                                  embed_dim * 3,
+                                  bias=False,
+                                  dtype=dtype)
+        self.out_proj = nn.Linear(embed_dim,
+                                  embed_dim,
+                                  bias=False,
+                                  dtype=dtype)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self,
+                x: torch.Tensor,
+                causal: bool = False,
+                attn_mask: torch.Tensor | None = None):
+        """
+        x : [batch , seq_len , embed_dim]
+        attn_mask : optional boolean mask broadcastable to [batch , seq_len , seq_len]
+                    – e.g., padding mask.
+        """
+        B, T, _ = x.shape
+
+        # ---- Project ----
+        qkv = self.qkv_proj(x)                       # [B , T , 3·C]
+        qkv = qkv.view(B, T, 3, self.num_heads,
+                       self.head_dim).permute(2, 0, 3, 1,
+                                             4)      # [3 , B , H , T , d]
+
+        Q, K, V = qkv[0], qkv[1], qkv[2]             # each [B , H , T , d]
+
+        # ---- Collapse batch & heads -------------------------------------------------
+        # This matches {@code flash_attn_func}'s expected layout.
+        Q = Q.reshape(B * self.num_heads, T, self.head_dim)
+        K = K.reshape(B * self.num_heads, T, self.head_dim)
+        V = V.reshape(B * self.num_heads, T, self.head_dim)
+
+        # ---- Call kernel ------------------------------------------------------------
+        O = flash_attn_func(Q,
+                            K,
+                            V,
+                            dropout_p=self.dropout.p,
+                            causal=causal)
+
+        # ---- Restore original shape -------------------------------------------------
+        O = O.view(B, self.num_heads, T,
+                   self.head_dim).transpose(1, 2).contiguous()
+                     # → [B , T , H , d]
+        O = O.reshape(B, T, self.embed_dim)
+
+        return self.out_proj(O)
+```
+
+#### Using FP8  
+
+If your hardware supports fp8 Tensor Cores you can simply cast your inputs:
+
+```python
+# Cast model parameters once at start-up:
+model.to(torch.float8_e4m3fn)
+
+# Or work in mixed precision:
+with torch.autocast(device_type='cuda', dtype=torch.float16):
+    out = model(input_ids)
+```
+
+Internally FlashAttention‑3 will detect fp8 tensors and automatically switch to the **block‐quantised**, **incoherently processed** kernels described in the paper—no extra code changes are required.
+
+
+---
+
+## 4️⃣ Hooking FlashAttention‑3 into Hugging Face Transformers  
+
+Most transformer models inside 🤗 Transformers define their own MHA subclass (`BertSelfAttention`, `GPTNeoXSelfAttention`, …). Replacing these classes with our `FlashMHA` yields immediate speedups without altering training loops or tokenizers.
+
+### Example: Speeding up GPT‑NeoX
+
+```python
+from transformers import GPTNeoXForCausalLM
+import torch.nn as nn
+
+# Load pretrained model (weights stay in fp16/float32 as usual).
+model_fp32 = GPTNeoXForCausalLM.from_pretrained(
+    "EleutherAI/gpt-neox-20b",
+    torch_dtype=torch.float16   # use fp16 weights if you have enough GPU memory
+)
+
+# Replace its internal Self-Attention module:
+for layer in model_fp32.gpt_neox.layers:
+    hidden_sz   = layer.self_attn.embed_dim      # typically ≈2048
+    nheads      = layer.self_attn.num_attention_heads
+
+    layer.self_attn.__class__      = type("FlashSelfAttn", (), {})
+    layer.self_attn.forward         = FlashMHA(embed_dim=hidden_sz,
+                                              num_heads=nheads,
+                                              dropout=layer.self_attn.attention_dropout,
+                                              dtype=torch.float16).forward.__get__(layer.self_attn)
+
+# Move everything onto an H100:
+model_fp32.to("cuda")
+model_fp32.eval()
+
+# Inference example:
+input_ids = torch.randint(0, model_fp32.config.vocab_size,
+                          (1, 2048), device="cuda")
+with torch.no_grad():
+    logits = model_fp32(input_ids).logits   # now runs via FlashAttention‑3!
+```
+
+#### Optional: Swapping only at runtime  
+
+If you prefer not to modify model source files you can monkeypatch on import:
+
+```python
+from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXLayer
+
+def patched_forward(self, hidden_states):
+    return FlashMHA(self.attention.embed_dim,
+                    self.attention.num_attention_heads)(hidden_states)
+
+GPTNeoXLayer.forward.__code__ = patched_forward.__code__
+```
+
+(For production workloads you’d usually fork the model class instead of monkeypatching.)
+
+---
+
+## 5️⃣ Choosing Between FP16 and FP8  
+
+| Aspect | FP16 (native half) | FP8 (e4m3fn) |
+|---|---|---|
+| Throughput on H100 | ≈ 740 TFLOP/s ≤ 75 % utilization | ≈ 1.2 PFLOP/s ≈ 100 % Tensor Core utilization |
+| Memory footprint per tensor | ×2 reduction vs fp32 | ×4 reduction vs fp16 |
+| Numerical error on outlier‐heavy data | Same as FlashAttention‑2 (softmax kept in FP32) | ≈ 2.6× lower error than naïve per‐tensor fp8 quantisation thanks to block quantisation + incoherent processing |
+| When to use | Most LLM fine‐tuning / inference where memory is not limiting | Very long sequences (>4k tokens), inference at massive scale or when GPU memory is at premium |
+
+In practice try both modes on a small validation set—if your downstream quality metrics stay within tolerance you’ll enjoy roughly double throughput with fp8.
+
+
+---
+
+## 6️⃣ Performance Tips & Gotchas  
+
+* **Batch & head tiling** – The kernel internally chooses tile sizes (`B_r`, `B_c`) that balance shared memory usage versus register pressure. If you see low utilization on very short sequences (<1024 tokens), consider increasing batch size so total token count stays around ~16k per kernel launch—the sweet spot used in the paper’s benchmarks.
+* **Causal masking** – Set `causal=True` when generating autoregressive text; this disables half of the score matrix which slightly reduces TFLOPs but still gives > 60 % utilization.
+* **Mixed precision training** – Use PyTorch’s native AMP (`torch.autocast`) together with `torch.compile` if you’re on PyTorch ≥ 2.x – both compile time optimisations stack nicely on top of our kernel.
+* **Persistent kernels** – The current open source build contains a persistent kernel for FP16 paths which further reduces launch overhead on long sequences (>4k). For now the FP8 path uses a non‑persistent design—future releases will close this gap.
+* **Profiling** – Use `torch.profiler` or Nsight Systems to confirm that most time is spent inside `flash_attn_cuda_kernel`. If you see heavy time spent in data loading (`copy_kernel`), double check that your tensors are already resident on HBM (i.e., avoid `.cpu()` → `.cuda()` copies inside training loops).
+
+---
+
+## 7️⃣ Wrapping up  
+
+FlashAttention‑3 shows that modern GPUs aren’t just “faster GPUs”—they expose *new execution primitives* that software can exploit today:
+
+* Asynchronous memory movement + Tensor Core compute enables true producer–consumer pipelines.
+* Overlapping softmax with GEMM hides low-throughput special functions behind high-throughput matrix ops.
+* Leveraging FPGA-like low‐precision arithmetic while keeping exact results through smart quantisation tricks gives us TFLOP/ PFLOP speeds without sacrificing quality.
+
+All of this comes bundled in an easy-to-install Python package that plugs directly into PyTorch and Hugging Face pipelines—providing up to *twice* faster inference or training on an H100 while staying numerically robust even when working in aggressively low precision like FP8.
+
+Give it a spin:
+
+```bash
+pip install flash-attn                # get latest wheels
+python -c "import torch; print(torch.cuda.get_device_name())"
+# → Should print something like “NVIDIA H100”
+```
+
+Then replace your MHA layers with `FlashMHA` and watch those long-context tasks become *real time*. Happy coding! 🚀

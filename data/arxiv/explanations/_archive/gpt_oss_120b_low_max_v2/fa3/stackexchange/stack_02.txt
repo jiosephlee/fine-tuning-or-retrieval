@@ -1,0 +1,247 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### What is the exact data layout required for FP8 WGMMA operands and how is the in‑kernel transpose implemented?
+Question:
+The paper states that FP8 WGMMA only accepts k‑major operand layout, unlike FP16 which accepts both mn‑major and k‑major. It also mentions using LDSM/STSM instructions to transpose $V$ tiles after loading them into shared memory. I would like a detailed description of:
+1) the memory stride/order of $V$ before and after the transpose;
+2) how LDSM/STSM pack two 8‑bit entries to load 128‑byte tiles;
+3) any additional register shuffles needed after the transpose to match the accumulator layout described in Figures 5 and 6.
+A concrete code sketch or pseudo‑PTX would be very helpful.
+Answer:
+**Answer**
+
+The FP8 version of FlashAttention‑3 has to obey two constraints that do not exist for FP16 WGMMA:
+
+1. **Only k‑major layout is accepted for the *B* operand of the second GEMM** (the `V` matrix).  
+2. **The accumulator layout produced by the first FP8 WGMMA does not match the layout expected by the second WGMMA**; a small register‑permute has to be inserted.
+
+Below I describe how the kernel satisfies those constraints, how the in‑kernel transpose of `V` is performed with the `ldmatrix`/`stmatrix` (LDSM/STSM) instructions, and what register shuffles are needed before the second WGMMA.  The description is tied to the tile sizes used in the paper (`$B_r = 64$`, `$B_c = 64$`, `$d = 128$`) and to the $8\times8\times8$ FP8 tensor‑core tile that Hopper’s WGMMA implements.
+
+---
+
+### 1. Memory stride / order of **V** before and after the transpose  
+
+In global memory (GMEM) the value matrix is stored **row‑major in the head‑dimension** (`$d$`).  
+For a head dimension of 128 this means that a contiguous tile of shape  
+
+```
+V_tile_gmem[ B_c ][ d ]   // B_c rows, d columns
+```
+
+has stride `$stride\_row = d$` (128) and stride `$stride\_col = 1$`.  
+The GEMM we need to compute is
+
+\[
+O_i \;+=\; (Q_i K_j^{\top})\; V_j ,
+\]
+
+i.e. we multiply an **mn‑major** `$Q_i K_j^{\top}` (rows = query block, columns = key block)` with a **k‑major** `$V_j$`.  
+Therefore each tile of `V` that lives in shared memory must be laid out as
+
+```
+V_tile_smem[ d ][ B_c ]   // d rows, B_c columns   <-- k‑major
+```
+
+with stride `$stride\_row = B_c$` (64) and stride `$stride\_col = 1$`.  
+
+Consequently we have to **transpose** a `$B_c \times d$` tile after it is copied from GMEM into shared memory.  The transpose changes the effective strides from `$(d, 1)$` to `$(B_c, 1)$` while leaving the data order in registers unchanged.
+
+---
+
+### 2. How LDSM / STSM pack two 8‑bit entries
+
+Hopper’s `ldmatrix` (`LDSM`) instruction moves an **$8 \times 8$ matrix of *half‑words*** (16 bits) from shared memory to registers in a single warp instruction.  For FP8 we can treat two adjacent FP8 values as one half‑word and therefore load *two* FP8 elements per half‑word.
+
+A tile that we want to transpose consists of **$64 \times 128$** FP8 values, i.e. **4 × $(8 \times 8)$** sub‑tiles when we view them as half‑words:
+
+```
+          ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐
+          │ h0–h1 │ │ h2–h3 │ │ h4–h5 │ │ h6–h7 │
+          └───────┘ └───────┘ └───────┘ └───────┘
+           ... repeats for each 8‑row block ...
+```
+
+* **Loading (`ldmatrix`)** – each warp issues one `ldmatrix.sync.aligned.m8n8.shared.b64` (the “b64” suffix tells the hardware that each element is a *byte* pair).  
+  The instruction reads a contiguous **128‑byte** region from shared memory (8 rows × 8 columns × 2 bytes per packed element) and expands it into eight registers per thread (`%r0 … %r7`).  
+* **Storing (`stmatrix`)** – after we have rearranged those registers (see §3), we issue one `stmatrix.sync.aligned.m8n8.shared.b64`.  It writes exactly the same 128‑byte region back to shared memory, but because our registers now contain the transposed ordering, the destination region holds a transposed sub‑tile.
+
+Because each instruction processes an entire *packed* $8 \times 8$ block, four consecutive invocations cover a full `$64 \times 128$` tile:
+
+```ptx
+// Assume: %shared_V points to beginning of V_tile in SMEM
+//         %reg[0..31] are per‑thread registers
+
+// Loop over four sub‑tiles (each 8 rows × 32 columns)
+.for i in [0:3] {
+    .reg .b32   r0, r1, r2, r3, r4, r5, r6, r7;   // will hold packed FP8
+
+    // Load packed block (rows i*8 … i*8+7 , cols 0 …31)
+    ldmatrix.sync.aligned.m8n8.shared.b64
+        {r0, r1, r2, r3, r4, r5, r6, r7}, 
+        [%shared_V + i*128];                     // 128 B stride between blocks
+
+    // ---- register permutation for transpose ----
+    // See §3 for exact shuffle pattern.
+    // After this step each thread owns elements that belong
+    // to a different column in the original matrix.
+
+    // Store transposed block back to SMEM at transposed location
+    stmatrix.sync.aligned.m8n8.shared.b64
+        [%shared_V_trans + i*128],
+        {r0, r1, r2, r3, r4, r5, r6, r7};
+}
+```
+
+Each iteration moves exactly **128 bytes**, which matches the bandwidth of a single Tensor Core lane and therefore incurs essentially no extra latency beyond the normal TMA load that placed the original tile into SMEM.
+
+---
+
+### 3. Register shuffles needed after the transpose  
+
+#### (a) Register layout produced by the first FP8 WGMMA  
+
+For an FP8 WGMMA with tile shape `$M=64$, $N=64$, $K=64$`, each thread owns an **2 × 4** fragment of the C accumulator.  
+In PTX this fragment is laid out in registers as
+
+```
+c00 c01 c02 c03   // row 0 columns 0..3
+c10 c11 c12 c13   // row 1 columns 0..3
+c20 c21 c22 c23   // row 2 …
+c30 c31 c32 c33
+c40 …            // … up to row 7 (each thread owns two rows)
+c50 …
+c60 …
+c70 …
+```
+
+If we write those eight registers sequentially (`%c0 … %c7`) they appear in *row‑major* order.
+
+#### (b) Layout required for the second WGMMA  
+
+The second GEMM multiplies `(Q K^{\top})` – now stored as accumulator C – with transposed `V`.  
+WGMMA expects its **A operand** (the left matrix) to be *k‑major*: consecutive elements must correspond to successive values of K inside a single warp‐group column.  
+Because our accumulator is currently row‑major we have to apply a *column‑shuffle*:
+
+```
+new_order = { d0 d1 d4 d5 d2 d3 d6 d7 }
+```
+
+where each `d?` denotes one of the original eight registers (`%c0 … %c7`).  
+In practice this permutation can be expressed with a single warp‑wide byte‑permute (`prmt.b32`) followed by an intra‑warp shuffle (`shfl_xor`). The code fragment below shows one possible PTX implementation:
+
+```ptx
+// %c0…%c7 contain row–major accumulator fragment
+// pack them into two 32‑bit values so that prmt can work on bytes
+
+.reg .b32 temp0, temp1;
+mov.u32 temp0, {%c0,%c1,%c2,%c3};   // low half of fragment
+mov.u32 temp1, {%c4,%c5,%c6,%c7};   // high half
+
+// byte–permute according to mask {0,1,4,5,2,3,6,7}
+prmt.b32 %c0, temp0, temp1, 0x50403020;
+prmt.b32 %c1, temp0, temp1, 0x70605040;
+prmt.b32 %c2, temp0, temp1, 0x92817060;
+prmt.b32 %c3, temp0, temp1, 0xb4a39080;
+
+// Now %c0…%c3 hold columns {d0,d1,d4,d5}.  
+// A second set of shuffles (shfl_xor) swaps the remaining pairs 
+// so that we finally have {d2,d3,d6,d7} in %c4…%c7.
+shfl_sync.b32 %c4,%c4,%tid.x ^ 0x01;
+shfl_sync.b32 %c5,%c5,%tid.x ^ 0x01;
+shfl_sync.b32 %c6,%c6,%tid.x ^ 0x01;
+shfl_sync.b32 %c7,%c7,%tid.x ^ 0x01;
+```
+
+After this permutation each thread’s registers are exactly in k‑major order and can be fed directly into the second WGMMA:
+
+```ptx
+wmma.mma_async_fp8_f16_f16_fp32 
+    .dest_accumulator (%acc), 
+    .src_a (%acc),                 // now k‑major accumulator from first GEMM
+    .src_b (%v_transposed_regs),   // V tile already transposed in SMEM → loaded with ldmatrix
+    .src_c (%zero);                // accumulate into fresh C buffer
+```
+
+#### (c) Matching permutation on **V**
+
+The same column permutation performed on the accumulator must be mirrored on `V`.  
+Because we transpose `V` *in shared memory* using LDSM/STSM (section 2), we can write each sub‑tile into a location whose logical column index already incorporates that permutation. In other words,
+
+```
+store_address = base_smem + permuted_column_offset(i)
+```
+
+where `permuted_column_offset(i)` follows exactly `{0→0 , 1→1 , 2→4 , 3→5 , …}`. The PTX loop shown earlier stores each packed block at an address computed with that offset; no additional shuffle is required after loading because each thread already sees its elements in k‑major order.
+
+---
+
+### Putting it all together – pseudo kernel
+
+```ptx
+.visible .entry flashattention_fp8_forward(
+    .param .u64 Q_ptr,
+    .param .u64 K_ptr,
+    .param .u64 V_ptr,
+    .param .u64 O_ptr,
+    .param .u32 seq_len,
+    .param .u32 head_dim,
+    .param .u32 block_q,
+    .param .u32 block_k)
+{
+    // -------------------------------------------------------
+    //   Producer warp: TMA loads Q_i , K_j , V_j into SMEM
+    // -------------------------------------------------------
+    tma.load.async.shared [smem_Q], [Q_ptr + i*block_q*head_dim];
+    tma.load.async.shared [smem_K], [K_ptr + j*block_k*head_dim];
+    tma.load.async.shared [smem_V_raw], [V_ptr + j*block_k*head_dim];
+
+    // -------------------------------------------------------
+    //   Consumer warp – first GEMM: Q_i * K_j^T -> Acc_fp32
+    // -------------------------------------------------------
+    wgmma.mma_async_fp8_fp16_fp16_fp32 
+        .dest_accumulator (%acc), .src_a(%Q_reg), .src_b(%K_reg);
+
+    // -------------------------------------------------------
+    //   In‑kernel transpose of V_j while waiting for next K
+    // -------------------------------------------------------
+    @producer_done {
+        // four packed sub-tiles per V_j tile
+        for (int s=0; s<4; ++s) {
+            ldmatrix.sync.aligned.m8n8.shared.b64 
+                {r0..r7}, [smem_V_raw + s*128];
+            // permute registers so that they become k-major after store
+            permute_for_k_major(r0..r7);
+            stmatrix.sync.aligned.m8n8.shared.b64 
+                [smem_V_tiled + s*128], {r0..r7};
+        }
+        @producer_done_barrier;            // signal that V_j is ready
+    }
+
+    // -------------------------------------------------------
+    //   Register shuffle of accumulator to k-major order
+    // -------------------------------------------------------
+    permute_accumulator_to_k_major(%acc);
+
+    // -------------------------------------------------------
+    //   Second GEMM: (QK^T)_k-major * V_j_transposed -> O_i partials
+    // -------------------------------------------------------
+    wgmma.mma_async_fp8_fp16_fp16_fp32 
+        .dest_accumulator (%O_partial), 
+        .src_a(%acc),                // now k-major accumulator from first GEMM
+        .src_b(%V_tiled_reg);        // loaded from smem_V_tiled via ldmatrix
+
+    ...      // softmax reduction & accumulation as described in Alg.5
+
+}
+```
+
+The kernel above follows exactly what is described in Sections §4.3–§4.4 of the paper:
+
+* The producer warp uses TMA to bring tiles of `Q`, `K`, and raw `V` into shared memory.
+* Immediately after a `V` tile lands in shared memory we launch an LDSM/STSM‐based transpose; because LDSM works on packed FP8 pairs it moves a full **128‑byte** sub‑tile per instruction.
+* While the next `K` tile is being fetched we already start the second WGMMA with the transposed `V`; thus no extra synchronisation point is needed between GEMMs.
+* The only extra register work beyond what a plain FP16 kernel would do is:
+  * a small byte‑permute (`prmt.b32`) plus an intra‑warp shuffle (`shfl_xor`) to reorder the accumulator,
+  * and an identical permutation applied during the LDSM/STSM transpose of `V`.
+
+With these steps satisfied every iteration complies with Hopper’s k‑major requirement for both operands of the second FP8 WGMMA and produces exactly the accumulator layout shown in Figures 5 and 6 of the paper. The result is an end‑to‑end FP8 FlashAttention kernel that attains close to **$1.2\,\text{PFLOP/s}$** on H100 while keeping numerical error low thanks to block quantisation and incoherent processing.

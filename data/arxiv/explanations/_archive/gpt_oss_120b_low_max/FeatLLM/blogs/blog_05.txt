@@ -1,0 +1,258 @@
+\title{Blogs about the Paper: "Large Language Models Can Automatically Engineer Features for Few-Shot Tabular Learning"}
+
+# Practical Guide: Deploying FeatLLM with Only API Access to GPT‑3.5  
+
+Few‑shot tabular learning has traditionally required either a lot of labeled data or heavyweight fine‑tuning of large models. **FeatLLM** flips the script: it treats a large language model (LLM) as a *feature engineer* rather than an end‑to‑end predictor. The result is a lightweight pipeline that can be run using only the public inference API of GPT‑3.5 (or any comparable LLM), with no GPU‑intensive training steps.  
+
+In this post we walk through the entire workflow—from crafting the prompt that coax the LLM into generating useful rules, to turning those rules into binary features, training a tiny linear model, and finally using an ensemble of such “weak learners” for robust predictions. All steps are designed to run on a standard laptop or a modest cloud instance; the only external dependency is the LLM’s API.
+
+---
+
+## 1. Overview of the FeatLLM Pipeline  
+
+| Stage | What happens? | Key artifact |
+|------|----------------|--------------|
+| **Prompt construction** | Provide task description, feature definitions, and a handful of labeled examples. | Text prompt sent to GPT‑3.5 |
+| **Rule extraction** | GPT‑3.5 returns a fixed set of logical conditions (rules) per class. | Human‑readable rule list |
+| **Code generation & parsing** | A second LLM call turns each rule into executable Python code that evaluates the rule on a row. | `apply_rules(df)` function |
+| **Feature creation** | Apply the code to the whole dataset → binary matrix **Z** (rows × rules). | New feature matrix |
+| **Linear weight tuning** | Fit a non‑negative linear model \(\mathbf{w}\) on the few labeled rows (cross‑entropy loss). | Weight vector per class |
+| **Ensemble voting** | Repeat the whole process *T* times (different random seeds, bagged subsets of columns/rows). Average class probabilities across ensembles. | Final prediction |
+
+The heavy lifting—reasoning about which columns matter and how they interact—is done once per *ensemble member* via the LLM API. At inference time we only evaluate cheap binary features and dot‑product with learned weights.
+
+---
+
+## 2. Preparing Your Data  
+
+1. **Tabular format** – A pandas `DataFrame` where each column has a clear name (`f1`, `f2`, …) and an optional textual definition (e.g., “`age` – patient age in years”).  
+2. **Few‑shot labels** – Choose \(k\) rows (commonly 4–8) that cover all target classes. These will be serialized into the prompt as demonstrations.  
+3. **Feature metadata** – For every column, write a concise description: type (numeric, categorical, boolean) and any domain hint you think might help the LLM (“older patients tend to have higher risk”).  
+
+> **Tip:** Even if you lack perfect definitions, providing *some* natural language cue dramatically improves rule quality, as shown in the paper’s ablation study.
+
+---
+
+## 3. Prompt Design for Rule Extraction  
+
+The prompt is split into three logical blocks; keep the same structure for every LLM call.
+
+### 3.1 Basic Information  
+
+```text
+Task: Predict whether a patient will develop chronic heart failure.
+Labels: Yes / No
+Features:
+- age: numeric, patient age in years.
+- cholesterol: numeric, blood cholesterol level mg/dL.
+- smoker: categorical {yes, no}.
+- ejection_fraction: numeric, % of blood pumped per heartbeat.
+...
+Examples:
+Sample 1: age is 67. cholesterol is 210. smoker is yes. ejection_fraction is 30.
+Answer: Yes
+
+Sample 2: age is 45. cholesterol is 180. smoker is no. ejection_fraction is 55.
+Answer: No
+```
+
+*Serialisation follows*: `"f_j is <value>. ... Answer: <label>"`. Keep each example on its own line to avoid hitting token limits.
+
+### 3.2 Reasoning Instruction  
+
+```text
+Step 1: Based on medical knowledge, describe which features are generally associated with heart failure risk.
+
+Step 2: Using the above knowledge together with the examples, produce exactly ten logical rules that indicate a "Yes" prediction and ten rules for a "No" prediction.
+```
+
+The two‑step approach forces the model to pull out prior knowledge first (e.g., “higher age and lower ejection fraction increase risk”) before grounding it in the concrete demos.
+
+### 3.3 Response Instruction  
+
+```text
+For each class output rules in this format:
+Rule #i: IF <feature> <operator> <value> [AND <feature> <operator> <value> ...] THEN class = <Yes/No>
+Provide one rule per line.
+```
+
+By fixing the formatting we make downstream parsing deterministic even when GPT occasionally varies phrasing (“greater than” vs `>`).
+
+---
+
+## 4. Calling GPT‑3.5 and Capturing Rules  
+
+```python
+import openai, json, textwrap
+
+def query_gpt(prompt):
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo-0613",
+        messages=[{"role":"user","content":prompt}],
+        temperature=0.5,
+        max_tokens=1500,
+    )
+    return response["choices"][0]["message"]["content"]
+```
+
+Set `temperature=0.5` to encourage some diversity across ensemble members while keeping outputs sensible.
+
+Store the raw text; later we’ll feed it back to GPT for code generation.
+
+---
+
+## 5. Turning Natural‑Language Rules into Executable Code  
+
+Parsing free text can be brittle; instead we let GPT do the heavy parsing:
+
+```python
+code_prompt = f"""
+You are given a list of logical rules in natural language.
+
+Rules:
+{rules_text}
+
+Write a Python function `apply_rules(df)` that returns a DataFrame `Z`
+where each column corresponds to one rule (binary 0/1 indicating if
+the rule holds for that row). Preserve column names as "rule_i".
+"""
+code = query_gpt(code_prompt)
+exec(code)   # defines apply_rules in the current namespace
+Z = apply_rules(df)   # df = full dataset (including train + test)
+```
+
+Because GPT was trained on code, it reliably converts variations like “greater than” → `>` or “between X and Y” → appropriate logical combination.
+
+---
+
+## 6. Training the Linear Weight Model  
+
+We now have a binary feature matrix \(Z \in \{0,1\}^{N \times R}\), where \(R =\) number of rules per class \(\times\) number of classes (typically \(10 \times C\)). The downstream model is extremely simple:
+
+\[
+\text{logit}_k = \max(\mathbf{w}_k,0)\cdot \mathbf{z}_k,\qquad
+\mathbf{p}= \text{softmax}([\text{logit}_1,\dots,\text{logit}_C]).
+\]
+
+Implementation (PyTorch or NumPy):
+
+```python
+import torch, torch.nn.functional as F
+
+Z_train = torch.tensor(Z_train.values, dtype=torch.float32)
+y_train = torch.tensor(y_train.values)   # integer class ids
+
+w = torch.nn.Parameter(torch.zeros(R))   # one weight vector per class handled together
+
+optimizer = torch.optim.Adam([w], lr=0.01)
+
+for epoch in range(200):
+    optimizer.zero_grad()
+    logits = torch.relu(w).unsqueeze(0) * Z_train   # broadcasting over classes
+    logits = logits.sum(dim=1)                     # sum over rules per class
+    loss = F.cross_entropy(logits.unsqueeze(0), y_train)
+    loss.backward()
+    optimizer.step()
+```
+
+Because we only have a few labeled rows, early stopping via k‑fold cross validation works well; usually convergence is reached within dozens of epochs.
+
+---
+
+## 7. Bagging & Ensemble Construction  
+
+A single rule set may miss some informative columns—especially when your dataset has > 100 features and exceeds the LLM’s context window. Mitigate this by:
+
+1. **Feature bagging** – Randomly select a subset of columns (e.g., 30 % of total) before building the prompt.
+2. **Instance bagging** – Randomly shuffle or subsample your few-shot examples; order matters for LLMs.
+3. **Temperature boost** – Use `temperature=0.7` for some ensemble members to increase rule diversity.
+
+Run steps 2–6 *T* times (the paper finds \(T=20\) sufficient). After training each linear model \(\mathbf{w}^{(t)}\), obtain class probabilities \(\mathbf{p}^{(t)}\) for every test row and average:
+
+```python
+final_prob = sum(p_t for p_t in prob_list) / T
+pred_class = final_prob.argmax(axis=1)
+```
+
+The ensemble smooths out occasional mis‑generated rules and compensates for any spurious columns introduced by bagging.
+
+---
+
+## 8. Full End‑to‑End Script Skeleton  
+
+```python
+def featllm_pipeline(df, label_col, k_shot=4, n_ensembles=20,
+                     rule_per_class=10, bag_fraction=0.3):
+    # 1️⃣ Split few-shot training rows
+    train_idx = stratified_sample(df[label_col], k_shot)
+    df_train = df.iloc[train_idx]
+    df_test  = df.drop(train_idx)
+
+    ensemble_probs = []
+    for t in range(n_ensembles):
+        # 2️⃣ Random feature bagging
+        cols_subset = np.random.choice(df.columns.drop(label_col),
+                                       size=int(bag_fraction*len(df.columns)),
+                                       replace=False)
+        # add back label column for prompt generation
+        cols_prompt = list(cols_subset) + [label_col]
+
+        # 3️⃣ Build prompt with feature defs & few-shot examples
+        prompt = build_prompt(df[cols_prompt], df_train)
+
+        # 4️⃣ Query GPT‑3.5 → raw rules
+        raw_rules = query_gpt(prompt)
+
+        # 5️⃣ Generate parsing code and exec()
+        parse_code = query_gpt(make_code_prompt(raw_rules))
+        exec(parse_code)
+
+        # 6️⃣ Apply to whole dataset → binary matrix Z
+        Z_all = apply_rules(df[cols_subset])
+
+        # split Z back into train / test portions
+        Z_train = Z_all.iloc[train_idx]
+        Z_test  = Z_all.drop(train_idx)
+
+        # 7️⃣ Train linear weights on Z_train & few-shot labels
+        w = train_linear(Z_train.values, df_train[label_col].values)
+
+        # 8️⃣ Compute probabilities on test set
+        logits_test = np.maximum(w,0) * Z_test.values   # broadcasting
+        logits_test = logits_test.sum(axis=1)
+        probs_test = softmax(logits_test, axis=1)
+        ensemble_probs.append(probs_test)
+
+    final_prob = np.mean(ensemble_probs, axis=0)
+    return final_prob.argmax(axis=1), final_prob
+```
+
+Replace helper functions (`stratified_sample`, `build_prompt`, `make_code_prompt`, `train_linear`, `softmax`) with your own implementations—each mirrors the descriptions above.
+
+---
+
+## 9. Practical Considerations  
+
+| Issue | Mitigation |
+|------|------------|
+| **Prompt length overflow** | Use feature bagging; keep each example concise; omit rarely used columns from prompt |
+| **Noisy rule syntax** | Enforce response instruction; rely on second‑stage code generation rather than manual regex |
+| **Spurious correlations** | The two‑step reasoning instruction dramatically reduces reliance on irrelevant columns; ensemble further dilutes any occasional misbehaving rule |
+| **API cost** | Each ensemble member performs two calls (rule extraction + code generation). With \(T=20\), total calls ≈ 40 per dataset—a few cents on most commercial APIs |
+| **Latency at inference time** | After preprocessing, prediction reduces to a dot product—microseconds per sample |
+
+Empirically (see the original FeatLLM paper), this setup yields an average AUC gain of ~10 % over strong baselines such as TabLLM or STUNT while keeping inference costs comparable to classic Logistic Regression.
+
+---
+
+## 10. Closing Thoughts  
+
+FeatLLM demonstrates that you don’t need giant GPU clusters or fine‑tuning pipelines to reap benefits from LLMs in tabular domains. By reframing LLMs as “knowledgeable analysts” that write down decision rules, we can:
+
+* Leverage their world knowledge even with only a handful of labeled rows  
+* Keep runtime cheap—no per‑sample LLM calls at deployment  
+* Stay within API limits thanks to bagged prompts and deterministic parsing  
+
+Give it a try on your next low‑shot classification problem—whether it’s predicting loan defaults, medical outcomes, or equipment failures—and you’ll likely see better performance with less engineering overhead than traditional few‑shot methods.
+
+Happy modeling!

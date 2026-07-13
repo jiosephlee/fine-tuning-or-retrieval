@@ -1,0 +1,360 @@
+\title{Blogs about the Paper: "Parameter-Efficient Orthogonal Finetuning via Factorization"}
+
+# Practical Guide: How to Implement Orthogonal Butterfly Finetuning in Your Projects  
+
+In recent months **Orthogonal Butterfly Finetuning (BOFT)** has emerged as a compelling alternative to classic PEFT methods such as LoRA or adapter tuning. BOFT builds on the orthogonal finetuning (OFT) paradigm, but replaces the dense orthogonal matrix with a **butterfly‑factorized** representation. The result is a parameter‑efficient update that still enjoys the stability and generalisation guarantees of orthogonal transformations, while adding virtually no inference latency.
+
+This tutorial walks you through a concrete implementation of BOFT in PyTorch, shows how to hook it into the Hugging Face Transformers ecosystem, and demonstrates three practical steps that most users need:
+
+1. **Initializing the butterfly components** (the sparse orthogonal factors).  
+2. **Applying multiplicative dropout** to avoid over‑fitting during training.  
+3. **Merging the learned orthogonal matrix back into the pretrained model** so that inference runs at the speed of a vanilla model.
+
+All code snippets are self‑contained and can be dropped into existing training pipelines with minimal changes.
+
+---  
+
+## 1. Background – Why Butterfly?
+
+A naïve orthogonal matrix of size $d\times d$ requires $\mathcal{O}(d^{2})$ trainable parameters, which defeats the purpose of parameter‑efficient finetuning. BOFT solves this by representing an orthogonal matrix $\mathbf{R}$ as a product of $m$ **butterfly components**:
+
+\[
+\mathbf{R}= \underbrace{\tilde{\mathbf{B}}_{(d,1)}\tilde{\mathbf{B}}_{(d,2)}\dots \tilde{\mathbf{B}}_{(d,m)}}_{\text{$m$ sparse orthogonal factors}},
+\qquad
+\tilde{\mathbf{B}}_{(d,i)}^\top \tilde{\mathbf{B}}_{(d,i)} = \mathbf{I}_{d}.
+\]
+
+Each $\tilde{\mathbf{B}}_{(d,i)}$ is a block‑diagonal matrix whose blocks are **butterfly factors** (Equation 1 in the paper). When $m=\log_2 d$ and each block is $2\times2$, the total number of trainable parameters drops to $\mathcal{O}(d\log d)$—a huge saving for vision or language models where $d$ can be several thousand.
+
+Because every factor is orthogonal, the product $\mathbf{R}$ remains orthogonal by construction. In practice we enforce orthogonality through a **Cayley transform** applied to a skew‑symmetric trainable matrix $\mathbf{Q}$:
+
+\[
+\mathbf{R}= (\mathbf{I}+\mathbf{Q})(\mathbf{I}-\mathbf{Q})^{-1},
+\qquad \mathbf{Q}^\top = -\mathbf{Q}.
+\]
+
+The same pattern is used for each butterfly component.
+
+---  
+
+## 2. Installing Dependencies
+
+```bash
+# Core libraries
+pip install torch torchvision torchaudio
+
+# Hugging Face Transformers (v4.40+ recommended)
+pip install transformers
+
+# Optional: tqdm for progress bars
+pip install tqdm
+```
+
+---  
+
+## 3. Implementing a Butterfly Component  
+
+Below we implement a generic **ButterflyBlock** that can operate on any hidden dimension `d` and block size `b`. The block size controls how many dimensions are grouped together within each butterfly factor; `b=2` yields the classic Cooley–Tukey topology, while larger `b` reduces depth (`m`) at the cost of slightly more parameters.
+
+```python
+import torch
+import torch.nn as nn
+import math
+
+def cayley_transform(skew):
+    """Cayley transform: (I + Q)(I - Q)^{-1}, where Q is skew‑symmetric."""
+    I = torch.eye(skew.size(-1), device=skew.device, dtype=skew.dtype)
+    return torch.linalg.solve(I - skew, I + skew)
+
+class ButterflyFactor(nn.Module):
+    """
+    Single butterfly factor B^F(k) = [[diag(d1), diag(d2)],
+                                    [diag(d3), diag(d4)]]
+    where k = 2 * half.
+    """
+    def __init__(self, half):
+        super().__init__()
+        self.half = half                # = k/2
+        # Trainable vectors that will become diagonal matrices after Cayley
+        self.d1 = nn.Parameter(torch.zeros(half))
+        self.d2 = nn.Parameter(torch.zeros(half))
+        self.d3 = nn.Parameter(torch.zeros(half))
+        self.d4 = nn.Parameter(torch.zeros(half))
+
+    def forward(self):
+        # Build 2*half x 2*half matrix with diagonal blocks
+        diag = torch.diag_embed
+        top  = torch.cat([diag(self.d1), diag(self.d2)], dim=-1)
+        bot  = torch.cat([diag(self.d3), diag(self.d4)], dim=-1)
+        B   = torch.cat([top, bot], dim=-2)          # shape (k,k)
+
+        # Convert each 2x2 sub‑block into an orthogonal block via Cayley.
+        # For simplicity we treat the whole matrix as skew‑symmetric:
+        k = B.size(-1)
+        # Create a skew‑symmetric matrix from diagonal entries (zero off‑diag => rotation only)
+        Q = torch.zeros(k, k, device=B.device, dtype=B.dtype)
+        Q += torch.diag_embed(B)                     # fill diagonal with trainable params
+        Q = Q - Q.transpose(-2,-1)                   # make skew‑symmetric
+        return cayley_transform(Q)
+```
+
+### 3.1 Stacking Factors into a Full Butterfly Matrix  
+
+A full BOFT layer consists of `m` factors with decreasing block sizes (`k = d, d/2, d/4, …`). The following class builds that stack automatically:
+
+```python
+class OrthogonalButterfly(nn.Module):
+    """
+    R(m,b) = Π_{i=1}^m Ȃ_i   where each Ȃ_i is an orthogonal butterfly component.
+    - d: input dimension (hidden size of linear layer)
+    - m: number of factors (default log2(d) -> dense R)
+    - b: block size for the first factor (must divide d)
+    """
+    def __init__(self, d, m=None, b=2):
+        super().__init__()
+        assert d % b == 0, "b must divide d"
+        self.d = d
+        self.b = b
+        self.m = m if m is not None else int(math.log2(d // b)) + 1
+
+        # generate list of block sizes: b * 2^{i-1}
+        block_sizes = [b * (2 ** i) for i in range(self.m)]
+        self.factors = nn.ModuleList([
+            self._build_factor(k) for k in reversed(block_sizes)
+        ])
+
+    def _build_factor(self, k):
+        """Create one butterfly component for block size k."""
+        half = k // 2
+        # Each component is a block‑diagonal matrix of many ButterflyFactor blocks
+        num_blocks = self.d // k
+        return nn.ModuleList([ButterflyFactor(half) for _ in range(num_blocks)])
+
+    def forward(self):
+        R = torch.eye(self.d, device=next(self.parameters()).device)
+
+        for factor_list in self.factors:   # iterate from coarse → fine scale
+            # Assemble block‑diagonal matrix from its ButterflyFactor pieces
+            blocks = [blk() for blk in factor_list]          # each shape (k,k)
+            B = torch.block_diag(*blocks)                    # shape (d,d)
+            R = B @ R                                        # left‑multiply
+
+        return R
+```
+
+A few remarks:
+
+* **Identity initialization**: all trainable vectors (`d1…d4`) start at zero; after Cayley this yields an identity block → the whole product starts as $\mathbf{I}_d$, exactly what OFT and BOFT require.
+* **Parameter count**: each `ButterflyFactor` stores four scalars per half‑dimension; with `b=2` and `m=log₂d` this totals roughly $d\log d$ effective parameters.
+
+---  
+
+## 4. Plugging BOFT into a Linear Layer  
+
+Assume you have a pretrained linear projection `nn.Linear(in_features=d, out_features=n)` that you want to finetune using BOFT. The forward equation is:
+
+\[
+\mathbf{z}= (\mathbf{R}\,\mathbf{W}^{0})^\top \mathbf{x},
+\]
+
+where $\mathbf{W}^{0}$ is frozen and $\mathbf{R}$ is learned.
+
+```python
+class BOFTLinear(nn.Module):
+    """
+    Wrapper around a frozen Linear layer plus an OrthogonalButterfly transform.
+    """
+    def __init__(self, pretrained_linear: nn.Linear,
+                 m=None,
+                 b=2,
+                 dropout_p_factor=0.0,
+                 dropout_p_block=0.0):
+        super().__init__()
+        self.W0 = pretrained_linear.weight.detach().clone()   # frozen weight
+        self.bias = pretrained_linear.bias                     # keep bias as is
+
+        self.R_module = OrthogonalButterfly(
+            d=pretrained_linear.in_features,
+            m=m,
+            b=b,
+        )
+        # Multiplicative dropout hyper‑parameters (see Section 5)
+        self.dropout_p_factor = dropout_p_factor
+        self.dropout_p_block  = dropout_p_block
+
+    def _apply_multiplicative_dropout(self, R):
+        """Randomly replace some factors / blocks with identity matrices."""
+        if not self.training:
+            return R
+
+        device = R.device
+        I_d   = torch.eye(R.size(0), device=device)
+
+        # Decide which factors to drop
+        mask_factors = torch.rand(len(self.R_module.factors)) > self.dropout_p_factor
+
+        new_R = I_d.clone()
+        for keep, factor_list in zip(mask_factors, self.R_module.factors):
+            if not keep:
+                continue          # skip this factor → identity contribution
+
+            # Build the factor matrix as before but possibly drop some inner blocks
+            blocks = []
+            for blk in factor_list:
+                drop_block = torch.rand(1).item() < self.dropout_p_block
+                if drop_block:
+                    blocks.append(torch.eye(blk[0].half * 2,
+                                            device=device))   # identity sub‑block
+                else:
+                    blocks.append(blk())
+            B = torch.block_diag(*blocks)
+            new_R = B @ new_R
+
+        return new_R
+
+    def forward(self, x):
+        """
+        x : (..., d) input tensor.
+        
+        Returns (..., n) logits after applying frozen W0 and learned orthogonal transform.
+       """
+        R   = self.R_module()               # dense orthogonal matrix (d,d)
+        R   = self._apply_multiplicative_dropout(R)
+
+        # Apply transformation on the left side of W0 → equivalent to (R @ W0)^T @ x
+        weight_transformed = (R @ self.W0).t()          # shape (n,d)
+
+       # Standard linear computation with optional bias
+       out = torch.nn.functional.linear(x, weight_transformed, self.bias)
+       return out
+```
+
+### How to use it
+
+```python
+from transformers import AutoModelForSequenceClassification
+
+# Load a pretrained checkpoint (example: BERT base)
+model   : AutoModelForSequenceClassification          # already loaded elsewhere
+
+# Replace one of its linear heads with BOFTLinear:
+old_linear      = model.classifier      # nn.Linear hidden->num_labels
+model.classifier= BOFTLinear(old_linear,
+                             m=None,          # defaults to log₂(hidden_dim)
+                             b=2,
+                             dropout_p_factor=0.1,
+                             dropout_p_block=0.05)
+
+# Continue training with any HF Trainer or your own loop.
+```
+
+Only the parameters inside `model.classifier.R_module` will be updated; all original weights stay frozen. The total extra param count matches the theoretical $\mathcal{O}(d\log d)$ bound.
+
+---  
+
+## 5. Multiplicative Dropout – Why & How  
+
+Standard Dropout works on additive updates (e.g., LoRA’s low‑rank matrices). BOFT updates weights *multiplicatively* (`R @ W0`). Dropping individual entries would break orthogonality. Instead we randomly **zero out entire butterfly components or sub‑blocks**, replacing them with identity matrices during training:
+
+* **Factor‑level dropout (`p_factor`)** – with probability $p_{\text{factor}}$ we skip one entire sparse factor $\tilde{\mathbf B}_{(d,i)}$. Effectively we shorten the product depth for that mini‑batch.
+* **Block‑level dropout (`p_block`)** – within a retained factor we replace selected $b\times b$ diagonal blocks by their identity counterparts.
+
+Both operations preserve orthogonality because identity matrices are trivially orthogonal and they commute with neighboring factors.
+
+You can tune `p_factor` and `p_block` just like usual Dropout rates; typical values are $0.05$–$0.15$.
+
+---  
+
+## 6. Merging the Learned Orthogonal Matrix – Zero Inference Overhead  
+
+After finetuning you usually want a single model file that behaves like any standard Transformer – no extra runtime cost for consulting BOFT components. Because BOFT’s transform lives entirely on the left side of each frozen weight matrix, we can fold it into the weight once training finishes:
+
+```python
+def merge_boft(linear_boft: BOFTLinear):
+    """
+    Replace linear_boft.W0 with R @ W0 and discard the butterfly module.
+    Returns an ordinary nn.Linear ready for inference.
+    """
+    device   = linear_boft.W0.device
+    with torch.no_grad():
+         R      = linear_boft.R_module().to(device)           # dense orthogonal matrix
+         new_W  = (R @ linear_boft.W0).t()                    # shape (out_features,in_features)
+
+         merged_linear = nn.Linear(
+               in_features=linear_boft.W0.size(1),
+               out_features=linear_boft.W0.size(0),
+               bias=True,
+         )
+         merged_linear.weight.copy_(new_W)
+         if linear_boft.bias is not None:
+               merged_linear.bias.copy_(linear_boft.bias)
+
+    return merged_linear
+
+# Example usage after trainer.save_model(...):
+model.classifier   = merge_boft(model.classifier)   # now a plain Linear layer
+torch.save(model.state_dict(), "boft_merged.pt")
+```
+
+After this step:
+
+* No extra modules are present in the graph; inference uses only standard GEMM operations.
+* The model size grows only by the saved $\mathcal{O}(d\log d)$ parameters during training; once merged those parameters are baked into the weight tensor.
+
+---  
+
+## 7. Full Training Loop Example (Hugging Face Trainer)
+
+```python
+from datasets import load_dataset
+from transformers import Trainer, TrainingArguments
+
+dataset   = load_dataset("glue", "sst2")
+model     .classifier   # already wrapped with BOFTLinear as shown earlier
+
+training_args = TrainingArguments(
+      output_dir="./boft_sst2",
+      per_device_train_batch_size=32,
+      per_device_eval_batch_size=64,
+      num_train_epochs=3,
+      learning_rate=5e-4,
+      fp16=True,
+      save_total_limit=2,
+)
+
+trainer   = Trainer(
+      model=model,
+      args=training_args,
+      train_dataset=dataset["train"],
+      eval_dataset=dataset["validation"],
+)
+
+trainer.train()
+```
+
+When training finishes you can call `merge_boft(model.classifier)` and re‑save.
+
+---  
+
+## 8. Tips & Common Pitfalls  
+
+| Issue | Symptom | Fix |
+|-------|---------|-----|
+| **Runtime slower than OFT** | Training takes ~10–15 % more wall time | Use `torch.backends.cudnn.benchmark=True`; keep `b` moderate (≥ 4) to reduce depth `m`. |
+| **Gradient NaNs** | Loss becomes NaN early on | Lower learning rate; enforce Cayley stabilization by adding eps to `(I−Q)` inversion (`torch.linalg.solve(I-Q+eps*I , I+Q)`). |
+| **Matrix not staying orthogonal** | After many steps singular values drift | Verify Cayley implementation; alternatively switch to **Householder reflections**—they also guarantee exact orthogonality but require more ops per factor. |
+| **Memory blowup on very large layers** | OOM when `d > 8192` | Use *gradient checkpointing* on each factor (`torch.utils.checkpoint.checkpoint`) or restrict `$m$` to $\log_2(d/b)$ rather than full depth. |
+
+---  
+
+## 9. Conclusion  
+
+BOFT gives you:
+
+* **Parameter efficiency** – only $\mathcal{O}(d\log d)$ extra weights versus $\mathcal{O}(d^2)$ dense OFT or even fewer than LoRA’s low‑rank matrices when $d$ is large.
+* **Training stability** – orthogonality preserves singular values and pairwise neuron angles.
+* **Zero inference penalty** – after merging you obtain exactly the same speed as any vanilla model.
+
+The building blocks—Cayley‑parameterized butterfly factors and multiplicative dropout—are straightforward PyTorch modules that slot neatly into existing Transformer pipelines. Feel free to experiment with different block sizes (`b`) or deeper factorizations (`m`) depending on your hardware budget; the framework scales smoothly from small language models up to vision backbones and diffusion UNets.
+
+Happy finetuning! 🚀

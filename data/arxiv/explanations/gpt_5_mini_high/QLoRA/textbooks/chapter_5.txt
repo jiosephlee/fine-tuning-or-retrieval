@@ -1,0 +1,203 @@
+\title{A Textbook about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+Chapter 5: The QLoRA Algorithm and How to Implement It
+
+# Forward pass: dequantize to BF16 and add LoRA output
+
+At a high level QLoRA keeps the pretrained base model frozen and stored in a very compact low-precision format, and it trains only small low-rank adapter matrices (LoRA). At runtime (both training and inference) a layer's computation is the sum of two terms: the frozen pretrained linear projection computed from the quantized base weights, and the learned adapter projection. Before any linear algebra, the quantized base weights are reconstructed (dequantized) into the computation dtype so the matrix-multiply can be computed in high precision (the paper uses BFloat16). The adapter path is stored and computed directly in BFloat16.
+
+The paper writes the per-layer forward computation (using the notation from the paper) as
+\[
+\mathbf{Y}^{\text{BF16}} \;=\; \mathbf{X}^{\text{BF16}}\;\text{doubleDequant}\!\big(c_1^{\text{FP32}},\,c_2^{\text{k-bit}},\,\mathbf{W}^{\text{NF4}}\big)
+\;+\; \mathbf{X}^{\text{BF16}}\mathbf{L}_1^{\text{BF16}}\mathbf{L}_2^{\text{BF16}},
+\]
+where the first term is the dequantized base weight multiplication and the second is the LoRA adapter contribution (the original LoRA definition also includes an optional scalar scale $s$, see the paper's LoRA equation; including $s$ simply scales the adapter term). The important implementation points are:
+
+- Storage vs compute dtype: the base weight tensor $\mathbf{W}$ is stored in NF4 (4-bit NormalFloat) with compactly stored quantization constants; adapter matrices $\mathbf{L}_1,\mathbf{L}_2$ and the activations $\mathbf{X},\mathbf{Y}$ are handled in BFloat16 for computation. The dequantization step produces a BF16 weight buffer that is used immediately for the matrix multiply.
+
+- Lazy / per-layer dequantization: to minimize memory, dequantize a block or a single layer just before it is needed, do the BF16 matmul, then release the temporary BF16 buffer. This avoids inflating the full model into BF16 in memory.
+
+- Blockwise quantization: $\mathbf{W}$ is quantized blockwise (the paper uses blocksize 64 for $\mathbf{W}$) so the dequantization reconstructs per-block BF16 weights from the stored k-bit values and their quantization constants.
+
+This forward structure makes it straightforward to carry out a standard forward pass while keeping the large frozen model compact in memory.
+
+# Backward pass: compute gradients only for adapter weights
+
+QLoRA intentionally freezes the base model parameters, so during optimizer updates we only change the LoRA adapter parameters. Nevertheless, the backward pass must run through the network and compute all intermediate gradients required to form the adapter parameter gradients. Two practical consequences follow:
+
+1. Dequantization must occur during backward as well. If you use gradient checkpointing (commonly used to save activation memory) you will often need to recompute activations during the backward pass; those recomputations require the same dequantization procedure used in the forward pass so that matrix-multiplies are computed in BF16.
+
+2. Gradients are computed only for the adapter parameters. The base weights $\mathbf{W}$ remain frozen, so you do not accumulate or apply parameter updates for them. However you still need to use $\mathbf{W}$ (dequantized) to compute gradients that flow back into activations and into adapter gradients.
+
+It is helpful to see the local algebra for gradients of the adapter parameters (derivable by the chain rule from the forward formula). For a single layer with
+\[
+\mathbf{Y} = \mathbf{X}\mathbf{W} + s\,\mathbf{X}\mathbf{L}_1\mathbf{L}_2,
+\]
+set the short-hand $\mathbf{A}=\mathbf{X}\mathbf{L}_1$ (this is the low-rank intermediate). Let the scalar loss be $E$ and let $\frac{\partial E}{\partial \mathbf{Y}}$ be the incoming gradient. Then the adapter gradients are
+
+\[
+\frac{\partial E}{\partial \mathbf{L}_2}
+\;=\; s\,\mathbf{A}^{\!\top}\!\left(\frac{\partial E}{\partial \mathbf{Y}}\right)
+\qquad\text{and}\qquad
+\frac{\partial E}{\partial \mathbf{L}_1}
+\;=\; s\,\mathbf{X}^{\!\top}\!\left(\frac{\partial E}{\partial \mathbf{Y}}\mathbf{L}_2^{\!\top}\right).
+\]
+
+To propagate gradients into earlier parts of the network we also need
+\[
+\frac{\partial E}{\partial \mathbf{X}}
+\;=\; \frac{\partial E}{\partial \mathbf{Y}}\mathbf{W}^{\!\top}
+\;+\; s\,\frac{\partial E}{\partial \mathbf{Y}}(\mathbf{L}_1\mathbf{L}_2)^{\!\top}.
+\]
+Note that the term containing $\mathbf{W}^{\top}$ requires the dequantized BF16 representation of $\mathbf{W}$ in order to compute the matrix product with $\frac{\partial E}{\partial \mathbf{Y}}$ in BF16 precision. The paper highlights that while gradients for $\mathbf{W}$ are not needed (since $\mathbf{W}$ is frozen), the BF16 dequantized $\mathbf{W}$ is required so the backpropagation chain can be computed accurately.
+
+Finally, because adapters are small, computing and storing their gradients is cheap compared to the large activation gradient memory of the full model; this is one reason QLoRA can place adapters widely in the network (see the adapter placement section).
+
+# doubleDequant function and two-stage scale recovery
+
+Double Quantization in QLoRA stores the base weights in 4-bit NF4 but also compresses the per-block quantization constants to save memory. Reconstruction from storage into the BF16 computation format is therefore a two-stage dequantization: first recover the original per-block quantization constants, then use them to dequantize the 4-bit weight values.
+
+Formally the two-stage dequantization is written in the paper as
+\[
+\text{doubleDequant}(c_1^{\text{FP32}},\,c_2^{\text{k-bit}},\,\mathbf{W}^{\text{k-bit}})
+\;=\;
+\text{dequant}\!\big(\text{dequant}(c_1^{\text{FP32}},\,c_2^{\text{k-bit}}),\,\mathbf{W}^{\text{k-bit}}\big)
+\;=\;\mathbf{W}^{\text{BF16}}.
+\]
+Here the low-level dequant operator is the usual inverse of the quantization mapping used during compression: if some integer tensor $Z^{\text{Int}}$ was produced by $Z^{\text{Int}}=\text{round}(c\cdot Z^{\text{FP32}})$ for some scale $c$, then dequant simply divides by that scale,
+\[
+\text{dequant}(c, Z^{\text{Int}})=Z^{\text{Int}}/c.
+\]
+
+In the double-quantized storage layout the first stored object $c_2^{\text{FP32}}$ (the per-weight-block scale used to dequantize $\mathbf{W}$) is itself quantized into a small k-bit representation ($c_2^{\text{k-bit}}$) together with a higher-level scale $c_1^{\text{FP32}}$. The inverse path first reconstructs $c_2^{\text{FP32}}=\text{dequant}(c_1^{\text{FP32}},c_2^{\text{k-bit}})$ and then reconstructs the BF16 weights $\mathbf{W}^{\text{BF16}}=\text{dequant}(c_2^{\text{FP32}},\mathbf{W}^{\text{k-bit}})$.
+
+Two additional practical details the paper emphasizes:
+
+- Quantize the quantization constants to 8-bit floats (FP8) with a larger blocksize (the paper uses blocksize 256 for the $c_2$ quantization). Because the $c_2$ values are positive, the paper subtracts their mean before quantizing so that symmetric quantization around zero can be used for the $c_2$ values.
+
+- Memory arithmetic example (from the paper): storing full 32-bit constants with a blocksize of 64 costs on average $32/64 = 0.5$ bits per parameter. Using double quantization (8-bit for $c_2$ plus a shared 32-bit $c_1$ per group) reduces that cost to approximately $8/64 + 32/(64\cdot 256) = 0.127$ bits per parameter, saving about $0.373$ bits per parameter on average.
+
+Implementationally you therefore need a small kernel or function that, given the stored NF4 weight block and its compacted constant representation, runs the two-stage dequant to produce the BF16 block for the matmul.
+
+# Adapter placement across all transformer linear layers
+
+A central empirical finding of the paper is that where you place LoRA adapters matters a lot. The standard, lightweight practice of applying adapters only to a subset of attention projection matrices (e.g., query and value) was not sufficient to recover full fine-tuning performance in the experiments reported. Instead, the authors found that applying LoRA adapters to every linear layer (i.e., every linear projection inside transformer blocks) is the key change to match 16-bit full fine-tuning.
+
+Why does this make sense intuitively? A small low-rank adapter in a single location only modulates a portion of the model's representational pathways. Distributing small adapters everywhere lets the fine-tuning changes be spread across the network, approximating a richer update to the effective weight function without updating the large frozen matrices directly. Because adapter parameters are tiny compared to the base model, adding adapters to all linear layers remains memory-feasible: the large memory cost during training is mostly activations and gradients, not the adapter parameter storage.
+
+The paper also points out that LoRA memory usage is dominated by activation gradients rather than the LoRA parameters themselves. For their example LLaMA 7B experiment, LoRA parameter storage was about 26 MB while the input gradients for LoRA could be several hundred MB without gradient checkpointing — but gradient checkpointing can reduce that to tens of MB per sequence. The practical upshot is that you can afford to deploy LoRA at all linear layers without blowing up the parameter storage budget; you just have to manage activation and optimizer-state memory carefully (paged optimizers help here; see below).
+
+# Hyperparameters: rank r, scaling s, dropout, target modules
+
+The LoRA configuration has a few knobs that matter in practice. The paper reports the following observations and recommendations grounded in their experiments:
+
+- Rank $r$: this is the dimension of the low-rank factorization ($\mathbf{L}_1\in\mathbb{R}^{h\times r}$ and $\mathbf{L}_2\in\mathbb{R}^{r\times o}$). The authors find that the projection dimension $r$ is not the most critical hyperparameter — changes in $r$ do not materially affect final performance in their reported runs. In other words, modest ranks are sufficient when adapters are placed across all layers.
+
+- Scaling $s$: LoRA includes a scalar multiplier $s$ for the low-rank path (see the original LoRA equation). The paper consistently uses the scaled adapter term in the model equations (and training). Select $s$ as part of your usual LoRA setup; it multiplies the whole adapter contribution.
+
+- Dropout: the paper does not analyze or recommend a particular dropout scheme for LoRA. If you wish to use dropout on adapter outputs you would be adding a regularization choice that the paper did not study.
+
+- Target modules: the key empirical recommendation is to add LoRA adapters to all linear transformer block layers (not just a subset such as query/value). That is the primary “target modules” guidance that comes from the paper.
+
+Two further practical hyperparameter notes from the paper: (1) LoRA is parameter-efficient — typical LoRA parameter counts are a tiny fraction of the original model (the paper mentions typical LoRA weights equating to roughly 0.2% of original model weights in an example), and (2) you may need to adjust learning rate and batch size as you scale model size (the paper found that learning rates used for 7B generalized to larger scales except that they halved the learning rate and doubled the batch size for 33B/65B experiments).
+
+# Compute and storage dtypes in code and mixed precision
+
+QLoRA is explicitly a mixed-precision system with two distinct roles for data types:
+
+- Storage dtypes (compact, on-disk / in-GPU memory for long-lived parameters):
+  - Base weights: $\mathbf{W}^{\text{NF4}}$ (4-bit NormalFloat). NF4 is a k-bit data type derived by quantile analysis of a standard normal distribution; it is information-theoretically optimal for zero-centered normally distributed weights (see the paper for the quantile construction).
+  - First-level quantization constants (after double quantization): $c_2^{\text{k-bit}}$ (stored as FP8 in the paper's implementation).
+  - Second-level constants: $c_1^{\text{FP32}}$ (a small number of 32-bit scalars per large group of $c_2$ values).
+
+- Computation dtypes (temporary BF16 buffers used for arithmetic):
+  - Dequantized weights and all activations: BFloat16 (the paper consistently uses BFloat16 for all compute).
+  - LoRA parameters: stored and updated in BFloat16.
+
+The workflow is: keep the bulky model in NF4 + compact constants; when a layer is needed, run the two-stage dequantization to reconstruct BF16 weights; do the matmuls in BF16; compute adapter products in BF16; then discard the BF16 copy.
+
+Mixed-precision details to observe in your code:
+
+- Use BF16 for all matrix multiplies to match the paper's computation datatype. This keeps numerical behavior close to 16-bit fine-tuning baselines while still storing the model compactly.
+
+- Keep adapter parameters in BF16 consistently (and their optimizer states in the same precision choices you prefer) so that the adapter training happens in the same computation precision.
+
+- Use the block sizes recommended by the paper: blocksize 64 for $\mathbf{W}$ quantization and blocksize 256 for $c_2$ quantization. These choices are a trade-off between quantization error and quantization-constant overhead.
+
+# Optimizer choices and enabling paged optimizers
+
+The paper's main contribution for managing optimizer memory is the Paged Optimizer idea: put optimizer state (which can be large if you were updating full model weights, and still non-trivial for adapter optimizers over many steps) into memory that can be paged between CPU and GPU using NVIDIA unified memory. The essential idea is:
+
+- Allocate optimizer state (moments, accumulators, or whatever your optimizer needs) via a managed/paged allocation such that when the GPU requires more memory transiently (for example, during a long-sequence forward or during recomputation for gradient checkpointing), the operating system / CUDA runtime can evict pages of optimizer state to host RAM and bring them back later when the optimizer update step runs.
+
+- In practice, this means you do not have to fit all optimizer state for a large adapter configuration and large batch sizes permanently in GPU memory; occasional spikes can be handled by paging.
+
+The paper does not mandate a particular optimizer algorithm; any optimizer whose state can be allocated in paged (managed) memory is compatible. The authors note that for their 65B experiments on a 48GB GPU with a batch size of 16, they observed no training speed penalty from paging (though they caution that paging costs depend on workload and can appear for other settings).
+
+Implementation caution: paging causes page-in/page-out transfers at the OS/driver level. To avoid pathological slowdowns, localize optimizer access patterns where possible (i.e., only bring optimizer state to the GPU at the update step, free it when not needed), and avoid thrashing by minimizing repeated small updates that cause frequent page movement. The paper does not prescribe exact OS or CUDA flags — it uses NVIDIA unified memory semantics to achieve paging.
+
+# Training loop pseudocode and memory flow checklist
+
+Below is an outline pseudocode for a single training step faithful to the QLoRA approach described in the paper. This pseudocode intentionally stays at an algorithmic level (no framework-specific APIs) and follows the memory-conscious pattern recommended by QLoRA.
+
+Pseudocode (one training iteration):
+- inputs, targets = get_next_batch()
+- X = embed(inputs)          # activations in BF16
+- for each transformer layer in order:
+    - load stored block metadata for this layer (indices → blocks)
+    - for each block of the layer weight:
+        - reconstruct BF16 block: W_bf16_block = doubleDequant(c1, c2_block, W_block)
+        - compute base_out_block = X_block @ W_bf16_block
+        - free W_bf16_block (or keep if needed for immediate backward recompute)
+    - compute adapter_out = (X @ L1) @ L2    # all BF16; include scale s if used
+    - Y = base_out + adapter_out
+    - apply layer nonlinearity / residuals / layernorm as usual
+    - optionally checkpoint Y (or drop to enable recompute)
+    - set X = Y   # feed-forward
+
+- loss = loss_fn(X, targets)
+- Backward:
+    - compute dE/dY at top
+    - for layers in reverse order:
+         - if activation checkpointed: recompute forward for this layer — this requires re-running the per-block doubleDequant for the blocks needed to reconstruct the activations
+         - compute adapter gradients using the stored or recomputed activations (use the gradient formulas in the Backward Pass section)
+         - compute dE/dX for propagation; computing dE/dX requires the dequantized W (again dequantize the blocks needed)
+    - Now optimizer.step() updates adapters only (optimizer state pages back if necessary)
+    - optimizer.zero_grad()
+
+Memory flow checklist (what to hold where and when):
+- Long-term storage (compact, always resident):
+  - Base model parameters: $\mathbf{W}^{\text{NF4}}$ and per-block compact constants ($c_2^{\text{k-bit}}$ plus $c_1^{\text{FP32}}$).
+  - LoRA adapter parameters: $\mathbf{L}_1^{\text{BF16}},\mathbf{L}_2^{\text{BF16}}$.
+- Runtime ephemeral buffers (allocate and free promptly):
+  - Dequantized BF16 weight blocks for immediate matmul.
+  - Intermediate activations (store minimally; rely on checkpointing to trade compute for storage).
+  - BF16 scratch space for adapter intermediates (e.g., $\mathbf{A}=\mathbf{X}\mathbf{L}_1$).
+- Optimizer state:
+  - Store in paged (managed) memory so it can be evicted to host RAM during forward/backward spikes and brought back for update steps.
+- Checkpointing / recomputation:
+  - Use gradient checkpointing to reduce activation storage; when recomputation happens, be prepared to re-dequantize the same weight blocks as during forward.
+
+This pattern emphasizes freeing BF16 copies of base weights as soon as possible and keeping the long-term representation compact.
+
+# Inference: using quantized base with or without merging adapters
+
+At inference time you have two natural choices, both supported by the equations above:
+
+1. Keep adapters separate and compute their contribution at runtime. In this mode every layer's forward computation is
+   \[
+   \mathbf{Y} = \mathbf{X}\,\text{doubleDequant}(\ldots)\;+\;s\,\mathbf{X}\mathbf{L}_1\mathbf{L}_2,
+   \]
+   where you dequantize each required block of $\mathbf{W}$ to BF16 and add the adapter output. This keeps the base model and adapters modular: you can load different adapters for different tasks without changing the quantized base.
+
+2. Merge adapters into the base weights offline and re-quantize for a single combined weight. Because the adapter contribution is additive you can form an effective weight
+   \[
+   \mathbf{W}_{\text{eff}} \;=\; \mathbf{W} \;+\; s\,\mathbf{L}_1\mathbf{L}_2,
+   \]
+   and then (optionally) quantize $\mathbf{W}_{\text{eff}}$ back to NF4 for compact storage and fastest possible inference. This produces a single frozen weight per layer and removes the per-query adapter computation. The paper releases adapters and supports the modularity that makes either approach feasible.
+
+Which option to pick depends on deployment needs: keep adapters separate for flexibility and small memory overhead (but slightly more per-inference computation), or merge and re-quantize to get the simplest and fastest runtime if you do not need adapter swapping.
+
+Closing summary
+
+Implementing QLoRA is a disciplined combination of (a) storing the pretrained base model compactly in a blockwise NF4+double-quantized layout, (b) dequantizing on demand to BF16 for compute, (c) placing LoRA adapters broadly (all linear layers) and training them in BF16 while freezing the base weights, and (d) managing memory spikes by combining gradient checkpointing with paged optimizer states. The forward and backward algebra is conventional, with the important operational detail that dequantization happens both in forward and during any recomputation in backward so that adapter gradients and activation gradients are computed in BF16 precision. Following the paper's blocksize choices (64 for weights, 256 for quantized constants), using NF4 for weight storage and BF16 for computation, and allocating optimizer state in unified/paged memory are the principal engineering moves that make QLoRA finetuning of very large models (e.g., 65B) practical on a single GPU while matching 16-bit finetuning quality.

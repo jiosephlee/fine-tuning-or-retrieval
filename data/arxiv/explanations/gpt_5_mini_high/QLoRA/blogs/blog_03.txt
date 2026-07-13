@@ -1,0 +1,100 @@
+\title{Blogs about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+# Squeezing the Last Bits: Double Quantization and Paged Optimizers Explained
+
+QLoRA made finetuning very large models on a single 24–48 GB GPU practicable. Two relatively low‑profile engineering moves are crucial to that result: Double Quantization (DQ), which compresses the quantization scales themselves, and Paged Optimizers, which use NVIDIA Unified Memory to absorb occasional memory spikes from gradient checkpointing. This post walks through what these two tricks actually do, why they matter, and how they fit into QLoRA’s overall design.
+
+## TL;DR
+- When you quantize weights blockwise you must also store a per‑block scale (quantization constant). For small blocks that scalar becomes a nontrivial memory tax: bits_per_param = bits_of_constant / blocksize.
+- Double Quantization quantizes those quantization constants again (using 8‑bit floats and a larger blocksize), dramatically shrinking that overhead with no observed accuracy loss.
+- Paged Optimizers allocate optimizer state in CUDA Unified Memory so optimizer buffers can be evicted to host RAM and paged back on demand, preventing out‑of‑memory (OOM) failures caused by transient gradient‑checkpointing spikes.
+
+Both are small changes in concept but multiply into gigabytes of savings at the 65B scale.
+
+## Quick background: why quantization constants matter
+Blockwise k‑bit quantization stores for each block:
+- the k‑bit quantized values (e.g., NF4 for the weights), and
+- a per‑block scalar quantization constant $c$ (typically stored in 32‑bit float).
+
+That scalar is necessary to dequantize a block back to floating point when you need to compute with it. The per‑parameter overhead from the scale is
+$$
+\text{bits per parameter for constants} = \frac{\text{bits\_of\_constant}}{\text{blocksize}}.
+$$
+Example: with 32‑bit constant and blocksize 64, the constants add
+$$
+32/64 = 0.5
+$$
+bits per parameter. For very large models and the small block sizes you want for high precision, that overhead is meaningful.
+
+## Double Quantization: compressing the compressors
+The core idea of Double Quantization is simple: treat the per‑block quantization constants themselves as data to be quantized. Concretely, QLoRA does two levels of quantization:
+
+1. Quantize the weight blocks to a k‑bit data type (QLoRA uses 4‑bit NormalFloat, NF4), producing per‑block constants $c_2^{\text{FP32}}$.
+2. Quantize those constants $c_2^{\text{FP32}}$ to a smaller representation (QLoRA uses 8‑bit floats with a larger blocksize), producing quantized constants $c_2^{\text{FP8}}$ plus a second‑level scalar $c_1^{\text{FP32}}$.
+
+Two practical points the paper highlights:
+- Because the raw $c_2$ values are positive, QLoRA subtracts their mean before the second quantization to center them around zero and use symmetric quantization, which is simpler and more efficient.
+- They use a small blocksize (64) for the actual NF4 weight blocks (for precision) and a larger blocksize (256) for the second‑level quantization of $c_2$ (to reduce overhead).
+
+What happens at runtime is a small nested dequantization step. If you call the nested dequant function doubleDequant, the forward path converts stored NF4 + quantized constants back into a BF16 matrix that can be used for matrix multiplication. In QLoRA notation:
+$$
+\text{doubleDequant}(c_1^{\text{FP32}},\, c_2^{\text{k-bit}},\, \mathbf{W}^{\text{k-bit}})
+= \text{dequant}\big(\text{dequant}(c_1^{\text{FP32}}, c_2^{\text{k-bit}}), \mathbf{W}^{\text{4bit}}\big)
+= \mathbf{W}^{\text{BF16}}.
+$$
+
+Why this helps (numbers)
+- Baseline per‑parameter cost of 32‑bit constants with blocksize 64: $32/64 = 0.5$ bits.
+- After double quantization, per‑parameter cost becomes
+$$
+\frac{8}{64} + \frac{32}{64\cdot256} = 0.127\ \text{bits},
+$$
+because the second quantization uses 8 bits per c2 value at blocksize 256 and stores the top‑level $c_1^{\text{FP32}}$ at full precision but shared across larger groups.
+- Net saving: $0.5 - 0.127 = 0.373$ bits per parameter.
+
+At 65B parameters that is roughly
+$$
+65\cdot10^9 \times 0.373\ \text{bits} \approx 24.25\cdot10^9\ \text{bits} \approx 3.03\cdot10^9\ \text{bytes},
+$$
+i.e., about a 3 GB reduction from quantization constants alone. The QLoRA paper reports this average saving and also reports no empirical performance drop from this second quantization stage (the authors use FP8 for the constants and observed no degradation).
+
+Bottom line: Double Quantization lets you keep small weight block sizes (high precision) without paying the full penalty of many 32‑bit per‑block scales.
+
+## Paged Optimizers: smoothing runtime memory spikes
+Quantization reduces steady‑state storage for weights, but another source of training OOMs is transient memory spikes. Gradient checkpointing is used to trade compute for memory by saving fewer activations and recomputing them in the backward pass; this reduces overall memory but can create temporary peaks (e.g., when processing a long sequence) that briefly exceed GPU memory and trigger OOM.
+
+Paged Optimizers mitigate that by putting optimizer state in CUDA Unified Memory (managed memory). The GPU runtime will automatically move pages between GPU and host RAM as needed. QLoRA’s approach:
+
+- Allocate optimizer buffers (the optimizer state used during the parameter update step) in Unified Memory.
+- During the forward/backward pass, when a spike would otherwise exhaust GPU memory, the CUDA runtime can evict some optimizer pages to host RAM to make room.
+- When the optimizer update runs, the required pages are paged back to the device.
+
+This is effectively using host RAM as an automatic overflow store for rarely‑touched optimizer state. It’s like OS swapping but handled at the CUDA page level and driven by actual memory access patterns rather than explicit developer bookkeeping.
+
+Practical observations from the paper:
+- Paged Optimizers were essential for running 33B/65B QLoRA on a single 24/48 GB GPU because they absorb the occasional, hard‑to‑predict spikes caused by long sequences.
+- The authors did not provide comprehensive runtime benchmarks because paging is workload dependent; in one reported analysis, for a 65B model on a 48 GB GPU with batch size 16, paged optimizers showed the same training speed as regular optimizers. That suggests paging cost can be negligible when it happens rarely.
+- If paging happens frequently (many page faults), you will see runtime slowdowns because moving pages between host and device has cost. The point is that for gradient‑checkpointing spikes that are infrequent, paging is a practical and easy way to avoid OOM.
+
+## How these two fit into QLoRA’s pipeline
+QLoRA combines:
+- NF4 storage for weights (very compact, information‑theoretically tuned to normal weight distributions),
+- Double Quantization of per‑block scales (to shrink constant overhead),
+- LoRA adapters stored and trained in BF16, and
+- Paged Optimizers for optimizer state.
+
+At runtime a linear layer with a LoRA adapter looks like:
+$$
+\mathbf{Y}^{\text{BF16}} = \mathbf{X}^{\text{BF16}}\,\text{doubleDequant}(c_1^{\text{FP32}}, c_2^{\text{k-bit}}, \mathbf{W}^{\text{NF4}})\;+\;\mathbf{X}^{\text{BF16}}\mathbf{L}_1^{\text{BF16}}\mathbf{L}_2^{\text{BF16}}.
+$$
+Weights stay stored compactly, are dequantized for the multiply, and optimizer state lives in unified memory so rare peaks don’t kill the job. Together these design choices helped QLoRA reduce the average memory requirement for finetuning a 65B model from hundreds of GB down to a single 48 GB GPU, while preserving full 16‑bit finetuning performance.
+
+## Practical tips and caveats
+- Use a small blocksize for weight quantization (QLoRA uses 64) for precision, and a larger blocksize for the second quantization of scales (QLoRA uses 256) to cut overhead.
+- Center the per‑block scales (subtract the mean) before second quantization so symmetric schemes work well.
+- The paper uses 8‑bit floats (FP8) for the second quantization of the scales; they observed no accuracy degradation from this choice.
+- Paged Optimizers are a pragmatic fix for infrequent spikes; if your workload causes continuous page thrashing you will pay a runtime penalty. Monitor page fault activity and tune batch size / sequence length accordingly.
+- These techniques add a small implementation complexity (nested dequant and managed memory allocation), but the memory wins at large scale are substantial and verified in the paper.
+
+## Conclusion
+Double Quantization and Paged Optimizers are not flashy model ideas, but they remove two practical blockers to running large‑scale finetuning: the memory tax of per‑block quantization constants, and unpredictable runtime OOMs from checkpointing spikes. Together with NF4 and LoRA adapters, they helped QLoRA make 33B and 65B finetuning fit on single 24–48 GB GPUs while retaining 16‑bit finetuning quality. If you’re building memory‑tight training pipelines, both tricks are worth considering.

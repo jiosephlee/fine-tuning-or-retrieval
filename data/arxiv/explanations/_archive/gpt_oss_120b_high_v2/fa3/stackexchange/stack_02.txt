@@ -1,0 +1,186 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### How does ping‑pong scheduling overlap GEMM and softmax across warpgroups in FlashAttention‑3?
+Question:
+The paper introduces a ping‑pong schedule where one warpgroup performs softmax while another runs WGMMA GEMMs. I would like a step‑by‑step illustration of which iteration’s softmax is paired with which iteration’s matrix multiplication, and why this pattern yields higher Tensor Core utilization than the original FlashAttention‑2 loop.
+Answer:
+**Answer**
+
+In FlashAttention\-3 the inner loop that processes a key/value block $j$ is no longer executed “one\-thing\-after\-another’’ as it was in FlashAttention\-2.  
+Instead the kernel runs two warp‑groups inside each CTA --- let us call them $WG_A$ and $WG_B$.  
+One warp‑group always drives a Tensor\-Core matrix multiply (the **WGMMA** instruction), while the other warp‑group executes the rowwise operations that belong to the softmax (exponentials, row sums, scaling). After every iteration the two groups swap roles; this alternating behaviour is what the authors call **ping‐pong scheduling**.
+
+Below is a concrete walk­through of one CTA processing a query tile $\mathbf Q_i$ together with all key/value tiles  
+$\{\mathbf K_j,\;\mathbf V_j\rbrace _{\, j=0}^{T_c-1}$.  
+For clarity we denote  
+
+* $S^{(j)}=\;\mathbf Q_i\,\mathbf K_j^{\,\top}\;$   (the “SS‐GEMM’’);  
+* $\displaystyle 
+   \widetilde{\!\mathbf P}^{(j)}=\exp\bigrl(S^{(j)}-m_i\bigr)$ (the unnormalised softmax);  
+* $\ell_i$ (the running row sum);  
+* $\displaystyle {\bf O}_i$ (the partial output).
+
+The steps executed by the **consumer** warp group are listed exactly as they appear in Algorithm 2 of the paper.  
+All calls to **WGMMA** are asynchronous: they enqueue a Tensor Core operation and return immediately; an explicit ``wait’’ instruction later forces completion when its result is needed.
+
+---
+
+### Iteration 0 – priming the pipeline  
+
+Both warps load $\bf Q_i$, $\bf K_0$, and $\bf V_0$ from global memory into shared memory via TMA.  
+$WG_A$ issues  
+
+$$
+S_{\rm cur}= \bf Q_i\, {\bf K}_0^{\,\top}
+$$
+
+with a **WGMMA** (SS‐GEMM). The kernel immediately proceeds to ``commit’’ this instruction but does *not* stall – $WG_B$ can already start preparing the reduction variables $m_i,\;\ell_i$.  
+When hardware finally delivers $S_{\rm cur}$, $WG_B$
+
+* updates the running maximum   
+  $$ m_i = {\rm row\:max}\bigl(S_{\rm cur}, m_i\bigr); $$  
+* computes   
+  $$ \widetilde{\!\bf P}_{\rm cur}= \exp(S_{\rm cur}- m_i); $$  
+* updates   
+  $$ 
+     \ell_i
+       = e^{\, m^{\rm old}_i-m_i}\,\ell_i
+         + {\rm row\:sum}\!\bigl(\widetilde{\!\bf P}_{\rm cur}\bigr).
+   $$  
+
+At this point no value matrix has been used yet; therefore $WG_B$ finishes its work without any dependence on another GEMM.
+
+---
+
+### Iteration $j>0$ – steady state  
+
+Assume that after iteration&nbsp;$j{-}1$ we already have  
+
+* a completed SS‐GEMM   
+  $$ S_{\rm cur}= {\bf Q}_i\,{\bf K}_{\, j-1}^{\,\top}; $$  
+* its associated “softened’’ tile $\widetilde{\!\bf P}_{\rm cur}$;  
+* a ready value tile ${\bf V}_{\, j-1}$.
+
+The next loop body unfolds as follows:
+
+| Step | Performed by | What is launched / waited for                               | How it overlaps |
+|------|---------------|-------------------------------------------------------------|----------------|
+| a    | $WG_A$        | ``WGMMA(${\bf Q}_i,\ {\bf K}_j^{\,\top})'' →&nbsp;$S_{\rm next}$           | *Start* SSD‐GEMM for block&nbsp;$j$, independent of everything else |
+| b    | $WG_B$        | ``wait($V_{ j-1 } )'' then ``WGMMA($\<tilde{}\!{\bf P}_{\<cur}>$, ${\<V>}{\< j-1}> )'' →&nbsp;$ΔO                  | While SSD‐GEMM runs, consume ${\<V>}{\< j-1}>$, launch second RMUL (RS‐GEMM). |
+| c    | $WG_B$        |\hbox{``wait(SS–GEMM)}'' → obtain&nbsp;$S_{\rm next}$.                     | After receiving&nbsp;$S_{\rm next}$ compute *softmax* for block&nbsp;$j{-}1$: update&nbsp;$m_i,\;\ell_i,\;\widetilde{{\<P}>}_{\<next>}$. |
+| d    | $WG_B$        |\hbox{``wait(RS–GEMM)}'' → add&nbsp;$ΔO$ into ${\<O>} _ i$. Then rescale   
+   $$ 
+      {\bf O}_i
+       = {\rm diag}\Bigl(e^{\, m^{\: {\rm old}}_i-m _ i }\Bigr){^{-1}}
+         \cdot {\bf O}_i .
+   $$                              | RS–GEMM finishes while step&nbsp;c may already be underway ⇒ both outstanding simultaneously because their sources differ ($S_{\rm next}$ vs.~${V}_{ j-1 } )$. |
+| e    | Both groups   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(release shared memory buffers for tiles&nbsp;$K_j,V _ { j-1 }$, advance circular buffer index.)&nbsp;&nbsp;&nbsp;(tiny sync via ``bar.sync``). |
+
+The key observation is that *the softmax belonging to block&nbsp;$j{-}1*$ (**step c**) runs *while* *the SSD‐GEMM belonging to block&nbsp;$j*$ (**step a**) occupies Tensor Cores. Likewise *the RS‐GEMM belonging to block&nbsp;$j{-}1*$ (**step b**) overlaps exactly with that same SSD‐Gemm. In other words,
+
+```
+softmax(j−1)    ↔   SS−Gemm(j)
+RS−Gemmm(j−1 ) ↔   SS−Gemmm(j)
+```
+
+When all CTA blocks have been traversed, an epilogue performs one final RS‐Gemm 
+(`ΔO` using 
+$\widetilde{{\<P>}}\!_\textrm{{last}}\cdot {\bf V}_{{last}}$
+) followed by global rescaling based on
+the last max/row­sum pair.
+
+Because each half of a “ping’’ ($WG_A$: matrix multiply,
+while $WG_B$: softmax/RS‐Gemmm)
+is immediately followed by a “pong’’ where their roles swap,
+there is never a moment where *all*
+Tensor Cores sit idle waiting for exponentials.
+Stalls occur only at explicit ``wait’’ instructions guaranteeing data correctness;
+they are short because latency hides behind work issued by the opposite warp group.
+
+
+
+--- 
+
+### Why utilisation rises compared with FlashAttention‐2  
+
+FlashAttention‐2 executes exactly one phase per iteration
+
+```text
+SS–Gemmm → wait → softmax → wait → RS–Gemmm → wait …
+```
+
+During every *softmax* phase only a few special­function units (MFU)
+are active while all Tensor Cores sit idle.
+On an H100 these two kinds of units differ by roughly an order
+of magnitude: FP16 matrix multiplication delivers 
+$\approx 989~{\rm TFLOP/s}$ whereas special functions such
+as ``exp’’ deliver only 
+$\approx 3.9~{\rm TFLOP/s}$.  
+Consequently roughly half of each kernel’s wall time
+is spent doing work that cannot run on Tensor Cores,
+which explains why FlashAttention 2 attains only 
+$\approx 35~\$%\,$Tensor­Core utilisation on Hopper.
+
+
+
+In FlashAttention 3
+the ping–pong schedule turns this sequential pattern into
+a *two-stage pipeline*:  
+
+* Stage A – launch WGMMA for ${Q}{K}^{^\top}_ {\, j };$  
+* Stage B – simultaneously perform exponential/row‑sum reduction
+for block&nbsp;$ j{-}1 $
+plus an RS Gemmm using tiles already produced earlier.
+
+Since both stages run on disjoint functional units,
+their latencies overlap completely:
+while MFUs evaluate exponentials,
+WMAs feed fresh data into Tensor Cores;
+when exponentials finish,
+TFLOPs continue unabated on	the next pending Gemmm.
+In practice this raises observed FLOP throughput from about 
+$570~{\rm TFLOP/s}$ (FlashAttention 2 FP16,
+head dim&nbsp;$128$, seq len&nbsp;$8192)$
+to roughly 
+$620\dots640~{\rm TFLOP/s}$—
+an improvement corresponding to 
+$\approx 75~\$%\,$utilisation
+of H100’s FP16 tensor cores,
+close to what an optimal dense Gemmm would achieve.
+
+
+
+The benefit scales precisely because every additional interleaving reduces idle time proportionally
+to​​the ratio between tensor­core throughput and special­function throughput.
+When FP8 kernels double matrix­multiply bandwidth while exponential throughput stays unchanged,
+pipelining becomes even more critical;
+FlashAttention 3’s ping–pong scheme preserves most of those extra cycles
+for useful multiplies instead of letting them waste time in exponentiation stalls.
+
+
+
+--- 
+
+### Summary  
+
+Ping pong scheduling splits one CTA into two dedicated warp groups
+that alternately act as producer (launching an asynchronous WGMMA Gemmm
+for *the next* key block)
+and consumer (performing softmax on *the previous*
+Gemmm result and applying its weights to *the previously loaded*
+value block).
+Concretely,
+
+* softmax for block&nbsp;$j{-}1$
+overlaps with SS ⊙ Gemmm for block&nbsp;$j$,  
+* RS ⊙ Gemmm that uses
+   $\displaystyle
+      \widetilde{{\<P>}}{}^{({ j{-}1 })}
+   $
+also overlaps with that same future SS ⊙ Gemmm.
+
+By arranging these dependencies across iterations rather than within one iteration,
+all tensor cores stay busy almost continuously and special functions run hidden underneath.
+This hardware-aware restructuring lifts effective utilisation from roughly one third
+in FlashAttention 2 up toward three quarters on Hopper GPUs—and explains most
+of empirical speedup reported in the paper.

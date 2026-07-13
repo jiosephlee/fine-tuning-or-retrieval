@@ -1,0 +1,429 @@
+\title{Blogs about the Paper: "Controlling Text-to-Image Diffusion by Orthogonal Finetuning"}
+
+# Putting OFT Into Practice: A Step‑by‑Step Guide for Researchers and Hobbyists  
+
+*How to add Orthogonal Finetuning (OFT) – and its constrained cousin COFT – to your Stable Diffusion pipeline.*  
+
+---
+
+## 1. Why Orthogonal Finetuning?  
+
+Large text‑to‑image diffusion models such as Stable Diffusion are already great at turning a prompt into a photorealistic picture.  When we want them to **specialize** – e.g. generate a particular person from a handful of photos (subject‑driven generation) or obey an extra control signal like an edge map – we have to finetune the model.  
+
+Classic finetuning updates each weight directly or adds a low‑rank offset (LoRA).  These approaches either risk **destroying** the pretrained knowledge or require fiddly hyper‑parameter sweeps.  
+
+The OFT paper shows that the **pairwise angular relationships** between neurons – captured by *hyperspherical energy* – are crucial for preserving semantic capacity.  If we rotate *all* neurons in a layer by the same orthogonal matrix $R$, those angles stay exactly the same, so hyperspherical energy is unchanged.  In other words:
+
+\[
+\text{HE}(W) = \text{HE}(W^{0}) \quad \Longleftrightarrow \quad W = R\,W^{0}, \qquad R^{\top}R = I.
+\]
+
+This simple constraint yields two practical benefits:
+
+1. **Stability** – the model stays close to its pretrained state while still being able to shift semantics via direction changes.
+2. **Efficiency** – only a handful of orthogonal parameters need to be learned per layer (far fewer than full weight updates).
+
+COFT adds a small radius constraint $\|R - I\| \le \epsilon$ so that the finetuned model never wanders too far from the original weights, further smoothing training.
+
+Below is a hands‑on walk‑through of how you can plug OFT/COFT into a typical Stable Diffusion workflow.
+
+---
+
+## 2. Quick Primer on the Core Math  
+
+| Symbol | Meaning |
+|--------|---------|
+| $W^{0}\in\mathbb{R}^{d\times n}$ | Pretrained weight matrix of a linear layer (or reshaped conv kernel). |
+| $R\in\mathbb{R}^{d\times d}$ | Learned orthogonal matrix ($R^{\top}R = I$). |
+| $Q\in\mathbb{R}^{d\times d}$ | Skew‑symmetric generator ($Q = -Q^{\top}$) used in the Cayley transform. |
+| $\epsilon$ | Maximum allowed deviation from identity (COFT only). |
+| $\operatorname{HE}(\cdot)$ | Hyperspherical energy – sum over pairwise inverse distances on the unit sphere; preserved automatically when $R$ is orthogonal. |
+
+The **Cayley transform** gives us an easy way to enforce orthogonality while keeping gradients tractable:
+
+\[
+R = (\mathbf{I}+Q)(\mathbf{I}-Q)^{-1}, \qquad Q=-Q^{\top}.
+\]
+
+When $Q=0$, $R$ starts as the identity matrix – exactly what we need for a “zero‑init” finetune.
+
+---
+
+## 3. Environment Setup  
+
+```bash
+# Create a fresh environment
+conda create -n oft python=3.10 -y
+conda activate oft
+
+# Core libraries
+pip install torch==2.1.* torchvision diffusers transformers accelerate
+
+# Optional utilities for visualization
+pip install matplotlib tqdm pillow
+```
+
+> **Tip:** The code below works with `diffusers>=0.21`.  If you use an older version, adjust import paths accordingly.
+
+---
+
+## 4. Implementing an OFT Layer  
+
+We wrap any linear/conv weight that you would normally finetune with an *orthogonal adapter*.  The adapter stores a learnable skew‑symmetric matrix `Q` and computes `R` on the fly via the Cayley transform.
+
+```python
+import torch
+import torch.nn as nn
+
+class OrthogonalAdapter(nn.Module):
+    """
+    Implements W = R @ W0 where R is orthogonal via Cayley transform.
+    Supports optional block‑diagonal factorization.
+    """
+    def __init__(self, dim_in: int, dim_out: int,
+                 n_blocks: int = 1,
+                 share_blocks: bool = False,
+                 eps_constraint: float | None = None):
+        """
+        dim_in  : input dimension d of the underlying weight.
+        dim_out : output dimension n (unchanged).
+        n_blocks: number of diagonal blocks in R       (default=1 → full matrix).
+        share_blocks:
+            if True all blocks share the same Q → O(d² / n_blocks²) parameters.
+        eps_constraint:
+            if set activates COFT radius constraint ‖R−I‖ ≤ eps.
+        """
+        super().__init__()
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+        self.n_blocks = n_blocks
+        self.share_blocks = share_blocks
+        self.eps = eps_constraint
+
+        # Size of each block
+        assert dim_in % n_blocks == 0, "dim_in must be divisible by n_blocks"
+        block_dim = dim_in // n_blocks
+
+        # Initialise skew‑symmetric matrices Q_i with zeros → R=I at start.
+        if share_blocks:
+            # One Q shared across all blocks
+            self.Q_shared = nn.Parameter(torch.zeros(block_dim, block_dim))
+        else:
+            # Independent Q per block
+            self.Q_blocks = nn.Parameter(
+                torch.zeros(n_blocks, block_dim, block_dim)
+            )
+
+    def _cayley(self, Q):
+        """Cayley transform: R = (I+Q)(I−Q)^{-1}."""
+        I = torch.eye(Q.shape[-1], device=Q.device, dtype=Q.dtype)
+        # Note: In practice we add a small damping term to avoid singularities.
+        return torch.linalg.solve(I - Q, I + Q)
+
+    def _build_R(self):
+        """Construct full block‑diagonal orthogonal matrix."""
+        if self.share_blocks:
+            # One block → repeat across diagonal
+            Q_block = self.Q_shared - self.Q_shared.T   # enforce skew symmetry
+            R_block = self._cayley(Q_block)
+            R_full = torch.block_diag(*[R_block] * self.n_blocks)
+        else:
+            blocks = []
+            for i in range(self.n_blocks):
+                Q_i = self.Q_blocks[i] - self.Q_blocks[i].T   # skew sym.
+                R_i = self._cayley(Q_i)
+                blocks.append(R_i)
+            R_full = torch.block_diag(*blocks)
+
+        # Optional COFT radius clipping
+        if self.eps is not None:
+            # Simple projection onto Frobenius ball around I
+            delta = R_full - torch.eye(R_full.shape[0], device=R_full.device)
+            norm_delta = torch.norm(delta)
+            if norm_delta > self.eps:
+                delta = delta * (self.eps / norm_delta)
+                R_full = torch.eye(R_full.shape[0], device=R_full.device) + delta
+
+        return R_full
+
+    def forward(self, x, weight_pretrained):
+        """
+        x               : input tensor (... , d)
+        weight_pretrained: frozen pretrained weight W0 ∈ ℝ^{d×n}
+        Returns z = (R·W0)^T x .
+        """
+        R = self._build_R()                     # d×d orthogonal
+        W_finetuned = torch.matmul(R, weight_pretrained)   # d×n
+        return torch.matmul(x, W_finetuned)     # (... , n)
+```
+
+### How to attach it to Stable Diffusion  
+
+Stable Diffusion’s UNet consists of many `nn.Linear` modules inside attention projections (`to_q`, `to_k`, `to_v`, `to_out`).  
+A minimal patch looks like:
+
+```python
+from diffusers import StableDiffusionPipeline
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5",
+    torch_dtype=torch.float16,
+    safety_checker=None,
+)
+
+# Freeze everything first
+pipe.unet.requires_grad_(False)
+
+# Replace attention proj weights with OFT adapters (example on one layer)
+def inject_oft(unet):
+    for name, module in unet.named_modules():
+        if isinstance(module, nn.Linear) and 'attn' in name:
+            # Keep original weight frozen
+            module.weight.requires_grad_(False)
+
+            # Create adapter; here we use 4 blocks → moderate parameter count
+            adapter = OrthogonalAdapter(
+                dim_in=module.in_features,
+                dim_out=module.out_features,
+                n_blocks=4,
+                share_blocks=False,
+                eps_constraint=None   # set to float for COFT later
+            )
+            # Register under same name so it appears in state_dict()
+            setattr(unet, f"{name}_oft", adapter)
+
+inject_oft(pipe.unet)
+pipe.unet.train()   # now only adapters have grads
+```
+
+During training you call:
+
+```python
+def forward_pass(pipe, prompt_ids, control_signal=None):
+    # standard diffusion forward up to UNet; inside UNet each Linear calls our adapter.
+    latents = pipe.vae.encode(...).latent_dist.sample()
+    noise_pred = pipe.unet(latents,
+                          timestep,
+                          encoder_hidden_states=prompt_ids,
+                          control=control_signal)   # e.g., canny edges via ControlNet style conditioning
+
+    return noise_pred
+```
+
+The key point is that **the original weights never change**; only `OrthogonalAdapter` learns its `Q` matrices.
+
+---
+
+## 5. Choosing Block–Diagonal Structure  
+
+### Why Blocks?  
+
+- A full \(d\times d\) orthogonal matrix costs \(d(d-1)/2\) parameters – prohibitive for large layers (`d≈1024`).  
+- Splitting into \(r\) blocks reduces parameters roughly by factor \(r\):  
+  \[
+  \#\text{params} \approx \frac{d(d/r-1)}{2}.
+  \]  
+- Sharing all blocks (`share_blocks=True`) brings it down further to \(\mathcal{O}\bigl(d^{2}/r^{2}\bigr)\).
+
+### Practical Recommendations  
+
+| Scenario | `dim_in` (`d`) | Suggested `n_blocks` | Share? | Approx. trainable params |
+|----------|----------------|----------------------|-------|---------------------------|
+| Small MLPs (`d≈256`) | 256 | 1 (full) or 2 | No | ~32 k |
+| UNet attention proj (`d≈1024`) | 1024 | 8–16 | **No** (independent blocks) | ~32 k–64 k |
+| Memory‐constrained GPU (~8 GB) | 1024 | 16–32 | Yes | <10 k |
+
+> **Tip:** Start with `n_blocks=8` and no sharing; if GPU OOM occurs increase `n_blocks` or enable sharing.
+
+---
+
+## 6. Adding the COFT Radius Constraint  
+
+COFT simply caps how far \(R\) can drift from identity:
+
+```python
+adapter_coft = OrthogonalAdapter(
+    dim_in=1024,
+    dim_out=1024,
+    n_blocks=8,
+    share_blocks=False,
+    eps_constraint=0.05   # adjust experimentally; smaller → more conservative finetune.
+)
+```
+
+The implementation above projects \(R-I\) onto an $\epsilon$-ball after each forward pass (which is cheap because it reuses already computed `delta`). In practice you can also enforce it after each optimizer step:
+
+```python
+with torch.no_grad():
+    for p in adapter.parameters():
+        if p.grad is None:
+            continue
+    # The projection is already baked into _build_R().
+```
+
+When you use COFT you usually **increase** learning rate a bit (`lr ≈ 5e-4`) because the extra constraint stabilizes updates.
+
+---
+
+## 7. Hyperparameter Cheat Sheet  
+
+| Parameter               | Typical Value                                        | Reasoning |
+|-------------------------|------------------------------------------------------|-----------|
+| Learning rate (`lr`)    | Subject‑driven: `1e-5` – `5e-5`<br>Controllable: `5e-4` – `1e-3` | Smaller LR preserves semantics; larger LR needed when control signals dominate loss surface. |
+| Batch size              | 4–8 images per GPU                                   | Fits most consumer GPUs; larger batches improve gradient estimate but not required due to low‐dim update space. |
+| Optimiser               | AdamW (`weight_decay=0`)                             | Standard for diffusion fine‑tuning; weight decay unnecessary because parameters live on manifold already. |
+| Number of epochs / steps| Subject‐driven: **400–800 steps** (~½ epoch on DreamBooth data)<br>Controllable: **5–20 epochs** depending on dataset size.| OFT converges quickly; stopping early avoids over‑rotation beyond needed semantics. |
+| `n_blocks`              | See Section 5                                        | Trade-off between capacity and memory footprint. |
+| COFT ε                  | `0.02–0.08`                                          | Smaller ε → tighter adherence to pretrained behaviour; larger ε → more flexibility—tune on validation loss curve. |
+| Gradient clipping       | Optional ‑ clip norm at `1.0`                        | Prevents occasional spikes from Cayley inversion errors.|
+
+**Warm‑start tip:** Always initialise adapters with zeroed `Q`. This makes $R=\mathbf{I}$ initially so your first forward pass equals exactly the pretrained model—a sanity check that your wiring is correct.
+
+---
+
+## 8. Full Training Loop Example  
+
+Below is an end‑to‑end schematic for **subject‑driven generation** using DreamBooth data (≈5 images).  
+
+```python
+import os
+from transformers import CLIPTextModel, CLIPTokenizer
+
+# -------------------------------------------------
+# Prepare data --------------------------------------------------------------
+train_images_dir   = "./my_subject/images/"      # few-shot images of subject A    
+prompt_template   = "a photo of {}"             # placeholder will be replaced by token
+  
+tokenizer         = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+text_encoder      = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
+tokenizer.add_tokens(["<subject>"])               # DreamBooth custom token  
+text_encoder.resize_token_embeddings(len(tokenizer))
+
+custom_token_id   = tokenizer.convert_tokens_to_ids("<subject>")
+instance_prompt   = "<subject> smiling"
+
+# -------------------------------------------------
+# Optimiser ----------------------------------------------------
+optimizer         = torch.optim.AdamW(
+                        filter(lambda p: p.requires_grad,
+                               pipe.unet.parameters()),
+                        lr=5e-5)
+
+# -------------------------------------------------
+# Training loop -------------------------------------------------
+num_steps         = 800      # corresponds roughly to DreamBooth's recommendation 
+pipe.unet.train()
+
+for step in range(num_steps):
+    ## Sample image & encode -----------------------------------------
+    img_path      = random.choice(os.listdir(train_images_dir))
+    image         = load_image(os.path.join(train_images_dir, img_path)).to(pipe.device)
+    
+    ## Encode text ----------------------------------------------------
+    txt_input     = tokenizer([instance_prompt], padding="max_length",
+                             truncation=True, max_length=tokenizer.model_max_length,
+                             return_tensors="pt").to(pipe.device)
+    
+    ## Forward diffusion + loss ---------------------------------------
+    loss          = dreambooth_loss(pipe,
+                                   image=image,
+                                   prompt_ids=txt_input.input_ids,
+                                   token_embeddings=text_encoder(txt_input.input_ids)[0],
+                                   guidance_scale=7.5)
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if step % 100 == 0:
+        print(f"[{step}/{num_steps}] loss={loss.item():.4f}")
+
+print("✅ Finetuning finished! Saving adapters…")
+torch.save(pipe.unet.state_dict(), "oft_subject_A_adapter.pt")
+```
+
+> The function `dreambooth_loss` follows the original DreamBooth formulation (reconstruction + prior preservation). It only touches weights that have `.requires_grad=True`, i.e., our adapters.
+
+For **controllable generation**, replace the loss term with a combination of reconstruction loss against paired `(control_signal, target_image)` pairs plus standard diffusion denoising objective—exactly what ControlNet or T2I‑Adapter do—but now your trainable params are just the OFT adapters attached to attention layers.
+
+---
+
+## 9. Debugging & Troubleshooting  
+
+### Symptom ‑ “Generated images look blurry / collapse after many steps”  
+*Possible causes & fixes*  
+- **Orthogonality drift**: Verify that `$||R^\top R - I||$` stays near zero during training (`torch.norm(R.T @ R - I)` printed every epoch). If it grows > 1e‑3 try decreasing learning rate or increase number of Cayley iterations (**use double precision** during compute).  
+- **Cayley singularity**: When eigenvalues approach ±1 the denominator $(I-Q)$ becomes ill-conditioned → NaNs. Add a tiny damping term before inversion:
+
+```python
+delta           = 1e-6 * torch.eye(Q.shape[-1], device=Q.device)
+R               = torch.linalg.solve(I - Q + delta, I + Q)
+```
+
+### Symptom ‑ “Control signal barely influences output”  
+*Possible causes & fixes*  
+- Too restrictive `$ε$` in COFT ⇒ model cannot rotate enough to incorporate new conditioning signals → raise ε gradually (`ε ← ε * 1.2` every few epochs).  
+- Insufficient capacity in `$R$` due to too many blocks with sharing → reduce sharing or increase number of blocks.
+
+### Symptom ‑ “Training extremely slow”  
+*Tips*  
+- Make sure you are **not computing gradients through frozen weights** (`weight.requires_grad=False`).  
+- Cache precomputed `$W^{0}$` once per epoch instead of recomputing inside every forward pass; you can store them as buffers inside your adapter class (`self.register_buffer('W0', pretrained_weight.clone().detach())`).  
+- For very deep UNets consider applying adapters only to *key* attention layers (e.g., middle three transformer blocks); this often yields comparable quality at even lower cost.
+
+### Symptom ‑ “Orthogonality check passes but generated diversity drops”  
+*Interpretation*  
+Preserving hyperspherical energy means neurons keep their pairwise angles—good—but sometimes we may need **more freedom** than pure rotation offers (e.g., adjusting magnitude). The authors propose *Rescaled OFT*: add a learnable diagonal scaling matrix $D$. Implementation adds one extra line:
+
+```python
+s      = nn.Parameter(torch.ones(dim_out))          # scale per output neuron
+D      = torch.diag(s)
+W_finetuned_scaled = torch.matmul(R @ W0, D)
+z      = x @ W_finetuned_scaled                     # replace forward line above
+```
+
+This increases expressivity without breaking angle preservation.
+
+---
+
+## 10. Inference – No Overhead!  
+
+Because OFT’s transformation lives entirely inside the weight matrix multiplication, you can “bake” it into a standard weight before using the model:
+
+```python
+def bake_adapters(unet):
+    for name,module in unet.named_modules():
+       if hasattr(module,'oft'):          # our adapters are stored under *_oft*
+           adapter   = getattr(unet,f"{name}_oft")
+           R         = adapter._build_R().detach()
+           W0_buffer =(module.weight.detach())
+           module.weight.copy_(torch.matmul(R,W0_buffer))
+           delattr(unet,f"{name}_oft")   # remove extra buffers
+
+bake_adapters(pipe.unet.eval())
+print("✅ Model ready – inference speed unchanged.")
+```
+
+After baking you can discard optimizer state and any auxiliary tensors—all you need is an ordinary UNet ready for fast serving.
+
+---
+
+## 11. Wrap‑Up & Next Steps  
+
+We’ve covered:
+
+* The motivation behind preserving hyperspherical energy with orthogonal transformations.
+* How to build an efficient *Orthogonal Adapter* using Cayley transforms and block‐diagonal parameterization.
+* Practical tricks for integrating into Stable Diffusion’s attention layers.
+* Recommended hyperparameters and when to switch between plain OFT vs its constrained variant COFT.
+* A minimal debugging checklist so you don’t get stuck in silent NaN land.
+
+### What’s Next?  
+
+- **Composable fine‑tuning:** Because two orthogonal matrices multiply into another orthogonal matrix ($R_{new}=R_{2}R_{1}$), you could stack subject adaptation followed by edge control without any extra inference cost—just remember to keep track of order!  
+- **Extending beyond linear layers:** The same principle applies to convolution kernels after reshaping them into `(out_channels × in_channels·k²)` matrices; plug an adapter there for even richer control over spatial features.  
+- **Scaling up:** If memory becomes tight on very large models (`d ≥2048`) explore low‑rank approximations of $Q$, or adopt dynamic sparsity patterns inside each block—both still preserve orthogonality locally.
+
+Give it a try! With only a few hundred trainable parameters you can turn off-the-shelf Stable Diffusion into a custom subject generator or edge‑to‑photo artist without slowing down inference at all.
+
+Happy fine‑tuning! 🚀

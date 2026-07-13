@@ -1,0 +1,216 @@
+\title{A Textbook about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+Chapter 2: # 2. Background Concepts
+
+Understanding QLoRA requires a firm grasp of a few foundational ideas that appear throughout modern large‑language‑model (LLM) literature: the mechanics of block‑wise k‑bit quantization, the architecture and hyper‐parameters of Low‑Rank Adapters (LoRA), the memory trade‑offs between full parameter fine‑tuning and parameter‑efficient fine‑tuning, and finally the empirical fact that pre‑trained weights are approximately normally distributed. This chapter presents each of these notions in depth, explaining the intuition behind them and carefully deriving the key equations. Because these concepts recur in QLoRA’s design, they will serve as the building blocks for the subsequent chapters where we assemble the full finetuning pipeline.
+
+---
+
+## Block‑wise k‑bit Quantization and the Role of Quantization Constants
+
+### The Goal of Quantization
+
+Quantization turns a floating‑point tensor that lives in a high‑precision space (normally FP32 or BF16) into a tensor that can be stored with far fewer bits. The most common usage in the LLM community is to reduce memory requirements during inference: a weight matrix that would otherwise require, say, 32 bytes per element can be stored in just one or two bytes per element. The challenge is that we want to keep the numerical and statistical properties of the original tensor – the distribution of values, the dynamic range, and small differences that matter for downstream accuracy – as faithfully as possible.
+
+### From a Full Precision Tensor to a Block‑wise Quantized Tensor
+
+Suppose we have a tensor of weights
+\[
+\mathbf{W}\in\mathbb{R}^{b\times h},
+\]
+where \(b\) is the number of rows (often the batch dimension) and \(h\) is the hidden dimension. Quantization proceeds in two steps:
+
+1. **Block partitioning.** We flatten the tensor into a one‑dimensional array and split it into \(n\) contiguous blocks each of length \(B\):
+   \[
+   \text{blocks} = \bigl\{\,\mathbf{w}_1,\dots,\mathbf{w}_n\,\bigr\},
+   \qquad
+   n \;=\;\frac{b\times h}{B}.
+   \]
+   Each block is quantized independently. This mitigates the problem of outliers that would otherwise dominate a single scale.
+
+2. **Per‑block scaling (quantization constant).** Each block gets its own *quantization constant* \(c_i\) which rescales the block’s values into the numeric range allowed by the target datatype. If we are quantizing to signed 8‑bit integers with a range \([-127,127]\) the process is:
+
+   \[
+   \mathbf{w}_i^{\text{Int8}} \;=\;
+   \text{round}\!\!\left(
+         \frac{127}{\lvert\!c_i\rvert}\,\mathbf{w}_i
+     \right)
+   \quad \text{where}\quad
+   c_i \;\triangleq\;\max_{j}\bigl|w_{i,j}\bigr|.
+   \tag{2.1}
+   \]
+
+   The de‑quantization operator is the inverse:
+   \[
+   \text{dequant}(c_i,\mathbf{w}_i^{\text{Int8}})\;=\;\frac{\mathbf{w}_i^{\text{Int8}}}{127/c_i}
+      \;=\;\frac{c_i}{127}\,\mathbf{w}_i^{\text{Int8}}.
+   \tag{2.2}
+   \]
+
+   The constant \(c_i\) is called the *quantization constant*, sometimes also referred to as the *scale* or *factor*.
+
+### Why Block‑wise Scaling Matters
+
+If the whole tensor were scaled using a single global maximum, a few very large weights would force the scale to be huge. When other weights are quantized using that scale they would map to very small integer values, causing most bins to be empty and leading to heavy information loss. By using a local, per‑block maximum we keep most weights within the most useful region of the quantization grid, saving useful representational granularity.
+
+The choice of block size \(B\) is a trade‑off:
+- **Smaller blocks** increase the number of constants that must be stored, which in turn increases memory usage, but they reduce quantization error by allowing tighter scaling.
+- **Larger blocks** reduce the number of constants, saving memory but increasing quantization error because the block’s outliers will drag the scale up.
+
+In practice, works such as SmoothQuant and LLM.int8 use block sizes on the order of 64 or 256 rows, striking a balance between precision and memory overhead.
+
+### Quantization Constants Beyond the First Level
+
+In larger systems we sometimes apply a *double* quantization: after quantizing the weight tensor we also compress the constants themselves, because they make up a non‑negligible fraction of the memory footprint. Concretely:
+
+1. The first‑level constants \(c_2^{\text{FP32}}\) are collected into a vector of the same shape as the weight blocks.  
+2. We quantize this vector itself using a second quantization step: we pick a wider block size (e.g. 256) and a higher bit‑width (often 8‑bit float).  
+3. The resulting 8‑bit float constants \(c_2^{\text{FP8}}\) replace the 32‑bit floats while a *second‑stage* scaling \(c_1^{\text{FP32}}\) is stored per second‑level block.  
+
+The final *double* de‑quantization algorithm is:
+
+\[
+\text{doubleDequant}(c_1^{\text{FP32}},\,c_2^{\text{k-bit}},\,\mathbf{W}^{\text{NF4}})
+   \;=\;\text{dequant}\!\Bigl(
+          \text{dequant}\bigl(c_1^{\text{FP32}},\,c_2^{\text{k-bit}}\bigr),
+          \,\mathbf{W}^{\text{k-bit}}
+       \Bigr).
+\tag{2.3}
+\]
+
+This hierarchy can shrink the memory usage of the constants from \(0.5\) bits per weight (single‑level, 32‑bit scale) down to roughly \(0.13\) bits per weight, a saving of more than one third on a 65‑B parameter model.
+
+---
+
+## Low‑Rank Adapters (LoRA): Theory and Practical Hyper‑Parameters
+
+### Motivation: Parameter‑Efficient Fine‑Tuning
+
+When fine‑tuning an LLM on a specific task, the naive approach is to update every weight in the network. For a 30‑B model that means propagating gradients through \(30\times10^9\) parameters and storing twice that many activation gradients during back‑propagation – an overwhelming memory load. *Parameter‑efficient fine‑tuning* (PEFT) solves this by freezing the original weights and introducing a tiny set of trainable variables that *modulate* the pre‑trained function.
+
+LoRA is perhaps the simplest and most widely used PEFT technique. Its core insight is that the linear transformations of a transformer can be *low‑rank perturbed* without altering the base weight matrix.
+
+### The LoRA Formulation
+
+Consider a linear layer that computes
+
+\[
+\mathbf{Y}\;=\;\mathbf{X}\mathbf{W},
+\]
+where \(\mathbf{X}\in\mathbb{R}^{b\times h_{\text{in}}}\) is the input, \(\mathbf{W}\in\mathbb{R}^{h_{\text{in}}\times h_{\text{out}}}\) is the weight matrix, and \(\mathbf{Y}\in\mathbb{R}^{b\times h_{\text{out}}}\) is the output.
+
+LoRA augments this transformation with a *low‑rank* additive term:
+
+\[
+\mathbf{Y}\;=\;\mathbf{X}\mathbf{W}\;+\;s\,\mathbf{X}\mathbf{L}_1\mathbf{L}_2,
+\tag{2.4}
+\]
+where:
+- \(\mathbf{L}_1\in\mathbb{R}^{h_{\text{in}}\times r}\) and \(\mathbf{L}_2\in\mathbb{R}^{r\times h_{\text{out}}}\) are *trainable* matrices,
+- \(r\ll\min(h_{\text{in}},h_{\text{out}})\) is the *rank* hyper‑parameter (often 4–64),
+- \(s\) is a scalar scaling factor that normalizes the magnitude of the LoRA term.
+
+Notice that \(\mathbf{W}\) remains fixed; during training, only \(\mathbf{L}_1,\mathbf{L}_2\) evolve. Substituting (2.4) into the feed‑forward path yields a forward computation that involves an extra matrix multiplication \(\mathbf{X}\mathbf{L}_1\mathbf{L}_2\), which is cheap because \(\mathbf{L}_1\) and \(\mathbf{L}_2\) are small.
+
+When training with back‑propagation, gradients are only propagated into \(\mathbf{L}_1,\mathbf{L}_2\). Importantly, gradients through \(\mathbf{W}\) are discarded, which drastically reduces the memory needed for storing activation gradients.
+
+### Hyper‑Parameters and Practical Choices
+
+| Hyper‑Parameter | Typical Value | Why it Matters |
+|-----------------|---------------|----------------|
+| Rank \(r\) | 8–64 | Controls the capacity of the adapters. Larger \(r\) gives more expressive power but slightly more memory usage. |
+| Scaling \(s\) | \(\sqrt{r}/h_{\text{out}}\) or learned | Normalizes the LoRA term so it starts with a small effect. |
+| Adapter placement | Every linear layer, or only query/key/value projections | Full‑layer adapters give performance close to full‑finetuning but incur more memory; limiting to key/value matrices is lighter but can lose accuracy. |
+| Number of adapters | One per block/ layer | A balance between fine‑grained tuning and avoiding over‑parameterization. |
+| Training schedule | One fine‑tuning epoch or more | With sufficient data, a single epoch often suffices for adapters because the base model already encodes general language knowledge. |
+
+In QLoRA we deploy *LoRA at every linear block* in the transformer – thus each attention head and feed‑forward network gains a pair of small adapters. Because these adapters are tiny (typically a few megabytes per 7‑B model), we can afford to add them everywhere without exceeding the memory budget.
+
+---
+
+## Memory Footprint Analysis of Full Fine‑Tuning vs LoRA
+
+### Anatomy of Memory Usage During Back‑Propagation
+
+When training a neural network using stochastic gradient descent, the GPU memory consumption can be separated into a few distinct components:
+
+1. **Model parameters** – the weight matrices themselves (e.g. \(\mathbf{W}\)).  
+2. **Activations** – the intermediate outputs \(\mathbf{X}, \mathbf{Y}\) that must be stored so their gradients can be computed.  
+3. **Gradients** – the partial derivatives \(\partial E/\partial \mathbf{W}\) that are needed for weight updates.  
+4. **Optimizer states** – momentum, Adam bias‑correction terms, etc.
+
+For **full fine‑tuning** all of these are required for every parameter. Consider a LLaMA‑7B model. The 32‑bit weight tensor alone requires roughly \(7\times10^9 \times 32\text{ bit}\approx 28\text{ GB}\). But because each layer’s activations must be kept for back‑propagation, the peak memory often skews between 500–800 GB, far exceeding the capacity of any single consumer GPU. Even with gradient checkpointing – where activations are recomputed rather than stored – the required memory shrinks only to the point where *gradient checkpointing itself triggers intense memory spikes* at the start of a forward pass.
+
+With **LoRA** we freeze the base weights \(\mathbf{W}\), so gradients with respect to them are never computed. The back‑propagation graph then consists of:
+
+- The forward pass through a *quantized* weight tensor (stored in 4 bits), which can be denormalized on‑the‑fly to BF16 for computation.  
+- The forward and backward pass through the relatively tiny adapter matrices \((\mathbf{L}_1,\mathbf{L}_2)\).
+
+The gradients to be stored are therefore only \(\bigl(\partial E/\partial \mathbf{L}_1,\, \partial E/\partial \mathbf{L}_2\bigr)\), which occupy a handful of megabytes. Bottlenecks move from weight gradients to *activation gradients*. In practice we observe that the average activation gradient memory per token for a 7‑B model with LoRA is about 18 MB when gradient checkpointing is used, versus >400 MB for full fine‑tuning. Yet the base weight tensor remains in the GPU memory in its compressed form (≈ 5 GB for 4‑bit NF4), giving a *dramatic overall reduction from >780 GB to <48 GB* for the largest LLaMA‑65B.
+
+### Concrete Numbers
+
+| Model | Training Paradigm | Peak GPU Memory (GB) |
+|-------|-------------------|----------------------|
+| LLaMA‑7B | Full 16‑bit fine‑tune | ~780 |
+| LLaMA‑7B | LoRA + 4‑bit quantized base | <48 |
+| LLaMA‑65B | LoRA + 4‑bit quantized base | ~48 |
+
+The numbers above are *average* values obtained during a full training run with standard hyper‑parameters (batch size 16, sequence length 2048). They underline the major acceleration that QLoRA brings to high‑scale finetuning.
+
+---
+
+## Statistical Normality of Neural‑Network Weight Distributions
+
+### Empirical Observation
+
+If one plucks weight matrices from any pre‑trained transformer (LLaMA, GPT‑Neo, T5, etc.), vectorize them, and compute summary statistics, one consistently finds that the resulting distribution is **approximately zero‑centered Gaussian**. In mathematical form:
+\[
+w \sim \mathcal{N}\!\bigl(0,\sigma^2\bigr),
+\tag{2.5}
+\]
+with the standard deviation \(\sigma\) varying by layer but never exceeding a few units. This fact is not a regime‑specific accident: it holds for random initialization, for self‑supervised training in the language modeling objective, and for downstream fine‑tuning.
+
+A visual illustration of this property is a histogram of the weights in a particular attention head. The curve is bell‑shaped, symmetric around zero, with most values lying within \([-2\sigma,2\sigma]\).
+
+### Why Is This Important for Quantization?
+
+Quantization schemes that allocate bits uniformly across the numerical range (e.g. converting to an integer grid) suffer badly when the tensor’s distribution is *heavy‑tailed* or *skewed*: many quantization bins become empty. Conversely, for a normal distribution, one can design a *quantile‑optimal* representation that makes maximal use of the limited bits. Intuitively, we should spread more resolution around the peak where the density is high, and give less resolution to the tails.
+
+This is precisely the principle behind the **NormalFloat (NFk)** datatype introduced in QLoRA. By knowing that the weights follow a normal distribution, we can compute the exact quantiles and assign each bin to a value that reflects equal probability density. The resulting codec is *information‑theoretically optimal* because the entropy of a discretised normal distribution is maximised by a balanced quantile partition.
+
+### Computing the NFk Quantization Levels
+
+Let \(k\) be the number of bits per weight. The target is to split the interval \([-1,1]\) into \(2^k\) bins so that each bin contains exactly the same probability mass for a standard normal distribution \(\mathcal{N}(0,1)\). For each bin index \(i\in\{0,\dots,2^k-1\}\) we compute its representative value \(q_i\) as the average quantile of the interval borders:
+\[
+q_i \;=\;\frac{1}{2}
+   \Bigl(
+      Q_{\mathcal{N}}\!\bigl(\tfrac{i}{2^k+1}\bigr)
+      \;+\;
+      Q_{\mathcal{N}}\!\bigl(\tfrac{i+1}{2^k+1}\bigr)
+   \Bigr).
+   \tag{2.6}
+\]
+Here \(Q_{\mathcal{N}}\) is the inverse cumulative distribution function (the *probit*). The subtraction of \(\tfrac{1}{2^{k}+1}\) ensures that the edge bins are not-empty even for extreme values. Since the normal density is symmetric, we build a *symmetric* trecentary list but duplicate zero once. This yields an *asymmetric* but *zero‑exact* NFk data type: every integer code has a *unique* 32‑bit floating point value, and the exact zero can be represented with zero error.
+
+In practice, for NF4 (k = 4) the eighteen non‑zero quantisation levels fit into a small lookup table. When performing a *forward* dot product, we first multiply the input embedding by the NF4 weight, de‑quantise via the table lookup → BF16, and then compute the product as usual. The *backward* path follows the same route: we propagate gradients with respect to the *de‑quantised* weight, but we never compute or store gradients w.r.t the underlying NF4 tensor.
+
+### Quantile Estimation versus Exact Quantiles
+
+Alternative quantization strategies compute approximate quantiles (e.g. via medians or histograms). These are *fast* but can mis‑allocate bins if the empirical distribution is slightly skewed, leading to sub‑optimal precision near the tails. NF4 sidesteps the need for approximate estimation because we assume a normal prior; theoretical optimality guarantees that even with a small constant \(k\) we preserve more of the original tensor’s integrity than, say, a naïve 4‑bit integer quantizer.
+
+---
+
+# Summary
+
+We have dissected the three pillars on which QLoRA stands:
+
+1. **Block‑wise k‑bit quantization** permits a significant reduction in model size while preserving value distribution through per‑block scaling. It also opens the door to *double* quantization of the scaling constants themselves, economising further on memory.  
+
+2. **Low‑Rank Adapters (LoRA)** provide a powerful yet lightweight side channel to fine‑tune a frozen base. By adding a pair of low‑rank matrices per linear layer and scaling their contribution appropriately, we can recover performance comparable to full‑finetuning with an order‑of‑magnitude fewer trainable parameters.  
+
+3. **Memory Analysis** contrasts the enormous memory footprints of full fine‑tuning vs. LoRA, highlighting that in the latter case the dominant bottleneck shifts from weight gradients to activation gradients, which are inexpensive for small adapters.  
+
+4. **Normality of Weights** is not merely a statistical curiosity; it is the key enabler for **NormalFloat (NFk)**, the information‑theoretic optimal quantization scheme used in QLoRA. By aligning the quantizer directly with the underlying distribution, NF4 achieved higher empirical performance than generic 4‑bit integer or floating‑point representations.
+
+With these concepts firmly understood, the subsequent chapters can explain how QLoRA stitches them together into a pragmatic, high‑performance finite‑tuning procedure that brings 65‑B parameter models within reach of a single 48‑GB GPU.

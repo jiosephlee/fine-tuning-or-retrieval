@@ -1,0 +1,91 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### Why does FP8 FlashAttention‑3 achieve higher utilization than FP16 on Hopper?
+Question:
+The results show that FP8 reaches close to 1.2 PFLOPs/s while FP16 achieves up to 740 TFLOPs/s. Since FP8 is half the precision of FP16, I would expect lower throughput unless the algorithm is specifically optimized. What aspects of the FP8 kernel (e.g., operand packing, register reuse, pipeline depth) allow it to outperform the FP16 kernel in terms of TFLOPs/s? Is the 2× throughput gain simply due to the hardware, or are there additional algorithmic modifications?
+Answer:
+**Why FP8 FlashAttention‑3 can outperform FP16 on Hopper**
+
+The paper shows that the FP8 version of FlashAttention‑3 achieves almost **1.2 PFLOPs/s**, roughly **1.6 ×** the FP16 throughput (≈ 740 TFLOPs/s).  That ratio is more than what one would naively expect from a “half‑precision” format.  Two complementary reasons explain this:
+
+1. **Hardware‑level bandwidth boost**
+2. **Algorithmic changes that let the kernel keep the Tensor‑Cores busy**
+
+Below I describe how the kernel is engineered to make full use of Hopper’s FP8 Tensor‑Cores, and why the extra 2× comes from more than just the raw hardware multiplication.
+
+---
+
+### 1. Hopper’s FP8 Tensor‑Core throughput
+
+On Hopper the WGMMA instruction can target three precisions:
+
+| precision | multiply‑add throughput per SM |
+|-----------|--------------------------------|
+| FP16      |  989 TFLOPs/s  |
+| BF16      |  989 TFLOPs/s  |
+| FP8(e4m3) | 1980 TFLOPs/s |
+
+So a single WGMMA GEMM that uses FP8 operands produces **twice** as many FLOPs as the same GEMM in FP16, **for the same amount of instruction latency**.  This is the *hardware* source of the 2× boost.
+
+But only if the kernel is *able* to issue HW‑FP8 WGMMA instructions at full capacity does this matter.  The paper has invested heavily in making that possible.
+
+---
+
+### 2. Making the kernel FP8‑friendly
+
+#### a. Operand‑layout compliance
+
+FP8 WGMMA on Hopper accepts *k‑major* operands only.  In normal attention, the first GEMM (\(QK^T\)) is written in the form that permits an *mn‑major* layout for the Q matrix (contiguous in the query dimension) and K in k‑major (contiguous in the sequence dimension).  The second GEMM (\(PV\)) needs V in **k‑major** too – but V is naturally stored in *mn‑major* (contiguous in heads).  
+The kernel solves this by
+
+* **In‑kernel transpose of V tiles** using the `ldmatrix`/`stmatrix` instructions.  
+  These warp‑wide load/store ops can copy and transpose an 8 × 8 tile in a single instruction, and they are register‑efficient (they read 128 bytes directly into registers).  
+* **Register permutation** of the FP32 accumulator from the first WGMMA so that its layout matches the transposed V layout for the second WGMMA.  
+  The paper notes that a simple byte‑permute sequence (e.g., `{d0,d1,d4,d5,d2,d3,d6,d7}`) aligns the tiles without shuffles.
+
+Because these transformations are done entirely inside the warp‑group that is already active, no extra memory traffic or stalls are incurred.
+
+#### b. Co‑alesced memory traffic
+
+With the transpose performed in registers, the kernel can keep the data resident in shared memory for the whole time it is needed by both GEMMs.  The upstream TMA loads are still k‑major, so each load is 2‑byte aligned and fully coalesced.  This avoids the extra bandwidth that would otherwise be required for a full‑scale reshape in global memory.
+
+#### c. Block‑quantization & incoherent processing
+
+FP8 has a coarse mantissa (3 bits), so quantization errors can be large.  The kernel lowers this error in two ways that do not disturb throughput:
+
+1. **Block quantization** – one scale per block (e.g., per \(B_r\) rows of Q or per \(B_c\) rows of K/V) instead of one per tensor.  This keeps the same number of FP8 operands (the same arithmetic) but reduces the dynamic range that each block must support, so the 3‑bit mantissa is more useful.  The block scale is simply multiplied into the partial‑sum during accumulation; no extra ops are needed.
+2. **Incoherent processing** – before quantizing, each row of Q and K is multiplied by a random orthogonal matrix \(M\) (product of diagonal \(±1\) and a Hadamard matrix).  Because \(M M^T = I\), the product \(QK^T\) is unchanged, but the entries of Q and K become “smoothed” and outliers are spread out.  The matrix multiply is O(d log d), and the paper shows it can be fused with rotary embedding, giving no extra runtime cost.
+
+These numeric tricks have **no impact** on the 4‑byte FP8 operands that are fed into the Tensor‑Cores; they only affect the scaling factors and the data that is *pre‑compressed*.
+
+---
+
+### 3. Overlap of computation and data movement
+
+Even with fast FP8 matrix ops, the attention kernel has non‑GEMM work: subtracting the row‑max, exponentiating, and normalising.  
+Hopper separates the TF‑MMA and the special‑function units, so the kernel can schedule
+
+* a second warp‑group doing \(\widetilde{P}\,V\) (the second WGMMA) while
+* another warp‑group doing the softmax (exp, sum) for the *next* block of scores.
+
+This **2‑stage overlapped pipeline** (described in §4.2 of the paper) lets the Tensor‑Cores stay busy most of the time.  The old, non‑overlapped kernels saw a large fraction of the cycle spent on softmax, but the new design hides that latency.  In the FP8 kernel the effect is even more pronounced because the WGMMA throughput is already twice that of FP16; the softmax no longer becomes a serial bottleneck.
+
+---
+
+### 4. The resulting “throughput boost”
+
+Combining the above:
+
+* **Hardware**: FP8 WGMMA delivers 2 × the FLOPs.
+* **Kernel design**: operand layout transformations, in‑kernel transposition, and register permutations make the kernel *able* to issue those FP8 WGMMA instructions without stalls.
+* **Overlap**: the 2‑stage pipeline hides the slower softmax part, keeping the Tensor‑Cores busy.
+
+The 1.2 PFLOPs/s observed in the paper is 70–80 % of the theoretical 1.5 PFLOPs/s peak for Hopper, which is close to what a perfect FP8 GEMM would achieve.  The FP16 kernel, despite being perfectly foward, runs at only ~740 TFLOPs/s because the same overlap and layout tricks are not needed (the Tensor‑Cores are already saturated, and the softmax remains a serial cost).
+
+So the 2× throughput gain is **not solely** a hardware feature; it is a *synergistic* effect of:
+
+1. exploiting the 2× FP8 throughput,
+2. re‑organising data flow so that the accelerator can use FP8,
+3. overlapping the remaining low‑throughput operations with matrix multiplication.
+
+This combination is what allows FlashAttention‑3 to use FP8 more efficiently than FP16 on Hopper.

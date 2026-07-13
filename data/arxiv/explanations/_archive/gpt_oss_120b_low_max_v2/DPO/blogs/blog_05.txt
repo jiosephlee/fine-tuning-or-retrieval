@@ -1,0 +1,364 @@
+\title{Blogs about the Paper: "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"}
+
+# How to Deploy Direct Preference Optimization in Your Own Project  
+
+*Turn human preferences into a fine‑tuned language model without any reinforcement learning. In this tutorial we walk through building a preference dataset, picking a reference model, coding the DPO loss with PyTorch / 🤗 Transformers, and fine‑tuning a ~2 B‑parameter LM. We finish with practical tips on hyper‑parameters and common pitfalls.*
+
+---
+
+## 1. Why Direct Preference Optimization (DPO)?
+
+Traditional RLHF pipelines train three separate components:
+
+1. **Supervised Fine‑Tuning (SFT)** – a base LM that already knows how to generate text.  
+2. **Reward Model** – learned from human pairwise comparisons.  
+3. **RL step (usually PPO)** – maximizes the reward while staying close to the SFT model via a KL penalty.
+
+This pipeline is powerful but heavyweight: you need to generate samples during training, tune PPO clipping parameters, and keep the reward model stable.  
+
+DPO replaces the whole reward‑model + RL stage with a single binary‑cross‑entropy loss that directly reshapes the policy’s probability distribution:
+
+\[
+\mathcal{L}_{\text{DPO}}(\theta)=-
+\mathbb{E}_{(x,y_w,y_l)\sim\mathcal{D}}
+\log\sigma\!\Bigl(
+\beta \log\frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)}-
+\beta \log\frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}
+\Bigr)
+\]
+
+Here  
+
+* \(\pi_{\text{ref}}\) is the reference (usually the SFT) model,  
+* \(\pi_\theta\) is the model we are fine‑tuning,  
+* \(y_w\) / \(y_l\) are the preferred and dispreferred completions, and  
+* \(\beta\) controls how strongly we push the policy toward the preferred answer (larger \(\beta\) → tighter KL constraint).
+
+Because the loss is just a standard cross‑entropy term, training reduces to ordinary gradient descent—no sampling loop, no value function, no PPO hyper‑parameters.
+
+---
+
+## 2. Preparing a Preference Dataset  
+
+### 2.1 Collecting Pairwise Comparisons  
+
+A DPO dataset \(\mathcal{D}\) consists of triples \((x, y_w, y_l)\). The easiest way to collect them:
+
+| Step | What you do | Tooling ideas |
+|------|--------------|---------------|
+| **Prompt selection** | Choose a set of inputs \(x\) relevant to your task (e.g., “Write a positive review of …”). | Pull examples from your downstream corpus or generate synthetic prompts with GPT‑4. |
+| **Sample two completions** | Run your *reference* model \(\pi_{\text{ref}}\) twice (or use two different models) to obtain \(y_1, y_2\). | `model.generate` with `do_sample=True`, `temperature=0.7`. |
+| **Human labeling** | Show annotators the prompt and both completions; ask which is *better* (or “more helpful”). | Use lightweight UIs like **Prolific**, **Scale AI**, or an internal Google Form. |
+| **Store triples** | Record `prompt`, `preferred`, `rejected`. | CSV / JSONL works fine (`{"prompt":..., "chosen":..., "rejected":...}`).
+
+If you lack budget for human annotators, you can bootstrap with a *proxy* classifier—e.g., a sentiment model for sentiment control or an automatic summarization metric for TL;DR tasks—as long as you treat it as “pseudo‑preferences”. The original DPO paper demonstrated that such synthetic preferences still yield useful policies.
+
+### 2.2 Formatting for PyTorch  
+
+```python
+import json
+from pathlib import Path
+
+def load_preferences(path: str):
+    data = []
+    for line in Path(path).read_text().splitlines():
+        obj = json.loads(line)
+        data.append((obj["prompt"], obj["chosen"], obj["rejected"]))
+    return data
+```
+
+You’ll later feed these strings into the tokenizer of your LM.
+
+---
+
+## 3. Choosing & Loading the Reference Model  
+
+The reference model should be *the same architecture* you intend to fine‑tune because DPO needs both \(\pi_{\text{ref}}\) and \(\pi_\theta\) probabilities for each token. Typical workflow:
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model_name = "EleutherAI/pythia-2b"   # ~2 B parameters
+tokenizer   = AutoTokenizer.from_pretrained(model_name)
+tokenizer.pad_token = tokenizer.eos_token   # ensure padding works
+
+# Load reference (SFT) checkpoint
+ref_model = AutoModelForCausalLM.from_pretrained(
+    "path/to/your/sft_checkpoint",  # can be same as base if you skip SFT
+    device_map="auto"
+)
+ref_model.eval()   # keep it frozen during DPO training
+```
+
+If you have an existing SFT checkpoint (e.g., after instruction‑tuning), use it as the reference; otherwise just load the raw pretrained checkpoint—this matches how DPO papers initialize \(\pi_{\text{ref}}\).
+
+---
+
+## 4. Implementing the DPO Loss  
+
+Below is a compact PyTorch implementation that works with 🤗 Transformers.
+
+```python
+import torch
+import torch.nn.functional as F
+
+beta = 0.1                # typical starting value; see §7 for tuning
+
+def log_prob(model, input_ids, attention_mask):
+    """
+    Returns log probabilities of each token given its prefix.
+    Shape: (batch, seq_len)
+    """
+    with torch.no_grad():                     # ref model is frozen
+        outputs = model(input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=False,
+                        return_dict=True)
+    # logits shape: (batch, seq_len, vocab)
+    logits = outputs.logits
+    # shift so that token i predicts token i+1
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = input_ids[:, 1:].contiguous()
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+
+    # Gather log prob of the true next token
+    token_logp = log_probs.gather(2,
+                 shift_labels.unsqueeze(-1)).squeeze(-1)   # (batch, seq_len-1)
+
+    # Mask padding tokens
+    if attention_mask is not None:
+        token_logp = token_logp * attention_mask[:, 1:]
+
+    # Sum over sequence dimension -> total log prob of whole completion
+    seq_logp = token_logp.sum(dim=-1)      # (batch,)
+    return seq_logp
+
+def dpo_loss(theta_model,
+             ref_model,
+             batch):
+    """
+    batch: dict with keys `prompt_ids`, `chosen_ids`, `rejected_ids`,
+           each already padded + attention mask tensors.
+    """
+    # ----- logs under current policy -----
+    pi_chosen   = log_prob(theta_model,
+                           batch["chosen_ids"],
+                           batch["chosen_mask"])
+    pi_reject   = log_prob(theta_model,
+                           batch["rejected_ids"],
+                           batch["reject_mask"])
+
+    # ----- logs under reference -----
+    pi_ref_chosen = log_prob(ref_model,
+                             batch["chosen_ids"],
+                             batch["chosen_mask"])
+    pi_ref_reject = log_prob(ref_model,
+                             batch["rejected_ids"],
+                             batch["reject_mask"])
+
+    # Compute the DPO score inside σ()
+    diff = beta * ( (pi_chosen - pi_ref_chosen)
+                  - (pi_reject - pi_ref_reject) )   # shape (batch,)
+    
+    loss = -F.logsigmoid(diff).mean()
+    return loss
+```
+
+### DataLoader preparation
+
+```python
+from torch.utils.data import Dataset, DataLoader
+
+class DPODataset(Dataset):
+    def __init__(self, triples, tokenizer, max_len=256):
+        self.triples = triples
+        self.tok = tokenizer
+        self.max_len = max_len
+    
+    def __len__(self): return len(self.triples)
+
+    def __getitem__(self, idx):
+        prompt, chosen, rejected = self.triples[idx]
+
+        # Encode each piece separately then concatenate prompt+completion.
+        enc_prompt   = self.tok(prompt,
+                                truncation=True,
+                                max_length=self.max_len,
+                                add_special_tokens=False)
+        enc_chosen   = self.tok(chosen,
+                                truncation=True,
+                                max_length=self.max_len,
+                                add_special_tokens=False)
+        enc_reject   = self.tok(rejected,
+                                truncation=True,
+                                max_length=self.max_len,
+                                add_special_tokens=False)
+
+        def combine(p,c):
+            ids   = p['input_ids'] + c['input_ids'] + [self.tok.eos_token_id]
+            mask  = p['attention_mask'] + c['attention_mask'] + [1]
+            ids   = ids[:self.max_len]
+            mask  = mask[:self.max_len]
+            return torch.tensor(ids), torch.tensor(mask)
+
+        chosen_ids, chosen_mask       = combine(enc_prompt, enc_chosen)
+        reject_ids, reject_mask       = combine(enc_prompt, enc_reject)
+
+        return {
+            "prompt_ids": torch.tensor(enc_prompt['input_ids']),
+            "chosen_ids": chosen_ids,
+            "chosen_mask": chosen_mask,
+            "rejected_ids": reject_ids,
+            "reject_mask": reject_mask,
+        }
+
+dset   = DPODataset(preferences, tokenizer)
+loader  = DataLoader(dset,
+                     batch_size=8,
+                     shuffle=True,
+                     collate_fn=lambda x: {k: torch.stack([d[k] for d in x])
+                                          for k in x[0]})
+```
+
+### Training loop
+
+```python
+from transformers import AdamW, get_scheduler
+
+model      = AutoModelForCausalLM.from_pretrained(model_name).to("cuda")
+optimizer  = AdamW(model.parameters(), lr=5e-6)
+
+num_epochs   = 3
+num_steps    = len(loader) * num_epochs
+scheduler    = get_scheduler("linear",
+                            optimizer=optimizer,
+                            num_warmup_steps=int(0.1*num_steps),
+                            num_training_steps=num_steps)
+
+model.train()
+for epoch in range(num_epochs):
+    for step,batch in enumerate(loader):
+        loss = dpo_loss(model, ref_model, batch)
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+        if step % 100 == 0:
+            print(f"epoch {epoch} step {step} loss {loss.item():.4f}")
+```
+
+That’s it—once training finishes you have a model that directly embodies the preferences encoded in your dataset.
+
+---
+
+## 5. Hyper‑parameter Guidelines  
+
+| Hyper‑parameter | What it controls | Reasonable range / tip |
+|-----------------|------------------|------------------------|
+| `beta`          | Strength of KL regularization (larger → less drift from reference). | Start with `0.1`. For aggressive steering try `0.5`. If KL blows up (>10 bits per token) reduce it. |
+| Learning rate (`lr`) | Step size for policy update. | Because DPO gradients are similar magnitude to standard LM fine‑tuning, `5e-6`–`2e-5` works well for 2 B models. |
+| Batch size      | Number of preference triples per update; larger batches reduce variance of the importance weight term (`σ` argument). | With GPU memory ~24 GB you can push to 32; otherwise 8–16 is fine. |
+| Max sequence length (`max_len`) | Upper bound on total prompt+completion tokens used for log‑prob computation. | Keep it low enough (<256 tokens) to avoid excessive padding while still covering your completions fully. |
+| Number of epochs / steps | Training horizon before over‑fitting preferences becomes visible. | Monitor validation win‑rate; early stopping after ~3–5 epochs usually suffices for ~10k preference pairs. |
+
+**Tip:** Track two metrics on a hold‑out preference set:  
+
+1. **Preference accuracy** – fraction of pairs where your current policy ranks the preferred completion higher (just compute Eq.(5)).  
+2. **Average KL** – compute sequence‑level KL between \(\pi_\theta\) and \(\pi_{\text{ref}}\).  
+
+A good DPO run will climb accuracy while keeping KL modest (<5 bits per token). If KL skyrockets early on, lower `beta`.
+
+---
+
+## 6. Troubleshooting Common Issues  
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| **Policy collapses to always output the preferred completion** (very low diversity). | `beta` too high → KL term dominates; model overfits to narrow set of tokens.| Reduce `beta` or add small temperature during generation at inference time. |
+| **Training diverges (loss becomes NaN or spikes)** | Log probabilities underflow because of extremely long sequences or missing padding masks.| Verify that masks are correctly aligned; clip sequence length; add `torch.nn.utils.clip_grad_norm_`. |
+| **Preference accuracy stalls at ~60% despite many epochs** | Preference data may be noisy or insufficiently varied.| Increase dataset size; optionally augment with synthetic preferences from a high‑quality classifier; double‑check label quality. |
+| **Large KL but high reward** | Model drifts far from reference; may be okay if you intentionally want aggressive steering.| If you care about preserving base knowledge (e.g., factuality), lower `beta` or keep a small fraction of SFT data mixed in (simple “mixed fine‑tune”). |
+
+---
+
+## 7. Evaluation Checklist  
+
+After training:
+
+1️⃣ **Win rate against reference** – Use GPT‑4 or human judges to compare generated outputs from \(\pi_\theta\) vs.\ \(\pi_{\text{ref}}\).  
+2️⃣ **KL measurement** – Compute average per‑token KL on an unseen prompt set:  
+
+```python
+def avg_kl(policy_model, ref_model, prompts):
+    ks = []
+    for p in prompts:
+        ids   = tokenizer(p, return_tensors="pt").input_ids.to("cuda")
+        # sample two completions per prompt for stable estimate
+        out_pi  = policy_model.generate(ids,
+                                        max_length=ids.shape[-1]+50,
+                                        do_sample=True)
+        out_ref= ref_model.generate(ids,
+                                    max_length=ids.shape[-1]+50,
+                                    do_sample=True)
+
+        pi_logp   = log_prob(policy_model,out_pi,out_pi.ne(tokenizer.pad_token_id))
+        ref_logp  = log_prob(ref_model ,out_pi,out_pi.ne(tokenizer.pad_token_id))
+        ks.append((pi_logp - ref_logp).exp().log().mean().item())
+    return sum(ks)/len(ks)
+```
+
+3️⃣ **Task-specific metrics** – ROUGE for summarization, sentiment classifier score for sentiment control etc., but always corroborate with human judgment because automated metrics can be misaligned.
+
+---
+
+## 8️⃣ End‑to‑End Example (Putting It All Together)
+
+```bash
+# 1️⃣ Install dependencies
+pip install torch transformers datasets tqdm
+
+# 2️⃣ Prepare data (assume prefs.jsonl exists)
+python prepare.py --input prefs.jsonl --output train.pkl
+
+# 3️⃣ Run training
+python dpo_train.py \
+     --model EleutherAI/pythia-2b \
+     --ref_ckpt path/to/sft_ckpt \
+     --train_data train.pkl \
+     --beta 0.1 \
+     --lr 5e-6 \
+     --epochs 3 \
+     --batch_size 8 \
+     --max_len 256 \
+     --output_dir ./dpo_2b_final
+```
+
+`dpo_train.py` would contain roughly the code fragments above wrapped into argparse handling and periodic validation logging.
+
+When training finishes:
+
+```bash
+python eval_winrate.py \
+      --model_dir ./dpo_2b_final \
+      --ref_dir path/to/sft_ckpt \
+      --eval_set path/to/test_prompts.txt \
+      --gpt4_prompt_path prompts/gpt4_eval.txt
+```
+
+You’ll get a concise table reporting win rates and average KL—ready to report in a paper or product demo.
+
+---
+
+## 9️⃣ Final Thoughts  
+
+Direct Preference Optimization removes the most cumbersome part of RLHF: reinforcement learning itself. By reparameterizing rewards as log‑probability ratios relative to a frozen reference model we obtain a clean cross‑entropy objective that can be trained with any modern deep learning stack.
+
+*Key takeaways*  
+
+* You only need **one** model at inference time—no separate reward network or PPO actor/critic pair.
+* The method scales exactly like standard supervised fine‑tuning; training cost is dominated by forward passes through both policy and reference models.
+* Hyper‑parameters are minimal: essentially `beta`, learning rate and batch size.
+* Empirically DPO matches or exceeds PPO on sentiment control, summarization and dialogue tasks while being far easier to reproduce.
+
+Give it a try on your next alignment experiment—whether you’re nudging an assistant toward helpfulness or biasing generation toward a specific style—without spending weeks wrestling with PPO clipping schedules! Happy fine‑tuning!

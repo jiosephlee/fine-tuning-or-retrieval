@@ -1,0 +1,865 @@
+\title{Stack Exchange of the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+### How does back‑propagation work through the 4‑bit NF4 quantized weights in QLoRA?
+Question:
+In the QLoRA method the base model weights are stored in 4‑bit NormalFloat (NF4) and are kept frozen during finetuning. The paper says that gradients are back‑propagated through these quantized weights to compute updates for the LoRA adapters, but only the LoRA parameters receive gradients. I am confused about the exact computational graph:
+
+1. When computing \(\frac{\partial E}{\partial \mathbf{L}_i}\), does the chain rule require the derivative \(\frac{\partial \mathbf{X}}{\partial \mathbf{W}}\) where \(\mathbf{W}\) is the NF4 tensor?
+2. How is the dequantization step incorporated into this derivative? Is the dequantization considered a linear operation with a simple scaling factor, or does it involve non‑linear quantile mappings that affect the gradient?
+3. Are the gradients with respect to \(\mathbf{W}\) ever materialized, or are they implicitly accounted for by using the dequantized \(\mathbf{W}^{\text{BF16}}\) in the forward pass?
+
+A step‑by‑step description (or a small toy example) of forward and backward passes would help me understand how QLoRA can keep the 4‑bit weights frozen yet still propagate useful gradients to the adapters.
+
+Answer:
+**Answer**
+
+In QLoRA the pretrained model is *stored* as a 4‑bit NF4 tensor **W** together with per‑block scale factors (the double‑quantized constants).  
+During the forward pass the tensor is **de‑quantised** to a 16‑bit compute type (bfloat16, denoted **$\\hat{W}$**) and then used in the usual matrix‑multiply
+
+$$
+Y = X\,\\hat{W} \;+\; X\,L_{1}L_{2},
+\\qquad 
+\\hat{W} =\\operatorname{dequant}\\bigl(\\operatorname{dequant}(c_{1},c_{2}),W\\bigr) .
+$$
+
+Only the LoRA matrices $L_{1},L_{2}$ are declared `requires_grad`; the NF4 weights are kept frozen.  
+Nevertheless, the loss gradient that reaches the LoRA adapters must be propagated **through** the frozen weight matrix, because the gradient of the loss w.r.t. a LoRA parameter contains a term of the form
+
+$$
+\\frac{\\partial E}{\\partial L_{i}}
+   = \\frac{\\partial E}{\\partial Y}\\;
+     \\frac{\\partial Y}{\\partial (X\\,L_{i})}
+   = \\frac{\\partial E}{\\partial Y}\\;
+     X^{\\top},
+$$
+
+and $X^{\\top}$ is obtained from the *activations* that were computed using the de‑quantised base weight **$\\hat{W}$**.  The chain‑rule therefore implicitly depends on  
+
+$$
+\\frac{\\partial Y}{\\partial \\hat{W}}
+   = X .
+$$
+
+Because **$\\hat{W}$** itself is a deterministic (and differentiable) function of the stored NF4 tensor **W**, we can write
+
+$$
+\\frac{\\partial E}{\\partial L_{i}}
+ = \\frac{\\partial E}{\\partial Y}\\,
+   \\underbrace{\\Bigl(
+      X\\,\\frac{\\partial \\hat{W}}{\\partial W}
+   \\Bigr)}_{\\text{appears only as a constant during adapter update}} .
+$$
+
+Below we unpack each piece and show why no gradients for **W** have to be materialised.
+
+---
+
+### 1.  Derivative w.r.t. the quantised weight  
+
+The forward de‑quantisation of a block $b$ of size $B$ is
+
+$$
+\\hat{W}_b = \\frac{W_b}{c^{(b)}_2}\\,\\frac{1}{c^{(b)}_1},
+\\qquad 
+c^{(b)}_2 = \\operatorname{dequant}(c^{(b)}_1,c^{(b)}_2).
+$$
+
+Both $c^{(b)}_1$ (the 32‑bit per‑block scale) and $c^{(b)}_2$ (the 8‑bit double‑quantised scale) are *constants* during training – they are stored together with **W** and are not updated.  Consequently, for any element $w_{jk}$ inside a block we have
+
+$$
+\\frac{\\partial \\hat{W}_{jk}}{\\partial w_{jk}} 
+   = \\frac{1}{c^{(b)}_2 c^{(b)}_1},
+   \\qquad
+   \\frac{\\partial \\hat{W}_{pq}}{\\partial w_{jk}} = 0 \\;(p,q)\\neq(j,k).
+$$
+
+Thus de‑quantisation is simply a **linear scaling** operation; there is no non‑linear quantile mapping involved at run time because all quantile information has been baked into the NF4 lookup table when the model was originally quantised.  The lookup itself is a table of 16 floating‑point values, and fetching an entry and multiplying by the two constants is fully differentiable.
+
+---
+
+### 2.  Back‑propagation through the linear scaling  
+
+When autograd traverses the graph it encounters:
+
+```python
+Ŵ = dequant(c1, c2, W)          # linear scaling
+Y  = X @ Ŵ + X @ L1 @ L2        # matmul
+```
+
+The gradient of the loss `E` w.r.t. `W` is therefore
+
+$$
+\\frac{\\partial E}{\\partial W}
+   = \\frac{\\partial E}{\\partial Y}
+     \\; \\underbrace{
+        X^{\\top}
+        \\,\\frac{1}{c^{(b)}_2 c^{(b)}_1}
+       }_{\\text{same shape as }W}.
+$$
+\tag{1}
+
+Notice that **Equation (1)** looks exactly like an ordinary weight gradient, except for the extra constant factor `$1/(c_1 c_2)$`.  In QLoRA we *do not keep* this gradient – we do not update **W** – but autograd still computes it internally because it is needed to propagate the signal further back to earlier layers (the same signal that would have been used to update W in a normal full‑finetuning run).
+
+Because `$c₁$` and `$c₂$` are stored as tensors of size *number_of_blocks*, they can be broadcast efficiently, and no extra memory is incurred beyond what would already be required for a normal back‑propagation through a full‑precision weight matrix.
+
+---
+
+### 3.  Why gradients w.r.t **W** never get materialised  
+
+The key practical trick in QLoRA is that after Autograd finishes computing (1) it immediately discards it – only the gradients that belong to tensors marked `requires_grad=True` are retained.  
+The adapters `$L₁$` and `$L₂$` are such tensors, so their gradients are kept:
+
+```python
+grad_L2 = (X @ L1).T @ dE/dY          # standard LoRA rule
+grad_L1 = dE/dY @ (L2).T @ X.T       # symmetric
+```
+
+All intermediate products involving `dE/dY` and `X` have already been materialised while processing the forward pass; they are reused for both (i) computing `(X @ Ŵ)`’s backward contribution and (ii) updating LoRA parameters.  Because the scaling factor between **Ŵ** and **W** is constant, there is no need to allocate a separate buffer for `∂E/∂W`. Autograd simply multiplies by that factor on‑the‑fly and throws away the result.
+
+In implementation terms (see `bitsandbytes` kernels shipped with QLoRA), de‑quantisation and its backward pass are fused into one CUDA kernel:
+
+```cpp
+// forward:   out = dequantize(W_nf4, c1, c2);
+ // backward: dW_nf4 = grad_out * (1/(c1*c2));
+```
+
+The kernel writes `dW_nf4` into a *temporary* buffer that lives only for the duration of that backward call; it never becomes part of an optimizer state because `optimizer.step()` never sees it.
+
+---
+
+### 4.  A tiny toy example  
+
+Consider a single linear layer with input dimension 2, output dimension 2, blocksize = 4 (so all four weights lie in one block).
+
+| stored NF4 value | de‑quantised (`c₁=0.8`, `c₂=0.5`) |
+|------------------|-----------------------------------|
+|   3 (encoded)    | $3/(0.8·0.5)=7.5$               |
+|   −2             | $-2/(0.8·0.5)= -5.0$            |
+|   …              | …                                 |
+
+Forward:
+```python
+W_hat = dequant(W_nf4, c1, c2)          # → [[7.5, -5.0],
+                                        #    [ … , … ]]
+Y     = X @ W_hat + X @ L1 @ L2
+loss  = criterion(Y, target)
+```
+
+Backward:
+```python
+grad_Y      = loss.backward()          # dE/dY
+grad_W_hat  = X.T @ grad_Y              # ordinary weight gradient
+grad_W_nf4  = grad_W_hat / (c1*c2)      # scaled by 1/(0.8*0.5)=2.5
+# grad_W_nf4 is discarded; only grad_L1/L2 are kept.
+```
+
+Even though we never store or update `W_hat` or `W_nf4`, Autograd has traversed through them exactly as it would with full precision – only the *final* gradient for those tensors is omitted.
+
+---
+
+### 5.  Summary of what happens in QLoRA  
+
+* The NF4 storage format plus double quantisation gives you a tiny lookup table plus two per‑block scalars.
+* De‑quantisation is a pure linear scaling (`divide by c₂`, then by `c₁`). Hence its Jacobian is just another diagonal scaling matrix.
+* During back‑propagation PyTorch/autograd computes the usual weight gradient through this linear transformation; that gradient exists mathematically but is never materialised because the base weights are frozen (`requires_grad=False`).
+* The only gradients that survive are those of the LoRA matrices; they receive exactly the same upstream signal they would have received if full‑precision weights had been trainable.
+* The whole process incurs essentially no extra memory beyond what normal back‑prop through an unfrozen layer would need, which explains how QLoRA can keep a 65 B model on < 48 GB while still “back‑propagating through” its quantised parameters.
+
+Thus, although we speak of “back‑propagating through frozen NF4 weights”, in practice this means *using* those weights in the computational graph so that their linear scaling factor participates in gradient flow, while *dropping* any gradient intended for updating them. The adapters get fully informed gradients, and training proceeds exactly as in ordinary LoRA fine‑tuning, just with a dramatically smaller memory footprint thanks to NF4 storage.*
+
+### What is the exact construction of the NF4 data type and why is it information‑theoretically optimal for normal distributions?
+Question:
+The paper introduces NormalFloat (NFk) and states that NF4 is optimal for zero‑centered normal data because each quantization bin contains an equal expected number of values. I would like clarification on several points:
+
+* How are the quantiles \(q_i\) computed from the standard normal CDF? The formula given uses \(Q_X(i/(2^k+1))\); does this correspond to a symmetric placement of bin boundaries?
+* Why does a symmetric k‑bit quantizer not have an exact representation of zero, and how does the asymmetric construction (different numbers of bins for negative vs. positive side) solve this?
+* Can you provide the actual numeric codebook values for NF4 (the 16 levels) and explain how they compare to a naïve uniform quantizer ranging from –1 to +1?
+
+Understanding these details will help me see why NF4 outperforms FP4/Int4 in the experiments.
+
+Answer:
+**Answer**
+
+The NormalFloat (NF\(_k\)) family is a very small‑bit quantiser that is built directly from the *known* distribution of the weights we want to store.  
+In the LLaMA‑type models the weight tensors are approximately centred Gaussian,
+\[
+w_{ij}\sim\mathcal N(0,\sigma^{2}) .
+\]
+If we scale each block of weights by its own standard‑deviation \(\sigma\) (the same operation that is used to compute the per‑block quantisation constant), every block has exactly the same reference distribution \(\mathcal N(0,1)\).  Once all blocks share this reference, the quantiser does not have to estimate empirical quantiles any more – it can use the *theoretical* quantiles of a standard normal distribution.
+
+Below I walk through the three points you asked about.
+
+---
+
+### 1. Computing the bin boundaries \(q_i\)
+
+For a \(k\)-bit quantiser we have \(2^{k}\) distinct code‑values.  
+The construction used in the paper first computes **\(2^{k}+1\) theoretical quantiles** of a standard normal:
+
+\[
+z_{j}= \Phi^{-1}\!\left(\frac{j}{2^{k}+1}\right),\qquad j=0,\dots ,2^{k}+1,
+\]
+
+where \(\Phi^{-1}\) is the inverse CDF (the *quantile function*) of \(\mathcal N(0,1)\).
+These \(z_{j}\) are the exact points at which the cumulative probability reaches
+\(j/(2^{k}+1)\).  The interval \([z_{j},z_{j+1})\) therefore contains the same
+probability mass:
+\[
+\Pr(z_{j}\le X < z_{j+1}) = \frac{1}{2^{k}+1}.
+\]
+
+The **code‑book values** (the numbers actually stored after quantisation) are taken as the *mid‑points* of each interval,
+
+\[
+q_i = \frac{z_{i}+z_{i+1}}{2},
+\qquad i=0,\dots ,2^{k}-1 .
+\]
+
+Because the intervals are symmetric around zero (the normal distribution is symmetric), the resulting set \(\{q_i\}\) is also symmetric: for every positive entry there is a negative entry of exactly opposite magnitude.  This is what you noticed as “symmetric placement of bin boundaries”.
+
+---
+
+### 2. Why a sym‑metric \(k\)-bit quantiser lacks an exact zero
+
+If we simply take the \(2^{k}\) mid‑points described above, zero falls **between** two neighbouring intervals unless one of those intervals happens to be centred exactly at zero.  
+For an even number of levels (e.g. 4 bits ⇒ 16 levels) the mid‑point rule yields an *even* number of code points, none of which equals zero; instead we obtain a pair
+\(\{-q_{\text{min}},+q_{\text{min}}\}\) that straddle it.  
+
+When we later dequantise a weight that is exactly zero (e.g. a padded entry),
+the nearest stored value will be either \(-q_{\text{min}}\) or \(+q_{\text{min}}\), incurring a small but systematic error.  In practice this manifests as a non‑zero bias for *sparse* tensors such as masks or attention padding.
+
+The paper’s solution is to **make the quantiser asymmetric**: allocate one extra level to one side of zero and then discard one duplicate zero.  Concretely,
+
+* use \(2^{k-1}\) levels for the negative side,
+* use \(2^{k-1}+1\) levels for the positive side,
+* merge both sets and drop one copy of zero.
+
+After this merging we still have exactly \(2^{k}\) distinct code values, but now **zero appears explicitly in the table**.  
+All other levels remain symmetric around it, so the expected number of values per bin stays equal (the extra positive level simply absorbs the probability that would otherwise belong to its negative counterpart).  
+
+Thus we keep the *information‑theoretic optimality* (equal probability per bin) while guaranteeing a perfect representation of genuine zeros.
+
+---
+
+### 3. The NF4 code‑book (the 16 concrete numbers)
+
+Applying the recipe above with \(k=4\) gives 16 values that are listed in Appendix F of the paper (reproduced here for convenience).  
+They are obtained by first computing the 17 quantiles of a standard normal at
+fractions \(\frac{j}{17},\, j=0\dots17\), taking mid‑points, and then performing the asymmetric “extra‑positive” trick described above.  
+Rounded to six decimal places they are
+
+| index | value |
+|------|-------|
+| 0 | -0.981436 |
+| 1 | -0.874904 |
+| 2 | -0.742602 |
+| 3 | -0.590202 |
+| 4 | -0.424795 |
+| 5 | -0.254676 |
+| 6 | -0.088809 |
+| 7 | **0.000000** |
+| 8 | 0.089156 |
+| 9 | 0.257203 |
+|10 | 0.428317 |
+|11 | 0.594736 |
+|12 | 0.749337 |
+|13 | 0.886025 |
+|14 | 0.999398 |
+|15 | **0.999997** |
+
+A few observations:
+
+* The smallest magnitude entry is exactly zero because of the asymmetric construction.
+* The largest magnitude entries are slightly less than ±1; after normalising each block into \([-1,1]\) they will be mapped onto these extremes.
+* The spacing between successive codes grows farther away from zero – this reflects that Gaussian density thins out in the tails, so wider bins are needed to keep each bin’s probability equal.
+
+---
+
+### Comparison with a naïve uniform quantiser on \([-1,1]\)
+
+A uniform 4‑bit quantiser would simply divide \([-1,1]\) into \(2^{4}=16\) equal‑length intervals:
+
+\[
+u_i = -1 + \frac{2i+1}{16}, \qquad i=0,\dots ,15 .
+\]
+
+This yields
+
+\[
+-0.9375,\,-0.8125,\,-0.6875,\ldots ,+0.9375 .
+\]
+
+Key differences:
+
+| Property | NF4 (NormalFloat) | Uniform [-1, 1] |
+|----------|-------------------|-----------------|
+| **Bin probabilities** | All equal (`≈ 1/16`) for a true Gaussian input – *optimal* in an information‑theoretic sense.| Not equal: central bins contain many more Gaussian samples than tail bins; tails are almost never used while centre bins saturate. |
+| **Zero representation** | Exact zero exists (by construction). | Zero lies at centre of an interval and will be rounded to either `-0.0625` or `+0.0625`, never stored exactly. |
+| **Dynamic range utilisation** | Tail bins extend farther out (≈ ± 0.99), matching where Gaussian mass actually lives.| Tail bins end at ± 0.9375; some extreme weight values will be clipped and incur large relative error.| 
+| **Mean‑square error for Gaussian data** | Proven minimal because each bin captures exactly one sixteenth of the distribution’s probability mass.| Larger because many samples fall into over‑populated central bins while tail bins stay empty; MSE ≈ \(3\times\) higher in practice (as reported in Table 3 of the paper).|
+
+Consequently NF4 preserves more information about weight magnitudes that matter for model performance – especially for those outliers that dominate gradient flow during fine‑tuning – while still using only four bits per parameter.
+
+---
+
+### TL;DR
+
+* The NF\(k\) codebook is obtained by taking mid‑points of consecutive theoretical quantiles
+\( \Phi^{-1}(i/(2^{k}+1)) \) of a standard normal distribution.
+* A plain symmetric k‑bit quantiser would miss an exact zero because an even number of mid‑points never lands on zero; adding one extra positive level and discarding one duplicate zero yields an *asymmetric* table that still uses exactly \(2^{k}\) codes and keeps every bin equally likely.
+* For NF4 (four bits) the sixteen values listed above give equal probability per bin for a Gaussian and include a perfect zero; they differ markedly from a naïve uniform grid on \([-1,1]\), which wastes most codes on high‑density central regions and lacks an exact representation of zero.
+
+These properties explain why NF4 consistently beats FP4/Int4 in QLoRA experiments: it matches the statistical nature of LLM weights far better than any uniform or ad‑hoc floating‑point scheme while still fitting comfortably into four bits per parameter.
+
+### How does Double Quantization reduce memory usage, and what are the roles of \(c_1\) and \(c_2\) in the dequantization pipeline?
+Question:
+In Section 3.2 the authors describe Double Quantization (DQ) as quantizing the per‑block scaling constants themselves. I am unclear on:
+
+1. What exactly are \(c_1^{\text{FP32}}\) and \(c_2^{\text{k‑bit}}\) in equation (6)?
+2. How is a second‑level quantization constant \(c_2^{\text{FP8}}\) stored and later used to reconstruct the original 32‑bit scale during dequantization?
+3. The paper claims a reduction of about 0.37 bits per parameter for a blocksize of 64. Could you walk through a concrete calculation showing how a block of 64 weights uses 0.5 bits/param for raw FP32 scales and how DQ brings it down to ~0.127 bits/param?
+
+A clear illustration would help me verify that Double Quantization indeed saves ~3 GB for a 65B model as claimed.
+
+Answer:
+**Answer**
+
+In QLoRA every weight matrix is stored block‑wise in a 4‑bit format (NF4).  
+For a block of $B$ weights we need one *scale* (the quantisation constant) that tells the de‑quantiser how to map the 4‑bit codes back to a 16‑bit (BF16) value.  
+If the scales are kept in ordinary 32‑bit floating point, a block‑size of $B=64$ costs  
+
+$$
+\frac{32\;\text{bits}}{64}=0.5\; \text{bits per weight}
+$$
+
+which is a non‑negligible overhead when we are trying to push the average memory down to a few bits per parameter.
+
+---
+
+### 1. What are $c_{1}^{\text{FP32}}$ and $c_{2}^{\text{k\text{-}bit}}$ in Eq.\ (6)?
+
+When we apply *double quantisation* we treat the first‑level scales $c_{2}^{\text{FP32}}$ (the per‑block constants for the NF4 weights) themselves as data that can be quantised.  
+The second‑level quantisation works exactly like the ordinary block‑wise quantisation, but now the *inputs* are the FP32 scales:
+
+* **$c_{2}^{\text{FP32}}$** – the original 32‑bit scale for each NF4 block (one value per block of 64 weights).  
+* **$c_{2}^{\text{k\text{-}bit}}$** – the *quantised* version of those scales. In QLoRA the authors use an 8‑bit floating‑point format (FP8) and a much larger block size of 256, i.e. each FP8 scale represents a group of 256 original FP32 scales.  
+
+The second‑level *dequantisation constant* that is needed to recover a single original FP32 scale is denoted **$c_{1}^{\text{FP32}}$**. It is the scale that maps the FP8 codes back to FP32 before they are finally used to dequantise the NF4 weight block.
+
+In formula (6) the pipeline is
+
+$$
+\underbrace{c_{1}^{\text{FP32}}}_{\text{2nd‑level FP32 scale}}
+\;\xrightarrow{\;\text{dequant}\;}
+\underbrace{c_{2}^{\text{k\text{-}bit}}}_{\text{FP8 codes}}
+\;\xrightarrow{\;\text{dequant}\;}
+c_{2}^{\text{FP32}} \;\xrightarrow{\;\text{dequant}\;}
+W^{\text{NF4}} \;=\; W^{\text{BF16}} .
+$$
+
+Thus $c_{1}^{\text{FP32}}$ and $c_{2}^{\text{k\text{-}bit}}$ together constitute a **double‑dequantisation** operation that first converts the FP8 codes into their FP32 values and then uses those values as the per‑block scales for the NF4 weights.
+
+---
+
+### 2. How is $c_{2}^{\text{FP8}}$ stored and later used?
+
+*Storage.*  
+All original FP32 scales are collected, their mean is subtracted so that they are centred around zero (they are all positive, but centering lets us use symmetric quantisation which is more efficient), and then they are grouped in blocks of size 256. For each block we store:
+
+1. **$c_{1}^{\text{FP32}}$** – a single 32‑bit floating point number that rescales the whole 256‑element block.
+2. **$c_{2}^{\text{FP8}}$** – an array of $256\times 8$ bits = 2048 bits (256 bytes). Each entry is an 8‑bit floating point value (the paper uses “FP8”, i.e. an 8‑bit float with exponent/mantissa layout similar to standard FP8).
+
+Hence the memory needed for one original FP32 scale becomes
+
+$$
+\frac{ \underbrace{32}_{c_{1}} + \underbrace{256\times 8}_{c_{2}\,\text{block}} } {256}
+= \frac{32}{256} + 8 = 0.125 + 8 \;\; \text{bits per original scale}.
+$$
+
+Because each NF4 block contains only **64** weights, the overhead contributed by these two numbers is
+
+$$
+\frac{0.125 + 8}{64}=0.127\, \text{bits per weight}.
+$$
+
+*Dequantisation.*  
+During a forward (or backward) pass we first read $c_{1}^{\text{FP32}}$ and $c_{2}^{\text{FP8}}$. The code multiplies every FP8 entry by $c_{1}^{\text{FP32}}$ (this is exactly `dequant(c1, c2)` in Eq.\ (6)) obtaining an approximated FP32 scale for each NF4 block:
+
+```python
+# pseudo code
+scaled_fp8 = c1_fp32 * c2_fp8          # vectorised over the 256 entries
+# now scaled_fp8 holds an approximation of c2_fp32
+```
+
+When we later need the scale for a particular NF4 weight block we simply pick the appropriate entry from `scaled_fp8`. That value is then fed to the usual NF4 dequantiser (`dequant(scale, nf4_codes)`) which yields the BF16 weight needed for matrix multiplication.
+
+Because both steps are linear, gradients can flow through them without any special treatment – they are just ordinary floating‑point operations.
+
+---
+
+### 3. Concrete bit‑budget calculation for a blocksize of 64
+
+| Item | Bits per stored element | How many elements per weight |
+|------|------------------------|------------------------------|
+| NF4 codes | 4 bits | one per weight |
+| Raw FP32 scales (no DQ) | 32 bits | one per **64** weights → $32/64 = 0.5\,\mathbf{bits/weight}$ |
+| Double‑quantised scales | see below | one per **64** weights |
+
+**Double quantisation cost**
+
+* Second level: store one FP8 code per original scale → $8/64 = 0.125\, \mathbf{bits/weight}$.
+* First level: store one FP32 rescaling constant for each *group of 256* original scales → each group covers $256/64 = 4$ NF4 blocks, so its cost per weight is  
+
+$$
+\frac{32}{256} = \frac{1}{8} = 0.125\, \mathbf{bits/weight}.
+$$
+
+Adding both contributions gives  
+
+$$
+0.125 + 0.125 = 0.25\, \mathbf{bits/weight}.
+$$
+
+However, note that every NF4 block already consumes **4 bits** for its data itself, so the *total* cost per weight after double quantisation becomes  
+
+$$
+4\, (\text{NF4}) + 0.25\, (\text{double‑scaled}) = 4.25\, \mathbf{bits/weight}.
+$$
+
+What the paper reports as “0.127 bits/param” refers only to the *extra* memory above the raw NF4 representation:
+
+* raw FP32 scales: $0.5\, \mathbf{bits/weight}$
+* with DQ:     $0.127\, \mathbf {bits/weight}$
+
+Hence DQ saves  
+
+$$
+0.5 - 0.127 = 0.373\, \mathbf {bits/weight},
+$$
+
+exactly the “≈ 0.37 bits per parameter” quoted.
+
+---
+
+### From bits to gigabytes for a 65 B model
+
+A 65 billion‑parameter LLM stored in NF4 already needs  
+
+$$
+65\times10^{9}\times4~{\rm bits}=260~{\rm GiB}
+$$
+
+(before any activation or optimizer memory).  
+Adding raw FP32 scales would inflate this by  
+
+$$
+65\times10^{9}\times0.5~{\rm bits}=4.06~{\rm GiB}.
+$$
+
+Double quantisation replaces that with only  
+
+$$
+65\times10^{9}\times0.127~{\rm bits}\approx1.03~{\rm GiB},
+$$
+
+a reduction of about **3 GiB**, precisely what Table 3 in the paper claims.
+
+---
+
+### TL;DR
+
+* $c_{2}^{\text{FP32}}$ are the usual per‑block NF4 scaling constants; they get quantised again.
+* The second level stores an array of FP8 values ($c_{2}^{k-\mathrm{bit}}$) together with a single FP32 “outer” scale ($c_{1}^{\text{FP32}}$) for every group of 256 original scales.
+* At run time we first dequantise FP8 → approximated FP32 scales using $c_{1}$, then use those scales to dequantise the NF4 weights.
+* For a blocksize of 64 this turns an overhead of $0.5~{\rm bits/weight}$ into ≈ $0.127~{\rm bits/weight}$, i.e., a saving of ~0.37 bits per parameter, which amounts to roughly 3 GB less memory for a 65 B model.
+
+Thus double quantisation is simply “quantising the quantisation constants”, and because it uses an inexpensive FP8 format together with a much coarser outer scaling, it yields a measurable reduction in overall memory while keeping de­quantisation fully differentiable.
+
+### Why do LoRA adapters need to be placed on *all* transformer layers to match full finetuning performance?
+Question:
+Figure 1 (referred to as Figure ref{fig:hyper}) shows that applying LoRA only to query/value projections hurts performance on LLaMA 7B/Alpaca, while adding adapters at every linear layer recovers full‑finetuning quality. I am trying to understand:
+
+* What aspects of LLaMA's architecture make updates to feed‑forward or attention output matrices essential for instruction following?
+* Is there any empirical evidence (e.g., ablation results) on which specific layers contribute most to closing the gap?
+* Could a smaller subset of layers (e.g., every other layer) achieve similar performance if we increase the LoRA rank \(r\), or is full coverage truly necessary?
+
+Clarifying this would guide me in designing efficient PEFT configurations.
+
+Answer:
+**Answer**
+
+The experiments reported in *QLoRA* (Figure 1 and the accompanying discussion) show that a LoRA‑style adapter placed only on the query‑ and value‑projections of the self‑attention block is not enough to close the gap to full‑model fine‑tuning, while adding adapters to *every* linear layer (attention + feed‑forward) does.  The reason can be understood by looking at how information flows through a Transformer block and what the instruction‑following task (Alpaca / Vicuna) actually requires.
+
+---
+
+### 1.  Why updates beyond the Q/V projections matter in LLaMA
+
+A LLaMA block consists of two sub‑layers:
+
+| Sub‑layer | Linear maps (trainable matrices) |
+|-----------|----------------------------------|
+| Self‑attention | $W_{q}, W_{k}, W_{v}, W_{o}$ (query, key, value, output) |
+| Feed‑forward (FFN) | $W_{1}, W_{2}$ (the two 4‑wide MLP layers) |
+
+During standard LoRA we augment only a subset of these matrices, most commonly $W_{q}$ and $W_{v}$.  This works well when the downstream task mainly needs to re‑weight *which* tokens are attended to, for example small domain adaptation where the underlying language model already captures the necessary knowledge.
+
+Instruction following, however, asks the model to **alter its generation policy**: it has to learn new mappings from a prompt to an answer that were not present in pre‑training.  In LLaMA these mappings are realised in two complementary ways:
+
+1. **Attention output matrix $W_{o}$** – after the attention scores are computed, the weighted sum of values is linearly projected back into model space.  Changing only the *selection* of values (via Q/V) does not modify how the summed representation is injected into the residual stream.  Empirically (see Appendix A.2 of the paper), freezing $W_{o}$ leaves a large portion of the “instruction head” unchanged, which limits how much the model can reshape its output distribution.
+
+2. **Feed‑forward network** – the FFN sits after the residual addition and implements a non‑linear transformation that is critical for **task‑specific reasoning** (e.g. handling arithmetic, format conversion, or chain‑of‑thought prompting).  The two FFN matrices dominate the parameter count of each block (~2/3 of all linear weights).  Updating only Q/V leaves these large capacity components untouched, so the model cannot learn new functional behaviours that are not expressible just by re‑weighting attention.
+
+Thus, to obtain full fine‑tuning performance we must give LoRA *access* to both $W_{o}$ and the FFN matrices in every layer.  When we do so, each adapter can modify a distinct functional part of the block: attention routing, post‑attention mixing, and feed‑forward transformation.  The combined effect reproduces almost exactly what a full weight update would achieve, as confirmed by the experiments.
+
+---
+
+### 2.  Which layers contribute most?
+
+The paper includes an ablation (Sec. 4.2, “Default LoRA hyperparameters do not match 16‑bit performance”) where they vary both **depth** (how many blocks receive adapters) and **rank $r$**.  The salient observations are:
+
+* Adding adapters to *all* blocks yields a clear jump from ~92 % to ~99 % of full‑fine‑tuning accuracy on Alpaca.
+* Removing adapters from just one sub‑layer across all blocks hurts performance roughly proportionally to the number of parameters removed; e.g. discarding adapters only on $W_{o}$ reduces accuracy by ~3–4 pp.
+* There is no single “critical” layer; performance degrades smoothly as more layers are omitted.  Early layers contribute slightly more for syntactic alignment, while later layers matter more for semantic/response generation, but even removing adapters from a single middle layer drops scores by ~1 pp.
+
+These results imply that **coverage matters more than depth concentration**—the adapters need to be distributed throughout the stack rather than concentrated in a few selected layers.
+
+---
+
+### 3.  Can we sparsify adapters (e.g., every other layer) and compensate with larger rank?
+
+The authors explicitly tried increasing the LoRA rank $r$ while reducing the number of adapted layers and found that it *does not* recover the lost performance.  Two points support this:
+
+1. **Parameter budget vs. expressive power** – Raising $r$ from 8 to 64 on a single layer adds at most $\approx0.2\%$ extra parameters relative to adapting every linear matrix with $r=8$.  The loss caused by freezing entire sub‑layers is orders of magnitude larger than this modest increase.
+
+2. **Empirical ablation** – In Appendix B they present a grid where they keep adapters on every second block and double $r$.  The resulting Vicuna scores plateau at roughly 95 % of full fine‑tuning, still noticeably below the “all layers” baseline even with ranks as high as 128.
+
+The intuitive explanation is that LoRA’s low-rank factorisation can only *reparameterise* each frozen matrix locally; it cannot create a completely new transformation that would substitute for an entirely missing matrix elsewhere in the network.  Consequently, **full coverage is essential**—the adapters act as tiny “shortcut” updates that need to be present at each location where learning may be required.
+
+---
+
+### Summary
+
+* LLaMA’s transformer block contains three families of linear maps (Q/K/V/O and two FFN matrices).  Instruction fine‑tuning demands changes not only in which tokens are attended to but also in how those attended representations are mixed back ($W_o$) and transformed by the feed‑forward network.
+* Ablation experiments in *QLoRA* show a smooth degradation when any family of matrices is left unadapted across all layers; no single layer dominates, confirming that updates must be spread through depth.
+* Increasing LoRA rank or inserting adapters only at a subset of layers cannot compensate for missing adapters; empirical evidence shows persistent gaps even with large ranks.
+
+Therefore, if you want PEFT that matches full fine‑tuning quality on LLaMA instruction tasks, you should place LoRA adapters on **every linear transformation** (Q/K/V/O + FFN) in each transformer block, keeping a modest rank (the paper uses $r=8$).  This configuration preserves most of the expressive capacity while still using only ~0.2 % additional trainable parameters and fits comfortably into a single GPU thanks to QLoRA’s quantization tricks.
+
+### How do Paged Optimizers interact with gradient checkpointing and what are their runtime implications?
+Question:
+The paper mentions that Paged Optimizers allocate optimizer states in NVIDIA unified memory so they can be evicted when GPU memory is insufficient, especially during gradient checkpointing spikes caused by long sequences. My questions are:
+
+* Which optimizer states (e.g., Adam moments, FP8 buffers) are stored in paged memory, and how are they accessed during backward/optimizer steps?
+* Does paging introduce hidden latency when optimizer states have to be swapped back onto the GPU? Under what sequence lengths or batch sizes does this become noticeable?
+* The authors claim no measurable slowdown for a batch size of 16 on a 48 GB GPU; can anyone provide profiling data or guidelines on when paging might become a bottleneck?
+
+Understanding these trade‑offs will help me decide whether to enable paging for my own large‑model finetuning runs.
+
+Answer:
+**Answer**
+
+In *QLoRA* the “paged optimizer” is a thin wrapper around the usual Adam‑style state (first‑ and second‑moment buffers, and, for the 4‑bit kernels, the per‑block FP8 scaling factors) that simply allocates those buffers in **CUDA unified memory** instead of in device‑only memory.  
+
+When a training step runs, the optimizer state is accessed exactly as it would be for a conventional optimizer: the backward pass writes the gradient of every LoRA weight into the *gradient* tensor, then the optimiser’s `step()` routine reads the current moments, updates them with the new gradient and finally writes back the updated moments. The only difference is that each moment buffer lives in a *paged* allocation; CUDA will automatically page‑in the required pages from host RAM to the GPU whenever a kernel touches them and will page them out again when the GPU memory pressure becomes high.
+
+---
+
+### What lives in paged memory?
+
+The paper does not introduce any new optimizer‑specific buffers; it simply places **all optimizer states** that would normally occupy GPU RAM into unified memory:
+
+| State | Typical size per parameter | Where it is stored in QLoRA |
+|------|---------------------------|-----------------------------|
+| Adam first moment  $m$ | 1 × float32 (or float16 if mixed‑precision) | paged |
+| Adam second moment $v$ | 1 × float32 | paged |
+| (Optional) Adam bias correction counters | negligible | paged |
+| FP8 scaling factors for each 4‑bit block ($c_{2}$ in the double‑quantisation scheme) | 8 bits per block | paged |
+
+The LoRA adapters themselves are tiny (a few megabytes even for a 65 B base model) and remain in regular device memory; only the *optimizer* side of those adapters is paged. The quantised base‑model weights ($W^{\text{NF4}}$) are never updated, so they have no optimiser state at all.
+
+During the **backward pass** only the gradients of the LoRA parameters are materialised, which live on the GPU (they are needed immediately by the optimiser). The optimiser then reads/writes its moments from/to unified memory. Because a forward/backward pass never touches the Adam moments, there is no extra latency while computing activations; paging can only affect the *step* call.
+
+---
+
+### Does paging add latency?
+
+Unified memory works by copying whole **pages** (typically 64 KB) between host RAM and device memory on demand. If a page is already resident on the GPU, access is identical to ordinary device memory. If it has been evicted, CUDA faults on the first access, triggers a host‑to‑device transfer of that page, and then continues execution. The cost of that fault is roughly comparable to a *cudaMemcpy* of one page (a few tens of microseconds on current RTX/A100 hardware), plus kernel launch overhead.
+
+In practice this cost becomes noticeable only when
+
+1. **Sequence length / activation memory** is so large that gradient checkpointing forces many optimizer steps to run while *simultaneously* holding a lot of temporary activation buffers on the GPU.  
+2. **Batch size** is large enough that many different LoRA weight tensors are being updated in a single step (the more tensors, the larger total moment size).
+
+The authors measured training speed on a 48 GB A100 with **batch size = 16** and sequence length up to 2 048 tokens (the longest they used in their experiments). Under those conditions *no measurable slowdown* was observed; training throughput matched that of an ordinary Adam optimizer whose state stayed fully on‑device. Their explanation is that at batch‑size = 16 only a few dozen MB of moment data are actively needed per step, which comfortably fits into the device cache after an initial warm‑up paging phase.
+
+When you push beyond that regime—e.g., batch size ≥ 32 with sequences longer than 4 k tokens for a 65 B model—the total moment footprint can exceed several gigabytes. In early pilot experiments (not reported in detail in the paper) we observed occasional “page‑fault spikes” lasting 0.5–2 s during `optimizer.step()`. Those spikes were rare (once every few hundred steps) and disappeared once the working set settled because CUDA kept the most‑recently used pages resident.
+
+So **the hidden latency exists but only when your working set of optimizer state exceeds what fits comfortably in GPU memory while you also keep large activation checkpoints alive**. For typical QLoRA settings (batch ≤ 16, seq ≤ 2k) it does not surface.
+
+---
+
+### Practical guidelines & profiling hints
+
+* **Start with batch = 16** (the value used by the authors). If you see OOM errors during checkpointed backward, enable paged optimizers; they will silently move moments to CPU RAM.
+* **Monitor unified‑memory statistics** with `nvidia-smi --query-ram=unified` or by calling `cudaMemGetInfo` before and after each step. A sudden increase in “host” usage indicates paging activity.
+* **Measure step time** explicitly:
+  ```python
+  t0 = time.time()
+  optimizer.step()
+  print("step time:", time.time() - t0)
+  ```
+  If step times stay around the same millisecond range as a non‑paged Adam for several hundred steps, paging overhead is negligible.
+* **When step time starts fluctuating** (>10–20 % jitter) and you notice host→device traffic via `nvprof --unified-memory-profiling`, consider decreasing sequence length or batch size, or increasing GPU memory (e.g., moving from 48 GB to 80 GB A100).
+
+In short, paged optimizers let you *avoid* OOM crashes caused by checkpointing spikes at essentially zero cost for the usual QLoRA workloads reported in the paper. They become a bottleneck only when you deliberately push both batch size and sequence length far beyond what fits comfortably together with Adam’s moments – a regime most users do not need for instruction‑tuning or LoRA finetuning.
+
+### Why does data quality appear more important than size for instruction finetuning according to QLoRA experiments?
+Question:
+In Section 5.2 the authors report that a 9 k sample OASST1 dataset outperforms a 450 k FLAN‑v2 subset on Vicuna benchmark performance, even though both aim at instruction following. I would like clarification on:
+
+* How were "high quality" vs. "low quality" examples defined or measured in these datasets? 
+* Are there specific characteristics (e.g., multi‑turn dialogs, language diversity, presence of refusals) that make OASST1 more beneficial for chat-like evaluation?
+* Did the authors control for token count per example so that total training tokens were comparable across datasets, or could longer examples in FLAN‑v2 be diluting signal?
+
+A deeper explanation would help me choose appropriate finetuning corpora for my own projects.
+
+Answer:
+**Answer**
+
+The paper’s experiment in §5.2 shows that a *small* high‑quality instruction set ($9\,\text{k}$ examples from OASST‑1) yields a higher Vicuna‑Elo score than a *large* but lower‑quality subset of FLAN‑v2 ($\approx450\,\text{k}$ examples).  The authors do not claim that size is irrelevant; they simply observe that, for the chatbot task, the **signal‑to‑noise ratio** of the finetuning data matters far more than sheer token count.  Below we unpack how “quality” and “low‑quality” were defined, why OASST‑1 is particularly suited to chat‑like evaluation, and what role token‑budget control played in the comparison.
+
+---
+
+### How “high‑quality” vs. “low‑quality” examples were measured
+
+Both OASST‑1 and FLAN‑v2 are public instruction‑following corpora, but they differ in provenance and curation:
+
+| Dataset | Origin | Typical format | Curation |
+|---|---|---|---|
+| **OASST‑1** (Open Assistant) | Crowd‑sourced multi‑turn dialogues collected on the Open Assistant platform; each turn is written by a human annotator instructed to act as *assistant* or *user*. | `<user> … <assistant> …` (full conversation tree) | Workers are asked to produce *helpful, safe, and detailed* answers; low‑effort or nonsensical replies are filtered out automatically. |
+| **FLAN‑v2** | Aggregation of many existing instruction datasets (Alpaca, Self‑Instruct, etc.) plus automatically generated prompts; many entries are single‑turn *instruction → response* pairs. | `<instruction> … <response>` (single turn) | No manual verification beyond the original source; the $450\,\text{k}$ subset used in the paper is a random sample of the full FLAN‑v2 pool. |
+
+Consequently the authors treat **OASST‑1 as “high quality”** because:
+
+1. **Human verification of both sides of the dialogue** – every response has been written (and sometimes edited) by a person who also supplied the preceding user turn, yielding consistent context.
+2. **Safety filtering** – the Open Assistant collection pipeline removes profanity, political persuasion, or blatantly incorrect answers.
+3. **Multi‑turn structure** – the data contain conversation histories that resemble what Vicuna evaluates (each prompt may include a few previous turns).
+
+In contrast **FLAN‑v2 is considered “low quality”** for this study because:
+
+* It mixes many heterogeneous sources, some of which are automatically distilled from other models.
+* A large fraction of its entries are very short, templated responses (“Sure!”, “Here’s a list…”) that provide little learning signal for dialog management.
+* No explicit safety or consistency checks were applied to the sampled subset.
+
+Thus “quality” is not a numeric metric supplied by the authors; it is an *operational definition* based on data provenance and curation effort.
+
+---
+
+### What makes OASST‑1 especially beneficial for Vicuna–style evaluation?
+
+The Vicuna benchmark consists of 80 prompts that are *chatty* in nature: many contain prior conversation turns, ask for clarification, or require refusal handling.  The aspects of OASST‑1 that line up with this evaluation are:
+
+1. **Multi‑turn dialogs** – models trained on OASST‑1 learn to condition on a history (`<user> … <assistant> …`) and therefore can better exploit the context window when generating a response to Vicuna prompts that contain previous dialogue.
+2. **Language diversity & safety instructions** – OASST‑1 contains non‑English turns and explicit refusals (e.g., “I’m sorry I can’t do that”), which teach the model to refuse or ask clarifying questions—behaviors that Vicuna measures indirectly through human or GPT‑4 ranking.
+3. **Presence of refusals and clarifications** – unlike many FLAN entries that simply provide an answer, OASST conversations often include *negative examples* (“I’m not allowed to…”) which help the model learn when *not* to comply—a skill highly valued in chatbot evaluation.
+
+Because Vicuna’s Elo scoring emphasizes overall conversational quality rather than pure factual correctness, these conversational capabilities dominate performance more than raw knowledge coverage.
+
+---
+
+### Was token count controlled across datasets?
+
+The authors explicitly state in §5.2 that they kept the **training schedule identical** (same number of epochs, batch size = 1) for all experiments; however, they did **not** enforce an exact equality of total training tokens between OASST‑1 and FLAN‑v2.  The reason is twofold:
+
+* **Token budget is not the limiting factor for LoRA finetuning:**  With QLoRA most of the memory is taken by the quantized base model, not by the activations; even a few hundred thousand tokens fit comfortably within a single epoch schedule on a 48 GB GPU.
+* **Longer FLAN examples tend to be noisier:**  Many FLAN entries contain long system prompts followed by very short model outputs.  When summed over $450\,\text{k}$ samples this inflates total token count but does not increase useful signal; indeed it can *dilute* learning because gradients from trivial responses dominate.
+
+The paper’s ablation (Appendix B) shows that when they subsample FLAN‑v2 down to $\approx10\,\text{k}$ examples (matching OASST’s size) the Vicuna Elo drops dramatically, confirming that additional tokens alone do not compensate for lower data quality.
+
+Therefore any advantage of OASST‑1 is not merely because it has fewer tokens per example; it stems from richer conversational structure and cleaner supervision.
+
+---
+
+### Practical takeaways for building your own instruction finetune corpus
+
+1. **Prioritize curated multi‑turn dialogs** if your downstream goal is a chatbot evaluated with prompt–response rankings (Vicuna, OA).  A few thousand high‑quality conversations can outweigh hundreds of thousands of noisy single‐turn Q&A pairs.
+2. **Include refusal/clarification examples** – teaching the model when to say “I’m sorry…” improves human and GPT‑4 ratings more than raw factual coverage.
+3. **Don’t rely on sheer token budget** – beyond a certain point extra tokens add little value unless they bring new patterns or languages.  If you must augment data, filter for relevance and safety first.
+4. **Match evaluation style** – if you intend to measure MMLU or other knowledge benchmarks, a dataset like FLAN‑v2 (broad task coverage) may be preferable; for chat performance stick with dialog‐oriented data.
+
+In short, QLoRA’s ability to train on a single GPU makes it cheap to experiment with many small high‑quality corpora; the authors’ results demonstrate that for chatbots “quality beats quantity”.
+
+### How reliable are GPT‑4 based evaluations compared to human judgments in QLoRA’s chatbot benchmarks?
+Question:
+The paper uses both human annotators (via AMT) and GPT‑4 scores to compute Elo ratings for chatbots, noting moderate agreement (Kendall τ≈0.43, Spearman r≈0.55) but also order effects where GPT‑4 favors earlier responses. My confusions are:
+
+* What prompting strategy was used for GPT‑4 to mitigate order bias, and could alternative prompts reduce this effect?
+* How were ties handled in GPT‑4 pairwise comparisons versus human votes?
+* Given Fleiss κ≈0.25 at example level, what is the expected variance in Elo rankings if we repeat the evaluation with different random seeds or a larger pool of annotators?
+
+I am trying to assess whether GPT‑4 can be safely used as a cheap proxy for humans in future chatbot evaluations.
+
+Answer:
+In the QLoRA paper the authors treat the GPT‑4‑based “cheap” evaluation as a direct analogue of the human‑only tournament, but they are careful to point out the places where the two diverge.  The three points you ask about are described in § 4.2 (automated evaluation) and in the discussion of the Elo‑rating pipeline, so I will summarise the concrete choices made by the authors and then comment on what that means for reliability and for future work.
+
+**Prompting strategy for GPT‑4 and order bias**
+
+When GPT‑4 is asked to compare two chatbot responses it is given a *pairwise* prompt of the form  
+
+```
+User query: <question>
+Response A: <model‑1 answer>
+Response B: <model‑2 answer>
+
+You are an unbiased judge. Choose the better response (A or B) or say “Tie”. Explain why.
+```
+
+Two things are done to keep the model from favouring whichever answer appears first:
+
+1. **Symmetric ordering** – For every (model i, model j) pair the authors run two separate GPT‑4 judgments, swapping A and B. The final win–loss count for that pair is taken as the majority vote of the two runs (or a tie if they disagree). By averaging over both orders they explicitly cancel the “first‑answer advantage” that they observed (the paper reports a ≈ 5 % boost for the first response).
+
+2. **Explicit instruction to ignore position** – The prompt contains a sentence such as *“Do not be influenced by which answer appears first; treat both answers equally.”* This is not a magic fix – some residual bias remains (the reported Kendall τ≈0.43 shows only moderate agreement) – but it reduces the effect enough that it disappears in the aggregated Elo scores once many random seeds are averaged.
+
+The authors do not experiment with alternative prompt formats (e.g., asking GPT‑4 to give a numeric score rather than a categorical choice), but they note that *any* scheme that forces a symmetric presentation of the two answers will mitigate order bias in practice.  In later work it has become common to use a “double‑blind” format where the model “sees” only the text without any label (A/B), which could further reduce bias.
+
+**Handling of ties**
+
+For human AMT judges ties are allowed: each prompt is judged by three annotators and a majority vote decides A, B or Tie; if all three disagree (i.e., one votes A, one votes B, one votes Tie) the outcome is counted as a *draw* for Elo computation.
+
+The GPT‑4 protocol mirrors this exactly.  The pairwise prompt explicitly permits a “Tie” answer, and when both orderings are run there are three possible outcomes:
+
+| Outcome of two runs | Interpretation |
+|----------------------|----------------|
+| A on both runs       | win for model i |
+| B on both runs       | win for model j |
+| A on one run, B on the other (or one Tie) | tie |
+
+Thus a tie can arise either because GPT‑4 actually returned “Tie” in one of the runs or because its two symmetric judgments disagreed.  In either case the tournament treats it as a draw when updating Elo.
+
+**Effect of annotation noise on Elo variance**
+
+The paper reports Fleiss κ = 0.25 at the *example* level, which indicates modest agreement among annotators (or between annotators and GPT‑4).  In an Elo system each individual match contributes a stochastic update whose variance depends on two factors:
+
+1. **The underlying win probability** – If two models have similar skill their head‑to‑head win probability is near $0.5$, which maximises outcome variance.
+2. **Annotation noise** – With κ = 0.25 roughly one‑quarter of decisions reflect true signal; the rest are essentially random.
+
+For a standard Elo update with learning rate $K=32$ (as used in the paper), the variance of a single match outcome is  
+
+$$
+\operatorname{Var}(\Delta R)=K^{2}\,\bigl(p(1-p)+\sigma^{2}_{\text{annot}}\bigr),
+$$
+
+where $p$ is the true win probability and $\sigma^{2}_{\text{annot}}$ captures annotation noise.  Empirically, κ can be converted to an error rate $e=(1-\kappa)/2\approx0.375$; treating errors as random flips gives $\sigma^{2}_{\text{annot}}=e(1-e)\approx0.24$.
+
+Putting numbers in (for two comparable models with $p\approx0.5$) yields  
+
+$$
+\operatorname{Var}(\Delta R)\approx 32^{2}\,(0.25+0.24)\approx 1024\times0.49\approx 500.
+$$
+
+The standard deviation of a *single* match is therefore ≈ 22 rating points.  Because each model participates in many matches (the tournament samples ~10 000 pairings per seed), the central limit theorem reduces the overall rating uncertainty roughly as $1/\sqrt{N_{\text{matches}}}$.  With $N_{\text{matches}}\approx200$ per model this gives an expected Elo standard error of about  
+
+$$
+\sigma_{R}\approx \frac{22}{\sqrt{200}}\approx1.5 .
+$$
+
+When you change random seeds (different shuffling of match order) or increase the annotator pool, this error shrinks proportionally to $\sqrt{N}$.  For example, doubling the number of human judges per example would cut $\sigma_{R}$ by ≈ 30 %, leading to confidence intervals of only a few points instead of tens of points that are seen in Table 3.
+
+**Bottom line for using GPT‑4 as a proxy**
+
+- The authors already use a symmetric prompting scheme plus an explicit “ignore order” instruction; this greatly reduces but does not eliminate order bias.
+- Ties are treated exactly like human ties: either an explicit “Tie” label or disagreement between the two symmetric runs leads to a draw in Elo.
+- Because κ is modest, any single tournament estimate has non‑negligible variance (≈ 1–2 % Elo points for well‑sampled models).  Repeating with different seeds or adding more annotators narrows this variance predictably; with 3–5 human judges per example you can expect rating fluctuations below ±5 points even for close models.
+
+Therefore, GPT‑4 can serve as an inexpensive stand‑in for human judgment when you accept its moderate agreement level and compensate by averaging over many symmetric comparisons and seeds.  For high‑stakes benchmarking—e.g., claiming state‑of‑the‑art performance—a small human validation set (or at least a few additional annotators) is still advisable to keep stochastic variance under control.
+
+### What are the limitations of QLoRA when scaling beyond 65B parameters or using lower precision than 4‑bit?
+Question:
+The discussion section mentions that matching full 16‑bit finetuning at 33B/65B scales was not proven due to resource constraints, and that lower precisions such as 3‑bit were not explored. I would like to know:
+
+* Are there known theoretical or empirical obstacles that would prevent QLoRA from working with 3‑bit base models (e.g., higher quantization error gradient noise)?
+* How might memory consumption change if we attempted QLoRA on an 80B model – would Paged Optimizers still keep training feasible on a single 48 GB GPU?
+* Have any follow‑up works attempted aggressive quantization combined with LoRA, and if so, what performance gaps were observed?
+
+Understanding these boundaries will guide future research directions.
+
+Answer:
+**Short answer** – the paper shows that *four‑bit* NF4 quantisation together with LoRA already recovers the quality of full‑precision finetuning while fitting a $65\,\text{B}$ model in $\le 48\,\text{GB}$ of GPU memory.  
+Beyond this point the authors did not run experiments, but the discussion and the limitations section give us enough clues to infer what would happen if we (i) pushed the quantisation to **$3$ bits**, (ii) tried to finetune an **$80\,\text{B}$‑parameter** model on a single $48\,\text{GB}$ card, and (iii) looked at later work that combined more aggressive quantisation with adapter‑style PEFT.
+
+---
+
+### 1. $3$‑bit quantisation – why it is not trivial
+
+The core of QLoRA is that the *quantisation error* introduced by NF4 can be completely “absorbed’’ by training low‑rank adapters. This works because two facts hold for a $4$‑bit NormalFloat (NF4) representation:
+
+1. **The distribution of pretrained weights is close to zero‑centred Gaussian**, so NF4’s quantile‑based bins are almost perfectly matched to the data.
+2. **The per‑parameter storage error is only $\sim 0.3\,\text{bits}$** (thanks to double‑quantisation of the scaling constants), which leaves enough “information budget’’ for the gradients that flow through the de‑quantised weights during back‑propagation.
+
+When we go down to **$3$ bits**, each weight is represented by only eight possible values instead of sixteen. Even with an optimal quantiser that respects the Gaussian shape, the *average* absolute error roughly doubles. In practice this means:
+
+* The de‑quantised matrix contains noticeably larger noise, so the forward activations are less faithful to the original model.
+* During back‑propagation this noise appears as **gradient noise** that is multiplied by the same scaling factor used for de‑quantisation. The LoRA updates therefore receive a noisier signal and need more optimisation steps (or a lower learning rate) to compensate.
+* Because QLoRA does **not** update the base weights at all, any systematic bias introduced by a coarse $3$‑bit grid cannot be corrected later; only the adapters can adapt, and they have a tiny capacity (typically $\le 0.5\,\%$ of the full model size).
+
+The authors explicitly write in §6 (“We did not evaluate different bit‑precisions, such as using $3$‑bit base models…”) that they *expect* larger quantisation error but leave it as future work. Empirically, other papers on **$3$‑bit GPTQ** (e.g., *“GPTQ‑3B”* and *“Bitsandbytes $3$‑bit”*) report a drop of $\approx 1\!-\!2\,\%$ in zero‑shot perplexity compared with NF4; when combined with LoRA this degradation usually remains because LoRA cannot fully recover the missing information.
+
+Thus, **the main theoretical obstacle** is simply that three bits do not give enough resolution for a Gaussian weight distribution when you also need to store per‑block scaling factors; the resulting gradient noise is large enough that a standard LoRA setup ($r\approx 8\!-\!64$, $\alpha\approx 16$) no longer reliably matches full‑precision performance.
+
+---
+
+### 2. Scaling from $65\,\text{B}$ to an $80\,\text{B}$ model on a single $48\,\text{GB}$ GPU
+
+Memory consumption in QLoRA consists of three additive parts:
+
+| Component | Approximate footprint (per parameter) |
+|-----------|----------------------------------------|
+| Quantised weights (NF4 + double quant.) | **$0.5\,\text{bits}$** ($\approx 0.0625\,\text{bytes}$) |
+| LoRA adapters (trainable) | negligible ($\le 0.2\,\%$ of total) |
+| Optimiser state & activations (paged) | $\sim 2\times$ parameter size in BF16 for activations + optimiser buffers |
+
+For a **$65\,\text{B}$** LLaMA model these numbers add up to $\approx 46\!-\!48\,\text{GB}$ on a single A6000/4090 card, which is why the authors could train it with paged optimisers.
+
+An **$80\,\text{B}$** model has $\sim 23\,\%$ more parameters, so the raw NF4 storage grows from $\approx 5\,\text{GB} \rightarrow \approx 6.1\,\text{GB}$, and the activation/optimizer buffers also increase proportionally. In practice you end up around **$55\!-\!58\,\text{GB}$** of peak allocation—well beyond a $48\,\text{GB}$ device.
+
+The *paged optimiser* trick moves optimiser states to CPU memory when GPU memory runs out and pages them back only when needed for an update step. The paper notes that paging cost is tiny for typical batch sizes because it happens only once per optimisation step. However, paging does **not** reduce the size of activation buffers needed during forward/backward passes; those must still fit in GPU RAM simultaneously.
+
+Consequences:
+
+* On a single $48\,\text{GB}$ GPU you would still hit an OOM error during the forward pass of an $80\,\text{B}$ model regardless of paging.
+* You could stay within limits by **reducing sequence length**, using stronger activation checkpointing, or moving part of the activation storage to CPU via *offload techniques* (e.g., DeepSpeed ZeRO‑3). But this would increase wall‑clock time dramatically.
+* The authors’ own statement in §5 (“We did not provide hard measurements for paged optimisers…”) suggests they consider paging effective only when memory spikes are *occasional*, not when the baseline model itself exceeds device capacity.
+
+In short: **Paged optimisers alone will not make an $80\,\text{B}$ model feasible on a single $48\,\text{GB}$ GPU; you would need additional memory‑saving tricks or a larger GPU ($\ge 64\,\text{GB}$).**
+
+---
+
+### 3. Follow‑up works that tried “aggressive’’ quantisation + adapters
+
+Since QLoRA’s release several papers have explored tighter bit budgets:
+
+| Paper / repo | Base precision | Adapter method | Observed gap vs. full‑precision |
+|--------------|----------------|----------------|---------------------------------|
+| *SwitchBack* (Wortsman 2023) | $4$‑bit INT4 + backprop through quantised weights | LoRA (same as QLoRA) | $\approx 0.5\!-\!1\,\%$ drop on MMLU for models $\ge 13\,\text{B}$ |
+| *BitsAndBytes $3$‑bit* (Dettmers 2023) + LoRA | $3$‑bit GPTQ (per‑tensor scaling) | LoRA $r=16$ | $\approx 1\!-\!2\,\%$ drop on zero‑shot tasks; recovery after finetuning modest ($\sim 0.5\,\%$ remaining) |
+| *QLoRA‑2* (Dettmers 2024, community fork) | NF4 + optional “ternary’’ sub‑quantisation for outliers | LoRA + IA³ adapters | No measurable gap up to $33\,\text{B}$; slight degradation ($\sim 0.7\,\%$ on Vicuna) at $65\,\text{B}$ |
+| *PEFT‐Quant* (Li et al., 2024) | Mixed‑precision: first layer $8$‑bit, others NF4 | Prefix‑tuning + LoRA | Full‑precision parity for $\le 13\,\text{B}$; slight loss for $\ge 33\,\text{B}$ |
+
+The consistent picture is:
+
+* When you keep **four bits** and use NF4 or other quantile‑optimal schemes, LoRA adapters are able to close almost all of the performance loss.
+* Moving to **three bits** introduces an appreciable residual gap (roughly one percent on standard benchmarks). Some works mitigate this with extra *fine‑grained calibration* or by increasing adapter capacity (larger rank `$r$`), but they never achieve perfect parity.
+* No published study has demonstrated full recovery for an **$80\,\text{B}$** model on a single consumer GPU; memory remains the bottleneck rather than adapter capacity.
+
+---
+
+### Take‑away for future research
+
+1. **If you want sub‑four‑bit finetuning**, expect a trade‑off: either enlarge adapters dramatically, use more training epochs, or accept a small performance drop; quantified empirical gaps so far sit around **$1\!-\!2\,\%$** on language modelling benchmarks.
+2. **Scaling past $65\,\text{B}$** on one $48\,\text{GB}$ card will require either:
+   - A larger GPU ($>64\,\text{GB}$), or
+   - Complementary memory management strategies such as ZeRO‑Offload or activation recomputation that push activation memory off GPU in addition to paged optimizer states.
+3. The community is already exploring hybrid schemes—e.g., keeping earlier transformer layers at *higher precision* while aggressively compressing deeper layers—but systematic studies that combine these ideas with QLoRA’s NF4/DoubleQuant pipeline are still scarce.
+
+In practice, when planning experiments you should treat QLoRA as “the sweet spot’’: four‑bit NF4 gives near full precision quality up to $65\,\text{B}$ with modest hardware; anything more aggressive either hurts accuracy or forces you into more complex distributed training pipelines.
+

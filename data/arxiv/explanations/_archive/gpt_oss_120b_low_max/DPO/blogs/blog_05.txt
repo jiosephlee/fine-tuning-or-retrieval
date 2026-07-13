@@ -1,0 +1,500 @@
+\title{Blogs about the Paper: "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"}
+
+# Practical Guide: Implementing Direct Preference Optimization in Minutes  
+
+*If you’ve been wrestling with “RLHF‑style” pipelines and the endless loop of reward‑model training + PPO, you’re not alone.  The new **Direct Preference Optimization (DPO)** algorithm lets you sidestep that whole reinforcement‑learning stage and fine‑tune a language model directly from preference data with a single binary‑cross‑entropy loss.  In this post we walk through a hands‑on implementation on a modest model (≈ 350 M parameters) using the familiar PyTorch + 🤗 Transformers stack and the TRLX library (which already ships a simple PPO trainer).  By the end you’ll have a reproducible notebook that goes from raw preference pairs to a DPO‑trained model in under an hour.*  
+
+---  
+
+## Table of Contents
+1. [Why DPO? A Quick Recap](#why-dpo)  
+2. [Setup: Packages & Hardware](#setup)  
+3. [Preparing Preference Data](#data)  
+4. [Building the Reference Model (`π_ref`)](#reference)  
+5. [Defining the DPO Loss in PyTorch](#loss)  
+6. [Training Loop with TRLX Utilities](#training)  
+7. [Hyper‑parameters that Matter (`β`, temperature, batch size)](#hparams)  
+8. [Common Pitfalls & Debugging Tips](#pitfalls)  
+9. [Evaluating Your DPO Model](#eval)  
+10. [Next Steps & Scaling Up](#next)  
+
+---  
+
+<a name="why-dpo"></a>  
+
+## 1. Why DPO? A Quick Recap  
+
+Traditional RLHF follows three stages:  
+
+1. **Supervised fine‑tuning (SFT)** – turn a pre‑trained LM into a helpful policy.  
+2. **Reward modelling** – fit a scalar reward function `r_φ(x, y)` to pairwise human preferences using the Bradley‑Terry likelihood (Eq. (2) of the paper).  
+3. **RL fine‑tuning** – optimise `π_θ` to maximise `r_φ` while staying close to the reference policy (`π_ref`, usually the SFT model), typically via PPO.
+
+DPO shows that for the KL‑constrained objective  
+
+\[
+\max_{\pi}\; \mathbb{E}_{x,y\sim \pi}[r(x,y)] - \beta \, \mathrm{KL}\big(\pi(\cdot|x)\,\Vert\,\pi_{\text{ref}}(\cdot|x)\big)
+\]
+
+the optimal policy has a closed‑form relationship to the reward (Eq. (3)):  
+
+\[
+\pi^{*}(y|x)=\frac{1}{Z(x)}\,\pi_{\text{ref}}(y|x)\exp\!\Big(\frac{1}{\beta}r(x,y)\Big).
+\]
+
+By **re‑parameterising** the reward as  
+
+\[
+r_{\theta}(x,y)=\beta \log\frac{\pi_{\theta}(y|x)}{\pi_{\text{ref}}(y|x)},
+\]
+
+the Bradley‑Terry likelihood can be expressed **directly** in terms of `π_θ` and `π_ref`.  Consequently we can train `π_θ` by maximising the following DPO loss (Eq. (7)):  
+
+\[
+\mathcal{L}_{\text{DPO}}(\theta)=
+-\mathbb{E}_{(x,y_w,y_l)\sim\mathcal{D}}
+\log\sigma\!\Big(\beta \log\frac{\pi_{\theta}(y_w|x)}{\pi_{\text{ref}}(y_w|x)}
+-
+\beta \log\frac{\pi_{\theta}(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\Big).
+\]
+
+All we need is:
+
+* a **reference policy** (`π_ref`) — usually the SFT checkpoint,
+* a **pre‑generated preference dataset** (`𝒟`) containing `(prompt, winner, loser)` triples,
+* a **scalar β** controlling how conservative the update is.
+
+That’s it—no reward network, no advantage estimator, no KL baselines.
+
+---  
+
+<a name="setup"></a>  
+
+## 2. Setup: Packages & Hardware  
+
+The implementation below runs on a single GPU (≥ 12 GB VRAM).  We rely on:
+
+```bash
+pip install torch transformers datasets trl tqdm accelerate
+```
+
+- **torch** – core deep‑learning engine.  
+- **transformers** – model loading and tokenisation.  
+- **datasets** – convenient CSV/JSON loading utilities (we’ll use a tiny custom CSV).  
+- **trl** – provides an easy trainer wrapper (originally for PPO; we will reuse its data collator).  
+- **accelerate** – optional multi‑GPU handling; not required for this tutorial.
+
+Make sure you have CUDA enabled:
+
+```bash
+python -c "import torch; print(torch.cuda.is_available())"
+```
+
+If you’re on Google Colab, select “GPU” as runtime and install the same packages.
+
+---  
+
+<a name="data"></a>  
+
+## 3. Preparing Preference Data  
+
+DPO works with any *offline* collection of pairwise preferences.  For this demo we create a tiny synthetic dataset from the IMDb sentiment corpus: each prompt is the first half of a review; two completions are generated with different temperatures, and we label whichever completion receives higher sentiment as the winner.
+
+```python
+import csv, pathlib, random
+from datasets import Dataset
+
+DATA_PATH = pathlib.Path("preferences.csv")
+if not DATA_PATH.exists():
+    # Create synthetic data (run once)
+    from transformers import pipeline
+    sentiment = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
+    # Load a small language model for generating candidates
+    generator = pipeline("text-generation", model="gpt2", device=0)
+
+    # A few raw prompts taken from IMDb (you could load more)
+    raw_prompts = [
+        "I loved this movie because",
+        "The plot was terrible and",
+        "What I liked most about the film was",
+        "The acting felt completely flat when",
+    ]
+
+    rows = []
+    for prompt in raw_prompts:
+        # generate two candidates at different temperatures
+        cand_low = generator(prompt, max_new_tokens=30, temperature=0.7)[0]["generated_text"]
+        cand_high = generator(prompt, max_new_tokens=30, temperature=1.2)[0]["generated_text"]
+        # score with sentiment classifier
+        s_low = sentiment(cand_low)[0]["score"] if sentiment(cand_low)[0]["label"]=="POSITIVE" else -sentiment(cand_low)[0]["score"]
+        s_high = sentiment(cand_high)[0]["score"] if sentiment(cand_high)[0]["label"]=="POSITIVE" else -sentiment(cand_high)[0]["score"]
+        winner, loser = (cand_low, cand_high) if s_low > s_high else (cand_high, cand_low)
+        rows.append({"prompt": prompt, "winner": winner, "loser": loser})
+
+    with open(DATA_PATH, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["prompt","winner","loser"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+# Load into 🤗 datasets
+pref_dataset = Dataset.from_csv(str(DATA_PATH))
+print(pref_dataset[0])
+```
+
+The final `pref_dataset` has three columns:
+
+| prompt | winner | loser |
+|--------|--------|-------|
+
+You can replace this CSV with any human‑annotated preference file as long as it follows the same schema.
+
+---  
+
+<a name="reference"></a>  
+
+## 4. Building the Reference Model (`π_ref`)  
+
+The reference policy should be **the same architecture** that you intend to train with DPO; otherwise KL calculations become ill‑defined because token vocabularies differ.
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+MODEL_NAME = "gpt2-medium"   # ≈ 350 M params; fits on most GPUs.
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer.pad_token = tokenizer.eos_token   # required for batching
+
+ref_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+ref_model.requires_grad_(False)       # Freeze – we never fine‑tune it.
+ref_model.eval()
+```
+
+If you already have an SFT checkpoint (e.g., after instruction tuning), load that instead of the vanilla pretrained checkpoint—the DPO algorithm will treat whatever you feed as `π_ref`.
+
+---  
+
+<a name="loss"></a>  
+
+## 5. Defining the DPO Loss in PyTorch  
+
+Below is a compact implementation that mirrors Eq. (7).  The key steps are:
+
+1. Tokenise winner/loser jointly for efficient batching.
+2. Compute log‑probabilities under **both** `π_θ` (the trainable model) *and* `π_ref`.
+3. Form the log‑ratio term `β * (log π_θ - log π_ref)` for winner and loser.
+4. Apply sigmoid (`σ`) and binary cross entropy.
+
+```python
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
+class DPOLoss(nn.Module):
+    def __init__(self, ref_model, beta: float = 0.1):
+        super().__init__()
+        self.ref_model = ref_model   # frozen reference policy
+        self.beta = beta
+
+    def forward(self, logits_theta, logits_ref, attention_mask):
+        """
+        logits_* : Tensor[batch, seq_len, vocab] – raw LM logits.
+        attention_mask : Tensor[batch, seq_len] – 1 where tokens are real.
+        """
+        # Masked log‐softmax → per-token log prob.
+        logp_theta = F.log_softmax(logits_theta, dim=-1)
+        logp_ref   = F.log_softmax(logits_ref, dim=-1)
+
+        # Gather log probs for each token position (ignore padding)
+        # shape -> [batch]
+        def seq_logprob(logp):
+            token_ids = torch.argmax(attention_mask * -1e9 + torch.arange(logp.shape[1], device=logp.device), dim=1)
+            # Actually sum over all real tokens
+            seq_logp = (logp * attention_mask.unsqueeze(-1)).sum(dim=[1,2])
+            return seq_logp
+
+        # Sum log probs over whole sequence for each example:
+        logp_theta_seq = seq_logprob(logp_theta)
+        logp_ref_seq   = seq_logprob(logp_ref)
+
+        # Compute β·Δlogprob for winners & losers (batch contains both)
+        # In our dataloader we will concatenate win and loss examples,
+        # then later split them back out.
+        return None   # placeholder – see training loop below.
+```
+
+Instead of building a generic loss class we actually embed it inside our training loop because we need **two forward passes per batch** (one through `π_θ`, one through `π_ref`).  The code below shows how to combine them efficiently.
+
+---  
+
+<a name="training"></a>  
+
+## 6. Training Loop with TRLX Utilities  
+
+TRLX already provides helpers for tokenisation and batching of preference data (`PreferenceDataset`).  We’ll borrow its data collator but replace PPO’s loss with our DPO loss.
+
+```python
+from trl import DataCollatorForCompletionOnlyLM
+from torch.utils.data import DataLoader
+
+BATCH_SIZE = 8          # fits on 12 GB GPU for GPT2-medium
+MAX_LENGTH = 64
+
+def tokenize_pair(example):
+    """Tokenise prompt+completion; keep separate ids for winner/loser."""
+    win_enc = tokenizer(
+        example["prompt"] + example["winner"],
+        truncation=True,
+        max_length=MAX_LENGTH,
+        padding="max_length",
+    )
+    los_enc = tokenizer(
+        example["prompt"] + example["loser"],
+        truncation=True,
+        max_length=MAX_LENGTH,
+        padding="max_length",
+    )
+    return {
+        "input_ids_win": win_enc["input_ids"],
+        "attention_mask_win": win_enc["attention_mask"],
+        "input_ids_los": los_enc["input_ids"],
+        "attention_mask_los": los_enc["attention_mask"],
+    }
+
+tokenized_ds = pref_dataset.map(tokenize_pair, remove_columns=["prompt","winner","loser"])
+dataloader = DataLoader(
+    tokenized_ds,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    collate_fn=lambda batch: {
+         k: torch.tensor([d[k] for d in batch], dtype=torch.long)
+         for k in batch[0].keys()
+    },
+)
+
+# Trainable DPO model -------------------------------------------------
+model_dpo = AutoModelForCausalLM.from_pretrained(MODEL_NAME)   # fresh copy
+model_dpo.train()
+optimizer = torch.optim.AdamW(model_dpo.parameters(), lr=5e-6)
+
+beta = 0.1      # typical starting value; see hyperparameter section
+
+for epoch in range(3):      # tiny epochs for demo purposes
+    for batch in dataloader:
+         optimizer.zero_grad()
+
+         # ----- forward passes -------------------------------------------------
+         logits_win_theta = model_dpo(
+             input_ids=batch["input_ids_win"], 
+             attention_mask=batch["attention_mask_win"]
+         ).logits                           # [B,T,V]
+         logits_los_theta = model_dpo(
+             input_ids=batch["input_ids_los"], 
+             attention_mask=batch["attention_mask_los"]
+         ).logits
+
+         with torch.no_grad():
+             logits_win_ref = ref_model(
+                 input_ids=batch["input_ids_win"], 
+                 attention_mask=batch["attention_mask_win"]
+             ).logits
+             logits_los_ref = ref_model(
+                 input_ids=batch["input_ids_los"], 
+                 attention_mask=batch["attention_mask_los"]
+             ).logits
+
+         # ----- compute sequence log-probabilities -----------------------------
+         def seq_logprob(logits, mask):
+             logp = F.log_softmax(logits, dim=-1)           # [B,T,V]
+             token_logp = (logp * mask.unsqueeze(-1)).sum(dim=-1)   # sum over V → [B,T]
+             return (token_logp * mask).sum(dim=-1)                # sum over T → [B]
+
+         lp_win_theta = seq_logprob(logits_win_theta, batch["attention_mask_win"])
+         lp_los_theta = seq_logprob(logits_los_theta, batch["attention_mask_los"])
+         lp_win_ref   = seq_logprob(logits_win_ref , batch["attention_mask_win"])
+         lp_los_ref   = seq_logprob(logits_los_ref , batch["attention_mask_los"])
+
+         # ----- DPO objective -------------------------------------------------
+         delta_win = beta * (lp_win_theta - lp_win_ref)
+         delta_los = beta * (lp_los_theta - lp_los_ref)
+
+         dpo_logits = delta_win - delta_los                     # shape [B]
+         dpo_loss   = -F.logsigmoid(dpo_logits).mean()          # −log σ(...)
+         
+         dpo_loss.backward()
+         optimizer.step()
+
+    print(f"epoch {epoch+1} | loss {dpo_loss.item():.4f}")
+```
+
+A few remarks:
+
+* The loss reduces to binary cross entropy because `logsigmoid(z)=log σ(z)`.  
+* We **do not** backpropagate through the reference model (`torch.no_grad()`), preserving memory and speed.  
+* The KL constraint is implicitly enforced by `β`. Larger β → more aggressive divergence from `π_ref`; smaller β → highly conservative updates.
+
+That’s all—no reward network training, no advantage computation.
+
+---  
+
+<a name="hparams"></a>  
+
+## 7. Hyper‑parameters That Matter  
+
+| Hyperparameter | Typical Range | Effect |
+|----------------|---------------|--------|
+| `β`            | $0.\!05$–$5$ | Controls KL strength: low values keep `π_θ` close to reference; high values allow bigger leaps but may overfit noisy preferences |
+| Learning rate   | $10^{-5}$–$10^{-6}$ | Standard LM fine‑tuning rates work; start at $5\times10^{-6}$ and increase only if loss plateaus |
+| Batch size      | $4$–$32$ (depending on GPU) | Larger batches stabilise gradients because each ``example’’ contains both winner & loser |
+| Max sequence length | $64$–$128$ tokens | Longer sequences give richer signals but increase memory consumption |
+| Temperature at generation time | $0$–$0.8$ | For evaluation only; DPO works well even at non‑greedy temperatures because KL penalty already discourages extreme wandering |
+
+**Tip:** If you notice your model quickly collapses to always outputting the winner pattern regardless of prompt context, lower `β` or increase batch size—both help regularise against “reward overoptimisation”.
+
+--- 
+
+<a name="pitfalls"></a>  
+
+## 8. Common Pitfalls & Debugging Tips  
+
+1️⃣ **Mismatched Tokenisers** – Ensure that both `π_θ` & `π_ref` use *exactly* the same tokenizer object (same vocabulary & special tokens). A silent mismatch will produce wildly different log probs and break training.
+
+2️⃣ **Padding Mask Errors** – The sequence log probability must ignore padded positions; otherwise you bias longer generations toward higher likelihood just because they contain more tokens.
+
+3️⃣ **Reference Policy Drift** – If you inadvertently fine‑tune `π_ref` during an earlier SFT step without saving a frozen copy, DPO will compare against a moving target leading to unstable KL estimates.
+
+4️⃣ **β Too Large** – When β ≫ 1 your loss approximates ordinary supervised learning on winners vs losers; KL regularisation vanishes and you may see mode collapse where every prompt yields near‐identical high‐reward completions.
+
+5️⃣ **Insufficient Preference Diversity** – Preference datasets should cover varied prompts; training on a tiny homogeneous set leads to overfitting and poor OOD performance.
+
+To diagnose issues quickly:
+
+```python
+with torch.no_grad():
+    kl_estimate = ((lp_win_theta - lp_win_ref) + (lp_los_theta - lp_los_ref)).mean()
+print("Avg per‑example KL approx:", kl_estimate.item())
+```
+
+If this number jumps far above your target KL (e.g., > 10), consider reducing β or increasing regularisation via early stopping.
+
+--- 
+
+<a name="eval"></a>  
+
+## 9. Evaluating Your DPO Model  
+
+Because DPO directly optimises preferences, an intuitive test is a *win rate* against an untouched SFT baseline:
+
+```python
+def generate(model, prompt):
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    out     = model.generate(**inputs,
+                             max_new_tokens=40,
+                             do_sample=True,
+                             temperature=0.7,
+                             top_p=0.9)
+    return tokenizer.decode(out[0], skip_special_tokens=True)
+
+# Sample prompts from validation set:
+val_prompts = ["The movie started off", "I was disappointed when", ...]
+wins      , total     = 0 , len(val_prompts)
+
+for p in val_prompts:
+    sft_out   = generate(ref_model.to("cuda"), p)      # reference SFT output
+    dpo_out   = generate(model_dpo.to("cuda"), p)     # our DPO model
+
+    # Use an external evaluator — e.g., Sentiment classifier or GPT‑4 API —
+    pref_winner_is_dpo = external_preference(p, dpo_out, sft_out)
+    wins += pref_winner_is_dpo
+
+print(f"DPO win rate vs SFT: {wins/total:.2%}")
+```
+
+For quick sanity checks you can replace `external_preference` with any deterministic scorer such as VADER sentiment or ROUGE against gold references when available.
+
+--- 
+
+<a name="next"></a>  
+
+## 10. Next Steps & Scaling Up  
+
+* **Larger models:** Swap `"gpt2-medium"` for `"EleutherAI/pythia-6b"` or any custom checkpoint—just increase batch size or use gradient accumulation.
+* **Self‑labeling:** After an initial DPO fine‑tune you can generate fresh completions on unlabeled prompts and ask your current policy to rank them; feed those new pairs back into training—a loop akin to “self‑RLHF” but still RL‑free.
+* **Multitask preferences:** Concatenate multiple datasets (sentiment control + safety vs harmlessness) and keep *one* global `β`. The loss naturally balances across tasks because every pair contributes its own sigmoid term.
+* **Distributed training:** The code above runs on one GPU; wrapping the dataloader with `accelerate` or using DeepSpeed ZeRO makes it trivial to scale to > 50 B parameters—no extra RL infrastructure required.
+
+---
+
+### TL;DR Code Snapshot
+
+```python
+# pip install torch transformers datasets trl tqdm accelerate
+
+import torch, torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import Dataset
+from torch.utils.data import DataLoader
+
+# 1️⃣ Load frozen reference policy π_ref ---------------------------
+ref_tokenizer = AutoTokenizer.from_pretrained("gpt2-medium")
+ref_tokenizer.pad_token = ref_tokenizer.eos_token
+π_ref          = AutoModelForCausalLM.from_pretrained("gpt2-medium")
+π_ref.requires_grad_(False); π_ref.eval()
+
+# 2️⃣ Load / create preference dataset -----------------------------
+pref_ds   = Dataset.from_csv("preferences.csv")   # columns: prompt,winner,loser
+
+def tokenize(example):
+    win_enc = ref_tokenizer(example["prompt"]+example["winner"],
+                            truncation=True,max_length=64,padding="max_length")
+    los_enc = ref_tokenizer(example["prompt"]+example["loser"],
+                            truncation=True,max_length=64,padding="max_length")
+    return {"input_ids_win": win_enc["input_ids"],
+            "attention_mask_win": win_enc["attention_mask"],
+            "input_ids_los": los_enc["input_ids"],
+            "attention_mask_los": los_enc["attention_mask"]}
+
+tokenized_ds   = pref_ds.map(tokenize)
+loader         = DataLoader(tokenized_ds,batch_size=8,
+                           shuffle=True,
+                           collate_fn=lambda b:{k:torch.tensor([d[k] for d in b]) 
+                                                for k in b[0]})
+
+# 3️⃣ Initialise trainable policy π_θ ---------------------------------
+π_theta   = AutoModelForCausalLM.from_pretrained("gpt2-medium")
+optim     : torch.optim.AdamW(π_theta.parameters(), lr=5e-6)
+
+β          : float   ← tune in {0.05,…,5}
+for epoch in range(3):
+   for batch in loader:
+       optim.zero_grad()
+
+       lt_w   = π_theta(input_ids=batch["input_ids_win"],
+                        attention_mask=batch["attention_mask_win"]).logits
+       lt_l   ...
+
+       with torch.no_grad():
+           lr_w   ...
+           lr_l   ...
+
+       def seq_lp(logits,masks):
+           logp=F.log_softmax(logits,-1)
+           return ((logp*masks.unsqueeze(-1)).sum(-1)*masks).sum(-1)
+
+       pwθ=seq_lp(lt_w,batch["attention_mask_win"])
+       plθ=seq_lp(lt_l,batch["attention_mask_los"])
+       pwR=seq_lp(lr_w,batch["attention_mask_win"])
+       plR=seq_lp(lr_l,batch["attention_mask_los"])
+
+       dpo_logits=β*(pwθ-pwR)-β*(plθ-plR)
+       loss      =( -F.logsigmoid(dpo_logits).mean() )
+       loss.backward(); optim.step()
+```
+
+That’s it—you now have a fully functional DPO trainer!  The code is intentionally minimal so you can drop it into your own repo or Jupyter notebook without pulling in heavyweight RL libraries.
+
+---
+
+### Closing Thoughts 
+
+Direct Preference Optimization turns “RLHF” into pure supervised learning: by reparameterising rewards as log ratios between a trainable policy and its frozen reference version we obtain an exact closed‐form optimality condition that is directly optimisable with a binary cross‐entropy loss.  The result is dramatically simpler pipelines, fewer moving parts—and empirically competitive performance on sentiment control, summarisation and dialogue tasks even at modest scales.
+
+Give it a try on your own preference dataset—whether you’re teaching a chatbot to be more helpful or steering a code assistant toward safe completions—and let us know how it behaves under different β settings! Happy fine‑tuning!

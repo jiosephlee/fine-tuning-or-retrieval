@@ -1,0 +1,334 @@
+\title{Blogs about the Paper: "Group Sequence Policy Optimization"}
+
+# A Step‑by‑Step Walkthrough of the GSPO Algorithm  
+
+In this post we unpack **Group Sequence Policy Optimization (GSPO)**, the new reinforcement‑learning (RL) algorithm that powers the latest Qwen3 models.  While the original paper is dense with notation, the core ideas are straightforward: work at the **sequence level** instead of the token level, compute a single importance ratio per generated response, and clip that ratio before applying the advantage‑weighted gradient update.
+
+Below you’ll find a practical, developer‑friendly guide that walks through every stage of a GSPO training step:
+
+1. **Sampling a group of responses** for each query.  
+2. **Computing sequence‑level importance ratios** (the “s‑ratio”).  
+3. **Normalizing advantages** across the group.  
+4. **Applying the PPO‑style clipping** on the s‑ratio.  
+5. **Back‑propagating** the final loss.
+
+We also provide concrete PyTorch pseudocode and discuss hyper‑parameter choices that matter in large‑scale RL, especially for Mixture‑of‑Experts (MoE) models.
+
+---
+
+## 1. Problem Setting and Notation Recap  
+
+| Symbol | Meaning |
+|--------|----------|
+| `π_θ(y|x)` | Autoregressive language model (policy) probability of generating response `y` given query `x`. |
+| `y = (y₁,…,y_T)` | Token sequence of length `T = |y|`. |
+| `r(x, y) ∈ [0,1]` | Reward from a verifier (e.g., a reward model). |
+| `G` | Number of responses sampled per query – the **group size**. |
+| `ε` | Clipping half‑width (often written as `(1‑ε, 1+ε)`). |
+
+GSPO treats every response as a single decision unit: the **importance ratio** is built from the full sequence likelihood, normalized by its length to avoid exploding values for long generations.
+
+\[
+s_i(\theta) \;=\;
+\Bigl(\frac{\pi_\theta(y_i\mid x)}{\pi_{\theta_{\text{old}}}(y_i\mid x)}\Bigr)^{\!1/|y_i|}
+=
+\exp\!\Bigl(\frac{1}{|y_i|}
+\sum_{t=1}^{|y_i|}
+\log \frac{\pi_\theta(y_{i,t}\mid x, y_{i,<t})}
+{\pi_{\theta_{\text{old}}}(y_{i,t}\mid x, y_{i,<t})}\Bigr)
+\]
+
+The exponentiation by `1/|y_i|` is **length normalisation**, which keeps `s_i` roughly in the same numeric range regardless of how many tokens a response contains.
+
+---
+
+## 2. End‑to‑End GSPO Workflow  
+
+Below is a high‑level description of one training iteration.
+
+### Step 0: Prepare Data  
+
+- `queries` – a batch of prompts drawn from the dataset `𝒟`.  
+- `policy_old` – a *snapshot* of the model parameters before this iteration (`θ_old`).  
+- `policy_new` – same architecture but with fresh parameters (`θ`).  
+
+Both policies share the same tokenizer and architecture; they differ only in weights.
+
+### Step 1: Sample a Group of Responses  
+
+For every query `x` we generate **G** completions using `policy_old`. In practice we use nucleus sampling or temperature sampling to encourage diversity.
+
+```python
+def sample_group(policy, queries, G, max_len=512):
+    # policy: nn.Module with .generate()
+    # returns List[List[TokenIds]]  -> shape (batch, G, seq_len)
+    groups = []
+    for x in queries:
+        # generate G independent samples
+        samples = policy.generate(
+            input_ids=x.unsqueeze(0).repeat(G, 1),
+            max_length=max_len,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9
+        )
+        groups.append(samples)   # (G, seq_len)
+    return torch.stack(groups)   # (batch, G, seq_len)
+```
+
+*Tip:* For MoE models this step can be parallelised across many GPUs; no special handling is required because GSPO does not rely on token‑level importance ratios.
+
+### Step 2: Compute Log‑Likelihoods Under Both Policies  
+
+We need two scalars per response:
+
+```python
+def log_likelihood(policy, queries, responses):
+    """
+    Compute log p(y|x) for each (x, y) pair.
+    Returns tensor shape (batch, G).
+    """
+    # Concatenate queries and responses for batched forward pass
+    # Assume policy returns log_probs for each token position
+    batch, G, seq_len = responses.shape
+    inputs = torch.cat([queries.unsqueeze(1).expand(-1, G, -1).reshape(-1, queries.shape[-1]),
+                        responses.reshape(-1, seq_len)], dim=-1)
+
+    # shift labels for autoregressive loss
+    logits = policy(inputs)                     # (B*G, vocab)
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+    # gather log probs of generated tokens
+    token_logp = log_probs.gather(2,
+        responses.reshape(-1, seq_len, 1)).squeeze(-1)   # (B*G, seq_len)
+
+    # sum over time → log p(y|x)
+    seq_logp = token_logp.sum(dim=-1).view(batch, G)
+    return seq_logp
+```
+
+Run this twice:
+
+```python
+logp_old = log_likelihood(policy_old, queries, group_responses)   # (B,G)
+logp_new = log_likelihood(policy_new, queries, group_responses)   # (B,G)
+```
+
+Because both forward passes share the same input tokens we can optionally fuse them to save memory—especially important for giant MoE models.
+
+### Step 3: Compute Sequence‑Level Importance Ratios  
+
+```python
+seq_lengths = (group_responses != tokenizer.pad_token_id).sum(dim=-1)   # (B,G)
+s_ratio = torch.exp((logp_new - logp_old) / seq_lengths.float())      # (B,G)
+```
+
+The division by `seq_lengths` implements the length normalisation described earlier.
+
+### Step 4: Get Rewards and Normalized Advantages  
+
+```python
+# Assume reward_fn returns a tensor in [0, 1]
+rewards = reward_fn(queries.unsqueeze(1), group_responses)            # (B,G)
+
+# Groupwise mean/std for each query
+mean_r = rewards.mean(dim=1, keepdim=True)
+std_r  = rewards.std(dim=1, unbiased=False, keepdim=True).clamp(min=1e-8)
+
+advantage = (rewards - mean_r) / std_r                               # (B,G)
+```
+
+The advantage is identical to GRPO’s “relative advantage” but now attached to an entire sequence.
+
+### Step 5: Apply PPO‑Style Clipping on the s‑ratio  
+
+Clipping boundaries are *much tighter* than in token‑level PPO because the s‑ratio is already smoothed by length normalisation.
+
+```python
+epsilon_low  = 3e-4   # left clipping bound (≈ 0.9997×)
+epsilon_high = 4e-4   # right clipping bound (≈ 1.0004×)
+
+clip_low  = 1.0 - epsilon_low
+clip_high = 1.0 + epsilon_high
+
+s_clipped = torch.clamp(s_ratio,
+                        min=clip_low,
+                        max=clip_high)                     # (B,G)
+
+# The min() expression from PPO:
+obj_raw   = s_ratio * advantage
+obj_clip  = s_clipped * advantage
+surrogate_obj = torch.min(obj_raw, obj_clip)                       # (B,G)
+```
+
+### Step 6: Formulate the Final Loss and Backpropagate  
+
+GSPO maximises the surrogate objective; in practice we minimise its negative.
+
+```python
+loss = - surrogate_obj.mean()          # scalar
+
+optimizer.zero_grad()
+loss.backward()
+torch.nn.utils.clip_grad_norm_(policy_new.parameters(), max_norm=1.0)
+optimizer.step()
+```
+
+That’s it—the whole iteration runs in a few lines once you have utilities for sampling and likelihood computation.
+
+---
+
+## 3. Full Pseudocode  
+
+Putting everything together:
+
+```python
+def gspo_step(policy_new,
+              policy_old,
+              optimizer,
+              queries,
+              G=4,
+              max_len=512,
+              epsilon_low=3e-4,
+              epsilon_high=4e-4):
+    """One GSPO training step."""
+    #########################
+    # 1️⃣ Sample responses #
+    #########################
+    group_y = sample_group(policy_old, queries, G=G,
+                           max_len=max_len)               # (B,G,T)
+
+    ##############################
+    # 2️⃣ Log‐likelihoods old/new #
+    ##############################
+    logp_old = log_likelihood(policy_old,
+                              queries,
+                              group_y)                 # (B,G)
+    logp_new = log_likelihood(policy_new,
+                              queries,
+                              group_y)                 # (B,G)
+
+    ##########################################
+    # 3️⃣ Sequence‐level importance ratios   #
+    ##########################################
+    lengths = (group_y != tokenizer.pad_token_id).sum(-1).float()   # (B,G)
+    s_ratio = torch.exp((logp_new - logp_old) / lengths)
+
+    #############################################
+    # 4️⃣ Rewards & normalized advantages       #
+    #############################################
+    rewards   = reward_fn(queries.unsqueeze(1), group_y)           # (B,G)
+    mean_r    = rewards.mean(dim=1, keepdim=True)
+    std_r     = rewards.std(dim=1, unbiased=False,
+                            keepdim=True).clamp(min=1e-8)
+    adv       = (rewards - mean_r) / std_r                         # (B,G)
+
+    ##########################################################
+    # 5️⃣ Clip s_ratio & build surrogate objective           #
+    ##########################################################
+    low_clip  = 1.0 - epsilon_low
+    high_clip = 1.0 + epsilon_high
+
+    s_clipped   = s_ratio.clamp(min=low_clip,
+                               max=high_clip)
+
+    obj_raw   = s_ratio * adv
+    obj_clip  = s_clipped * adv
+    surrogate = torch.min(obj_raw,
+                          obj_clip).mean()                     # scalar
+
+    ##########################################################
+    # 6️⃣ Optimisation step                                   #
+##########################################################
+    
+        loss      = -surrogate                 # maximise → minimise negative
+    
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy_new.parameters(),
+                                        max_norm=0.5)
+        optimizer.step()
+
+        return loss.item(), adv.mean().item()
+```
+
+**Key points**
+
+- The *only* gradients flow through `policy_new`; all terms involving `policy_old` are detached by design because they are treated as constants during this step.
+- Length normalisation (`/ lengths`) keeps `s_ratio` bounded even for very long generations—a critical factor for stability.
+- The clipping bounds (`ε≈10⁻⁴`) are orders of magnitude tighter than those used in token‑level PPO or GRPO because we clip whole sequences rather than individual tokens.
+- The algorithm works unchanged for MoE models: since we never touch token‑wise ratios (`w_{i,t}`), expert‐routing volatility does not cause divergence.
+
+---
+
+## 4. Hyperparameter Tuning Tips  
+
+| Hyperparameter | Recommended Range | Why it matters |
+|----------------|-------------------|----------------|
+| **Group size `G`** | 2 – 8 | Larger groups give more stable advantage estimates but increase memory usage. In practice `G = 4` balances variance reduction and GPU budget. |
+| **Clipping ε** | `(3e-4 , 4e-4)` for Qwen3‑scale models | Because `s_ratio` ≈ 1 after length normalisation; too large ε reintroduces noisy updates; too small ε can over‑clip and slow learning. |
+| **Reward scaling** | Keep rewards in `[0 , 1]`; optionally apply a temperature > 0 to sharpen differences | The advantage normalization already handles scale; extreme reward values can still cause exploding gradients if not bounded. |
+| **Learning rate** | 5e‑6 – 2e‑5 with AdamW + cosine decay | RL fine‑tuning is sensitive; start low and warm up for a few thousand steps if possible. |
+| **Gradient clipping norm** | 0.5 – 2.0 | Prevents occasional spikes due to outlier sequences; value depends on model size—larger MoE models tolerate slightly higher norms. |
+| **Sequence length limit** | ≤ 1024 tokens for most RL tasks | Longer generations increase variance of both likelihood ratios and rewards; if you need longer contexts consider splitting into multiple turns and using GSPO-token instead. |
+
+**Practical checklist before launching a full run**
+
+- Verify that both old and new policies compute *identical* tokenisation on sampled responses (`torch.equal(tokenizer.encode(...))`).  
+- Run a short “sanity” loop with a tiny batch (`batch_size=2`) and check that `s_ratio.mean()` stays close to 1 throughout training – large drifts indicate bugs in likelihood computation or padding handling.  
+- For MoE models enable gradient checkpointing or activation recomputation to stay within GPU memory while still evaluating full likelihoods.
+
+---
+
+## 5. Extending GSPO: Token‑Level Variant (`GSPO-token`)  
+
+When you need per‑token advantage adjustments—e.g., multi‑turn dialogues where only a subset of tokens should be rewarded—you can switch to the token variant presented in the paper:
+
+```python
+# Inside gspo_step after obtaining s_ratio:
+# detach to stop gradients flowing through it per token
+s_detached = s_ratio.detach()               # shape (B,G)
+
+# Build per-token importance factor:
+# note that torch.exp(logp_new - logp_old)/lengths == s_detached already.
+# Multiply each token's log-prob gradient by s_detached:
+log_probs_new = ...                         # (B*G,T,VocabLogits)
+token_logp_new = ...                        # gather as before
+
+# Gradient term becomes: s_detached[..., None] * token_logp_new.grad ...
+```
+
+The mathematical derivation shows that when all token advantages are identical (`A_{i,t}=A_i`) this variant collapses back to pure GSPO—so you only need it when you deliberately assign different advantages inside one response.
+
+---
+
+## 6. Why GSPO Is a Game Changer  
+
+- **Stability:** By clipping whole sequences we avoid accumulating high‑variance noise across thousands of tokens—a known failure mode of GRPO that leads to irreversible collapse.
+- **MoE Friendly:** No need for “Routing Replay” because importance ratios no longer depend on per‑token expert routing decisions.
+- **Infrastructure Simplicity:** Sequence‐level likelihoods are tolerant to precision mismatches between training and inference engines; you can directly reuse inference logits in RL pipelines.
+- **Sample Efficiency:** Empirically more than twice as many tokens get clipped compared with GRPO yet training proceeds faster—indicating that clean sequence‐level signals outweigh raw token count.
+
+---
+
+## 7. Wrap‑Up  
+
+GSPO strips away unnecessary token‐level machinery and aligns the RL objective with how we actually score language model outputs: at the *sequence* level. Implementing it involves three clear steps—sample groups, compute length‐normalised importance ratios, and apply tight PPO clipping—followed by an ordinary backpropagation pass.
+
+The code snippets above should let you drop GSPO into an existing RLHF pipeline with minimal changes:
+
+```python
+# Typical training loop skeleton
+for epoch in range(num_epochs):
+    for batch_queries in data_loader:
+        loss_val, adv_avg = gspo_step(policy_new,
+                                      policy_old,
+                                      optimizer,
+                                      batch_queries)
+        logger.log(loss=loss_val,
+                   advantage=adv_avg,
+                   step=global_step)
+        policy_old.load_state_dict(policy_new.state_dict())   # periodic sync
+```
+
+Give it a try on your own LLM or MoE stack—watch your RL fine-tuning become markedly more stable and efficient! Happy coding!

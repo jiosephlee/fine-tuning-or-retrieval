@@ -274,6 +274,7 @@ def process_papers(
     output_extension=None,
     paraphrase_workers=None,
     model="gpt-4.1",
+    model_slug=None,
     is_hippa=False,
     reasoning_effort=None,
     prompt_domain=DEFAULT_PROMPT_DOMAIN,
@@ -283,7 +284,12 @@ def process_papers(
     get_system_prompt(prompt_domain)
     input_extension = normalize_extension(input_extension)
     output_extension = normalize_extension(output_extension or input_extension)
-    
+
+    # Namespace outputs by the generator model, e.g. .../paraphrased/glm/{domain}/{i}.tex
+    slug = utils.model_slug(model, override=model_slug)
+    output_dir = os.path.join(output_dir, slug, "")
+    print(f"Writing paraphrases under: {output_dir} (model={model}, slug={slug})")
+
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
@@ -390,7 +396,12 @@ if __name__ == "__main__":
     parser.add_argument(
         '--model',
         default='gpt-4.1',
-        help='Model passed to utils.query_llm.'
+        help='Model passed to utils.query_llm. Namespaced ids with a "/" (e.g. nvidia/GLM-5.2-NVFP4) are routed to the PARCC LiteLLM proxy automatically.'
+    )
+    parser.add_argument(
+        '--model_slug',
+        default=None,
+        help='Override the output subfolder name for this model. Defaults to utils.model_slug(model).'
     )
     parser.add_argument(
         '--is_hippa',
@@ -432,6 +443,7 @@ if __name__ == "__main__":
         output_extension=args.output_extension,
         paraphrase_workers=args.paraphrase_workers,
         model=args.model,
+        model_slug=args.model_slug,
         is_hippa=args.is_hippa,
         reasoning_effort=args.reasoning_effort,
         prompt_domain=args.prompt_domain,

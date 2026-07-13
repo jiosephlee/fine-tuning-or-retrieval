@@ -1,0 +1,76 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 9: FP8 Accuracy: Block Quantization and Incoherent Processing
+
+# FP8 e4m3 format: limited mantissa and dynamic range vs FP16/BF16
+
+Modern GPUs (for example, NVIDIA Hopper) offer FP8 (e4m3) as a low-precision option that can significantly raise peak matmul throughput: the hardware WGMMA path can target FP8 and deliver roughly 2× the matmul throughput per SM compared to FP16/BF16. That gain in raw throughput, however, comes at the cost of much coarser numeric representation. In the e4m3 variant of FP8, only 3 bits are used for the significand (mantissa) and 4 bits for the exponent. With so few mantissa bits, FP8 represents numbers only roughly — small relative differences are lost — and with only 4 exponent bits the dynamic range is also restricted compared to FP16 or BF16. The net effect is higher numerical error in arithmetic and a much greater sensitivity to value distributions (especially to large, infrequent values) than in the wider formats.
+
+Because attention computes many inner products and then applies a softmax, the representation quality for the inputs $\mathbf{Q},\mathbf{K},\mathbf{V}$ matters: small relative errors in dot products can change the softmax weights appreciably, and those errors can propagate to the final output. Thus, making FP8 practical for attention requires algorithmic strategies that control quantization error even while enjoying the increased throughput.
+
+# Outlier-heavy activations in LLMs and pitfalls of per-tensor scaling
+
+Large models and modern LLM activations are often “heavy tailed”: most activations are moderate, but a tiny fraction of elements can be much larger in magnitude than the rest. Such outliers are well documented in practice and were explicitly simulated in the paper’s numerical tests by sampling each entry of $\mathbf{Q},\mathbf{K},\mathbf{V}$ as
+$\mathcal{N}(0,1) + \mathrm{Bernoulli}(0.001)\cdot \mathcal{N}(0,100)$, i.e., normally distributed values with a 0.1% chance of an additional large Gaussian term. This kind of distribution produces rare but very large entries that dominate per-tensor statistics.
+
+A common and simple FP8 strategy is per-tensor scaling: one scalar scale is chosen for an entire tensor so that values fit into FP8’s representable range before rounding. Per-tensor scaling is cheap and convenient, but it is also brittle in the presence of outliers: a single very large element forces the global scale to be large, which effectively compresses all the remaining elements toward zero relative to that scale. With only 3 bits of mantissa, most of the representational precision for the many typical elements is lost, producing large quantization error. In other words, a single outlier can force most entries to be represented with very few effective significant bits, harming downstream dot products and softmax computations.
+
+# Block quantization: per-block scales for Q, K, V (B_r x d or B_c x d) aligned with algorithmic tiles
+
+Block quantization addresses the limitation of per-tensor scaling by using one scale factor per block rather than one per whole tensor. FlashAttention-3’s computation already operates on tiles: queries come in blocks of size $B_r \times d$ (we denote the query block size by $B_r$ and the head dimension by $d$), and keys/values naturally come in blocks of size $B_c \times d$. Block quantization simply matches the quantization granularity to those tiles: for each query block and for each key/value block, keep a separate scalar scale and quantize those $B_r\times d$ or $B_c\times d$ blocks independently into FP8.
+
+Because each block typically has a much smaller dynamic range than an entire tensor, a per-block scale lets the quantized block use FP8’s exponent and mantissa more effectively; the result is substantially lower quantization error than a single global scale. The storage overhead is minimal: one scalar per block (the scale) must be remembered, but the blocks and their scales align directly with the algorithm’s tiling so the bookkeeping is simple. Conceptually, if a block’s quantized representation is denoted $\tilde{\mathbf{Q}}_i$ together with its scale $\gamma_{Q,i}$ (so the dequantized block is approximated as $\hat{\mathbf{Q}}_i \approx \gamma_{Q,i}\,\tilde{\mathbf{Q}}_i$), then each block is rescaled only by its own factor rather than by a tensor-wide scalar. This localizes the effect of outliers to the few blocks that actually contain them.
+
+# Fusing block quantization with rotary embedding without extra runtime
+
+In practice, the values that feed attention often pass through preprocessing steps such as rotary position embeddings (or other token-wise transforms) immediately before entering the attention kernel. FlashAttention-3 exploits this pipeline structure: the block quantization step can be fused into the same memory-bound pass that computes rotary embeddings (or any similar pre-attention per-token transform). Because rotary embedding is memory-bandwidth bound, doing the per-block scaling/quantization in the same read/write pass does not meaningfully increase runtime; the memory traffic dominates and the extra arithmetic for computing a block’s scale and applying it is cheap in comparison.
+
+Operationally, fusing means that when we visit a block of $\mathbf{Q}$ or $\mathbf{K}/\mathbf{V}$ to apply the rotary embedding, we also compute the block’s scale and write out the FP8 representation and the scalar scale. The result is that block quantization costs essentially the same wall-clock time as applying rotary embedding alone, i.e., it is performed “at no additional slowdown” in real runs, as observed in the paper.
+
+# Adjusting S blocks to account for per-block scales at no extra compute
+
+When both operands are quantized blockwise, their dot-products inherit simple multiplicative corrections that are easy to apply. Suppose a query block and a key block are quantized to $\tilde{\mathbf{Q}}_i$ and $\tilde{\mathbf{K}}_j$ with dequantization scales $\gamma_{Q,i}$ and $\gamma_{K,j}$ so that $\hat{\mathbf{Q}}_i \approx \gamma_{Q,i}\,\tilde{\mathbf{Q}}_i$ and $\hat{\mathbf{K}}_j \approx \gamma_{K,j}\,\tilde{\mathbf{K}}_j$. Then the mixed-precision block of scores satisfies
+\[
+\mathbf{S}_{ij} \;=\; \hat{\mathbf{Q}}_i\,\hat{\mathbf{K}}_j^\top
+\;\approx\; \bigl(\gamma_{Q,i}\gamma_{K,j}\bigr)\,\bigl(\tilde{\mathbf{Q}}_i\tilde{\mathbf{K}}_j^\top\bigr)
+\;=\; \bigl(\gamma_{Q,i}\gamma_{K,j}\bigr)\,\tilde{\mathbf{S}}_{ij},
+\]
+where $\tilde{\mathbf{S}}_{ij}$ denotes the dot-product computed from the quantized blocks. The correction from quantization is thus a single scalar multiplier per block: multiply each entry of $\tilde{\mathbf{S}}_{ij}$ by $\gamma_{Q,i}\gamma_{K,j}$ to recover the approximate full-precision block $\mathbf{S}_{ij}$.
+
+Because FlashAttention-3 already computes and reduces scores block-by-block inside the kernel, this scalar correction is trivial to accommodate: the scalar product $\gamma_{Q,i}\gamma_{K,j}$ can be applied to a block of $\tilde{\mathbf{S}}_{ij}$ in the same register/local arithmetic context where the block is already being processed. In other words, the correction is a per-block scalar multiply and can be folded into existing rescaling and softmax steps so that it does not require additional global memory reads/writes or extra heavyweight operations. The algorithmic tiling therefore makes block quantization a natural, low-overhead fit.
+
+# Incoherent processing: multiply Q and K by the same random orthogonal matrix M
+
+Block quantization reduces error by shrinking the per-block dynamic range, but outliers can still dominate individual blocks. Incoherent processing further reduces quantization error by mixing coordinates before quantization so that outliers are spread rather than concentrated. Concretely, FlashAttention-3 multiplies both $\mathbf{Q}$ and $\mathbf{K}$ on the right by the same orthogonal matrix $M$ prior to quantization and tile-wise FP8 encoding. The key algebraic fact is that if $M$ is orthogonal (so $M M^\top = I$), then the attention scores are invariant under this common transform:
+\[
+(\mathbf{Q}M)(\mathbf{K}M)^\top \;=\; \mathbf{Q}\,M\,M^\top\,\mathbf{K}^\top \;=\; \mathbf{Q}\,\mathbf{K}^\top.
+\]
+Hence, in exact arithmetic the attention computation is unchanged by this pre-multiplication. But because quantization is applied after multiplication by $M$, the distribution of entries seen by the quantizer is different: each coordinate of $\mathbf{Q}M$ or $\mathbf{K}M$ is a linear combination of many original coordinates, so a single extreme value in one coordinate becomes spread out across many coordinates. After blockwise quantization, this “incoherency” reduces the peak-to-typical ratios that cause large quantization errors, improving numeric fidelity.
+
+The paper refers to this idea as “incoherent processing,” and emphasizes that multiplying by the same $M$ on both sides preserves the exact attention result in the unquantized case while making the subsequent quantization far less harmful.
+
+# Using Hadamard with random signs for O(d log d) cost and fusion with rotary
+
+A naive dense orthogonal $d\times d$ matrix costs $O(d^2)$ time to apply, which would defeat the performance gains from using FP8. FlashAttention-3 uses a structured orthogonal transform that is both effective at spreading out outliers and cheap to apply: the product of random diagonal sign matrices (diagonals of $\pm 1$) and the Hadamard matrix. This construction gives an orthogonal $M$ that can be applied using the fast Walsh–Hadamard transform in $O(d\log d)$ time rather than $O(d^2)$.
+
+Because the Hadamard transform and diagonal sign multiplications are simple elementwise or structured operations, they can also be fused with other per-token transforms (for example, rotary embedding) at the memory-bound stage immediately before quantization. In practice, therefore, applying $M$ does not meaningfully raise the runtime: FlashAttention-3 can combine the Hadamard-based mixing with other pre-attention operations to keep the wall-clock cost negligible compared to memory access time.
+
+# Invariance of QK^T under common orthogonal transforms and intuition for outlier spreading
+
+It is helpful to restate the invariance and the intuition behind why mixing helps. The algebraic invariance is immediate from orthogonality:
+\[
+(\mathbf{Q}M)(\mathbf{K}M)^\top
+= \mathbf{Q} M M^\top \mathbf{K}^\top
+= \mathbf{Q} \mathbf{K}^\top.
+\]
+This identity guarantees that any improvements in quantized accuracy come purely from better-conditioned inputs to the quantizer, not from changing the mathematical object the attention would compute in full precision.
+
+Intuitively, consider a block that contains an element that is orders of magnitude larger than its peers. If we quantize that block with a single scale, the presence of the outlier forces a large scale, making the typical entries small relative to that scale and thus poorly represented. If instead we first multiply by $M$, that single extreme value contributes in small amounts to many coordinates after the transform; each block now sees a milder dynamic range, and the blockwise scale can be chosen to preserve more information across entries. The Hadamard-based $M$ achieves this mixing efficiently and deterministically (given the random signs), turning localized extremes into incoherent, distributed contributions that quantize much better.
+
+# Empirical result: up to 2.6× lower RMSE vs FP8 per-tensor scaling baseline
+
+The combined effect of block quantization and incoherent processing was validated empirically in the paper. The baseline FP8 implementation used per-tensor scaling (with matmul accumulators in FP32 and intermediate softmax results kept in FP16). On the outlier-heavy synthetic test described earlier (each entry sampled as $\mathcal{N}(0,1) + \mathrm{Bernoulli}(0.001)\cdot \mathcal{N}(0,100)$), FlashAttention-3 using block quantization together with incoherent processing reduced the root mean squared error (RMSE) by a factor of about $2.6\times$ relative to that per-tensor FP8 baseline. This shows that the two ideas — blockwise scaling aligned with FlashAttention tiles, and inexpensive orthogonal mixing before quantization — are effective in making FP8 a practical option for attention with much lower numerical degradation than a naive per-tensor quantization scheme.
+
+Summary
+
+Putting the pieces together: FP8 promises large throughput gains but must be handled carefully because of its very limited mantissa and exponent. Block quantization aligns natural algorithmic tiles with per-block scales so each block keeps much of its own precision. Incoherent processing (mixing by an orthogonal $M$ built from Hadamard and random signs) spreads rare outliers so they no longer dominate individual blocks. Both techniques are designed to be low-overhead in practice: block quantization is fused with pre-attention memory-bound transforms like rotary embedding, and the Hadamard-based mixing is $O(d\log d)$ and can also be fused. Empirically these ideas together produced a substantial reduction in FP8 numerical error (about $2.6\times$ RMSE improvement) compared to a simple per-tensor FP8 baseline, making low-precision attention both faster and more accurate in practice.

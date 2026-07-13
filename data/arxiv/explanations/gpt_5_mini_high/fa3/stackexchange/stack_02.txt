@@ -1,0 +1,43 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### What exactly are commit-but-don’t-wait semantics for WGMMA and TMA in the 2-stage pipeline?
+Question:
+The 2-stage consumer pseudocode issues WGMMA for $\mathbf{Q}_i\mathbf{K}_j^\top$ and for $\widetilde{\mathbf{P}}_{\mathrm{cur}}\mathbf{V}_{j-1}$ with commit but do not wait, then waits later before using the results. What are the concrete PTX or CUTLASS primitives that implement these semantics for Hopper (e.g., wgmma.mma_async and the corresponding wait)? Similarly, what are the TMA primitives and barriers used to signal tile readiness from producer to consumer? How do these primitives guarantee that softmax never reads $\mathbf{S}_{\mathrm{next}}$ until its GEMM has completed, even under aggressive compiler instruction reordering?
+Answer:
+Short answer: "commit-but-don’t-wait" in the 2‑stage pipeline is just issuing the hardware’s asynchronous primitives (start the tensor‑core GEMM or the TMA copy) and returning immediately; later the code executes the corresponding explicit wait/fence primitive before touching the results. On Hopper these are the asynchronous WGMMA and TMA primitives (and their wait/commit counterparts) exposed in PTX/SASS and wrapped by CUTLASS. The concrete mapping used in FlashAttention‑3 is:
+
+- Tensor Core (WGMMA) async: issue the async GEMM via the WGMMA async instruction (PTX/SASS form commonly written as wgmma.mma_async or the CUTLASS wrapper that emits it), and later execute the matching wgmma wait (wgmma.mma_wait / wait_all) before any instruction that reads the accumulator.  
+- TMA (global→shared) async: issue the TMA load(s) and commit them, and use the TMA wait/commit semantics (CUTLASS provides TMA load/commit/wait helpers) plus intra‑CTA synchronization (bar.sync / __threadfence_block or a shared‑memory “ready” flag) to let consumers see the tile only after the transfer finished.
+
+Why this is safe (intuition + mechanics). The GPU provides two separate hardware engines: a Tensor Core engine (WGMMA) that can accept "start" requests and run matmuls asynchronously, and a DMA/TMA engine that handles global→shared copies asynchronously. The PTX/SASS async op (wgmma.mma_async) enqueues work on the tensor engine and returns; the corresponding wait instruction is a hardware synchronization point: it tells the scheduler to stall instruction retirement until the requested async operations have finished and the accumulator/register state is valid. Because the wait is an actual PTX/SASS synchronization instruction (not a plain C++ function), the compiler cannot legally move the consumer code that depends on the WGMMA result past the wait: the wait creates a true data/ordering dependency visible to the backend and the hardware scoreboard enforces it. The same principle holds for TMA: commits and waits for TMA (or the CUTLASS TMA wrapper) are explicit events that must be emitted into SASS; you then pair them with a small producer->consumer handshake (a ready bit in shared memory + __threadfence_block / bar.sync or a TMA wait) so the consumer never reads the SMEM tile until the TMA copy completed.
+
+A compact PTX‑style sketch of the pattern used in the paper (pseudo‑PTX / SASS):
+
+  // start next $Q*K^T$ asynchronously
+  wgmma.mma_async  ...  // starts GEMM that will produce $S_{next}$
+  // start RS‑GEMM for previous tile ($P_{cur} * V_{j-1}$) asynchronously
+  wgmma.mma_async  ...
+  // now we need $S_{next}$ for softmax: wait for the specific async WGMMA to complete
+  wgmma.mma_wait  #n_pending_for_S_next
+  // safe to read $S_{next}$ registers and compute softmax
+  // later wait for the $P_{cur} * V$ GEMM to finish before using its outputs
+  wgmma.mma_wait  #n_pending_for_PV
+
+And for TMA producer->consumer handshake the usual idiom is:
+
+  // producer warp:
+  tma.load.async (GMEM -> SMEM) for $K_j/V_j$ tiles  // async issue
+  tma.commit()                                      // commit group to TMA
+  __threadfence_block()                             // ensure ordering
+  shared_stage_ready[stage] = 1                     // write ready flag
+  // consumer warp:
+  wait_until(shared_stage_ready[stage] == 1)        // or bar.sync + check
+  // At this point SMEM tile is safe to read; alternatively consumer can call tma.wait()
+
+Practical mapping to CUTLASS and the paper implementation. The authors use CUTLASS’s WGMMA and TMA abstractions rather than hand‑writing SASS; CUTLASS emits the appropriate wgmma.mma_async / wgmma.mma_wait and TMA commit/wait sequences for Hopper. In other words, in the FlashAttention‑3 code you’ll see CUTLASS calls that wrap the async WGMMA and a corresponding wait (CUTLASS names vary across versions, but conceptually they are “mma_async” + “mma_wait” wrappers and “tma::load/commit/wait” pipeline helpers). The paper explicitly says it uses WGMMA and TMA abstractions from CUTLASS, plus bar.sync for warpgroup handshakes.
+
+Why compiler reordering is not a problem. Compilers can reorder ordinary C++/CUDA instructions, but they cannot legally move work across explicit PTX/SASS synchronization primitives that affect register or memory visibility. The async issue is a side‑effecting instruction (it changes the tensor engine’s pending‑ops scoreboard) and the wait is a required visibility point. CUTLASS emits these primitives (or inline PTX) so the NVCC backend will preserve the order that matters: any instruction that needs the WGMMA accumulator must be placed after the corresponding wgmma.mma_wait in the final SASS, and that wait will block retirement until the Tensor Core finished. For inter‑warp signaling, a ready flag plus __threadfence_block / bar.sync (or TMA’s own wait) is used; these are also concrete SASS instructions / memory fences, so the backend cannot invisibly reorder the softmax reads before the completion/wait.
+
+Implementation checklist / gotchas. Implementers must (1) use the proper async + wait pair (don’t try to emulate it with C++ memory ops), (2) make the producer->consumer handshake explicit (shared memory flag + __threadfence_block or bar.sync / pipeline object) so the consumer never polls stale SMEM, and (3) ensure the wait counts are correct (WGMMA wait often takes a count of pending ops or you use a “wait_all” form). Using CUTLASS’s built‑in async GEMM and TMA pipeline helpers avoids subtle mistakes; if you emit raw inline PTX, mark the asm volatile and/or use the provided CP/WGMMA/TMA wait primitives so NVCC/SASS keep your ordering intact.
+
+If you want, I can point to the exact CUTLASS functions (in the CUTLASS release used by the paper) and show the small inline‑PTX snippets CUTLASS emits for mma_async / mma_wait and TMA commit/wait.

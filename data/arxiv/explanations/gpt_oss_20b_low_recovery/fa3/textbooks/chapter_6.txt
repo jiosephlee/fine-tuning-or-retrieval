@@ -1,0 +1,129 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 6: # Backward Pass and Gradient Flow
+
+The backward pass of multi‑head attention is the computational stage that propagates gradients from the loss back through the attention mechanism.  In FlashAttention‑3 the forward pass is engineered to fuse the softmax reduction and the two matrix multiplications (Q‑K\(^\top\) and P‑V) into a single, highly‑optimized kernel that exploits warp‑specialized asynchrony and, for FP8, block quantization.  The backward pass must *mirror* this efficient execution while computing the gradients with respect to the three input projections \(\mathbf{Q}\), \(\mathbf{K}\), and \(\mathbf{V}\).  The following sections describe how the backward algorithm is derived, how its operations are partitioned into producer and consumer warps, and how the same overlapping and precision‑aware tricks used in the forward direction are reused to achieve maximal GPU utilization.
+
+---
+
+## Mathematical Derivation of Attention Gradients
+
+The forward attention routine produces the output
+\[
+\mathbf{O} \;=\; \mathbf{P}\mathbf{V},
+\qquad
+\mathbf{P} \;=\; \operatorname{softmax}\!\left(\alpha\,\mathbf{Q}\mathbf{K}^{\top}\right),
+\qquad
+\alpha \;=\; \frac{1}{\sqrt{d}} .
+\]
+Let the loss‐dependent back‑propagated values be \(\mathbf{dO} \in \mathbb{R}^{N\times d}\).  The chain‐rule derivatives for the single‑head case are
+
+\[
+\begin{aligned}
+\mathbf{dV} &= \mathbf{P}^{\!\top}\mathbf{dO} ,\\[0.3em]
+\mathbf{dP} &= \mathbf{dO}\,\mathbf{V}^{\!\top} ,\\[0.3em]
+\mathbf{dS} &= \mathrm{dsoftmax}\!\bigl(\mathbf{dP}\bigr) ,\\[0.3em]
+\mathbf{dQ} &= \alpha\,\mathbf{dS}\,\mathbf{K} ,\\
+\mathbf{dK} &= \alpha\,\mathbf{dS}^{\!\top}\mathbf{Q} .
+\end{aligned}
+\]
+The derivative of softmax is the element‑wise operation
+\[
+\mathrm{dsoftmax}(\mathbf{dP}) 
+= \bigl(\operatorname{diag}(\mathbf{p}) - \mathbf{p}\mathbf{p}^{\!\top}\bigr)\,\mathbf{dP},
+\quad
+\mathbf{p}\;=\;\mathrm{softmax}(\mathbf{S}) .
+\]
+For a row \(\mathbf{s}\in\mathbb{R}^{N}\) with softmax row \(\mathbf{p}\), the Jacobian applied to the gradient row \(\mathbf{r}\) reduces to
+\[
+\bigl(\mathbf{p}\odot \mathbf{r}\bigr)
+- \bigl(\mathbf{p}^{\!\top}\mathbf{r}\bigr)\mathbf{p},
+\]
+where \(\odot\) denotes element‑wise product.  Thus computing \(\mathbf{dS}\) consists of, per row, a dot product, an element‑wise product, a subtraction, and another dot product.  The operations below are executed *in situ*: \(\mathbf{P}\) is *not* materialized and both \(\mathbf{p}\) and the intermediate scalars are kept in register/SMEM, exactly as in the forward pass.
+
+---
+
+## Backward Kernel Layout: Producer/Consumer Partitioning
+
+The backward kernel follows the same producer/consumer partitioning pattern as the forward kernel, but the roles are inverted:
+
+* **Producer warpgroups** now load the *gradients* \(\mathbf{dO}\) from global memory and, crucially, *generate the necessary per‑row scalar reductions* (the row sums of \(\mathbf{dP}\) and the dot‑product with \(\mathbf{p}\)) that the consumer warpgroups need.  This is analogous to the forward producer that bubbles the query block \(\mathbf{Q}\) into shared memory.
+
+* **Consumer warpgroups** consume the partially reduced gradients, fetch the *original* \(\mathbf{Q}, \mathbf{K}, \mathbf{V}\) tiles from global memory or from the *persistent* shared‑memory buffers created during the forward pass, and perform the two required matrix multiplications.
+
+Because the algorithm uses a *pipelined* approach (the forward pass already kept \(\mathbf{Q}\) and the per‑block scale factors in SMEM), the consumer can begin its jobs immediately after the producer pushes a block of \(\mathbf{dO}\).  The layout mirrors the forward pass:
+
+* **Shared‐memory tiles:**  
+  \(\tilde{\mathbf{Q}} \in \mathbb{R}^{B_r\times d}\) (the query block)  
+  \(\tilde{\mathbf{K}} \in \mathbb{R}^{B_c\times d}\) (the key block)  
+  \(\tilde{\mathbf{V}} \in \mathbb{R}^{B_c\times d}\) (the value block)  
+  \(\tilde{\mathbf{dO}} \in \mathbb{R}^{B_r\times d}\) (the gradient block)
+
+* **Producer registers:**  
+  These hold value of the *softmax‑gradient* for each column \(j\) of \(\mathbf{S}\) as it is streamed in, enabling the consumer to apply the Jacobian without re‑loading \(\mathbf{p}\).
+
+The continuous data‑flow across the warp‑group boundary is enforced by the same `bar.sync` primitives that synchronized the forward pipeline.  Importantly, the backward kernel reuses the *ping‑pong* buffer that held \(\mathbf{Q}\) and \(\mathbf{K}\) during the forward pass, thereby avoiding any extra asynchronous loads.
+
+---
+
+## Overlapping Backward GEMMs with Softmax Derivative
+
+In the forward pass, we overlapped softmax with the second GEMM using a 2‑stage pipeline; the backward pass can benefit from identical overlap because each block requires *two* matrix multiplications:
+
+1. \(\mathbf{dP}\mathbf{V}^{\!\top}\) (producing \(\mathbf{dV}\))
+2. \(\mathbf{dS}\mathbf{K}\)  or  \(\mathbf{dS}^{\!\top}\mathbf{Q}\) (producing \(\mathbf{dQ}\) or \(\mathbf{dK}\))
+
+The *softmax derivative* is computed *after* the first multiplication because it needs \(\mathbf{P}\), which has already been calculated implicitly in the forward pass; nonetheless, the consumer must compute the *row‑wise* Jacobian on the fly.  The following schedule is applied:
+
+```
+for j = 0 .. T_c-1:
+    // 1st stage (already producing dP from previous iteration or initial load)
+    issue WGMA(dP * V_j^T)   // -> dV_j
+    // 2nd stage (overlaps with softmax derivative of next block)
+    issue WGMA(dS * K_j^T)   // -> dQ_j or dK_j
+    // compute softmax derivative on current block:
+    compute dS_j from stored p, dP_j
+    // bloom regs for next cycle
+```
+
+The derivation of \(\mathbf{dS}\) only needs the *stored row* of \(\mathbf{p}\) and \(\mathbf{dP}\) for the current block, so we can compute it *while the WGMA for \(\mathbf{dP}\mathbf{V}^{\!\top}\) is running*.  The timing diagram is identical to that of the forward 2‑stage pipeline (see Fig. 5 in the paper), but the direction of the GOPs (in/out) is reversed.
+
+The use of `barriers` to hand the block over to the next consumer warpgroup ensures that the softmax derivative never stalls a WGMA.  Experimental results in the paper’s ablation study confirm that overlapping the GEMMs with the softmax derivative yields a 10–15 % performance boost for long sequences.
+
+---
+
+## Memory Footprint and Register Usage for the Backward Pass
+
+Because the backward pass must hold **four** operands simultaneously (two matrices per gradient) it naturally demands more on‑chip resources than the forward pass.  The key contiguity rules, however, remain the same:
+
+* The **query** and **key** blocks are held in SMEM and accessed by the consumers as *access‑level* operands for WGMMA.
+* The **gradients** \(\mathbf{dO}\) are transiently stored in registers; they are streamed out of GMEM by the producers and loaded into SMEM by the consumers per block.
+* The intermediate **softmax‑derivative** intermediates are kept in registers, as they are needed only within a single warp‑group iteration.
+
+The register count per CTA rises by an amount proportional to \((2B_r + 2B_c)\), but as the value of each block is only \(d\) bytes, the additional footprint stays within the 256 register budget for typical block sizes (\(B_r, B_c \le 64\)).  To preserve occupancy, we use mixed‑precision (`__int8` or `__half` for *caches*) in the registers that store scaling factors, thereby keeping the *S‑cache* from being saturated.
+
+FP16/FP8 denominator scaling (the \(\ell_i\) scalar from the forward pass) is also kept in shared memory; the backward kernel reads it only if it needs to rescale \(\mathbf{dV}\).  This reuse is one of the factors that allows the backward kernel to run in roughly 70 % of the forward kernel’s time on H100, as shown in the table below (refer to Appendix C.2 for the full metric).
+
+---
+
+## FP8 Backward Pass: Accumulator Precision and Quantization Impact
+
+When the model weights are stored in FP8 but the backward gradients are required in higher precision, the implementation takes two independent steps:
+
+1. **Accumulator Precision** – The WGMMA multiplications for \(\mathbf{dP}\mathbf{V}^T\) and \(\mathbf{dS}\mathbf{K}\) are performed in FP8 *operands* but the *accumulators* are maintained in FP32 or BF16.  Because the original model’s forward pass already performed the attention’s matrix multiplications in FP8 with FP32 accumulators, re‑using the same precision strategy ensures *numerical consistency* between forward and backward passes.  Code‑wise this is achieved by launching the WGMMA with the `WMMA_ACC_LP48` flag, which tells the compiler to promote the accumulator to 48‑bit floating point.
+
+2. **Block Quantization** – For FP8, the *scales* applied to each block of \(\mathbf{Q}\) and \(\mathbf{K}\) during the forward pass (section 3.1) are persisted in a *scale table* in SMEM.  The backward kernel multiplies the *gradient* blocks by the *inverse* of this scale prior to feeding them into the WGMMA, exactly as done in the forward pass.  Since the gradient tensors \(\mathbf{dO}\) are often much larger due to the summation across heads, it is cheaper to perform the block‑wise de‑quantization **inside** the softmax‑derivative path, avoiding an extra memory traffic.
+
+3. **Incoherent Processing** – The random matrix \(\mathbf{M}\) that was applied to \(\mathbf{Q}\) and \(\mathbf{K}\) in the forward pass preserves its orthogonality.  Because \((\mathbf{Q}\mathbf{M})(\mathbf{K}\mathbf{M})^\top = \mathbf{Q}\mathbf{K}^\top\), the backward gradients can be *paced* through \(\mathbf{M}\) as well.  Practically, the \(\mathbf{M}\) transform is applied to \(\mathbf{dQ}\) and \(\mathbf{dK}\) after the WGMMA, thereby keeping the output in the same *coherent* space as in the forward evaluation.  This additional Hadamard‑diagonal multiplication is done via `__shfl_xor_sync` and is invisible to the rest of the pipeline.
+
+The combined effect of these techniques is a 2.6× reduction in the root‑mean‑square error of the FP8 backward pass relative to a naïve per‑tensor scaling scheme, as reported in the paper’s numerical error table.
+
+---
+
+## Performance and Utilization Results for Backward Kernels
+
+The patched backward kernel achieves a **75 %** integer‑level utilization of the Hopper H100’s Tensor Core capacity when running with FP16, and **70 %** utilization for FP8 with FP32 accumulators.  These figures are extracted from the comprehensive AXI‑based performance profiling (see Figure 12 in the paper) and match the theoretical FLOP throughput of the forward routine, confirming that the backward pass is *completely fused* and *non‑blocking*.
+
+On a typical H100 SXM5 launch, using a batch of 8, head dimension 128, sequence length 8192, the backward time of FlashAttention‑3 is measured at **2.5 ms**, compared to **3.6 ms** for the legacy FlashAttention‑2 and **5.8 ms** for the cuDNN reference.  The FP8 backward kernel replaces 1.4 ms of the FP16 computation by running two tensor‑core multiplies at double the throughput, and the added cost of the softmax‑derivative pipeline is fully amortized by the overlapping schedule.
+
+In summary, by mirroring the forward kernel’s warp‑specialized pipeline, overlapping the softmax derivative with the two required GEMMs, and carefully aligning operand and accumulator formats for FP8, FlashAttention‑3 achieves a backward pass that is both **fast** and **numerically faithful** across precision regimes.  The same design principles can be ported to other GPU architectures that expose asynchronous memory engines and low‑precision tensor cores.

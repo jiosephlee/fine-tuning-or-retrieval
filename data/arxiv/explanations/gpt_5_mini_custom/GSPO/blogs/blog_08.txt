@@ -1,0 +1,96 @@
+\title{Blogs about the Paper: "Group Sequence Policy Optimization"}
+
+# Scaling Qwen3 with GSPO: Practical Tips and Takeaways
+
+Group Sequence Policy Optimization (GSPO) is a simple change with outsized practical impact: instead of applying importance weights and clipping at the token level, GSPO computes importance ratios at the sequence (response) level and clips entire responses. In Qwen3 training this design choice produced more stable RL, better sample efficiency, and made RL work reliably for large MoE models without special routing hacks. Below I summarize the practitioner-facing lessons from that work and the concrete decisions that mattered in production runs.
+
+## High-level intuition (short)
+- Importance sampling should correct the distribution over whole sequences, because the reward is granted at the sequence level. Token-level importance ratios (as used by GRPO/PPO variants) are computed from single-token draws and act more like high-variance noise when you use them to reweight gradients across long sequences.
+- GSPO uses a sequence-level importance ratio and then length-normalizes it so ratios for different-length responses are comparable. Clipping and advantage estimation are done per response, not per token. This both stabilizes gradients and matches the unit of reward to the unit of correction.
+
+## Picking group size G
+GSPO follows the group-relative advantage idea (as in GRPO) for value-free advantage estimation: for each query x you sample a group of G responses {y_i} and compute normalized advantages across that group. Practical takeaways from the paper:
+
+- Use a non-trivial group size (G > 1). The group is essential because the advantage for each response is computed as the standardized score within the group:
+  \[
+  \widehat{A}_i = \frac{r(x,y_i) - \mathrm{mean}(\{r(x,y_j)\}_j)}{\mathrm{std}(\{r(x,y_j)\}_j)}.
+  \]
+  A group of size 1 removes this standardization and loses the relative ranking signal.
+- The paper does not prescribe a single best G; choose G large enough to give reliable mean/std estimates but small enough to fit memory and throughput constraints. In production Qwen3 experiments a group-based scheme was used (the paper refers to typical group setups), and the mini-batching strategy (splitting rollout batches into multiple mini-batches) requires G > 1 to benefit from relative advantage normalization.
+
+If in doubt: start with the same grouping scheme you used for GRPO experiments; GSPO benefits from the same group-based sampling but is significantly more robust to the downstream optimization because it clips at sequence level.
+
+## Clipping ranges: much smaller than token-level methods
+One of the most surprising but important practical facts from the experiments is that GSPO uses clipping ranges that are orders of magnitude smaller than GRPO/PPO token-level clipping. In the reported Qwen3 fine-tuning runs:
+
+- GSPO left/right clipping ranges were around 3e-4 / 4e-4 (i.e., extremely tight when applied to the length-normalized sequence ratio).
+- GRPO’s token-level clipping ranges used for fair comparison were 0.2 / 0.27.
+
+Why this is reasonable:
+- GSPO's importance ratio is
+  \[
+  s_i(\theta) = \left(\frac{\pi_\theta(y_i\mid x)}{\pi_{\theta_\text{old}}(y_i\mid x)}\right)^{1/|y_i|}
+  = \exp\!\left(\frac{1}{|y_i|}\sum_{t=1}^{|y_i|}\log\frac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}{\pi_{\theta_\text{old}}(y_{i,t}\mid x,y_{i,<t})}\right),
+  \]
+  i.e., a per-token normalized geometric mean of likelihood ratios. After this normalization, typical deviations are numerically small and should be clipped much more tightly than token-level ratios.
+- Empirically, GSPO clipped a far larger fraction of tokens/responses (two orders of magnitude difference in clipped-token fraction), yet still produced more efficient learning. This demonstrates that the token-level gradient estimates in GRPO are noisier even when many tokens go unclipped.
+
+Practical recipe:
+- Expect clipping thresholds to be tiny when using length-normalized sequence ratios. Tune in the small range (1e-5 .. 1e-3) rather than typical PPO-style 0.1–0.3 ranges. The paper’s working numbers (3e-4 / 4e-4) are a good starting point for large models and long responses.
+
+## Why length-normalization matters
+Length normalization is a small but crucial design choice for the sequence ratio:
+
+- Without dividing by sequence length $|y|$, sequence likelihood ratios are multiplicative over tokens and explode (or vanish) with longer sequences. That makes clipping ranges length-dependent and unstable across responses of different lengths.
+- GSPO uses the per-token geometric mean (i.e., raising the sequence ratio to the power $1/|y|$). This keeps $s_i(\theta)$ numerically stable across varying $|y|$ and allows a single clipping policy to apply across lengths:
+  \[
+  s_i(\theta) = \left(\frac{\pi_\theta(y_i\mid x)}{\pi_{\theta_\text{old}}(y_i\mid x)}\right)^{1/|y_i|}.
+  \]
+- The length-normalized ratio reduces variance and prevents a few token-probability changes from producing huge swings in sequence-level importance.
+
+In practice: always apply length normalization for sequence-level importance ratios, especially for variable and long-generation tasks.
+
+## Scheduling compute, query refresh, and generation length
+The Qwen3 experiments reported continuous gains when the team increased training compute, refreshed queries, and extended generation length. The paper highlights these practices as complementary rather than contradicting each other.
+
+Practical guidance:
+
+- Schedule compute increases gradually: GSPO is stable enough to continue improving when you add more RL compute. If you hit plateaus, consider (a) increasing rollout volume, (b) increasing update steps, or (c) increasing group size—each affects how much signal you feed into the objective.
+- Regularly refresh the query set: the paper reports that updating the RL query set during training contributes to continuous performance improvement. In other words, avoid training for many steps on a stale query distribution; periodically add new or harder queries to keep the model improving on current needs.
+- Increase generation length when appropriate: GSPO remains stable as you extend response length, because the sequence-level ratio is length-normalized. If your task benefits from longer generations (deeper reasoning or multi-step answers), extend generation length to let RL practice those behaviors, and GSPO should continue to learn rather than destabilize.
+
+A practical schedule used in the experiments: scale training compute, update the query set at intervals, and extend generation length as model capability and task requirements grow. The exact cadences depend on infrastructure and labeling costs, but the core point is GSPO scales with these knobs without the catastrophic instability observed under GRPO.
+
+## MoE-specific benefits: no Routing Replay required
+Large Mixture-of-Experts (MoE) models introduce a new failure mode for token-level importance ratios: expert-activation volatility. After a parameter update the set of experts activated for the same response can change (the paper observed roughly 10% difference in activated experts per update for a 48-layer Qwen3-30B-A3B-Base), which makes token-level likelihoods under the new policy incomparable to the old policy unless you pin the routing decisions.
+
+Previously the team used a Routing Replay trick: cache the activated experts under the behavior policy and replay those routing masks when scoring under the current policy. This stabilizes token-level ratios but adds memory, communication, and capacity constraints.
+
+Why GSPO helps:
+- GSPO uses sequence-level likelihoods and is robust to modest per-token routing changes because the overall sequence likelihood remains a sensible measure of how probable the whole response is under each policy.
+- In practice GSPO removed the need for Routing Replay: it converged and optimized MoE models stably with conventional likelihood computation, simplifying infrastructure and allowing full model capacity during RL.
+
+If you are training MoE models, try GSPO first. It can eliminate the extra engineering complexity and overhead of routing-replay schemes.
+
+## Infrastructure and likelihood recomputation
+GSPO reduces sensitivity to precision/engine mismatch:
+
+- In many deployments, rollout generation is done with an inference engine (vLLM / SGLang) while training uses a separate engine (Megatron). Token-level recomputation of likelihoods in the training engine can be required because of minor numeric differences between engines.
+- Sequence-level likelihoods are more tolerant of those precision differences. GSPO therefore opens the door to using the inference-engine-provided sequence likelihoods directly for optimization without re-running every response in the training engine, which can reduce I/O, latency, and compute overheads in large-scale pipelines. This is particularly helpful in partial-rollout, multi-turn RL, and disaggregated train/infer setups.
+
+## GSPO-token: when you want token-level customization
+If you need token-level advantage shaping (for example, to weight earlier vs. later tokens differently in a multi-turn or partially supervised setting), GSPO offers a variant called GSPO-token. The key points:
+
+- GSPO-token keeps the same sequence-level importance scalar detached from gradients, then applies token-level advantages per token but multiplies them by the same detached sequence ratio.
+- When all token advantages in a response are equal, GSPO-token is numerically and theoretically identical to GSPO. Use GSPO-token only if you need per-token advantage modulation; otherwise prefer the simpler GSPO.
+
+## Summary: practical checklist to get started
+- Use GSPO (sequence-level importance ratio, length-normalized) instead of token-level GRPO/PPO variants when training RL on language models.
+- Keep group sampling (G > 1); compute advantages by standardizing rewards within each group.
+- Expect and tune very small clipping ranges for the length-normalized sequence ratio (start near the reported 3e-4 / 4e-4 range).
+- Always length-normalize the sequence likelihood ratio: raise the sequence ratio to the power $1/|y|$ or equivalently average log-ratios over tokens.
+- Schedule more compute, refresh queries periodically, and extend generation length as capability improves — GSPO is stable under all three.
+- For MoE models, GSPO removes the need for Routing Replay and simplifies infrastructure.
+- Consider GSPO-token only if you must customize token-level advantages.
+
+These choices were central to the Qwen3 RL improvements described in the paper: more stable training, better sample efficiency, and reliable scaling to large MoE models. If you are scaling RL on language models, GSPO is a low-friction change that deserves to be part of your baseline.

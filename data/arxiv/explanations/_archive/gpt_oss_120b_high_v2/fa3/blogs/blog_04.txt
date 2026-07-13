@@ -1,0 +1,168 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# Ping‑Pong Scheduling: Overlapping Softmax with Matrix Multiplication  
+
+*How FlashAttention‑3 hides the low‑throughput softmax behind high‑throughput Tensor‑Core GEMMs.*
+
+---
+
+## 1. The attention bottleneck in a nutshell  
+
+The forward pass of a single Transformer head boils down to three matrix operations  
+
+\[
+\mathbf{S}= \alpha\,\mathbf{Q}\mathbf{K}^{\!\top},\qquad
+\mathbf{P}= \operatorname{softmax}(\mathbf{S}),\qquad
+\mathbf{O}= \mathbf{P}\,\mathbf{V},
+\]
+
+where \(\mathbf{Q},\mathbf{K},\mathbf{V}\in\mathbb{R}^{N\times d}\) are query, key and value tensors,
+\(N\) is the sequence length and \(d\) the head dimension.  
+The two multiplications (\(\mathbf{Q}\mathbf{K}^\top\) and \(\mathbf{P}\mathbf{V}\)) are dense **GEMMs** that run on NVIDIA’s Tensor Cores at several hundred teraflops per GPU.  
+The **softmax** step – essentially a row‑wise exponentiation followed by a reduction – is orders of magnitude slower because it executes on the multi‑function unit (MFU), which on an H100 delivers only a few teraflops of exponential throughput.
+
+If we simply run these three steps sequentially, the MFU becomes a choke point: even though GEMMs dominate the FLOP count, their execution time is limited by how long we spend waiting for the softmax to finish.  
+
+> **Rule of thumb on H100**  
+> *FP16 matmul*: ~989 TFLOPs/s  
+> *Exponential*: ~3.9 TFLOPs/s  
+> → Softmax can eat up ~50 % of total cycles despite contributing <2 % of FLOPs.
+
+FlashAttention‑3 tackles this asymmetry with a clever overlap strategy it calls **ping‑pong scheduling**.
+
+---
+
+## 2. Hopper’s asynchronous engine – why we can overlap
+
+The Hopper architecture introduced two ingredients that make an overlap possible:
+
+| Feature | What it gives us |
+|---|---|
+| **Tensor Core asynchrony** (WGMMA instruction) | A matmul can be *launched* without stalling the issuing warp; results become available later via a hardware completion flag. |
+| **Tensor Memory Accelerator (TMA)** | Asynchronous copy between global memory (HBM) and shared memory (SMEM) runs in parallel with compute units. |
+| **Warp specialisation** | Within a CTA we can assign some warps only to data movement (producers) and other warps only to computation (consumers). This clean separation lets the compiler generate tight pipelines without unnecessary register spilling. |
+
+These primitives allow us to start a GEMM, immediately move on to other work (e.g., exponentials), and later synchronize only when we truly need the result.
+
+---
+
+## 3. Ping‑pong scheduling – the two‑stage pipeline
+
+At its core, ping‑pong scheduling reorganises one iteration of attention into **two overlapping stages** that run on *different* warp groups:
+
+1. **Stage A (producer warpgroup)** – loads the next key/value blocks from HBM into SMEM using TMA. This work is independent of any computation currently happening in Stage B.  
+2. **Stage B (consumer warpgroup)** – simultaneously performs three things:
+   * **GEMM 0** – multiplies the current query block \(\mathbf{Q}_i\) with the *previous* key block \(\mathbf{K}_{j-1}^\top\).  
+   * **Softmax** – takes the score matrix \(\mathbf{S}_{j-1}= \alpha\,\mathbf{Q}_i\mathbf{K}_{j-1}^\top\) produced by GEMM 0, subtracts its row‑wise max, exponentiates and accumulates row sums (\(\ell_i\)).  
+   * **GEMM 1** – multiplies the freshly computed probability block \(\widetilde{\mathbf{P}}_{j-1}=e^{\mathbf{S}_{j-1}-m_i}\) with the *previous* value block \(\mathbf{V}_{j-1}\).
+
+Crucially **the next GEMM 0** – i.e., \(\alpha\,\mathbf{Q}_i \mathbf{K}_{j}^\top\) – is launched *before* we finish Softmax for \(\mathbf{S}_{j-1}\). Because WGMMA is asynchronous we do not wait for its completion; instead we store its output registers (\(\mathbf{S}_{j}^{\text{next}}\)) in temporary buffers and move on to Softmax for \(\mathbf{S}_{j-1}\).  
+
+The sequence looks like this:
+
+```
+loop j = 0 … T_c−1
+    // ---------- Producer ----------
+    async load K_j , V_j  → SMEM          // TMA
+    // ---------- Consumer ----------
+    async WGMMA Q_i × K_j      → S_next // launch GEMM 0
+    async WGMMA P_cur × V_{j−1} → O_i    // launch GEMM 1
+    wait for S_next                // required for next Softmax
+    compute Softmax(S_cur) → P_cur // exponentials + reductions
+    // swap roles for next iteration (ping ↔ pong)
+```
+
+Because each iteration performs both a **GEMM 0** *(future)* and a **GEMM 1** *(past)* while Softmax works on the *current* block, every warp group flips between “softmax” and “matmul” duties—hence the name **ping‑pong**.
+
+### Visualising the timeline
+
+```
+time →
++--------------------------+--------------------------+--------------------------+
+|  Warp A : load K,V       |  Warp B : Softmax        | Warp A : load K,V       |
+|  Warp B : GEMM0(Q,K_j)   |  Warp A : GEMM0(Q,K_{j+1})|  Warp B : GEMM1(P,V_{j})|
+|  Warp A : GEMM1(P,V_{j−1})|  …                      | …                        |
++--------------------------+--------------------------+--------------------------+
+```
+
+While Warp A is busy moving data or launching a new matmul, Warp B is chewing through exponentials that would otherwise sit idle waiting for Tensor Cores.
+
+---
+
+## 4. Breaking dependencies – why this works
+
+Naïvely, softmax depends on `S = QKᵀ`, which depends on `K`, which in turn must be loaded from global memory before any computation can start. FlashAttention‑3 sidesteps these sequential constraints by introducing *double buffering*:
+
+* Two SMEM slots hold key/value tiles (`K_j`, `V_j`) so that while one slot feeds a running Gemm,
+another slot can be filled by an asynchronous TMA issued by a different warp group.
+* Intermediate score matrices (`S_cur`, `S_next`) live in registers across iterations,
+allowing us to issue “next‑block” gemms ahead of time without waiting for their results.
+
+Thus every dependency chain becomes either:
+* **asynchronous** ‑‑​which we simply launch early,
+* **local** ‑‐​which resolves within registers,
+or
+* **synchronised** ­–​via an explicit `bar.sync` only when a result is truly needed (e.g., before computing `exp`).
+
+---
+
+## 5. How much speed do we actually get?
+
+### Theory
+
+Softmax throughput on Hopper ≈ \(3.9~\text{TFLOPs/s}\); FP16 GEMM throughput ≈ \(989~\text{TFLOPs/s}\).  
+If both operations run sequentially, effective speed becomes
+
+\[
+\frac{\text{FLOPs}}{\frac{\text{FLOPs}_\text{gemm}}{\rho_\text{gemm}}+\frac{\text{FLOPs}_\text{sftmx}}{\rho_\text{sftmx}}}
+\simeq
+\rho_\text{gemm} \big/ \!\bigl(1+\tfrac{\rho_\text{sftmx}}{\rho_\text{gemm}}\bigr)
+\,,
+\]
+
+where \(\rho_\*\) denotes per‑operation throughput. Because \(\rho_{\text{sftmx}} / \rho_{\text{gemm}} \approx 0.004\), user‑visible utilisation drops dramatically once we include softmax latency.
+
+When we overlap them as in ping‑pong scheduling, softmax runs *concurrently* with another gemm that already consumes almost all Tensor Core capacity. The effective utilisation climbs close to that of pure gemm—empirically around **75 %**, i.e., ~740 TFLOPs/s for FP16 forward passes—giving us a **1.5–2× speedup** over FlashAttention‑2 which lacks this overlap.
+
+### Real numbers
+
+| Precision | Baseline FlashAttention‑2 | FlashAttention‑3 (ping‑pong) | Speedup |
+|-----------|---------------------------|------------------------------|---------|
+| FP16 FWD  | ~570 TFLOPs/s            | ~620–740 TFLOPs/s            | ×1.5–2 |
+| FP16 BWD  | ~400 TFLOPs/s            | ~600–700 TFLOPs/s            | ×1.5–1.75 |
+| FP8 FWD   | —                         | ~1.2 PFLOPs/s                | — |
+
+The gains come primarily from hiding softmax; other optimisations such as warp‐specialised producers/consumers give additional modest boosts but are not required for ping‑pong scheduling itself.
+
+---
+
+## 6. Practical tips & gotchas
+
+* **Compiler reordering** – NVCC may reshuffle instructions for its own optimisation passes. Verify with SASS inspection that `WGMMA` launches precede `exp`/`reduce` kernels; otherwise insert explicit `bar.sync` fences where needed.
+* **Register pressure** – Holding `S_next` plus temporary accumulators across iterations consumes roughly \(B_r\times B_c\times4~\text{bytes}\) per threadblock. Too large tile sizes (`B_r`, `B_c`) can cause spilling—profile your kernel with `nvprof` or Nsight Compute to find the sweet spot.
+* **Pipeline depth** – Extending from two stages to three stages would let us overlap even *both* gemms (`QKᵀ` and `PV`) with softmax, but each extra stage adds another copy of `S` in registers → higher register demand → potentially lower occupancy.
+* **Causal masking** – When masking halves the score matrix you still get similar overlap benefits; just make sure mask handling occurs before or after applying `exp`, not in between gemms where it would break pipelining.
+* **Mixed precision** – The same scheme works equally well in FP8 once operand layout constraints are satisfied (k-major format). In FP8 you get roughly double matmul throughput while MFU remains unchanged—overlap becomes even more valuable.
+
+---
+
+## 7. Takeaways
+
+* On modern GPUs like Hopper, matrix multiplies are *vastly* faster than elementwise functions such as exponentials.
+* By treating attention as a producer–consumer pipeline across warp groups—and by deliberately swapping responsibilities each iteration—we can keep both Tensor Cores *and* MFUs busy all the time.
+* The resulting “ping‑pong” schedule turns what used to be an idle side effect of serial execution into continuous work, delivering up-to‑2× speedups without changing any mathematical semantics of attention.
+* Because pipelining relies only on asynchronous launches (`WGMMA`, `TMA`) and simple barrier synchronisation, it can be transplanted to any GPU architecture offering similar async primitives—not just NVIDIA H100s.
+
+FlashAttention‑3’s ping‑pong scheduling shows how thoughtful software design—aware of hardware quirks—can squeeze out performance far beyond what raw FLOP counts suggest. If you’re building your own transformer kernels or thinking about long‐context inference on new accelerators, consider whether your “slow” operations can be tucked under a fast matrix multiplication using exactly this idea.
+
+--- 
+
+### References  
+
+(Only papers cited in our discussion)
+
+* Dao et al., “FlashAttention,” *NeurIPS*, 2022.  
+* Dao et al., “FlashAttention‑2,” *arXiv*, 2023.  
+* NVIDIA CUDA Programming Guide – Tensor Core & TMA sections (§7–9).  
+
+Feel free to check out the open‐source implementation at https://github.com/Dao-AILab/flash-attention !

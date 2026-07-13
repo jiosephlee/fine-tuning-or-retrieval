@@ -1,0 +1,237 @@
+\title{Stack Exchange of the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+### Why does softmax become a bottleneck when Tensor Cores have such high throughput?
+Question:
+I'm reading the FlashAttention-3 paper and I'm confused about why softmax is described as such a significant bottleneck. The paper states that on the H100, there are 989 TFLOPS of FP16 matmul throughput but only 3.9 TFLOPS for special functions like exponential. 
+
+The paper mentions that for attention with head dimension 128, there are 512x more matmul FLOPS than exponential operations, but exponential has 256x lower throughput, so "exponential can take 50% of the cycle compared to matmul." 
+
+I don't follow this calculation. If matmul has so many more FLOPS and much higher throughput, shouldn't matmul dominate the runtime? How does the softmax end up taking such a large fraction of the execution time?
+Answer:
+The confusion stems from mixing up *operation count* with *execution time*. The key insight is that while matmul has many more FLOPS, the Tensor Cores execute them so efficiently that the relative inefficiency of exponential operations becomes significant.
+
+Let me work through the math from the paper step by step.
+
+For attention with head dimension 128:
+- Matmul FLOPS outnumber exponential operations by a factor of **$512\times$**
+- But matmul throughput (989 TFLOPS) exceeds exponential throughput (3.9 TFLOPS) by a factor of **$256\times$**
+
+The execution time ratio is:
+
+$$\frac{\text{time for exponentials}}{\text{time for matmul}} = \frac{\text{exp operations} / \text{exp throughput}}{\text{matmul FLOPS} / \text{matmul throughput}}$$
+
+$$= \frac{\text{exp operations}}{\text{matmul FLOPS}} \times \frac{\text{matmul throughput}}{\text{exp throughput}}$$
+
+$$= \frac{1}{512} \times \frac{989}{3.9} \approx \frac{1}{512} \times 254 \approx 0.5$$
+
+So exponentials take approximately **50% of the matmul execution time**.
+
+Intuitively, the $512\times$ more matmul operations are handled by hardware that's $256\times$ faster, leaving only a $2\times$ net advantage in total work capacity. This nearly cancels out, making softmax competitive with matmul in terms of wall-clock time.
+
+This is a classic manifestation of **Amdahl's Law**: even a small fraction of low-throughput operations can dominate runtime when the rest is highly optimized. The paper addresses this by overlapping softmax computation with asynchronous Tensor Core operations, effectively "hiding" the softmax latency during matmul execution.
+
+### What does 'warp-specialization' actually mean in the context of FlashAttention-3?
+Question:
+The FlashAttention-3 paper talks about 'warp-specialization' as a key technique, where 'the warps of a CTA are divided into producer or consumer roles that only ever issue either data movement or computation.'
+
+I'm trying to understand what this means concretely. In Algorithm 1, I see there's an IF-ELSE branching on whether a thread is in the 'producer warpgroup' or not. Does this mean:
+
+1. Different warps within the same threadblock execute completely different code paths?
+2. Some warps only do TMA loads while others only do WGMMA computations?
+
+Also, how does the `setmaxnreg` instruction mentioned in the paper relate to this? Why would consumer warps need more registers than producer warps?
+Answer:
+**Warp-specialization** in FlashAttention-3 means exactly what you've inferred: different warps within the same CTA (cooperative thread array, i.e., threadblock) execute fundamentally different code paths. Some warps act as **producers** that only handle data movement via TMA (Tensor Memory Accelerator) loads, while others act as **consumers** that only perform computation via WGMMA (warpgroup matrix multiply-accumulate) instructions and softmax operations.
+
+Looking at Algorithm 1 in the paper, the IF-ELSE branching is the mechanism that implements this specialization. When a thread enters the kernel, it checks whether it belongs to the "producer warpgroup" or the "consumer warpgroup" and then proceeds down one of two completely separate execution paths. The producer warpgroup deallocates registers (line 3), then loops issuing asynchronous TMA loads of $\mathbf{Q}_i$, $\mathbf{K}_j$, and $\mathbf{V}_j$ tiles from HBM to shared memory. The consumer warpgroup reallocates registers (line 12), waits for data to arrive, and then performs the two GEMM operations ($\mathbf{Q}_i\mathbf{K}_j^T$ and $\tilde{\mathbf{P}}_i^{(j)}\mathbf{V}_j$) along with the online softmax computation.
+
+The **`setmaxnreg` instruction** dynamically reallocates the register budget between warpgroups. Consumer warps need more registers because WGMMA instructions require storing matrix tiles and accumulators in registers—for instance, the $\mathbf{S}_i^{(j)}$ scores matrix and the $\mathbf{O}_i$ output accumulator. The paper notes that WGMMA is a warpgroup-wide instruction operating on large tile sizes, which demands substantial register capacity. Producer warps, by contrast, primarily issue TMA loads, and as the paper mentions, "for [TMA] only a single thread is needed." Since producers don't perform heavy computation, they can operate with fewer registers, allowing the register budget to be shifted toward the consumers.
+
+This specialization exploits the hardware asynchrony on Hopper GPUs: TMA and Tensor Cores operate independently, so producers can prefetch the next data tiles while consumers are still computing on the current tiles. This overlap hides memory latency and keeps the Tensor Cores fed, which is key to achieving the 75\% utilization the paper reports.
+
+### How does the 2-stage pipeline break the sequential dependency between GEMM and softmax?
+Question:
+In FlashAttention-3's Algorithm 2 (the consumer warpgroup forward pass), I'm struggling to understand how the 2-stage pipelining breaks the sequential dependencies.
+
+The paper acknowledges that 'softmax relies on the output $\mathbf{S}_i^{(j)}$ of the first GEMM, while the second GEMM takes its result $\widetilde{\mathbf{P}}_i^{(j)}$ as an operand.' This seems like a strict sequential dependency: GEMM1 $\rightarrow$ softmax $\rightarrow$ GEMM2.
+
+But then the algorithm shows that within the mainloop, 'the second WGMMA operation of iteration $j$ is overlapped with softmax operations from iteration $j+1$.' 
+
+How does this work exactly? If I'm computing iteration $j$, I need the softmax result to run GEMM2. How can I start GEMM2 from iteration $j$ before finishing softmax from the same iteration? What am I misunderstanding about the data dependencies here?
+Answer:
+You've identified a key insight—the sequential dependency within a *single* iteration is indeed unbreakable. The algorithm doesn't violate this dependency; instead, it restructures the computation across iterations using software pipelining.
+
+Here's the crucial observation: in Algorithm 2, the second WGMMA at line 11 computes $\mathbf{O}_i \mathrel{+=} \tilde{\mathbf{P}}_{\mathrm{cur}} \mathbf{V}_{j-1}$. The subscript $\tilde{\mathbf{P}}_{\mathrm{cur}}$ refers to the probability matrix from the *previous* loop iteration, not the current one. This $\tilde{\mathbf{P}}_{\mathrm{cur}}$ was already computed by the softmax in iteration $j-1$.
+
+Let me trace through the pipeline:
+
+**Before the loop:** The algorithm computes $\mathbf{S}_{\mathrm{cur}} = \mathbf{Q}_i \mathbf{K}_0^\top$ and then applies softmax to obtain $\tilde{\mathbf{P}}_{\mathrm{cur}}$.
+
+**During loop iteration $j$:**
+- Line 9 starts $\mathbf{S}_{\mathrm{next}} = \mathbf{Q}_i \mathbf{K}_j^\top$ (first GEMM for attention on $\mathbf{K}_j$)
+- Line 11 starts $\mathbf{O}_i \mathrel{+=} \tilde{\mathbf{P}}_{\mathrm{cur}} \mathbf{V}_{j-1}$ (second GEMM for attention on $\mathbf{K}_{j-1}$, using $\tilde{\mathbf{P}}_{\mathrm{cur}}$ from the previous iteration)
+- Line 13 computes softmax on $\mathbf{S}_{\mathrm{next}}$, producing $\tilde{\mathbf{P}}_{\mathrm{next}}$ for attention on $\mathbf{K}_j$
+
+This $\tilde{\mathbf{P}}_{\mathrm{next}}$ becomes $\tilde{\mathbf{P}}_{\mathrm{cur}}$ for iteration $j+1$.
+
+So in **loop iteration $j+1$**:
+- Line 11 executes the second GEMM for attention iteration $j$ (it uses $\tilde{\mathbf{P}}_{\mathrm{cur}}$ which was computed in iteration $j$'s softmax)
+- Line 13 computes softmax for attention iteration $j+1$
+
+Since WGMMA on Hopper is asynchronous and runs on Tensor Cores while softmax runs on CUDA cores (specifically the multi-function unit), these operations from lines 11 and 13 can execute concurrently. The paper's statement that "the second WGMMA operation of iteration $j$ is overlapped with softmax operations from iteration $j+1$" refers to logical attention iterations indexed by $\mathbf{K}$ blocks—both operations happen within the same loop iteration $j+1$, but they belong to different logical iterations of the attention computation.
+
+This is classic software pipelining: by introducing buffers ($\mathbf{S}_{\mathrm{cur}}$, $\mathbf{S}_{\mathrm{next}}$, $\tilde{\mathbf{P}}_{\mathrm{cur}}$, $\tilde{\mathbf{P}}_{\mathrm{next}}$), we decouple when an operation is issued from which logical iteration it serves, allowing operations from successive logical iterations to overlap in time.
+
+### Why does FP8 WGMMA require k-major layout but FP16 doesn't?
+Question:
+In Section 2.2, the paper states that for FP16 WGMMA, 'both mn-major and k-major input operands are accepted for operands in SMEM, but for FP8 WGMMA, only the k-major format is supported.'
+
+I'm confused about why this hardware restriction exists. What is it about FP8 that makes the layout requirements more strict? The paper mentions that 'clashing FP32 accumulator and FP8 operand layouts pose an obstacle to invoking dependent FP8 WGMMAs' but I don't understand what this clash is.
+
+Also, why does this matter specifically for attention? The paper mentions needing to transpose $\mathbf{V}$ to satisfy this constraint, but I don't see why $\mathbf{V}$ specifically needs this transformation.
+Answer:
+The FP8 WGMMA layout restriction is fundamentally a hardware constraint in NVIDIA's Hopper architecture, and understanding why it matters requires looking at how attention's two GEMM operations connect.
+
+**Why FP8 has stricter layout requirements**
+
+For FP16 WGMMA instructions, the hardware can accept both `$mn$`-major (contiguous in the outer `$M/N$` dimension) and `$k$`-major (contiguous in the inner `$K$` dimension) layouts for operands in shared memory. However, FP8 WGMMA only supports `$k$`-major format—this is simply how NVIDIA designed the FP8 Tensor Core datapath, likely to optimize for the most common use case while minimizing hardware complexity.
+
+**The layout clash problem**
+
+In attention, you have two consecutive GEMMs: `$\mathbf{S} = \mathbf{Q}\mathbf{K}^\top$` followed by `$\mathbf{O} = \mathbf{P}\mathbf{V}$`. The output of the first GEMM (`$\mathbf{S}$`, stored as FP32 accumulators) becomes an input to the second GEMM (as `$\mathbf{P}$`). The problem is that the FP32 accumulator layout produced by FP8 WGMMA differs from the FP8 operand layout that the next FP8 WGMMA expects.
+
+As the paper notes in Section 3.3, the accumulator entries are held in registers in a certain order (depicted in their figures), and this must be permuted using byte permute instructions to match the layout required for the second WGMMA's operand.
+
+**Why `$\mathbf{V}$` specifically needs transposition**
+
+`$\mathbf{V}$` is typically stored contiguous in the head dimension (`$mn$`-major), but the second GEMM `$\mathbf{P}\mathbf{V}$` requires `$\mathbf{V}$` in `$k$`-major format for FP8 WGMMA. This means `$\mathbf{V}$` tiles need to be contiguous in the sequence length dimension—the opposite of the typical layout. The paper solves this with an in-kernel transpose using LDSM/STSM instructions, which can efficiently swap the layout when copying between SMEM and RMEM.
+
+### How does multiplying by a random orthogonal matrix help with quantization error?
+Question:
+The paper introduces 'incoherent processing' as a technique to reduce FP8 quantization error, where $\mathbf{Q}$ and $\mathbf{K}$ are multiplied by a random orthogonal matrix $\mathbf{M}$ before quantizing. 
+
+The explanation is that 'each entry of $\mathbf{Q}\mathbf{M}$ or $\mathbf{K}\mathbf{M}$ is a random sum of entries of $\mathbf{Q}$ or $\mathbf{K}$, thus reducing quantization error.'
+
+I understand that multiplying by an orthogonal matrix preserves the dot products (since $\mathbf{M}\mathbf{M}^\top = I$). But I don't understand why this helps with quantization. If I have an outlier value in $\mathbf{Q}$, how does spreading it across multiple entries via matrix multiplication make quantization easier?
+
+Also, why does the paper choose $\mathbf{M}$ to be 'the product of random diagonal matrices of $\pm 1$ and a Hadamard matrix'? What properties does this provide?
+Answer:
+The key insight is that incoherent processing transforms a **magnitude distribution problem** into a **more uniform one**, making quantization significantly easier.
+
+## Why outliers harm quantization
+
+When you quantize a tensor to FP8, you determine a scale factor based on the maximum magnitude value. If you have one outlier entry with magnitude 100 while most entries are around 1, the scale factor is dominated by that outlier. The result is that all the "normal" values get compressed into a tiny fraction of FP8's representable range, leading to large relative quantization errors for most entries.
+
+## How the orthogonal matrix helps
+
+When you compute $\mathbf{Q}\mathbf{M}$, each entry becomes a weighted sum of all entries in that row of $\mathbf{Q}$:
+
+$$(\mathbf{Q}\mathbf{M})_{i,j} = \sum_{k=1}^{d} q_{i,k} \cdot M_{k,j}$$
+
+If $\mathbf{Q}$ has an outlier at position $(i, k^*)$, that outlier contributes to **every entry** in row $i$ of the output—but diluted. With a normalized Hadamard matrix, each $M_{k,j} \approx \pm 1/\sqrt{d}$, so the outlier's contribution to any single output entry is roughly $O(\text{outlier}/\sqrt{d})$.
+
+The effect is analogous to spreading a large spike across many bins: the maximum magnitude drops, the distribution becomes more uniform, and the quantization scale becomes appropriate for all entries rather than just the outlier.
+
+## Why attention output is preserved
+
+Since $\mathbf{M}$ is orthogonal ($\mathbf{M}\mathbf{M}^\top = I$), the attention scores are unchanged:
+
+$$(\mathbf{Q}\mathbf{M})(\mathbf{K}\mathbf{M})^\top = \mathbf{Q}\mathbf{M}\mathbf{M}^\top\mathbf{K}^\top = \mathbf{Q}\mathbf{K}^\top$$
+
+The transformation happens *before* quantization and is mathematically invisible to the attention computation itself.
+
+## Why Hadamard + random diagonal matrices
+
+A naive orthogonal matrix multiplication costs $O(d^2)$. The paper uses $\mathbf{M} = \mathbf{D}_1 \mathbf{H} \mathbf{D}_2$ where $\mathbf{H}$ is a Hadamard matrix and $\mathbf{D}_1, \mathbf{D}_2$ are random diagonal matrices with $\pm 1$ entries. This choice provides:
+
+1. **Efficiency**: The Hadamard matrix has a fast transform algorithm (FWHT) that reduces complexity to $O(d \log d)$.
+
+2. **Randomness**: The random diagonal matrices ensure $\mathbf{M}$ behaves like a random orthogonal matrix rather than a fixed transform. Without this, certain input patterns might not get properly "spread."
+
+3. **Orthogonality**: Both Hadamard matrices (after normalization) and $\pm 1$ diagonal matrices are orthogonal, so their product preserves orthogonality.
+
+This construction can also be fused with operations like rotary embeddings at no additional computational cost, making it practical for real workloads.
+
+### What is the relationship between pingpong scheduling and intra-warpgroup overlapping?
+Question:
+The paper describes two different overlapping techniques: pingpong scheduling between warpgroups, and intra-warpgroup overlapping (the 2-stage pipeline). I'm confused about whether these are two separate techniques or how they relate.
+
+For pingpong scheduling, the paper says 'we use synchronization barriers to force the GEMMs of warpgroup 1 to be scheduled before the GEMMs of warpgroup 2' so that 'softmax of warpgroup 1 will be scheduled while warpgroup 2 is performing its GEMMs.'
+
+For intra-warpgroup overlapping, Algorithm 2 shows how one warpgroup can overlap its own GEMM and softmax operations.
+
+Are both techniques used simultaneously in FlashAttention-3, or are they alternatives? If both are used, how do they interact? The paper mentions performance improvements from each individually, but I can't tell if they're combined in the final algorithm.
+Answer:
+Based on my reading of the paper, pingpong scheduling and intra-warpgroup overlapping are **two separate but complementary techniques** that operate at different levels of the execution hierarchy, and they are **used together** in FlashAttention-3 to maximize hardware utilization.
+
+**Pingpong scheduling** operates at the *inter-warpgroup* level. The paper describes how synchronization barriers are used to force the GEMMs of warpgroup 1 to execute before those of warpgroup 2, which creates an opportunity for the softmax computation of warpgroup 1 to be scheduled while warpgroup 2 performs its GEMMs. This exploits the fact that exponential operations (used in softmax) run on a different hardware unit—the multi-function unit—than the Tensor Cores that execute GEMMs. The paper notes this improves performance "from 570 TFLOPS to 620-640 TFLOPS."
+
+**Intra-warpgroup overlapping** operates within a *single warpgroup*. As the paper states, "Even within one warpgroup, we can overlap some instructions in the softmax with some instructions in the GEMMs." Algorithm 2 shows how this works: by pipelining across iterations with additional register buffers, the second WGMMA of iteration $j$ overlaps with softmax operations from iteration $j+1$. This breaks the sequential dependency where softmax had to wait for GEMM completion.
+
+The key insight is that these techniques target differentGranularity levels of parallelism:
+- Pingpong exploits parallelism **between warpgroups** (different consumer warpgroups)
+- Intra-warpgroup overlapping exploits parallelism **within a warpgroup's instruction stream** (across loop iterations)
+
+The ablation study in Section 4.2 confirms they are combined: "our algorithmic improvements (asynchrony with warp-specialization and overlapping between GEMM and softmax) lead to significant speedup, from 570 to 661 TFLOPs." This final number (661 TFLOPs) exceeds the pingpong-only improvement (620-640 TFLOPs), indicating both techniques contribute additively.
+
+Algorithmically, intra-warpgroup overlapping (Algorithm 2) serves as "a replacement for the consumer path of Algorithm 1" in the complete FlashAttention-3 forward pass, while pingpong scheduling governs how multiple such consumer warpgroups coordinate their execution relative to each other.
+
+### How does the 'commit but do not wait' pattern in Algorithm 2 enable overlapping?
+Question:
+In Algorithm 2 of FlashAttention-3, I see a pattern where some WGMMA operations say 'Commit and wait' while others say 'Commit but do not wait.' For example:
+
+- Line 4: `Compute $\mathbf{S}_{\mathrm{cur}} = \mathbf{Q}_i \mathbf{K}_0^T$ using WGMMA. Commit and wait.`
+- Line 11: `Compute $\mathbf{S}_{\mathrm{next}} = \mathbf{Q}_i \mathbf{K}_{j}^T$ using WGMMA. Commit but do not wait.`
+
+I understand that WGMMA is asynchronous on Hopper, but I'm confused about what exactly 'commit' means and why waiting vs. not waiting enables overlapping. If I don't wait for a WGMMA to complete, can I use its output in subsequent operations?
+
+Also, line 13 says 'Wait for the WGMMA $\mathbf{Q}_i \mathbf{K}_{j}^T$' which happens later. Does this mean the softmax on line 14 is computing based on $\mathbf{S}_{\mathrm{cur}}$ from the previous iteration while $\mathbf{S}_{\mathrm{next}}$ is still being computed?
+Answer:
+The "commit but do not wait" pattern exploits a key feature of Hopper GPUs: WGMMA (Warp Group Matrix Multiply Accumulate) operations execute asynchronously on the Tensor Cores, separate from the CUDA cores that handle other operations like softmax.
+
+**What "commit" means:** In this context, "commit" means launching or submitting the WGMMA operation to the hardware. The operation begins executing on the Tensor Cores, but control immediately returns to the issuing warp without blocking.
+
+**Why waiting vs. not waiting enables overlapping:** When you "commit and wait," you stall the issuing warp until the WGMMA completes, preventing any other work. When you "commit but do not wait," the issuing warp can proceed to execute other instructions while the Tensor Core continues processing the GEMM in the background. Since softmax operations (which involve exponentials and row-wise reductions) run on different hardware units—the multi-function units and CUDA cores—they can execute concurrently with the asynchronous WGMMA.
+
+**Can you use the output without waiting?** No—you must wait before reading the result. This is why line 14 explicitly says "Wait for the WGMMA $\mathbf{Q}_i \mathbf{K}_{j}^T$" before line 15 uses $\mathbf{S}_{\mathrm{next}}$ in the softmax computation. The pattern is: launch operation, do independent work, then wait when you need the result.
+
+**What overlaps with what:** Looking at the algorithm flow, in iteration $j$:
+- Line 11 starts $\mathbf{S}_{\mathrm{next}} = \mathbf{Q}_i \mathbf{K}_j^T$ without waiting
+- Line 13 starts the second GEMM $\mathbf{O}_i \leftarrow \mathbf{O}_i + \tilde{\mathbf{P}}_{\mathrm{cur}} \mathbf{V}_{j-1}$ without waiting
+- Line 14 waits for the first WGMMA to complete
+- Line 15 computes softmax on $\mathbf{S}_{\mathrm{next}}$ — this can overlap with the second WGMMA from line 13, which may still be running
+
+So yes, your interpretation is correct: the softmax computes based on $\mathbf{S}_{\mathrm{next}}$ (not $\mathbf{S}_{\mathrm{cur}}$) after line 14's wait, but the second GEMM from line 13 can continue executing in the background during this softmax computation. This is the essence of the "2-stage pipelining" mentioned in Section 3.2, where the second WGMMA of iteration $j$ overlaps with the softmax that produces $\tilde{\mathbf{P}}_{\mathrm{next}}$ (which will be used in the subsequent iteration).
+
+### Why does block quantization help more than per-tensor quantization for attention?
+Question:
+The paper states that FlashAttention-3 uses 'block quantization' instead of 'per-tensor scaling' to reduce numerical error in FP8 attention. The difference is that block quantization keeps 'one scalar per block' while per-tensor quantization keeps 'one scalar per tensor.'
+
+I understand that having more scaling factors gives more precision, but I'm confused about why this specifically helps with the outlier problem mentioned in the paper. The paper says 'large models typically have outlier values that are much larger in magnitude than most other values, making quantization difficult.'
+
+If outliers are scattered throughout the tensor, how does blocking help? Wouldn't a block containing an outlier still have the same quantization problem within that block?
+
+Also, the paper says 'we can scale each block of $\mathbf{S}$ to account for this block quantization at no computation cost.' How can this scaling be free? Don't we need extra multiplications to apply the per-block scaling factors?
+Answer:
+You've raised two excellent questions about the block quantization technique in FlashAttention-3. Let me address each in turn.
+
+## Why block quantization helps with outliers
+
+The key insight is that with per-tensor quantization, a single scaling factor must accommodate the entire dynamic range of the tensor. If even one outlier exists anywhere in the tensor, that scaling factor becomes dominated by that outlier, forcing all other values to be quantized with reduced precision. The outlier "poisons" the quantization for every single value.
+
+Block quantization changes this fundamentally. Each block gets its own independent scaling factor, so an outlier only affects the quantization of values *within its own block*. The key realization is that while outliers may be scattered throughout the tensor, they are sparse by nature—most blocks won't contain outliers. Those blocks can use tighter scaling factors that preserve more precision for their typical values.
+
+Consider a concrete example: if you have a tensor with 100 blocks and outliers in 3 blocks, per-tensor quantization would degrade precision for all 100 blocks, while block quantization would only affect those 3 specific blocks. The other 97 blocks maintain high precision.
+
+## Why the scaling is "at no computation cost"
+
+This claim requires careful interpretation. The paper states that "As the FlashAttention-3 algorithm naturally operates on blocks, we can scale each block of $\mathbf{S}$ to account for this block quantization at no computation cost."
+
+There are two aspects to this:
+
+1. **Fusion with preceding operations**: The quantization itself can be fused with operations like rotary positional embeddings, which are memory-bandwidth bound. Since these operations are limited by memory throughput rather than compute, the additional quantization computation doesn't increase runtime—it "hides" behind the existing memory operations.
+
+2. **Natural integration with the block structure**: FlashAttention already processes attention in blocks (this is the core tiling strategy from the original FlashAttention). The algorithm iterates over blocks of $\mathbf{Q}$, $\mathbf{K}$, and $\mathbf{V}$ by design. When computing $\mathbf{S}_i^{(j)} = \mathbf{Q}_i \mathbf{K}_j^\top$, you're already handling blocks with indices $i$ and $j$. Incorporating per-block scaling factors doesn't require launching separate kernels or additional memory transfers—these scalars can be kept in fast on-chip memory and applied during the existing block-wise computation flow.
+
+The paper isn't claiming that zero multiplications occur, but rather that the overhead is effectively negligible because the operations integrate naturally with the algorithm's existing block-wise structure and can be fused with memory-bound operations where compute is already "free."
+

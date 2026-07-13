@@ -1,0 +1,395 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 2: GPU Architecture Primer: Hopper and the Asynchronous Execution Model  
+
+In this chapter we develop a detailed picture of the hardware primitives that make the FlashAttention‑3 algorithm possible.  Although the ideas are expressed in terms of NVIDIA’s Hopper GPU, the concepts—hierarchical memory, warps organized into producer‑consumer pipelines, and low‑precision tensor operations—apply broadly to modern graphics processors.  By the end of the chapter a reader will be able to read the FlashAttention‑3 pseudo‑code and understand why each instruction is placed where it is, how data moves between memory levels without stalling compute, and what constraints low‑precision formats impose on layout.
+
+---
+
+## Memory hierarchy: GMEM, L2, SMEM, registers  
+
+A GPU can be thought of as a many‑core processor whose performance is limited not only by raw arithmetic capability but also by how quickly data can be fetched from the various levels of memory.  Hopper (and its predecessors) expose a four‑level hierarchy:
+
+1. **Global Memory (GMEM)** – often called HBM because it resides in high‑bandwidth memory packages mounted on the board.  GMEM is off‑chip, accessible by every streaming multiprocessor (SM), and provides the largest capacity (hundreds of gigabytes).  Its latency is on the order of several hundred nanoseconds, and its bandwidth is limited by the external memory interface (≈ 2 TB/s on an H100 SXM5).  
+
+2. **L2 Cache** – a unified on‑chip cache that sits between GMEM and each SM.  All SMs share the same L2 pool; a cache line fetched from GMEM is stored here so that subsequent accesses from any SM can be serviced quickly.  L2 reduces effective GMEM traffic dramatically for workloads with temporal locality (e.g., repeated reads of keys or values during attention).  
+
+3. **Shared Memory (SMEM)** – a programmer‑managed scratchpad located inside each SM.  It is physically separate from registers and has far higher bandwidth than L2 (≈ 128 bytes per clock per SM on Hopper).  Crucially, SMEM is **banked**, allowing many simultaneous accesses as long as threads address different banks.  In practice we allocate SMEM as a circular buffer that holds tiles of the query, key, and value matrices while the kernel processes one block after another.  
+
+4. **Register File (RMEM)** – private to each thread (up to 256 registers per thread on Hopper).  Registers have essentially zero latency because they live inside the execution pipeline; they are used for scalar temporaries, for holding fragments of matrices that will be fed to Tensor Cores, and for storing intermediate softmax values in FlashAttention‑3.  Excessive register usage causes *spilling* into SMEM, which reduces performance sharply; thus all kernels are carefully tuned to keep register pressure low.
+
+The hierarchy follows a classic “capacity versus bandwidth” trade‑off: GMEM offers massive capacity but lowest bandwidth; registers have negligible capacity but highest bandwidth.  The art of high‑performance kernels is to keep hot data as close to the compute units as possible—ideally in registers or SMEM—while using asynchronous transfers to hide the long latency of GMEM.
+
+---
+
+## Thread organization: threads → warps → warpgroups → CTAs → clusters  
+
+CUDA’s execution model groups logical threads into increasingly larger structures that map onto physical hardware resources:
+
+| Level | Size | Mapping | Typical role |
+|------|------|---------|--------------|
+| **Thread** | 1 | Executes a single instruction stream | Holds one element of a matrix fragment |
+| **Warp** | 32 threads (NVIDIA) | Executed in lockstep on a SIMD unit | Performs a tile of a matrix multiply together |
+| **Warpgroup** | 4 contiguous warps → 128 threads | Shares a Tensor Core unit via the *warpgroup‑wide* (WGMMA) instruction | In FlashAttention‑3 one warpgroup acts as *producer* (issues TMA loads), another as *consumer* (issues WGMMA GEMMs) |
+| **CTA (Cooperative Thread Array)** | Up to several thousand threads (multiple warpgroups) | Scheduled onto a single SM; all threads can address the same SMEM region | Implements the whole tile computation for one query block |
+| **Cluster** | Group of CTAs (Hopper introduces *threadblock clusters*) | Distributed across multiple SMs that share an L2 slice and a GPC (Graphics Processor Cluster) | Allows very large problems to be split across several SMs while still sharing low-latency L2 |
+
+A CTA’s threads are co‑scheduled on an SM; therefore they can cooperate through shared memory barriers (`__syncthreads()` or lower‑level `bar.sync`).  Within a CTA we can further partition warps into *producer* and *consumer* roles—a technique called **warp‑specialization**.  The producer warps never perform heavy arithmetic; they only issue Tensor Memory Accelerator (TMA) copies from GMEM to SMEM.  Consumer warps never move data; they only launch WGMMA instructions that feed data directly from SMEM into Tensor Cores.  
+
+Because each warpgroup has its own register allocation (`setmaxnreg`), we can grant more registers to consumer warps (which need them for matrix fragments) while shrinking registers for producer warps (which need only one thread to drive TMA).  This asymmetric allocation reduces overall register pressure and improves occupancy.
+
+---
+
+## Tensor Cores and the WGMMA instruction  
+
+The most computationally intensive part of attention is the pair of matrix multiplications:
+
+\[
+\mathbf{S} = \alpha \,\mathbf{Q}\mathbf{K}^\top,\qquad
+\mathbf{O} = \mathbf{P}\mathbf{V},
+\]
+
+where \(\mathbf{Q},\mathbf{K},\mathbf{V}\in\mathbb{R}^{N\times d}\).  On Hopper these products are executed by **Tensor Cores**, specialized functional units that perform mixed‑precision fused multiply‑add on small tiles (typically \(8\times8\) or \(16\times16\)) at very high throughput.  
+
+The programming interface for Hopper’s Tensor Cores is the **warpgroup‐wide matrix multiply–accumulate** instruction, abbreviated **WGMMA** (`wmma::mma`).  A WGMMA operates on fragments that reside in registers for operand A, in shared memory for operand B, and accumulates into registers holding FP32 results.  
+
+Key properties:
+
+- **Asynchrony** – Unlike earlier architectures where Tensor Core launches were synchronous with respect to regular CUDA instructions, Hopper’s WGMMA begins execution immediately but does not stall subsequent non‑tensor instructions; it produces a *completion token* that can be waited on later (`bar.sync`).  This enables overlapping GEMM with softmax exponentials.
+- **Operand layout constraints** – For FP16 operands both row‑major (“mn-major”) and column‑major (“k-major”) layouts are accepted when stored in shared memory. For FP8 operands only the k‑major layout is legal; this restriction forces us to transpose value tiles inside the kernel.
+- **Accumulator width** – Regardless of operand precision, WGMMA accumulates into FP32 registers; this preserves numerical stability for intermediate sums such as those required by softmax rescaling.
+
+Because WGMMA consumes data directly from shared memory without first copying into registers, we must stage key/value tiles correctly in SMEM before launching it.  The Warp Specialization pattern guarantees that while consumer warps wait for their required tiles they are already present in shared memory thanks to producer warps’ asynchronous TMA transfers.
+
+---
+
+## Tensor Memory Accelerator (TMA) and async copies  
+
+Moving gigabytes of queries, keys, and values from GMETC (“global memory”) into shared memory would dominate runtime if done synchronously. Hopper introduces a dedicated hardware engine—the **Tensor Memory Accelerator (TMA)**—that performs bulk transfers between GMEM and SMEM without involving CUDA cores.
+
+Important aspects:
+
+1. **Async launch** – A TMA copy is initiated with a single instruction (`tma::load`), after which control returns immediately to the issuing warp while the hardware engine fetches data over PCIe/HBM pathways onto an internal FIFO.
+2. **Zero‐copy semantics** – The destination must be shared memory owned by the same CTA; once issued, any warp in that CTA may read from those locations once a completion event (`tma::commit`) has been observed.
+3. **Overlap with compute** – Because TMA runs concurrently with regular ALU instructions (including WGMMA), producer warps can issue multiple copies ahead of time, filling a circular buffer of size \(s\) blocks. Consumer warps then consume those blocks at their own pace while later copies are already in flight.
+
+In FlashAttention‑3 we allocate one stage per block of keys/values in shared memory; while stage \(j\) is being used by consumers (\(\mathbf{K}_j,\mathbf{V}_j\)), producers already fetched stage \((j+1)\,\%\,s\). This “ping‑pong” scheduling maximizes utilization of both TMA bandwidth and Tensor Core throughput.
+
+---
+
+## Warp‑specialization and producer‑consumer pipelines  
+
+The central insight behind FlashAttention‑3’s speedup is that computation and data movement need not be performed by all threads at once. By dividing a CTA’s warps into two functional groups we obtain a classic *producer–consumer pipeline*:
+
+- **Producer warpgroup**: Contains only enough threads to drive TMA loads (`setmaxnreg` shrinks their register files). It repeatedly loads \(\mathbf{Q}_i\), then iterates over blocks \(\{\mathbf{K}_j,\mathbf{V}_j\}_{j=0}^{T_c-1}\), placing each pair into successive stages of an \(s\)-stage circular buffer in shared memory.
+- **Consumer warpgroup**: Holds more registers per thread because it must hold fragments of \(\mathbf{Q}_i\) and intermediate softmax statistics (\(m_i,\ell_i\)). It fetches blocks from the buffer as soon as they become available, launches WGMMA GEMMs (`SS-GEMM` for \(\mathbf{Q}_i \mathbf{K}_j^\top\) and `RS-GEMM` for \(\widetilde{\mathbf P}_j \mathbf{V}_j\)), then proceeds with local softmax reduction.
+
+The pipeline works as follows:
+
+1. Producer issues TMA for \(\mathbf{Q}_i\); consumer waits until stage 0 signals readiness.
+2. Producer begins loading \(\mathbf{K}_0,\mathbf{V}_0\); consumer launches `SS-GEMM` on \(\mathbf{Q}_i,\mathbf{K}_0^\top\).
+3. While consumer computes softmax on \(\mathbf{S}^{(0)}\), producer prefetches \(\mathbf{K}_1,\mathbf{V}_1\).
+4. Consumer launches `RS-GEMM` using \(\widetilde{\mathbf P}^{(0)}\) and \(\mathbf V_0\); concurrently it begins `SS-GEMM` for block 1 once its tiles arrive.
+5. Steps 3–4 repeat until all blocks have been processed.
+
+Because TMA copies are asynchronous, producer warps never stall consumer warps after filling the initial \(s\) stages; they merely keep feeding new blocks at roughly one copy per iteration. Conversely, consumer warps never idle waiting for memory—they always have at least one GEMM ready because earlier copies have already arrived.
+
+The synchronization points are lightweight barriers (`bar.sync`) placed only at stage boundaries where ownership changes occur (e.g., after consuming stage \(j\) release it so producer may overwrite). This minimal barrier scheme lets both groups progress at near maximal throughput.
+
+---
+
+## Low‑precision formats (FP8, FP16, BF16) and layout constraints  
+
+Modern deep learning accelerators exploit reduced numerical precision to increase arithmetic density:
+
+| Format | Bits | Exponent bits | Mantissa bits | Typical use case |
+|--------|------|---------------|--------------|------------------|
+| FP16   | 16   |   5           |   10         | Early‑generation Tensor Cores |
+| BF16   | 16   |   8           |    7         | Training stability with reduced mantissa |
+| FP8 (e4m3) | 8   |   4           |    3         | Hopper Tensor Cores – up to 2× matmul throughput vs FP16 |
+
+When switching from FP16/BF16 to FP8 two practical challenges arise:
+
+1. **Per‐tensor scaling vs block scaling** – FP8 stores only three mantissa bits; naïve per‑tensor scaling suffers when outlier values dominate the range, leading to catastrophic quantization error in attention scores. FlashAttention‑3 mitigates this by performing **block quantization**, i.e., computing an independent scale factor for every tile (\(B_r\times d\) or \(B_c\times d\)). Because FlashAttention already operates tilewise, we can apply these scales without extra passes; after each GEMM we rescale using precomputed factors stored alongside each tile.
+
+2. **Operand layout restrictions** – For FP8 WGMMA:
+   - Operand A may retain any layout because it usually lives in registers.
+   - Operand B must be *k-major*, meaning consecutive elements correspond to adjacent entries along the inner dimension \(K\).  
+   In attention this requirement clashes with how value matrices are stored: normally \(\mathbf V\) is laid out row‑major with stride \(d\) (contiguous along head dimension). To satisfy k-major order we either transpose \(\mathbf V\) globally before attention or perform an *in‐kernel* transpose after loading it into shared memory.
+   
+   FlashAttention‑3 chooses the latter path because Global transposes would waste bandwidth and defeat our goal of keeping everything “in place”. The kernel uses NVIDIA’s `ldmatrix`/`stmatrix` instructions—vectorized loads/stores that move an entire \(8\times8\) tile between registers and shared memory—combined with an additional byte‐permute step to reorder bytes within each warp’s register file so that columns become rows exactly as required for FP8 WGMMAs.
+
+The conversion pipeline therefore looks like:
+
+```
+global Q,K,V      -> TMA load -> SMEM
+SMEM Q            -> registers -> WGMMA(A)
+SMEM K            -> registers -> WGMMA(B_kmajor)
+softmax -> FP32 accumulator
+SMEM V            -> ldmatrix + byte permute -> k-major layout
+WGMMA(A') * WGMMA(B') -> FP32 accumulator -> O
+```
+
+All intermediate products remain in FP32 even when operands are FP8; this double‐precision accumulator prevents overflow during reduction across many heads or long sequences—a crucial detail when computing exponentials for softmax.
+
+Finally, because FP8 operations execute twice as fast as FP16 on Hopper but special functions such as `exp` still run at their original low throughput (~3–4 TFLOPs/s), FlashAttention‑3 hides those special functions behind asynchronous GEMMs using the two–stage pipeline described earlier. The net effect is high tensor core utilization (> 70 %) even when many exponentials must be computed per iteration.
+
+---
+
+### Summary  
+
+We have dissected Hopper’s execution model layer by layer: global memory feeds a unified L2 cache; each SM offers fast shared memory and ample registers; within an SM instructions run on warpgroups that can specialize either as data movers (via TMA) or compute engines (via WGMMA). Asynchrony between these functional units lets us build producer–consumer pipelines that keep every part of the hardware busy while minimizing stalls caused by memory latency or instruction dependencies.
+
+Understanding these mechanisms clarifies why FlashAttention‑3’s three innovations—producer–consumer warp specialization, overlapping softmax with blockwise GEMMs, and hardware–accelerated FP8 quantization—deliver up to twice the throughput of previous FlashAttention versions while maintaining numerical fidelity through block quantization and incoherent processing techniques. Armed with this background you will now be prepared to explore how these hardware ideas are woven into concrete algorithmic steps later in this textbook.
+
+FlashAttention‑1 → 2: Baseline Attention Implementations
+=====================================================
+
+In this chapter we expose the evolution of exact attention kernels on GPUs, from the naïve “standard’’ implementation that materializes all intermediate matrices, through the first generation of FlashAttention that eliminated those memory traffic bottlenecks by tiling and kernel fusion, to the second generation that added block‑wise matrix multiplications and parallelism over the sequence dimension.  By following the algorithmic ideas introduced in the original papers we can understand why these kernels still fall short of saturating modern Hopper‑based H100 GPUs, and where the design decisions that limit utilization originate.
+
+---
+
+## Standard attention with materialized \(S\) and \(P\) matrices  
+
+The most straightforward way to implement multi‑head attention on a GPU follows directly from the mathematical definition.  For a single head we have query, key and value matrices  
+
+\[
+\mathbf{Q},\;\mathbf{K},\;\mathbf{V}\in\mathbb{R}^{N\times d},
+\]
+
+with sequence length \(N\) and head dimension \(d\).  The forward pass computes
+
+\[
+\mathbf{S}= \alpha\, \mathbf{Q}\mathbf{K}^{\!\top}\in \mathbb{R}^{N\times N},
+\qquad 
+\mathbf{P}= \operatorname{softmax}(\mathbf{S})\in \mathbb{R}^{N\times N},
+\qquad 
+\mathbf{O}= \mathbf{P}\,\mathbf{V}\in \mathbb{R}^{N\times d},
+\]
+
+where \(\alpha = 1/\sqrt d\) is the usual scaling factor and the softmax is applied row‑wise.  In practice one first subtracts the row‑wise maximum of \(\mathbf S\) to avoid overflow in the exponential:
+
+\[
+\tilde{\mathbf S}= \mathbf S - \operatorname{rowmax}(\mathbf S),
+\qquad
+\mathbf P = \frac{\exp(\tilde{\mathbf S})}{\sum_j \exp(\tilde{\mathbf S}_{ij})}.
+\]
+
+A “standard’’ GPU kernel implements these three steps as three separate GEMM (general‑matrix‑multiply) calls:
+
+1. **QKᵀ GEMM** – computes the full dense score matrix \(\mathbf S\).  
+2. **Softmax kernel** – reads the entire \(\mathbf S\) from global memory (HBM), performs a reduction to obtain each row’s maximum, subtracts it, exponentiates each element, and finally normalises each row. The result is stored as \(\mathbf P\).  
+3. **PV GEMM** – multiplies the dense probability matrix by the value matrix to obtain \(\mathbf O\).
+
+Because both \(\mathbf S\) and \(\mathbf P\) have size \(N\times N\), their materialisation forces two full passes over HBM: one to write \(\mathbf S\) after step 1 and one to read it back for step 2, plus another read of \(\mathbf P\) before step 3.  Even though each GEMM individually is highly optimized on GPUs, the overall runtime becomes dominated by these memory transfers when \(N\) grows large.  Moreover, each kernel launch incurs a small but non‑negligible overhead, and synchronization points between them introduce idle periods for Tensor Cores.
+
+The backward pass suffers from analogous inefficiencies: it must recompute or store additional intermediate quantities (e.g., gradients of softmax), leading to even more global memory traffic.
+
+Thus, despite its conceptual clarity, “standard’’ attention is far from optimal on modern GPUs where arithmetic throughput vastly exceeds memory bandwidth.
+
+---
+
+## FlashAttention‑1: Tiling & kernel fusion  
+
+FlashAttention (the first generation introduced by Dao et al.) was motivated by exactly the inefficiencies described above.  Its core insight is that the softmax reduction can be performed **locally** inside a tiled computation, thereby removing the need to write out the full score matrix.
+
+### Tiling strategy  
+
+Instead of forming an \(N\times N\) matrix in one shot, FlashAttention partitions the query matrix into row blocks of size \(B_r\times d\) and the key/value matrices into column blocks of size \(B_c\times d\).  For a fixed query tile \(\mathbf Q_i \in \mathbb R^{B_r\times d}\) and a key tile \(\mathbf K_j \in \mathbb R^{B_c\times d}\), it computes a *partial* score tile
+
+\[
+\mathbf S_i^{(j)} = \alpha\, \mathbf Q_i\, \mathbf K_j^{\!\top}\in \mathbb R^{B_r\times B_c}.
+\]
+
+The crucial observation is that the softmax of a row depends only on *all* its partial scores across every key block.  Therefore one can maintain two per‑row accumulators while looping over \(j\):
+
+- \(m_i^{(j)} = \max_{k<j} (\text{rowmax of } \mathbf S_i^{(k)})\), i.e., running maximum,
+- \(\ell_i^{(j)} = \sum_{k<j} \exp(\text{rowmax-adjusted } \mathbf S_i^{(k)})\,.\)
+
+When a new partial score tile arrives we (a) update its running maximum, (b) shift previously accumulated exponentials by a scaling factor \(e^{m_i^{(j-1)}-m_i^{(j)}}\), and (c) add the new exponentials to obtain an updated denominator.  At exactly the same time we compute a partial output contribution
+
+\[
+\Delta_i^{(j)} =  \bigl(e^{m_i^{(j-1)}-m_i^{(j)}}\,\,P_i^{(j-1)} + e^{-\!m_i^{(j)}}\,e^{\,\mathbf S_i^{(j)}}   \bigr)\,\mathbf V_j,
+\]
+
+where \(P_i^{(j-1)} = e^{\, -m_i^{(j-1)}}\,e^{\,S_i^{(<j)}}/\ell_i^{(j-1)}.\)  
+Because all terms are gathered while iterating through key blocks, there is never a need to write either full \(\mathbf S\) or full \(\mathbf P.\)
+
+### Kernel fusion  
+
+FlashAttention‑1 collapses all three logical steps—QKᵀ multiplication, softmax reduction, PV multiplication—into **one** GPU kernel per query block.  Within that kernel we:
+
+1. Load the current query tile into shared memory (fast on‑chip cache).  
+2. Loop over all key/value blocks: for each block,
+   - Load the key and value tiles (also into shared memory),
+   - Issue a GEMM between the query tile and key tile (the “SS‑GEMM”, meaning both operands reside in shared memory),
+   - Perform row‑wise max & exponentiation locally,
+   - Issue another GEMM between the locally normalised scores and the value tile (the “RS‑GEMM”, meaning one operand comes from registers after softmax).  
+3. After finishing all blocks, apply a final rescaling using accumulated denominators.
+
+All memory traffic therefore consists of loading each tile *once* from global memory into shared memory; there are no writes of intermediate results back to global memory until the final output tile is written out.  Consequently FlashAttention‑1 dramatically reduces bandwidth pressure and achieves markedly higher FLOP utilization than standard attention.
+
+### Remaining limitations  
+
+Although FlashAttention‑1 eliminates most global reads/writes, it still suffers from two practical drawbacks on Hopper GPUs:
+
+- **Tensor Core instruction mismatch:** The original implementation targeted Ampere’s Tensor Core primitives (e.g., `mma.sync`). Hopper introduces new warp‑group‐wide matrix multiply–accumulate instructions (`WGMMA`) that provide higher throughput but require different operand layouts; FlashAttention‑1 does not exploit these newer instructions.
+- **Synchronous execution model:** All operations within an iteration are executed sequentially: load → GEMM → softmax → GEMM → next load.  Because non‑GEMM operations such as exponentials have far lower arithmetic throughput than Tensor Core GEMMs, they become a bottleneck despite being few in number.
+
+These observations motivated a redesign leading to FlashAttention‑2.
+
+---
+
+## FlashAttention‑2: Blockwise GEMM + sequence parallelism  
+
+FlashAttention‑2 retains the tiled formulation of its predecessor but restructures two aspects of execution:
+
+### Parallelism over sequence length  
+
+In FlashAttention‑1 each CTA (cooperative thread array) processed an entire query block sequentially over *all* key blocks.  FlashAttention‑2 instead distributes work **over both dimensions**: different CTAs handle distinct portions of *both* queries and keys simultaneously.  Concretely, let
+
+- \(T_r = \lceil N / B_r\rceil\) be the number of query blocks,
+- \(T_c = \lceil N / B_c\rceil\) be the number of key/value blocks.
+
+A grid of CTAs now covers an \(T_r\times T_c\) plane; each CTA computes one rectangular sub‑matrix of an intermediate result, allowing many CTAs to run concurrently across the whole sequence pair space.  This improves occupancy—the fraction of active warps per SM—by ensuring that every SM has work even when one dimension would otherwise be short.
+
+### Blockwise GEMM with improved occupancy  
+
+FlashAttention‑2 changes how each partial product is performed: rather than using generic shared-memory GEMMs (“SS”), it invokes low-level Tensor Core WGMMAs directly on tiles residing in registers after they have been loaded via asynchronous Tensor Memory Accelerator (TMA) copies.  Because WGMMAs operate on warp groups (four warps acting together), they achieve near–peak FP16/BF16 throughput while still respecting Hopper’s layout constraints (see § 2).
+
+Consequently FlashAttention‑2 can approach NVIDIA’s cuBLAS‐level performance for large dense matrix multiplications while still avoiding materialisation of intermediates.
+
+### Persistent synchronous model  
+
+Despite these hardware‑aware changes, FlashAttention‑2 preserves a *synchronous* execution flow:
+
+```
+for each key block j:
+    load K_j , V_j   (asynchronously via TMA)
+    wait for load completion
+    compute Q·K_jᵀ   (WGMMA)
+    wait for GEMM completion
+    perform softmax update
+    compute P_j·V_j   (WGMMA)
+    wait for GEMM completion
+```
+
+All non‑GEMM work—softmax scaling, exponentials, reductions—is performed after each GEMM finishes and before launching the next one.  The dependency chain forces every CTA to stall while waiting for floating‐point special function units (which have orders-of-magnitude lower throughput than Tensor Cores).  On Hopper’s H100 GPU this results in **low overall utilization**, measured experimentally at roughly **35 %** compared with ≈80–90 % achieved by dedicated dense GEMM kernels.
+
+Two structural reasons explain this underutilization:
+
+1. **Imbalanced pipeline stages:** The rise time for Tensor Core WMMA instructions vastly exceeds that for exponential or division operations; consequently while Tensor Cores sit idle awaiting softmax results they cannot hide their latency.
+2. **Lack of warp specialization:** All warps within a CTA issue both loads (`TMA`) and compute (`WGMMA`).  Because TMA uses dedicated hardware units separate from CUDA cores, there is no systematic overlap between data movement and computation; warps must synchronize after each load before any can start their WMMA round.
+
+These observations identify precisely where FlashAttention‑2 leaves performance on the table—namely in its synchronous design that does not exploit Hopper’s built‑in *asynchrony* between Tensor Cores and TMA units.
+
+---
+
+## Performance bottlenecks on H100: low utilization & synchronous execution  
+
+When profiling FlashAttention‑2 on an H100 SXM5 GPU several recurring stalls appear:
+
+| Stage | Responsible hardware | Throughput | Observed effect |
+|------|----------------------|-----------|----------------|
+| Matrix multiply (WGMMAs) | Tensor Cores | ≈ 989 TFLOPs/s FP16 | Near full utilisation when alone |
+| Softmax calculations (exp, max reduction) | CUDA cores + MFU (multi-function unit) | ≈ 3.9 TFLOPs/s | Dominates wall time despite small FLOP count |
+| Data movement (TMA loads) | Tensor Memory Accelerator | High bandwidth but asynchronous; stalls when all warps wait for completion |
+
+Because every iteration forces an explicit barrier after each WGMA before launching any exponential kernel, Tensor Cores sit idle roughly half of each cycle in typical FP16 configurations with head dimension 128—exactly what yields ∼35 % total utilisation observed empirically.
+
+Moreover, Hopper’s newer *warp‐group specialization* feature—allowing distinct groups of warps to act as dedicated producers (responsible only for TMA loads) or consumers (responsible only for WGMMA)—is not used in FlashAttention‑2. Hence all warps compete for register space (`setmaxnreg` cannot reallocate registers dynamically), increasing register pressure and limiting achievable block sizes.
+
+Finally, low precision pathways such as FP8 are absent: FlashAttention‑2 only targets FP16/BF16 where tensor cores already run at high efficiency but still waste potential compute cycles that could be reclaimed by switching to FP8's doubled throughput.
+
+These bottlenecks motivate the three innovations presented in FlashAttention‑3—producer–consumer asynchrony via warp specialization, overlapping softmax with blockwise GEMMs through a two‑stage pipeline, and hardware‐accelerated FP8 kernels—each directly addressing an inefficiency identified above.
+
+---
+
+**Design Principles of FlashAttention‑3**
+
+# Motivation for Exploiting Asynchrony  
+
+The attention layer of a Transformer is dominated by matrix‑multiplication work, yet on modern GPUs the raw arithmetic units (Tensor Cores) are not the only factor determining performance.  The GPU execution model is fundamentally asynchronous: distinct hardware engines—Tensor Core GEMM units, the Tensor Memory Accelerator (TMA) that streams data between global memory (GMEM) and shared memory (SMEM), and the general‑purpose CUDA cores that execute scalar arithmetic and special functions—operate concurrently.  If a program schedules work in a purely synchronous fashion, each engine must wait for the previous one to finish before it can begin, and the overall utilization collapses to the slowest component.
+
+In earlier FlashAttention versions the algorithm was reorganized to reduce global‑memory traffic, but it still followed a lock‑step pattern: load a block of keys and values, compute the query‑key product, perform softmax on that product, then multiply by the value block.  All three steps were carried out by the same warpgroup before proceeding to the next key block.  Consequently, while the GEMM was executing on Tensor Cores, the CUDA cores were idle, and while the softmax was executing, the Tensor Cores sat idle as well.  On Hopper’s H100 GPU this leads to dramatically under‑utilized Tensor Cores—empirically only about 35 % of their theoretical throughput is reached—while the special‑function units (SFU) that implement exponentiation are saturated.
+
+The key insight behind FlashAttention‑3 is that these engines can be *decoupled* into producer and consumer roles.  A *producer* warpgroup is responsible solely for moving data from GMEM into SMEM using TMA; a *consumer* warpgroup consumes those tiles to perform GEMM via the warp‑group‑wide matrix multiply‑accumulate (WGMMA) instruction.  Because TMA and WGMMA are both asynchronous, a producer can issue a new load while a consumer is still completing its prior GEMM.  This “producer‑consumer” pipeline hides the latency of memory movement behind computation, raising Tensor Core utilization toward the hardware ceiling.
+
+Moreover, Hopper permits dynamic reallocation of registers between warpgroups (`setmaxnreg`).  Consumer warps, which execute WGMMA, can claim a larger register pool, while producer warps need only a single thread to issue TMA.  This *warp specialization* further reduces contention for shared resources such as register file bandwidth and allows each engine to run near its optimal issue rate.
+
+# Why Softmax Becomes the New Bottleneck  
+
+Even after fully overlapping data movement with GEMM, attention still contains non‑matrix operations: subtraction of rowwise maxima, exponentiation, multiplication by scaling factors, and rowwise reductions required for normalisation.  These operations are implemented on the SFU or ordinary CUDA cores rather than on Tensor Cores, and their raw throughput on H100 is orders of magnitude lower than that of FP16 or FP8 matrix multiplications.
+
+A concrete back‑of‑the‑envelope calculation illustrates this shift in balance.  For a typical head dimension \(d=128\) and sequence length \(N=8192\), the forward pass performs roughly \(2N^2 d\) floating‑point operations in GEMM (the query‑key product and the weighted sum with values).  In FP16 this amounts to about \(1.7\times10^{12}\) FLOPs.  By contrast, computing \(\exp(\cdot)\) for every element of the score matrix contributes only \(N^2\) exponentials—approximately \(6.7\times10^{7}\) special‑function calls.  The H100 provides about 989 TFLOP/s for FP16 GEMM but merely 3.9 TFLOP/s for exponentials; thus exponentiation can consume roughly half of the wall‑clock time even though it represents less than 0.1 % of total FLOPs.
+
+FlashAttention‑3 therefore introduces an *intra‑warpgroup overlap*: while one warpgroup is still performing softmax on block \(j\), another warpgroup has already launched the GEMM for block \(j+1\).  This “ping‑pong” schedule is realized by inserting synchronization barriers (`bar.sync`) at carefully chosen points so that softmax work always runs in parallel with pending WGMMA instructions.  The result is that both Tensor Cores and SFUs are kept busy simultaneously, eliminating softmax as a performance choke point.
+
+# Accuracy Concerns When Moving to FP8  
+
+FP8 (the e4m3 format used on Hopper) halves the mantissa width relative to FP16 (3 bits versus 10 bits) while retaining an exponent range comparable to BF16.  This yields up to twice the raw throughput for GEMM but also dramatically amplifies quantisation error.  Two phenomena make naïve FP8 attention unreliable:
+
+1. **Outlier Values** – Large language models often exhibit activation outliers: entries whose magnitude can be dozens of standard deviations larger than typical values (e.g., due to residual connections or specialised token embeddings).  When quantising an entire tensor with a single scale factor (per‑tensor quantisation), those outliers dominate the scale, forcing most entries into a coarse low‑precision bucket and increasing absolute error.
+
+2. **Layout Constraints** – Hopper’s FP8 WGMMA accepts only *k‑major* operand layouts in shared memory; rows must be contiguous in the inner reduction dimension \(K\).  In standard attention pipelines queries, keys and values are stored contiguously in channel (head) dimension, which conflicts with this requirement for the second GEMM (\(P V^\top\)).  Naïve transposition would add extra memory traffic that erodes any performance gains.
+
+FlashAttention‑3 addresses both issues:
+
+* **Block Quantisation** – Instead of one global scale per tensor, each tile processed by a warpgroup obtains its own scaling factor (one per \((B_r\times d)\) query block or \((B_c\times d)\) key/value block).  Because each tile contains far fewer extreme outliers than an entire tensor, its dynamic range is much tighter and FP8 representation incurs lower relative error.  The scaling factors are fused into existing per‑tile preprocessing steps (e.g., rotary embedding), so no extra bandwidth is consumed.
+
+* **Incoherent Processing via Random Orthogonal Mixing** – Prior to quantisation we left‑multiply both \(\mathbf{Q}\) and \(\mathbf{K}\) by a random orthogonal matrix \(\mathbf{M}\).  Orthogonality guarantees \(\mathbf{Q}\mathbf{K}^\top = (\mathbf{Q}\mathbf{M})(\mathbf{K}\mathbf{M})^\top\), so attention scores remain unchanged mathematically.  However, each entry of \(\mathbf{Q}\mathbf{M}\) becomes a sum of many original entries with random signs; this spreads any large outlier across many positions, reducing its per‑element magnitude before quantisation—a technique known as *incoherent processing*.  Efficient implementations use a diagonal sign matrix combined with a Hadamard transform (\(O(d\log d)\)) that can be fused with rotary embeddings at no extra compute cost.
+
+* **In‑Kernel Transpose Using LDSM/STSM** – To satisfy FP8's k‑major requirement without an external transpose kernel, FlashAttention‑3 employs `ldmatrix`/`stmatrix` instructions within the producer warpgroup. These instructions move an \(8\times8\) tile from SMEM to registers (or vice versa) while simultaneously permuting rows and columns at byte granularity. By packing two FP8 values into one 16‑bit lane we can reuse existing half‑precision `ldmatrix` logic; after loading each tile we write it back transposed into SMEM so that subsequent consumer WGMMAs see data in k‑major order. Because this work occurs in parallel with already‐running WGMMAs on other tiles, it incurs essentially no additional latency.
+
+Through these three mechanisms—per‑block scaling, orthogonal mixing, and on‑the‑fly transposition—FlashAttention‑3 attains an order‐of‐magnitude reduction in numerical error compared with naïve per‐tensor FP8 quantisation while preserving near‐peak TFLOP/s performance.
+
+# Overall Algorithmic Flow Chart  
+
+Below is a textual description of FlashAttention‑3’s forward pass; it captures all three design pillars discussed above.
+
+1. **Tile Partitioning**  
+   - Split the query matrix \(\mathbf{Q} \in \mathbb{R}^{N\times d}\) into row blocks \(\{\mathbf{Q}_i\}_{i=1}^{T_r}\) of size \(B_r\times d\).  
+   - Split keys and values \(\mathbf{K},\mathbf{V} \in \mathbb{R}^{N\times d}\) into column blocks \(\{\mathbf{K}_j,\mathbf{V}_j\}_{j=1}^{T_c}\) of size \(B_c\times d\).
+
+2. **Producer Warpgroup (Data Movement)**  
+   - Issue asynchronous TMA copies of \(\mathbf{Q}_i\), then iteratively stream each pair \((\mathbf{K}_j,\mathbf{V}_j)\).  
+   - After loading a value tile \(\mathbf{V}_j\), apply an in‑kernel transpose using `ldmatrix`/`stmatrix` so that its layout becomes k‑major compatible with FP8 WGMMAs.  
+   - Compute per‐tile scaling factors \(\sigma^{Q}_i,\sigma^{K}_j,\sigma^{V}_j\); apply them together with random orthogonal mixing matrices to obtain quantised FP8 tiles \(\hat{\mathbf{Q}}_i,\hat{\mathbf{K}}_j,\hat{\mathbf{V}}_j\).
+
+3. **Consumer Warpgroup Stage 0**  
+   - Wait until \(\hat{\mathbf{Q}}_i\) and \(\hat{\mathbf{K}}_0\) reside in SMEM.  
+   - Launch WGMMA to compute scores \(\mathbf{S}^{(0)} = \hat{\mathbf{Q}}_i\,\hat{\mathbf{K}}_0^{\!\top}\); this instruction returns asynchronously while computation proceeds on other tiles.
+
+4. **Softmax & Accumulation Pipeline (Two–Stage Overlap)**  
+   - After receiving \(\mathbf{S}^{(0)}\), subtract rowwise maximums \(m_i^{(0)} = \operatorname{rowmax}(\mathbf{S}^{(0)})\), exponentiate to obtain \(\widetilde{\mathbf P}^{(0)} = \exp(\mathbf S^{(0)} - m_i^{(0)})\), update running normaliser \(\ell_i\).  
+   - While this scalar/elementwise work runs on CUDA cores/SFUs, **simultaneously** launch WGMMA for scores of block 1: compute \(\mathbf S^{(1)} = \hat{\mathbf Q}_i\,\hat{\mathbf K}_1^{\!\top}\).  
+   - Once value tile \(\hat{\mathbf V}_0\) arrives from producer warps, multiply it with previously computed softmax tile: execute WGMMA
+     \[
+       \Delta O_i^{(0)} = \widetilde{\mathbf P}^{(0)}\,\hat{\mathbf V}_0
+     \]
+     and add to accumulator \(\mathbf O_i\). This second GEMM overlaps with softmax for block 1.
+
+5. **Iterative Loop**  
+   - For each subsequent block \(j=1,\dots,T_c-2\):  
+     * Launch WGMMA for scores of block \(j+1\).  
+     * Perform softmax on scores from previous iteration (\(j\)).  
+     * Launch WGMMA for accumulation using value tile from iteration \(j-1\).  
+     * Synchronise via lightweight barriers only where true data dependencies exist (e.g., when consuming a newly produced score or value tile).  
+
+6. **Finalisation**  
+   - After processing all key/value blocks, perform one last accumulation using the final softmax tile and value block \(T_c-1\).  
+   - Rescale accumulated output using final normaliser:
+     \[
+       \mathbf O_i \gets \operatorname{diag}(\ell_i)^{-1}\,\mathbf O_i,\qquad
+       L_i = m_i + \log (\ell_i)
+     \]
+   - Write output tiles $\mathbf O_i$ together with log‐norm $L_i$ back to GMEM.
+
+7. **Backward Pass (Conceptual Extension)**  
+   - The same producer–consumer pipeline is reused; gradients $\partial S$, $\partial P$, etc., follow identical overlapping patterns because they consist of identical GEMM shapes but reversed operand orders.
+
+The flow chart therefore contains three concurrent pipelines: (i) **memory movement** handled by producers via TMA; (ii) **high‑throughput GEMMs** handled by consumers via WGMMA; (iii) **low‑throughput scalar work** (softmax exponentials and reductions) overlapped across iterations through ping‑pong scheduling. The careful orchestration via warp specialization eliminates idle periods for any hardware engine, achieving close to hardware peak throughput while preserving numerical fidelity through blockwise FP8 quantisation and incoherent processing.
+
+---  
+
+In summary, FlashAttention‑3 unifies three complementary ideas—producer–consumer asynchrony exploiting Hopper’s TMA/Tensor Core split, GEMM–softmax pipelining that hides SFU latency behind Tensor Core work, and an FP8 execution path that respects layout constraints while mitigating quantisation error—to deliver a fast yet accurate attention primitive suited for long-context Transformers on today’s high-end GPUs.

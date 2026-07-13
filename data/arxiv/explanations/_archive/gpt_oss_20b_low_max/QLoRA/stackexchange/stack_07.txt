@@ -1,0 +1,86 @@
+\title{Stack Exchange of the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+### Can QLoRA be extended to support other PEFT methods beyond LoRA?
+Question:
+"We leave it to future work to explore tradeoffs of other PEFT approaches." Suppose we wanted to use prefix tuning or adapter prompt mixing instead of LoRA. What changes would be required in the double–dequantization step and memory budget calculations? Are there inherent benefits or obstacles specific to each method when combined with blockwise 4‑bit quantization?
+Answer:
+**Answer**
+
+QLoRA was designed around the idea that the *only* learnable parameters during fine‑tuning are the LoRA adapters. All other weights stay frozen in 4‑bit NF4 form, so gradients never flow into them. Because of this design the two most expensive parts of a forward‑/backward‑pass are
+
+1. **De‑quantization** – converting a block‑quantized weight matrix to BF16 (or FP16) before a matmul, and
+2. **Memory bookkeeping for the optimizer state** – most of it is spent on the small LoRA tensors and on activations that are checkpointed.
+
+If we replace LoRA with a different PEFT method, only the *second* part changes in practice: the shape and amount of learnable tensors changes, so the optimizer keeps a different set of states and gradients. The first part is largely untouched—every PEFT method still needs to run the frozen, quantized base through the model, therefore it still has to double‑dequantize $(c_1,c_2,\mathbf W)$ for every linear block.
+
+Below I detail what would change for two popular alternatives: **prefix tuning** and **adapter‑prompt mixing** (a.k.a. “prompt adapters”).
+
+---
+
+### 1. Prefix Tuning
+
+Prefix tuning inserts trainable “soft prompts” (few vectors) into each transformer layer, usually as additional key/value vectors in attention or as biases before a linear factor. Crucially:
+
+| What changes | Why it changes | Memory impact |
+|--------------|----------------|---------------|
+| **No adapter weights** are added to hidden layers. The parametric tensors are just a few 1‑dimensional “prefix” vectors per layer (often $P \times H$, where $P$ is prefix length, $H$ hidden size). | Prefixes do not alter the projection matrices; they are added at runtime via broadcasting or a small bias term before/after the fixed weight matrix. | Optimizer state becomes tiny (< 10 MB for a 65B LLaMA with $P=32$). |
+| **Back‑prop through quantized backbone still required** during forward because activation gradients need them to adjust the prefixes via chain rule. | Keeps exactly the same double‑dequantization cost as QLoRA because the frozen weights stay frozen. | No extra memory beyond prefixes; activations still dominate when checkpointing is involved. |
+| **No dynamic reshape of rank‑$r$ matrices** – prefix vectors are flat, so no matrix–matrix north–south products that would normally trigger extra GPU tensor broadcasts. | May reduce per‑step compute slightly because we avoid multiplying two low‑rank matrices per token. | Minor compute savings (≈ 5–10 %) but not significant relative to backbone cost. |
+
+Hence, extending QLoRA to prefix tuning requires:
+
+1. Replacing LoRA tensors $\mathbf L_1,\mathbf L_2$ with a small set of prefix vectors $\mathbf p_{Q,K,V}$.
+2. Modifying the forward pass to add these prefixes either by concatenation or by broadcasting.
+3. Leaving double‑dequantization in place – every time we apply a linear block $ \mathbf X \mathbf W $ we still call `doubleDequant(c_1,c_2,W_NF4)`.
+
+Because prefixes have much smaller dimensionality than LoRA adapters, memory budgets stay even smaller; no new bottleneck emerges.
+
+---
+
+### 2. Prompt Adapters / “Prompt Mixing”
+
+Prompt adapters treat user prompts as trainable embeddings that sit in front of or at specific positions in the token sequence (sometimes called “embedded prompts” or “prompt tuning + an extra adapter”). Here the finetuned component is typically located **outside** any linear projection; it is just added to token embeddings or applied as an additive bias to hidden states.
+
+What this means for QLoRA:
+
+| What changes | Why |
+|--------------|-----|
+| **No interaction with weight dequantization in linear layers** – model still runs through frozen layers as before, but no additional convolutional operations inside those layers linked to new parameters exist. | Prompt adapters work purely at embedding or hidden state level; they never modify matrix multiplications inside transformer blocks. |
+| **Optimizer registers only embeddings or bias tensors**, which occupy far fewer bytes than LoRA's $H\times r$ matrices (often < 1 % of LoRA budget). | Leads to trivial extra memory usage – mainly optimizer moments for a few tens of MB at most even on 65B models. |
+| **Extra backward pass paths** do *not* call `doubleDeQuant` because gradients never flow into $\mathbf W$. Only standard gradient collection on the prompt vectors occurs before each copied matmul step that uses them (e.g., early self‑attention). | The core double‑dequantization stays unchanged; we simply attach computed prefix biases prior to each matmul and back‑propagate through them normally.
+
+Thus, moving from LoRA to prompt adapters does not add any new dequantization bottleneck—only potentially reduces memory further.
+
+---
+
+### Common Obstacles and Benefits Across PEFTs
+
+| Issue | Impact on Blockwise 4‑bit Quantization |
+|-------|----------------------------------------|
+| Gradient Access vs Fixed Weights | All methods keep weights frozen; QLoRA matters only if parameters need gradient w.r.t $\mathbf W$. PT/Adapter mixing never require it, so fine‐tuning never suffers from limited backprop precision lost during double dequants. |
+| Compute Back‑overhead from Mathematically Complex Adapters | In LoRA we multiply $\mathbf X \mathbf L_1 \mathbf L_2$, an extra low‐rank matmul per forward pass which carries a tiny compute cost but needs gradient storage same as normal activation grads. In PT / Prompt Mix this cost vanishes; you only add small biases pre-matmul—almost no extra GPU load beyond reading those few tensors from device memory. |
+| Memory for Quantization Constants | Double quantization shrinks per‑parameter overhead from ≈ 0․5 bits → ≈ 0․13 bits regardless of PEFT strategy because constants belong to frozen weights only; they remain untouched by adapter choice. Therefore all PEFT techniques benefit equally from DQ’s ≈ 30 % savings per weight tensor area—and you can tune blocksize independently per tensor type if needed (e.g., larger blocksize for sparse latent prompts). |
+| Activation Checkpointing Interference | Heavy checkpointing spikes occur when long sequences force redundant recomputation; this isn’t affected by adapter type because checkpointing works on activations produced by *fixed* maybe purely low–rank transfer streams—not on adapters themselves RHS but you can reduce stride by moving all trainable modules out-of-line (e.g., in prompt mix you can avoid recomputation inside LV factorized matrices entirely). |
+
+---
+
+#### Concrete Recipe for Switching
+
+1. Keep your binary weights NF4 + DoubleQuant constants exactly as in QLoRA – no change.
+2. Replace each `LHS @ RQS` module:
+   - For *prefix tuning*: instantiate an `nn.Parameter` shape `(num_layers, prefix_len, hidden_size)` per key/value and inject it into self‑attention before projection ($K = K_{\text{baseline}} + \text{prefix}$, $V = V_{\text{baseline}} + \text{prefix}$).
+   - For *prompt adapters*: create an embedding matrix `(prompt_vocab_size, hidden_size)` and perform an additive bias after token embedding or use it as additional “virtual” tokens that follow input embedding.
+3. Adjust optimizer such that only these new parameters have learning rates > 0; rest remain frozen.
+4. Run your training loop unchanged: each forward still calls `doubleDequant(c_1,c_2,W_NF4)` just once per linear block.
+5. Verify that memory usage stays below your target HD (~48 GB for 65B): you should now have even less than before because you removed two low-rank matrices per layer.
+
+--- 
+
+### Bottom line
+
+- **Extension minimal:** Changing from LoRA to another PEFT method does *not* require rethinking double dequantization or DQ itself—those operations are part of handling the fixed base weights.
+- **Memory benefits:** Since most PEFT schemes (prefix tuning, prompt mixing) introduce fewer learnable parameters than full‐rank LoRA adapters, optimizer state and gradient memory shrink monotonically.
+- **Obstacles:** The main challenge is engineering integration: adding prefixes or prompt embeddings means ensuring proper broadcasting/concatenation vs LoRA’s factorized matmuls; if not done carefully you could inadvertently increase effective batch size or introduce communication overheads on multi-GPU setups.
+- **Benefits:** You get cleaner forward backs (no extra matmuls), lower compute cost per step (~5–10 % saving relative to LoRA), and lower peak RAM—both favorable for large models trained on modest GPUs.
+
+Thus extending QLoRA beyond LoRA is straightforward: keep its quantification machinery intact and only swap out how you inject task-specific information into the network while preserving low memory footprints—a perfect fit for frontier‐scale 4‑bit fine-tuning on consumer GPUs.​

@@ -1,0 +1,324 @@
+\title{Blogs about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+# Step‑by‑Step Guide: Fine‑tune a 65 B LLM on One 48 GB GPU Using QLoRA  
+
+*TL;DR – With QLoRA you can take a frozen 65 B‑parameter LLaMA checkpoint, compress it to the new NF4 (“NormalFloat‑4”) data type, attach low‑rank LoRA adapters at **every** linear layer, and finish an instruction‑following finetune in roughly one day on a single 48 GB GPU while keeping full‑precision quality.*
+
+---
+
+## 1️⃣ Why QLoRA makes a 65 B finetune possible  
+
+| Traditional 16‑bit finetune | QLoRA (4‑bit) |
+|------------------------------|---------------|
+| > 780 GB GPU RAM for LLaMA‑65B | < 48 GB GPU RAM |
+| Full model gradients must be stored | Only LoRA gradients (+ activations) |
+| Requires multi‑GPU clusters | Fits on a single RTX A6000 / RTX 4090 (48 GB) |
+
+QLoRA achieves this by three tricks described in the paper:
+
+1. **NF4 quantization** – an information‑theoretically optimal 4‑bit format for normally distributed weights.
+2. **Double quantization** – the per‑block scaling factors themselves are stored as FP8 (≈ 0.13 bits/parameter), shaving ≈ 3 GB off a 65 B model.
+3. **Paged optimizers** – optimizer states live in unified memory and spill to CPU only when needed, eliminating the occasional OOM spikes caused by gradient checkpointing.
+
+All three are implemented in the open‑source codebase (`artidoro/qlora` + `TimDettmers/bitsandbytes`).  
+
+> **Bottom line:** you keep the base model *frozen* in NF4 while only updating a tiny set of LoRA matrices; gradients flow through the dequantized weights during backpropagation, so no degradation is observed even on complex benchmarks like Vicuna or MMLU.
+
+---
+
+## 2️⃣ Prerequisites  
+
+| Item | Minimum requirement |
+|------|---------------------|
+| NVIDIA GPU | Compute capability ≥ 7.0 (A100, RTX 3090/4090/A6000 work) |
+| CUDA | ≥ 11.6 |
+| Python | ≥ 3.9 |
+| PyTorch | ≥ 2.0 built with matching CUDA |
+| Disk space | ≈ 200 GB for the raw LLaMA‑65B checkpoint + data + caches |
+
+You also need at least one instruction dataset (the paper used **OASST1**). The format has to be JSONL with fields `"instruction"`, `"input"` (optional), and `"output"` – exactly what HuggingFace 🤗datasets expects for “instruction fine‑tuning”.
+
+---
+
+## 3️⃣ Installing the QLoRA stack  
+
+```bash
+# Clone the repository
+git clone https://github.com/artidoro/qlora.git
+cd qlora
+
+# Create a fresh virtualenv (optional but recommended)
+python -m venv venv
+source venv/bin/activate
+
+# Core dependencies
+pip install -U pip setuptools wheel
+pip install torch==2.* torchvision torchaudio   # <-- pick the wheel matching your CUDA
+pip install transformers accelerate datasets sentencepiece tqdm
+
+# BitsAndBytes gives us NF4, double‑quant & paged AdamW
+pip install bitsandbytes==0.41.*   # version used by the authors
+```
+
+> **Tip:** If you hit “`bitsandbytes` compiled without CUDA support”, reinstall Torch first so it picks up your system’s CUDA headers before installing bitsandbytes again.
+
+---
+
+## 4️⃣ Preparing your instruction data  
+
+The simplest way is to download OASST1 from 🤗 Hub:
+
+```bash
+from datasets import load_dataset
+ds = load_dataset("openassistant/oasst1")
+ds["train"].to_json("oasst1_train.jsonl")
+```
+
+If you have your own dataset, convert it to one line per JSON object:
+
+```json
+{
+  "instruction": "Summarize the plot of *Pride and Prejudice* in three sentences.",
+  "input": "",
+  "output": "Elizabeth Bennet meets Mr..."
+}
+```
+
+Make sure each record fits within your target max token length (the paper used ≤ 2048 tokens).
+
+---
+
+## 5️⃣ Defining LoRA adapters  
+
+QLoRA ships a thin wrapper around HuggingFace’s PEFT library.  
+Below is an example *YAML* configuration (`lora_config.yaml`) that mirrors what produced the best “Guanaco” models:
+
+```yaml
+r: 64                 # rank – default works well across scales
+lora_alpha: 16        # scaling factor
+target_modules:
+  - q_proj            # attention query
+  - k_proj            # key
+  - v_proj            # value
+  - o_proj            # output projection
+  - gate_proj         # feed‑forward gate (if present)
+  - up_proj           # feed‑forward up-projection
+  - down_proj         # feed‑forward down-projection
+lora_dropout: 0.05
+bias: none            # keep biases frozen
+task_type: CAUSAL_LM   # decoder‐only model like LLaMA
+```
+
+> **Why every linear layer?** The paper observed that restricting LoRA only to query/value matrices hurts performance significantly at large scales; adding adapters “at every network layer” almost eliminates any accuracy gap between full‐precision finetuning and QLoRA.
+
+---
+
+## 6️⃣ Enabling NF4 + Double Quant + Paged Optimizer  
+
+All three switches are exposed through model loading flags in 🤗 Transformers + BitsAndBytes:
+
+```python
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-2-65b-hf",          # any compatible checkpoint works
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",           # <-- NF4 datatype from QLoRA paper
+    bnb_4bit_use_double_quant=True,      # <-- double quantization of scaling factors
+    bnb_4bit_compute_dtype="bfloat16",   # compute precision = BF16 as recommended
+)
+```
+
+When using **paged AdamW**, simply request it via PEFT’s optimizer factory:
+
+```python
+from peft import get_peft_model, PeftConfig
+from bitsandbytes.optim import PagedAdamW8bit   # uses unified memory internally
+
+peft_cfg = PeftConfig.from_pretrained("path/to/lora_config.yaml")
+model = get_peft_model(model, peft_cfg)
+
+optimizer = PagedAdamW8bit(
+    model.parameters(),
+    lr=1e-5,
+    betas=(0.9,0.999),
+    eps=1e-08,
+)
+```
+
+The optimizer automatically pages gradients/optimizer states between GPU and CPU whenever RAM runs low – exactly what Section 3 calls **Paged Optimizers**.
+
+---
+
+## 7️⃣ Launching the training job  
+
+Below is a minimal `train_qlora.py` wrapper (the repo already contains one – feel free to adapt):
+
+```python
+import argparse, os
+from transformers import Trainer, TrainingArguments
+from datasets import load_dataset
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name_or_path")
+    parser.add_argument("--dataset_path")
+    parser.add_argument("--output_dir")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=1)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=16)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--max_seq_length", type=int, default=2048)
+    parser.add_argument("--num_train_epochs", type=int, default=3)
+    args = parser.parse_args()
+
+    # -------- Load model with NF4 ---------
+    from transformers import AutoModelForCausalLM
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path,
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype="bfloat16",
+        device_map="auto"
+    )
+
+    # -------- Attach LoRA ---------
+    from peft import get_peft_model, LoraConfig
+    lora_cfg = LoraConfig.from_pretrained("lora_config.yaml")
+    model = get_peft_model(model, lora_cfg)
+
+    # -------- Dataset ---------
+    ds = load_dataset("json", data_files=args.dataset_path)["train"]
+    
+    def tokenize(batch):
+        tokenized = tokenizer(batch["instruction"] + "\n" + batch.get("input","") + "\n" + batch["output"],
+                              truncation=True,
+                              max_length=args.max_seq_length,
+                              padding="max_length")
+        tokenized["labels"] = tokenized["input_ids"].copy()
+        return tokenized
+    
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    ds = ds.map(tokenize, batched=True)
+
+    # -------- Trainer ---------
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.learning_rate,
+        fp16=False,
+        bf16=True,
+        max_steps=-1,
+        num_train_epochs=args.num_train_epochs,
+        logging_steps=10,
+        save_total_limit=2,
+        evaluation_strategy="no",
+        report_to="none",
+        dataloader_pin_memory=False,
+        dataloader_num_workers=2,
+        warmup_ratio=0.03,
+        disable_tqdm=False,
+        run_name="qlora_65b_oasst1"
+    )
+    
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=ds,
+        optimizers=(optimizer, None),   # optimizer defined earlier with PagedAdamW8bit
+     )
+    
+     trainer.train()
+     trainer.save_model(args.output_dir)
+
+if __name__ == "__main__":
+   main()
+```
+
+### One‑liner launch (consumer vs professional GPU)
+
+```bash
+# Consumer RTX3090 / RTX4090 (24–24 GB)
+accelerate launch train_qlora.py \
+   --model_name_or_path meta-llama/Llama-2-33b-hf \
+   --dataset_path ./oasst1_train.jsonl \
+   --output_dir ./guanaco_33b \
+   --per_device_train_batch_size 1 \
+   --gradient_accumulation_steps 32 \
+   --learning_rate 5e-6 \
+   --max_seq_length 2048 \
+   --num_train_epochs 3
+
+# Professional A6000 / A100 (48 GB) — full 65 B model  
+accelerate launch train_qlora.py \
+   --model_name_or_path meta-llama/Llama-2-65b-hf \
+   --dataset_path ./oasst1_train.jsonl \
+   --output_dir ./guanaco_65b \
+   --per_device_train_batch_size 1 \
+   --gradient_accumulation_steps 48 \      # larger accumulation → effective batch ≈ 48 tokens 
+   --learning_rate 2e-5 \                 # halve LR compared to smaller models 
+   --max_seq_length 2048 \
+   --num_train_epochs 3
+```
+
+**What really happens under the hood?**
+
+* Each forward pass dequantizes NF4 → BF16 on‑the‑fly (`doubleDequant`).  
+* Only gradients w.r.t. LoRA matrices are kept; base‐model gradients are discarded after backpropagation – this yields < 48 GB total usage even though there are > 65000 M parameters frozen in “NF4”.  
+* PagedAdamW streams optimizer slots between GPU and CPU automatically; no manual checkpointing is needed beyond standard torch‐checkpointing used for activations (`trainer.use_gradient_checkpointing=True`).
+
+---
+
+## 8️⃣ Monitoring & Validation  
+
+During training you should see two numbers printed every few steps:
+
+* **train loss** – should drop steadily toward ≈ 0.9–1.2 depending on dataset size.
+* **GPU memory usage** – reported by `nvidia-smi`; expect ~45–47 GB after initial loading of the NF4 weights plus paged optimizer buffers.
+
+After finishing epoch(s), run any downstream benchmark you care about – e.g., MMLU few‑shot or Vicuna prompts – exactly as done in Sections \ref{sec:pushing}–\ref{sec:pushing} of the paper:
+
+```bash
+python evaluate_vicuna.py \
+   --model_path ./guanaco_65b \
+   --benchmark vicuna80.jsonl 
+```
+
+The authors observed that **a single professional GPU finetuned Guanaco 65B in ~24 h**, achieving **99.3 % of ChatGPT’s Vicuna score** while keeping inference memory at ~21 GB thanks to NF4 inference (the same datatype is used at inference time).
+
+---
+
+## 9️⃣ Common Pitfalls & Quick Fixes  
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `CUDA out of memory` after few steps | Gradient accumulation too low *or* sequence length too long | Reduce `--gradient_accumulation_steps` or lower `--max_seq_length`. Remember that activations dominate memory once checkpointing is enabled – try `trainer.use_gradient_checkpointing=True`. |
+| BitsAndBytes complains “unsupported compute capability” | Using an older GPU (< 7.x) | QLoRA needs at least compute capability 7.0 because NF4 kernels rely on tensor cores; upgrade hardware or fall back to FP8+FP16 which defeats most benefits. |
+| Model loads but stays *fp32* despite flags | Missing environment variables (`BITSANDBYTES_FORCE_KERNELS=TRUE`) or outdated bitsandbytes version | Reinstall bitsandbytes from source (`pip install git+https://github.com/TimDettmers/bitsandbytes.git`) ensuring it compiles against your CUDA toolkit version. |
+| Training extremely slow (> 30 tokens/sec) | FlashAttention not enabled & no mixed precision | Install flash-attention (`pip install flash-attn`) and set `--bf16` / `"torch_dtype": "bfloat16"` in trainer arguments as shown above.|
+
+---
+
+## 🔟 Expected Runtime & Resource Profile  
+
+| Model | Approximate wall clock time (single‐GPU) | Effective batch size* | Peak VRAM |
+|-------|------------------------------------------|----------------------|------------|
+| LLaMA 7 B | ~6–8 h                                 | ~128 tokens          | ≈ 32 GB |
+| LLaMA 33 B | ~10–12 h                               | ~96 tokens           | ≈ 44 GB |
+| LLaMA 65 B | ~22–24 h                               | ~64 tokens           | ≤ 48 GB |
+
+\*Effective batch size = `per_device_train_batch_size × gradient_accumulation_steps`.  
+These figures follow exactly what the authors reported (“12 h on a consumer GPU” for their best‐performing *Guanaco* 33B and “24 h on a single professional GPU” for *Guanaco* 65B).  
+
+Training speed scales linearly with token throughput; you can boost it further by enabling FlashAttention (`pip install flash-attn`) if your hardware supports it—no extra VRAM cost because attention kernels stay inside BF16 compute buffers.
+
+---
+
+## 🙌 What’s Next?  
+
+* **Evaluation:** Run GPT‑4 or human pairwise comparisons as outlined in Section 5 of the paper if you want Elo scores instead of raw BLEU/perplexity numbers.
+* **Fine‐tune on your own domain:** Swap OASST1 for any high-quality instruction set—just keep it under ~500k examples because data quality mattered more than sheer size according to Section 6 (“9k high-quality beats >400k generic”).  
+* **Deploy:** Inference also benefits from NF4 – just load your finetuned checkpoint with exactly the same flags (`load_in_4bit=True…`). The resulting deployment footprint is roughly half that of an FP16 model while preserving generation quality.
+
+Enjoy turning a massive LLaMA backbone into a ChatGPT‑level assistant—on hardware most researchers already own! 🚀

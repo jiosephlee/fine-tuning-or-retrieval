@@ -1,0 +1,395 @@
+\title{A Textbook about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+Chapter 4: 4. QLoRA Overview and Design Goals
+
+In this chapter we lay out the foundation of **QLoRA** (Quantized Low‑Rank Adapters).  QLoRA is a training recipe that marries two ideas that have independently proved effective in the literature: *block‑wise low‑bit quantization* of a pretrained language model, and *parameter‑efficient fine‑tuning* with Low‑Rank Adapters (LoRA).  The combination delivers **dramatic memory savings while preserving full 16‑bit training performance**.  We proceed by dissecting the logical flow of a QLoRA training step, clarifying the data types used for storage versus computation, and showing how gradients are routed only to the adapter parameters.
+
+> **Why QLoRA matters**  
+> Regular 16‑bit fine‑tuning of a 65B parameter model needs well over 700 GB of GPU memory—far beyond what is available on commodity hardware.  By freezing the base model’s weights, quantizing them to a highly efficient 4‑bit representation, and iteratively training only a tiny set of adapter weights, QLoRA reduces this requirement to under 48 GB on a single large GPU, while still matching or exceeding the performance obtained by full fine‑tuning.
+
+---
+
+## QLoRA Pipeline Architecture
+
+At its core, QLoRA follows **the same high‑level forward/backward loop** as conventional neural network training, except that two distinct transformations act on the base weights:
+
+1. **Storage‑to‑Compute conversion** – we store each weight matrix in a compact 4‑bit format (the “NormalFloat” data type), but every forward or backward operation requires first converting that compact representation back into a higher‐precision form suitable for linear algebra.
+
+2. **Adapter insertion** – we augment every linear projection in the transformer block with an additional low‑rank term.  This term is trainable; all other parameters remain frozen.
+
+The architectural diagram would look like:
+
+```
+Input Token Embeddings          ─────►
+                                      │
+                                   LayerNorm
+                                      │
+                                 ┌────▼─────────┐
+                                 │ Pretrained   │
+                                 │ (quantized)  │
+                                 │  Matrix W_Q4 │
+                                 └────▲───────▲─┘
+                                      │       │
+                +----------------——–+dx−−+   │ dequantization
+                |                                ▼ 
+              LoRA                           Linear Projection
+              (trainable)                    (h × h) weight matrix
+                                 ┌────►   ▲    ▲
+                                 |       |    |
+                                 ▼       |    |
+                               Residual                  ───►
+```
+
+In words: the original transformer projection \( \mathbf{X}\mathbf{W} \) is still applied at every layer, but the effective weight matrix is now 
+
+\[
+\mathbf{W}_{\text{eff}}=\underbrace{\text{dequant}\bigl(C_1,C_2,\mathbf{W}^{\text{NF4}}\bigr)}_{\text{frozen base}}
+     \;+\;
+s\,\underbrace{\mathbf{L}_1\mathbf{L}_2}_{\text{adapter}},
+\]
+
+where \(C_1,\ C_2\) are the two levels of quantization constants introduced later.
+
+---
+
+## Storage Data Type versus Computation Data Type
+
+*Storage data type* refers to how an individual tensor is serialized into GPU memory; *computation data type* denotes what precision is used during matrix multiplications.
+
+- **Storage:**  
+  The base model’s weight tensors are stored in **4‑bit NormalFloat (NF4)** format.  
+  NF4 packs each component into a nibble; the bits encode an equal‑frequency mapping onto values derived from the standard normal distribution.  
+  This choice gives optimal “information theoretic precision” for typical pretrained weight statistics (zero‑mean Gaussian with moderate variance), yielding better empirical behaviour than plain int4 or float4.
+
+- **Computation:**  
+  All arithmetic involving these tensors uses **BFloat16 (BF16)** precision.  
+  BF16 offers lower memory usage than FP32 while providing almost identical dynamic range and enough headroom for gradients and activations that can become large during backpropagation.
+
+Because BF16 only fits twice as many bits per element as NF4, swapping between storage and compute incurs minimal overhead: each forward call invokes a *double dequantization* routine that reconstructs \(\mathbf{W}\) from its compressed representation into BF16 buffer on‑the‑fly.
+
+---
+
+## Forward Pass with Double Dequantization
+
+The double dequantization routine performs two consecutive “dequant” operations:
+
+1. **Dequantize first‐level constants:** The first quantization step scaled each block of \(\mathbf{W}\) by a constant \(c_1^{\text{FP32}}\).  
+   Since these constants themselves occupy space, they are later re‐quantized itself into an **FP8** format (`c2`), allowing reuse of their own scaling.
+
+2. **Dequantize NF4 weights:** Each block of NF4 weights \(\mathbf{W}^{\text{NF4}}\) was stored with respect to its second constant \(c_2^{\text{k-bit}}\).  
+
+Mathematically:
+
+\[
+\begin{aligned}
+Z &= \text{dequant}(c_2^{\text{k-bit}},\, \mathbf{W}^{\text{k-bit}}),\\
+\mathbf{\hat W} &= \text{dequant}(c_1^{\text{FP32}},\, Z).
+\end{aligned}
+\]
+
+The routine `doubleDequant(c1,c2,W)` exactly implements this sequence:
+
+```python
+def doubleDequant(c1_fp32, c2_kbit, W_nf4):
+    # First level: dequant from FP8 constants to real numbers
+    Z = dequant(c2_kbit_scaled, W_nf4)          # -> BF16
+    # Second level: dequant from FP32 constant to final BF16 weight tensor
+    return dequant(c1_fp32, Z)                 # -> BF16
+```
+
+With `c2_kbit_scaled` already centered around zero via mean subtraction (since all \(c_2>0\)), `dequant` applies an affine transformation that maps integer codes to floating values belonging to `[-1,+1]`, then rescales them by the remaining constant `c1`.
+
+During evaluation or inference only one dequantization step is needed because gradients are absent; however during training both steps must be executed for every mini‑batch.
+
+---
+
+## Adapter Forward in BF16 Precision
+
+Once the base projection has been computed from its compressed representation:
+
+\[
+\mathbf{y}_{Q} = \mathbf{x}\,\rm K\,,
+\quad K=\texttt{doubleDequant}(c_1,c_2,\mathbf{W}^{NF4}), 
+\]
+
+we add the LoRA term:
+
+\[
+\mathbf{y}_{LF} = s\, \bigl( \mathbf{x}\,\mathbf L_1\bigr)\,\mathbf L_2,
+\quad s>0.
+\]
+
+All three tensors involved—input \(\mathbf{x}\), low-rank factors \(\mathbf L_1,\mathbf L_2\)—are stored and processed in BF16 because their sizes are modest (~\(r\times h + r\times o)\); storing them in lower precision would degrade adapter expressiveness more noticeably than storing them in higher precision.
+
+The *full* effective output is then
+
+\[
+Y = \underbrace{\mathbf{x}K}_{Q} + 
+    \underbrace{s\,(\mathbf xL_1)L_2}_{LF},
+    \quad Y\,:\,\mathbb R^{b\times o}.
+\]
+
+No higher precision than BF16 is required for any part of this computation because even the final output will subsequently be used only by other modules which themselves work in BF16/FP32 internally.
+
+---
+
+## Backward Pass Details (Gradients Only for Adapters)
+
+The key memory saving mechanism lies in whom we update during backpropagation:
+
+- The frozen base weights \(K = C^{-1}_1C^{-1}_2\,W^{NF4}\) are never modified; therefore their gradients are always zero.
+- The only learnable parameters are the LoRA factors \(L_1,L_{addr}>0}\).
+
+During backpropagation we still need derivatives with respect to *all given inputs*, including \(K^T*\epsilon_x$, where \(\epsilon_x=\partial E/\partial Y$ is the gradient from downstream layers*. However we do **not** store or propagate gradients for \(K$ itself; these derivatives simply pass through when computing gradients w.r.t. input $\mathbf x$ but they never touch $K$’s parameters. 
+
+Formally one can write for any batch:
+
+```python
+# Forward:
+y_q   = x @ K            # computed using doubleDequant(K)
+y_lag = s * ((x @ L1) @ L2)
+y     = y_q + y_lag
+
+# Backward:
+eps_y     = grad(loss_out)
+
+eps_x_q   = eps_y @ K.T                # derivative wrt input through frozen path
+eps_La = ... compute via chain rule using eps_y and current states
+
+update(L1,L2)          # apply optimiser based on eps_La only
+```
+
+Because the `eps_La` term does not involve computing gradients through `K`, we avoid both storage of intermediate gradient tensors for `K` and any extra computation outside adapter matrices. Moreover, due to *gradient checkpointing* employed on activation memories within transformer layers, only backpropagated activations through these short paths need to be kept alive until the adapter update step finishes; thus overall memory cost stays bounded at roughly that of executing a regular BF16 forward pass plus a handful of additional parameter updates.
+
+In practice this results in:
+
+- Adapter input gradients averaging ~18 MB per sequence after checkpointing (when mixed with batch size).
+- Total LoRA parameters ≪ 100 MB even at 65B scale.
+- Base model running as normal but in compressed memory (~5 GB for an uncompressed 65B model vs < 48 GB net).
+
+These figures match those reported in Section 3 of the paper: changing encoder/decoder choice or defaults may slightly alter exact numbers but never upends fundamental principles outlined here.
+
+---
+
+## Recap of Key Design Choices
+
+| Component | Rationale | Practical Impact |
+|-----------|-----------|------------------|
+| 4-bit NF4 | Optimised for Gaussian distribution; equal–frequency bins | Higher accuracy than plain int/float quants |
+| Two–level constants | Reduce memory spent on per–block scaling | ≈ 0.37 bits/param saving |
+| Double dequantisation | Guarantees correct mapping from storage → compute | No performance loss despite compression |
+| LoRA adapters everywhere | Keeps encoder/decoder geometry unchanged | Enables full accuracy recovery |
+| BFloat16 computation | Sufficient dynamic range + less float-overhead vs FP32 | Minor runtime penalty |
+| Optimiser Paged Memory | Evicts spike buffers automatically | Avoids OOM without manual tuning |
+
+Together they yield a tight trade: raw parameters live compressed yet remain fully usable during gradient flow thanks to carefully designed dequant layers; local adapters capture fine–grained learning capacity efficiently.
+
+In summary, QLoRA’s core innovation lies not just in compressing weights but coupling that compression with an adaptable low–rank bridge that restores expressive power during training while keeping GPU footprint minimal—exactly what read it needs over next chapters: how we see these design choices playing out across real models and tasks before handing them down to large language model practitioners who hope to run sizable systems on modest hardware.
+
+# 5 – 4‑Bit NormalFloat (NF4) Quantization  
+
+Large‑scale language models contain billions of floating‑point weight values that are, to a very good approximation, drawn from a zero–mean Gaussian distribution with different standard deviations for different layers.  The QLoRA approach exploits this statistical regularity to design a quantisation scheme that is *information‑theoretically optimal* for such data.  The resulting 4‑bit format, termed **NormalFloat 4 (NF4)**, replaces traditional 4‑bit integer or float representations and achieves a sustained performance advantage in practice.  
+In what follows we develop the NF4 data type formally, show how it can be derived from first principles, and describe the practical steps required to deploy it in a real large‑scale training pipeline.
+
+---
+
+## Normal distribution assumption for pretrained weights  
+
+Before any quantisation technique can be optimised, we must understand the underlying distribution of the model parameters.  Empirical studies across many transformer architectures—from LLaMA, GPT‑NeoX, OPT, BLOOM to Pythia—reveal that after standard pretraining the weight tensors of most feed‑forward and attention layers resemble samples from a zero‑centred Gaussian distribution \( \mathcal{N}(0,\sigma^2) \), where the standard deviation \(\sigma\) varies by layer but the shape is identical across layers.  This observation follows from multiple sources:
+
+1. **Random weight initialisation**: The prevalent practice of Glorot / He initialisation sets weights as Gaussian random variables centred at zero; during training these distributions preserve their centring even as mean values drift.
+2. **Weight decay and regularisation**: These techniques encourage weights to stay close to zero.
+3. **Layer normalisation and residual connections**: The internal inductive biases of transformer blocks favour zero‑mean weight distributions.
+
+Because a Gaussian density is fully characterised by its mean (zero) and variance (\(\sigma^2\)), we can *scale* any weight tensor such that its empirical standard deviation equals that of a *canonical* normal distribution \( \mathcal{N}(0,1) \). Once this scaling is performed, all weight tensors share an identical statistical profile; consequently the *entire distribution* over which we need to quantise becomes known.
+
+This key simplification allows us to compute an *information‑theoretically optimal* set of quantisation bins once and reuse them for any tensor—there is no need for per‑tensor calibration or costly look‑ups of empirical cumulative distributions.
+
+---
+
+## Quantile quantisation fundamentals  
+
+Suppose we wish to represent every element \(x\) of a real‐valued tensor using only \(k\) bits.  With \(k\) bits we have \(2^{k}\) distinct codewords.  Let us denote by \(q_i \in \mathbb{R}\) the *quantiser levels* or *codeword values*, where \(i\in\{0,\dots,2^{k}-1\}\).  In traditional scalar quantisation the levels are usually chosen as uniformly spaced integers scaled by a fixed range; however this induces heavy errors whenever the true distribution has long tails or concentrated mass at particular regions.
+
+**Quantile quantisation** seeks instead to place each codeword so that an equal fraction of input values fall into each bin:
+
+\[
+P(q_{i-1} \le X < q_i) = \frac{1}{2^{k}} .
+\]
+
+For a *known* distribution \(p_X(x)\), these thresholds are simply inverses of the cumulative density function (CDF):
+
+\[
+q_i = F_X^{-1}\!\Bigl(\frac{i}{2^{k}}\Bigr),
+\qquad i=0,\dots,2^{k}-1 ,
+\tag{5.1}
+\]
+
+where \(F_X^{-1}\) is the quantile function (inverse CDF).  
+If every element lands in its own bin with probability around one half‑percent (for k=8), the mean squared error (MSE) induced by rounding becomes theoreticaly minimised under a fixed bit budget: each level carries as much information as possible about its bin’s members.
+
+Quantile quantisation is especially well suited when the source distribution is known analytically—as with Gaussian weights—because we can compute \(F_X^{-1}\) in closed form using error functions or high‑accuracy approximations.
+
+---
+
+## Deriving optimal k‑bit NF data points via standard normal quantiles  
+
+Let us specialise Eq.(5.1) to our canonical normal source \(X\sim \mathcal{N}(0,1)\).  
+The CDF of this distribution is the standard normal cumulative function \(\Phi(z)\), whose inverse is denoted \(\Phi^{-1}(\cdot)\). Thus:
+
+\[
+q_i
+=
+\Phi^{-1}\!\left(\frac{i}{2^{k}}\right),
+    \quad i=0,\dots ,2^{k}-1 .
+\tag{5.2}
+\]
+
+Example: for k = 8 bits (\(256\) levels), the first few levels would be approximately:
+
+| i | qᵢ |
+|---|------------------------|
+| 0 | -3.772|
+| 13 | -3.00|
+| 64 | -0.40|
+| 128| 0 |
+| 192| +0.40|
+| 255| +3.772|
+
+The mathematical convenience lies in being able to evaluate these numbers with high precision offline and store them in a small lookup table—a cheap operation during runtime.
+
+However, there are two practical complications:
+
+1. **Symmetry & Zero-centering** – We typically desire an exact representation for zero to avoid systematic bias when handling padding tokens or other special symbols.
+2. **Bounded Range** – We want all levels mapped into a compact range such that they fit into four bits whilst preserving magnitude resolution.
+
+The first issue leads naturally to an *asymmetric* scheme described next; the second issue dictates mapping our infinite support Gaussian onto a finite interval \([-\,c_{\max}, c_{\max}]\).
+
+---
+
+### Mapping NF quantiles to [- 1, + 1] range
+
+We implicitly define an *absolute maximum value* \(c_{\max}\) for each weight tensor—the largest absolute entry after rescaling by block‐wise standard deviation (Eq.(3) in the background section). In practice we set
+
+\[
+c_{\max}
+= \max_{\text{block}}
+   |x|\quad
+   /\,\,\, 
+   (\text{block standard deviation})\, .
+\]
+
+Because all blocks share the same mean-zero unit-variance profile after rescaling, no block will contain numbers significantly outside \([-\,c_{\max}, c_{\max}]\); outliers are absorbed into the larger block’s scaling factor.
+
+To ensure every level lies within [- 1,+ 1], we *normalize* all codeworts defined in Eq.(5.2):
+
+\[
+q_i^{[\!-\,1,+\,1]} 
+   = 
+   q_i / c_{\max} .
+\]
+
+Hence each level now occupies part of the unit interval even as its absolute magnitude may vary between tensors: more spreadout layers receive larger \(c_{\max}\), but because all codewords are proportionally scaled their relative spacing remains preserved.
+
+With this scaling applied uniformly across all tensors, subsequent de‑quantisation simply reappplies the block scale:
+\(x = c_{\max} \times q_j^{[\!-\,1,+\,1]}\).
+
+---
+
+## Zero‑point handling and asymmetric construction (k-bit NFₖ)
+
+A naive symmetric mapping gives two representations for zero—one at index \(2^{k-1}-1/2\), one at \(2^{k-1}+0/5/2\)—which violates our desire for an exact zeropoint: many inference engines assume they can look up zero without error (e.g., padding). To enforce discrete zero while keeping all buckets approximately equal in mass, we use an **asymmetric** design:
+
+1. Partition levels into two halves: `negative` and `positive`.
+2. For each side compute half as many points as there are total positive indices:
+   
+   \[
+   N^- = N^+ = 2^{k-1},
+   \quad
+   n^\pm_i = F_X^{-1}\!\bigl(\frac{i+0}{N^\pm}\bigr)-F_X^{-1}\!\bigl(\frac{i+0}{N^\pm}+{\small\tfrac{0}{N^\pm}}\bigr)
+   .
+   \]
+
+   In practice this means that each side uses exactly half the range but still keeps equal bin probabilities.
+3. Concatenate negative and positive lists while removing one duplicate occurrence of zero when both sides produce it.
+
+The final data type now has `NF_k` symbols where `NF_k[0] < … < NF_k[−] < 0 < NF_k[+] …`, all inside `[- c_max,c_max]`.  
+With k = 4 bits we obtain eight distinct coding positions exactly matching Neelms’ **NF4** points listed in Appendix A.
+
+This asymmetry guarantees:
+
+- A perfectly reproducible analogue of null tokens with no quantization error.
+- Minimal loss-of-information for symmetric places on either side owing to equal bin width in terms of probability mass rather than absolute value.
+
+---
+
+## Comparison to standard FP4/Int4 representations  
+
+### Precision profile  
+Standard FP4 packs exponent + mantissa into four bits with typically only one integer bit; probability mass concentrates heavily near zero resulting in large relative errors on extreme values (outliers).  
+Int4 uses uniform spacing over some dynamic range; again bins either overshoot tiny valued weights or undershoot bulging tails.
+
+Both schemes ignore knowledge about how many weights actually occupy each interval; they simply spread bins evenly over numeric value space—an intuition consistent with Uniform Quantisers rather than Entropy Optimised ones.
+
+Normalized quantile-based NF4 places more bins where weights genuinely occur—roughly five out entries per bin near tails vs one outperforms uniform spline placement—and uses variable step sizes derived holistically from Gaussian theory rather than arbitrary heuristics like power‐of‐two scales used by float formats.
+
+### Empirical impact  
+In experiments reported across several backbone models (OPT, BLOOM, Pythia & LLaMA), NF4 achieves roughly 10–15 % higher perplexity figures on held-out language modelling datasets compared to FP4 or Int4 at identical bit budgets on average per parameter compression factor ~57× relative to FP32 accuracy degradation ~10–12%. Moreover:
+
+- When combined with LoRA adapters (`QLoRA` framework), NF4 fully recovers full-finetuning performance even at low precision—a feat unattainable by FP4 or Int4.
+- Double Quantization further compresses per-tensor constants down from 32-bit scalars (~200MB per model block) to less than ~37MB without affecting MSE performance.
+- Inference latency improves modestly due to tighter packing (~10–20%) while maintaining minimal memory overflow risk on consumer GPUs today.
+
+These gains derive intrinsically from respecting two statistical facts: (a) the covariance structure stabilises due largely five-bounded variance per token after nuclear cancellation during training; (b) each weight tensor is roughly posteriorly centered around zero.
+
+---
+
+## Implementing NF4 in practice  
+
+Implementing NF4 requires changes only down at two building blocks:
+
+| Step | Detail | Implementation |
+|------|--------|----------------|
+| **Define level table** | Compute four-bit grid using (*Equation 5.2*) then shift to [- c_max,+ c_max]. | Precompute float array once per bit-size then store as constant memory on GPU; use BF16 conversion on load via custom CUDA kernel (`nf_decode`). |
+| **Block-wise scaling `c_max`** | For every contiguous block B (typical B≈64 ops for QC), store maximum absolute value among tensors inside it (`abs(max)`); then keep `scale = max / c_max` stored as FP32 per block.| Plain GPU CPU mem copy + atomic reduction; use TVM fused kernel always on GPUs supporting BF16 arithmetic (`tensorlib`). |
+| **Double Quantization** | Compress `scale` itself using an additional eight-bit float injection before applying LoRA update.| Nested kernel: first dequantise scale from FP32→FP8→BF16 during forward pass; revert only when computing gradient w.r.t LoRA params.|
+
+All maths operations respect .bf16 precision only where necessary—so typical forward/backward multiplications run entirely in BF16—while storing large arrays only at low precision – saving forward memory overhead without hurting speed due intense GPU throughput advantage for BF16 multiply-adds.
+
+---
+
+### Practical guidelines
+
+- **Block size trade‐off**: Larger block sizes reduce extra metadata but incur higher MSE because each multiplier covers wider weight variance ranges; B ≈ 64 balances speed & fidelity.
+- **Overflow handling**: Add small guard band (\(10^{-3}\)) when computing ordinary maximums so that NaNs do not bleed through blocks.
+- **Model loading**: When reading pre-trained checkpoints saved in FP32/FP16 convert them online using built-in decompression functions (`nf_quantize_pretrain`). The runtime cost (~30% extra cpu time before loading session startup) permits one-time conversion offline for persistent deployments.
+- **LoRA Adapter updates**: Keep LoRA weights entirely full precision BF16; gradient accumulation done over small batches prevents element-wise accumulation errors common in integer math.
+
+
+
+---
+
+### Putting it together
+
+In QLoRA's flow
+the pre-trained base model produces tensors stored on GPU host memory (NVMe+Pageable + Unified Memory).  During forward propagation
+
+```python
+W_qf  = nf_quantize(W_fp32)
+scale_fb16 = dequant_scale_block(W_qf.blocks)
+W_bf16 = dequant(W_qf.scales)
+output = matmul(X_bf16 , W_bf16)+ Σ LoRA_terms
+```
+
+Only `W_qf` stays low precision; intermediate matrices remain BF16 thanks to fast CUDA kernels that expect BF16 inputs/outputs (`torch.bfloat16`).  
+Backpropagation through `W` never updates these tensors—instead gradients flow through LoRA adapters gradually nudging hidden representations until loss decreases while retaining original base cognition intact.
+
+Thus NF4’s design aligns mathematically with information theory and practically with modern deep learning JIT compilers and hardware fp8/bfloat currently deployed across datacentres—allowing researchers who normally require coupled multi–GPU clusters to finetune gigantic LLMs with just one modern consumer card.
+
+
+
+--- 
+
+#### Takeaway
+
+The NormalFloat family embodies a principled approach where *quantizable representation derives directly from statistical modelling*. For once we have eliminated blind hand-tuning of grainy integer scales—especially at bulky dimensions—and replaced them with quartiles engineered from global Gaussian assumptions—which provides both theoretical guarantees (*equal probability per bin*) and substantial empirical advantages when paired with efficient adapter fine-tuning methodologies like QLoRA.

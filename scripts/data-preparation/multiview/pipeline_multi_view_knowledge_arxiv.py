@@ -1,21 +1,49 @@
 import os
 import json
+import re
 import sys
+from pathlib import Path
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 # Add the project root to the path to allow importing utils
-sys.path.append('../../')
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DATA_ROOT = PROJECT_ROOT / "data"
+ARXIV_CLEANED_DIR = DATA_ROOT / "arxiv" / "cleaned"
+sys.path.insert(0, str(PROJECT_ROOT))
 import utils.utils as utils
+from utils.granular_outputs import write_granular_files
+from utils.multiview_recovery import TEXTBOOK_SCHEMA, manifest_valid, record_validated_view
 from importlib import reload
 reload(utils)
 
-def generate_stack_exchange_knowledge(paper_name):
+# Per-generation output budget. Defaults to the historical 32k cap; override via
+# MULTIVIEW_MAX_TOKENS to request longer completions (clamped to fit the served
+# context window by utils._create_vllm_completion).
+MAX_TOKENS = int(os.environ.get("MULTIVIEW_MAX_TOKENS", "32768"))
+
+
+def extract_paper_title(paper_content, paper_name):
+    """Return the paper's actual title from its \\title{...} block, falling back to the
+    filename (paper_name) if none is found. Mirrors pipeline_diverse_views.py."""
+    match = re.search(r'\\title\{(.*?)\}', paper_content, re.DOTALL)
+    if match:
+        title = match.group(1).strip().replace('\n', ' ')
+        # Collapse internal whitespace runs left by multi-line \title blocks.
+        title = re.sub(r'\s+', ' ', title)
+        if title:
+            return title
+    return paper_name
+
+def generate_stack_exchange_knowledge(paper_name, model=None, slug="gpt_5_mini_custom",
+                                      efforts=None, outline_model="gpt-5", writing_model="gpt-5-mini",
+                                      provider="auto", base_url=None,
+                                      max_workers=4):
     """Process a single paper to generate Stack Exchange style Q&A pairs."""
     print(f"Processing {paper_name}...")
-    
-    PAPER_FILE_PATH = f'../../data/arxiv/cleaned/{paper_name}.tex'
-    OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
+
+    PAPER_FILE_PATH = ARXIV_CLEANED_DIR / f"{paper_name}.tex"
+    OUTPUT_DIR = utils.explanations_dir('arxiv', slug, paper_name, root=str(DATA_ROOT))
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -65,12 +93,14 @@ Example:
     }
 
     response_questions_str = utils.query_llm(
-        prompt_questions, 
-        model='gpt-5',
-        reasoning_effort="medium",
-        system_prompt_included=True, 
-        return_json=True, 
-        max_tokens=10000
+        prompt_questions,
+        model=model or outline_model,
+        reasoning_effort=efforts["questions"],
+        system_prompt_included=True,
+        return_json=True,
+        max_tokens=MAX_TOKENS,
+        provider=provider,
+        base_url=base_url,
     )
 
     # Save the generated questions outline
@@ -80,8 +110,18 @@ Example:
     print(f"Saved Stack Exchange outline to {outline_log_path}")
 
     # Parse the questions response
+    if not (response_questions_str or "").strip():
+        print(f"WARNING: empty questions response for {paper_name}; skipping stack exchange view")
+        return
     questions_data = json.loads(response_questions_str)
-    questions = questions_data['questions']
+    questions = questions_data.get('questions') if isinstance(questions_data, dict) else None
+    if not questions:
+        print(f"WARNING: no 'questions' key for {paper_name}; skipping stack exchange view")
+        return
+    # json_object mode guarantees valid JSON but not the requested schema; smaller
+    # models occasionally omit a required key. Drop malformed entries so one bad
+    # question doesn't KeyError the whole run.
+    questions = [q for q in questions if isinstance(q, dict) and q.get('title') and q.get('question_body')]
 
     print(f"Generated {len(questions)} questions")
 
@@ -140,10 +180,12 @@ There have been other implementation attempts, like gradient checkpointing(e.g. 
         
         answer_text = utils.query_llm(
             prompt_answer,
-            model='gpt-5-mini',
-            reasoning_effort="low",
+            model=model or writing_model,
+            reasoning_effort=efforts["answer"],
             system_prompt_included=True,
-            max_tokens=2000
+            max_tokens=MAX_TOKENS,
+            provider=provider,
+            base_url=base_url,
         )
         
         return {
@@ -152,7 +194,7 @@ There have been other implementation attempts, like gradient checkpointing(e.g. 
             'answer': answer_text
         }
 
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         qa_pairs = list(tqdm(executor.map(generate_answer, filtered_questions), total=len(filtered_questions), desc="Generating Stack Exchange answers"))
 
     # --- 4. Refine answers to ensure correct LaTeX formatting ---
@@ -173,22 +215,31 @@ There have been other implementation attempts, like gradient checkpointing(e.g. 
         
         refined_answer_text = utils.query_llm(
             prompt_refine,
-            model='gpt-5-mini',
-            reasoning_effort="low",
+            model=model or writing_model,
+            reasoning_effort=efforts["refine"],
             system_prompt_included=True,
-            max_tokens=4000
+            max_tokens=MAX_TOKENS,
+            provider=provider,
+            base_url=base_url,
         )
-        
-        qa_pair['answer'] = refined_answer_text
+
+        # Never let an empty/failed refinement destroy a valid answer.
+        if refined_answer_text and refined_answer_text.strip():
+            qa_pair['answer'] = refined_answer_text
         return qa_pair
 
-    with ThreadPoolExecutor() as executor:
-        qa_pairs = list(tqdm(executor.map(refine_answer_latex, qa_pairs), total=len(qa_pairs), desc="Refining LaTeX"))
+    active_model = (model or writing_model).lower()
+    if "gpt-oss" in active_model:
+        print("Skipping LLM LaTeX refinement for GPT-OSS; retaining validated original answers")
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            qa_pairs = list(tqdm(executor.map(refine_answer_latex, qa_pairs), total=len(qa_pairs), desc="Refining LaTeX"))
 
     # --- 5. Create single Stack Exchange style explanation file ---
     print("Creating Stack Exchange explanation file...")
 
-    stackexchange_content = f"\\title{{Stack Exchange of the Paper: {paper_name}}}\n\n"
+    paper_title = extract_paper_title(paper_content, paper_name)
+    stackexchange_content = f'\\title{{Stack Exchange of the Paper: "{paper_title}"}}\n\n'
     for qa in qa_pairs:
         stackexchange_content += f"### {qa['title']}\nQuestion:\n{qa['question']}\nAnswer:\n{qa['answer']}\n\n"
 
@@ -198,13 +249,23 @@ There have been other implementation attempts, like gradient checkpointing(e.g. 
         f.write(stackexchange_content)
 
     print(f"Saved all Q&A pairs to {output_file}")
+    title_line = f'\\title{{Stack Exchange of the Paper: "{paper_title}"}}'
+    granular_qas = [
+        f"{title_line}\n\n### {qa['title']}\nQuestion:\n{qa['question']}\nAnswer:\n{qa['answer']}"
+        for qa in qa_pairs
+    ]
+    paths = write_granular_files(OUTPUT_DIR, "stackexchange", granular_qas)
+    print(f"Saved {len(paths)} files to {Path(OUTPUT_DIR) / 'stackexchange'}/")
 
-def generate_textbook_knowledge(paper_name):
+def generate_textbook_knowledge(paper_name, model=None, slug="gpt_5_mini_custom",
+                                efforts=None, outline_model="gpt-5", writing_model="gpt-5-mini",
+                                provider="auto", base_url=None,
+                                max_workers=4):
     """Process a single paper to generate a textbook-style explanation."""
     print(f"Processing {paper_name} for textbook generation...")
-    
-    PAPER_FILE_PATH = f'../../data/arxiv/cleaned/{paper_name}.tex'
-    OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
+
+    PAPER_FILE_PATH = ARXIV_CLEANED_DIR / f"{paper_name}.tex"
+    OUTPUT_DIR = utils.explanations_dir('arxiv', slug, paper_name, root=str(DATA_ROOT))
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -239,20 +300,61 @@ Provide the output as a JSON object with a single key "outline", which is a list
 
     response_outline_str = utils.query_llm(
         prompt_outline,
-        model='gpt-5',
+        model=model or outline_model,
+        reasoning_effort=efforts["outline"],
         system_prompt_included=True,
         return_json=True,
-        max_tokens=4000
+        json_schema={"type": "json_schema", "json_schema": {
+            "name": "textbook_outline", "strict": True, "schema": TEXTBOOK_SCHEMA}},
+        max_tokens=MAX_TOKENS,
+        provider=provider,
+        base_url=base_url,
     )
     
+    if isinstance(response_outline_str, dict):
+        response_outline_str = json.dumps(response_outline_str, ensure_ascii=False)
     # Save the generated textbook outline
     outline_log_path = os.path.join(OUTPUT_DIR, "textbook_outline.json")
     with open(outline_log_path, 'w') as f:
         f.write(response_outline_str)
     print(f"Saved textbook outline to {outline_log_path}")
 
-    outline_data = json.loads(response_outline_str)
-    outline = outline_data['outline']
+    def _parse_outline(raw):
+        pairs = []
+        data = json.loads(raw, object_pairs_hook=lambda p: p)
+        if isinstance(data, list):
+            pairs = next((v for k, v in data if k == 'outline'), [])
+        elif isinstance(data, dict):
+            pairs = data.get('outline', [])
+        if isinstance(pairs, list) and len(pairs) == 1 and isinstance(pairs[0], list):
+            pairs = pairs[0]
+        if isinstance(pairs, list) and pairs and isinstance(pairs[0], tuple):
+            recovered = []
+            current = None
+            for key, value in pairs:
+                if key == 'chapter_title':
+                    if current: recovered.append(current)
+                    current = {'chapter_title': value}
+                elif current is not None:
+                    current[key] = value
+            if current: recovered.append(current)
+            if recovered: return {'outline': recovered}
+        return json.loads(raw)
+
+    if not (response_outline_str or "").strip():
+        print(f"WARNING: empty textbook outline for {paper_name}; skipping textbook view")
+        return
+    outline_data = _parse_outline(response_outline_str)
+    outline = outline_data.get('outline') if isinstance(outline_data, dict) else None
+    if not outline:
+        print(f"WARNING: no 'outline' key for {paper_name}; skipping textbook view")
+        return
+    # Drop chapters missing a required field (schema drift under json_object mode).
+    outline = [c for c in outline if isinstance(c, dict) and c.get('chapter_title')
+               and c.get('description') and isinstance(c.get('subtopics'), list)]
+    with open(outline_log_path, 'w', encoding='utf-8') as f:
+        json.dump({'outline': outline}, f, ensure_ascii=False, indent=2)
+        f.write('\n')
     print(f"Parsed outline with {len(outline)} chapters.")
 
     # --- 2. Write each chapter in parallel ---
@@ -289,33 +391,46 @@ Start with the chapter title in the first line. Separate each subtopic with a se
         
         chapter_content = utils.query_llm(
             prompt_chapter,
-            model='gpt-5-mini',
-            reasoning_effort="medium",
+            model=model or writing_model,
+            reasoning_effort=efforts["chapter"],
             system_prompt_included=True,
-            max_tokens=4000
+            max_tokens=MAX_TOKENS,
+            provider=provider,
+            base_url=base_url,
         )
         return chapter_content
 
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         chapter_contents = list(tqdm(executor.map(write_chapter, outline), total=len(outline), desc="Writing textbook chapters"))
 
     # --- 3. Concatenate and save ---
     print("Assembling textbook...")
     full_textbook_content = "\n\n".join(chapter_contents)
-    full_textbook = f"\\title{{A Textbook about the Paper: {paper_name}}}\n\n{full_textbook_content}"
+    paper_title = extract_paper_title(paper_content, paper_name)
+    full_textbook = f'\\title{{A Textbook about the Paper: "{paper_title}"}}\n\n{full_textbook_content}'
     
     output_file = os.path.join(OUTPUT_DIR, "textbook.txt")
     with open(output_file, 'w') as f:
         f.write(full_textbook)
         
     print(f"Saved textbook to {output_file}")
+    title_line = f'\\title{{A Textbook about the Paper: "{paper_title}"}}'
+    granular_chapters = [
+        f"{title_line}\n\nChapter {i}: {chapter.strip()}"
+        for i, chapter in enumerate(chapter_contents, start=1)
+    ]
+    paths = write_granular_files(OUTPUT_DIR, "textbook", granular_chapters)
+    print(f"Saved {len(paths)} files to {Path(OUTPUT_DIR) / 'textbooks'}/")
 
-def generate_blog_knowledge(paper_name):
+def generate_blog_knowledge(paper_name, model=None, slug="gpt_5_mini_custom",
+                            efforts=None, outline_model="gpt-5", writing_model="gpt-5-mini",
+                            provider="auto", base_url=None,
+                            max_workers=4):
     """Process a single paper to generate related blog posts."""
     print(f"Processing {paper_name} for blog generation...")
-    
-    PAPER_FILE_PATH = f'../../data/arxiv/cleaned/{paper_name}.tex'
-    OUTPUT_DIR = f"../../data/arxiv/explanations/{paper_name}/"
+
+    PAPER_FILE_PATH = ARXIV_CLEANED_DIR / f"{paper_name}.tex"
+    OUTPUT_DIR = utils.explanations_dir('arxiv', slug, paper_name, root=str(DATA_ROOT))
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -343,11 +458,13 @@ Provide the output as a JSON object with a single key "blogs", which is a list o
 
     response_blog_ideas_str = utils.query_llm(
         prompt_blog_ideas,
-        model='gpt-5',
-        reasoning_effort="medium",
+        model=model or outline_model,
+        reasoning_effort=efforts["ideas"],
         system_prompt_included=True,
         return_json=True,
-        max_tokens=2000
+        max_tokens=MAX_TOKENS,
+        provider=provider,
+        base_url=base_url,
     )
 
     # Save the generated blog ideas outline
@@ -356,8 +473,16 @@ Provide the output as a JSON object with a single key "blogs", which is a list o
         f.write(response_blog_ideas_str)
     print(f"Saved blog outline to {outline_log_path}")
 
+    if not (response_blog_ideas_str or "").strip():
+        print(f"WARNING: empty blog ideas for {paper_name}; skipping blog view")
+        return
     blogs_data = json.loads(response_blog_ideas_str)
-    blogs = blogs_data['blogs']
+    blogs = blogs_data.get('blogs') if isinstance(blogs_data, dict) else None
+    if not blogs:
+        print(f"WARNING: no 'blogs' key for {paper_name}; skipping blog view")
+        return
+    # Drop malformed blog ideas (schema drift under json_object mode).
+    blogs = [b for b in blogs if isinstance(b, dict) and b.get('title') and b.get('description')]
     print(f"Parsed {len(blogs)} blog post ideas.")
 
     # --- 3. Write each blog post in parallel ---
@@ -390,40 +515,112 @@ Description: {description}"""
 
         blog_content = utils.query_llm(
             prompt_blog_content,
-            model='gpt-5-mini',
-            reasoning_effort="low",
+            model=model or writing_model,
+            reasoning_effort=efforts["post"],
             system_prompt_included=True,
-            max_tokens=4000
+            max_tokens=MAX_TOKENS,
+            provider=provider,
+            base_url=base_url,
         )
         return blog_content
 
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         blog_contents = list(tqdm(executor.map(write_blog, blogs), total=len(blogs), desc="Writing blog posts"))
 
     # --- 4. Concatenate and save ---
     print("Assembling blog posts...")
     full_blogs_content = "\n\n\n\n".join(blog_contents)
-    full_blogs_content = f"\\title{{Blogs about the Paper: {paper_name}}}\n\n{full_blogs_content}"
+    paper_title = extract_paper_title(paper_content, paper_name)
+    full_blogs_content = f'\\title{{Blogs about the Paper: "{paper_title}"}}\n\n{full_blogs_content}'
 
     output_file = os.path.join(OUTPUT_DIR, "blogs.txt")
     with open(output_file, 'w') as f:
         f.write(full_blogs_content)
 
     print(f"Saved blog posts to {output_file}")
+    title_line = f'\\title{{Blogs about the Paper: "{paper_title}"}}'
+    granular_blogs = [f"{title_line}\n\n{blog.strip()}" for blog in blog_contents]
+    paths = write_granular_files(OUTPUT_DIR, "blog", granular_blogs)
+    print(f"Saved {len(paths)} files to {Path(OUTPUT_DIR) / 'blogs'}/")
 
-def process_papers(paper_names=None):
+PART_GENERATORS = {
+    "stack_exchange": generate_stack_exchange_knowledge,
+    "textbook": generate_textbook_knowledge,
+    "blog": generate_blog_knowledge,
+}
+DEFAULT_PART_ORDER = ["stack_exchange", "textbook", "blog"]
+
+
+def resolve_parts(parts):
+    if not parts or "all" in parts:
+        return DEFAULT_PART_ORDER
+    return parts
+
+
+def process_papers(paper_names=None, parts=None, model=None, model_slug=None,
+                   reasoning_effort=None, outline_model="gpt-5", writing_model="gpt-5-mini",
+                   provider="auto", base_url=None, max_workers=4):
     if paper_names is None:
-        input_dir = "../../data/arxiv/cleaned/"
-        paper_names = [os.path.splitext(f)[0] for f in os.listdir(input_dir) if f.endswith('.tex')]
+        paper_names = [path.stem for path in ARXIV_CLEANED_DIR.glob("*.tex")]
 
+    # Per-step reasoning efforts: the 'custom' profile by default, or a uniform level.
+    efforts = utils.load_reasoning_efforts('arxiv', override=reasoning_effort)
+    mode = reasoning_effort or "custom"
+
+    # Folder name for outputs, suffixed by the reasoning-effort mode. When --model is set it
+    # names both tiers; otherwise the slug is named after the writing-tier model (so the
+    # default gpt-5-mini stays 'gpt_5_mini' and e.g. gpt-5.4-mini becomes 'gpt_5_4_mini').
+    # An explicit --model_slug is used verbatim (no suffix).
+    base = utils.model_slug(model) if model else utils.model_slug(writing_model)
+    slug = model_slug if model_slug else f"{base}_{mode}"
+    print(f"Writing explanations under slug='{slug}' "
+          f"(outline_model={model or outline_model}, writing_model={model or writing_model}, "
+          f"reasoning_effort mode={mode})")
+
+    selected_parts = resolve_parts(parts)
+    failures = []
     for paper_name in paper_names:
-        generate_stack_exchange_knowledge(paper_name)
-        generate_textbook_knowledge(paper_name)
-        generate_blog_knowledge(paper_name)
+        for part in selected_parts:
+            view = "stackexchange" if part == "stack_exchange" else part
+            item_dir = utils.explanations_dir('arxiv', slug, paper_name, root=str(DATA_ROOT))
+            if manifest_valid(item_dir, view):
+                print(f"Skipping manifest-validated {paper_name}/{view}")
+                continue
+            try:
+                PART_GENERATORS[part](
+                    paper_name, model=model, slug=slug, efforts=efforts[part],
+                    outline_model=outline_model, writing_model=writing_model,
+                    provider=provider, base_url=base_url, max_workers=max_workers,
+                )
+                record_validated_view(item_dir, view, {"model": model or writing_model,
+                    "provider": provider, "reasoning_effort": mode})
+            except Exception as exc:
+                failures.append(f"{paper_name}/{view}: {exc}")
+                print(f"ERROR: failed {paper_name}/{view}: {exc}", file=sys.stderr)
+    if failures:
+        raise RuntimeError("Incomplete multiview run:\n" + "\n".join(failures))
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--papers', nargs='+', help='Paper names to process. If not provided, all papers are processed.')
+    parser.add_argument('--parts', nargs='+', choices=['stack_exchange', 'textbook', 'blog', 'all'], default=['all'], help='Pipeline parts to run. Default: all.')
+    parser.add_argument('--model', default=None, help='Override generator model for ALL steps (both tiers). If set, takes precedence over --outline_model/--writing_model.')
+    parser.add_argument('--outline_model', default='gpt-5', help='Model for outline-tier steps (questions/outline/blog-ideas). Default: gpt-5.')
+    parser.add_argument('--writing_model', default='gpt-5-mini', help='Model for writing-tier steps (answers/chapter/post/refine). Also names the output slug. Default: gpt-5-mini.')
+    parser.add_argument('--model_slug', default=None, help='Override the output subfolder name verbatim (no reasoning-effort suffix). Defaults to <writing_model_slug>_<mode>, e.g. gpt_5_mini_custom.')
+    parser.add_argument('--provider', choices=sorted(utils.VALID_LLM_PROVIDERS), default='auto', help='LLM backend. Use vllm with --base_url for a self-hosted server.')
+    parser.add_argument('--base_url', default=None, help='OpenAI-compatible API base URL, including /v1. Falls back to VLLM_BASE_URL for provider=vllm.')
+    parser.add_argument('--max_workers', type=int, default=4, help='Maximum concurrent generation requests per view.')
+    parser.add_argument('--reasoning_effort', choices=['low', 'medium', 'high'], default=None,
+        help='Force a uniform reasoning effort for all outline+writing steps (slug suffix _low/_medium/_high). '
+             'Default (unset) uses the per-step "custom" profile from reasoning_effort.json (slug suffix _custom).')
     args = parser.parse_args()
-    process_papers(args.papers)
+    if args.max_workers < 1:
+        parser.error('--max_workers must be at least 1')
+    process_papers(
+        args.papers, args.parts, model=args.model, model_slug=args.model_slug,
+        reasoning_effort=args.reasoning_effort, outline_model=args.outline_model,
+        writing_model=args.writing_model, provider=args.provider,
+        base_url=args.base_url, max_workers=args.max_workers,
+    )

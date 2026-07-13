@@ -1,0 +1,135 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 5: # FlashAttention‑2 Revisited: Algorithmic Foundations
+
+Understanding modern GPU‐accelerated attention requires a deep dive into the algorithmic choices that underpin state‑of‑the‑art implementations. Among the most influential was **FlashAttention‑2**, which reimagined the canonical attention kernel by tiling over the sequence length dimension with key/value blocks. In this chapter we examine the forward and backward passes of FlashAttention‑2 in detail, analyze how its design interacts with GPU resource constraints and how it compares with high‑performance GEMM engines, and finally expose the performance bottlenecks that emerge when the algorithm is ported to newer architectures such as NVIDIA’s Hopper H100.
+
+---
+
+## Forward Pass in FlashAttention‑2 with Block Strategy
+
+The conventional formulation of self‑attention involves three matrix multiplications:
+
+1. **Score matrix**: $\mathbf{S} = \alpha \,\mathbf{Q}\mathbf{K}^{\top}$, an $N\times N$ matrix.
+2. **Softmax reduction** (row‑wise): $\mathbf{P} = \text{softmax}(\mathbf{S})$.
+3. **Output**: $\mathbf{O} = \mathbf{P}\mathbf{V}$, producing an $N\times d$ result.
+
+FlashAttention‑2 removes intermediate materialization of $\mathbf{S}$ and $\mathbf{P}$ by fusing these three operations into a single kernel that operates on *tiles* of the matrices. Let us denote:
+
+- $B_r$ : size of a query block (rows of $\mathbf{Q}$ and $\mathbf{O}$).
+- $B_c$ : size of a key/value block (rows of $\mathbf{K}$ and $\mathbf{V}$).
+- $T_r = \lceil N/B_r\rceil$ : number of query tiles.
+- $T_c = \lceil N/B_c\rceil$ : number of key/value tiles.
+
+For a particular query tile $\mathbf{Q}_i\in\mathbb{R}^{B_r\times d}$, FlashAttention‑2 iterates over all key/value tiles:
+
+```text
+for j = 0 … T_c-1:
+    // Load K_j, V_j into shared memory
+    S_i^{(j)}   = Q_i · K_j^T           // MM1 (dot products)
+    // Compute softmax statistics for this partial block:
+    m_i   = max(m_i, rowmax(S_i^{(j)}))
+    exp_S= exp(S_i^{(j)} - m_i)
+    l_i   = l_i·exp(m_old - m_i) + row_sum(exp_S)
+    // Apply accumulated scaling to O_i
+    O_i     = O_i·exp(m_old - m_i) + exp_S · V_j  // MM2
+```
+
+The global score matrix never materializes; instead, *rowwise* maximums ($m_i$) and *row sums* ($\ell_i$) are updated on the fly as new blocks arrive. At the end of the loop we rescale $O_i$ by $\ell_i$, obtaining exactly the same result as the naive implementation but without writing or reading an $N\times N$ intermediate.
+
+Because each threadblock processes one query tile ($B_r$ rows) it can be launched in parallel across all query tiles and all heads – a pattern that preserves high parallelism regardless of sequence length.
+
+---
+
+## Backward Pass Considerations
+
+The backward pass entails three additional matrix multiplications derived from the chain rule:
+
+\[
+\begin{aligned}
+d\!V &= P^\top dO ,\\
+dP   &= dO\, V^\top ,\\
+dS   &= {\rm dsoftmax}(dP) ,\\
+dQ   &= \alpha\, dS\, K ,\\
+dK   &= \alpha\, dS^\top Q .
+\end{aligned}
+\]
+
+In terms of implementation, each derivative requires yet another group of GEMMs that mirror the forward pass structure:
+
+| Derivative | GEMM pair | Memory pattern |
+|------------|-----------|----------------|
+| $dV$ | MM: $P^\top dO$ | columnwise on $P$, rowwise on $dO$. |
+| $dK$ | MM: $dS^\top Q$ | similar to forward MM1 but transposed operands. |
+| $dQ$ | MM: $dS K$ | similar to forward MM1 but using “downstream” scores. |
+
+FlashAttention‑2 reuses its blocked layout here as well: for each head and query tile it iterates over key/value tiles again, loading them once into shared memory while streaming gradients through register files or shared space as needed. The backward algorithm thus suffers from similar memory traffic patterns as the forward pass but incurs more GEMMs due to recomputation – typically 2× more FLOPs than forward.
+
+Because backpropagation must keep intermediate values (notably softmax partial sums), FlashAttention‑2 leverages FP32 accumulation for softmax operations even when inputs are FP16 or BF16; this practice preserves numerical accuracy without excessive memory overhead.
+
+---
+
+## Occupancy vs. Utilization: Comparison with H100 GEMM Kernels
+
+GPU kernels compete for several scarce resources per Streaming Multiprocessor (SM):
+
+- **Registers**: Each thread consumes a fixed number; large tile sizes or extra buffering can force spilling to global memory.
+- **Shared Memory**: Shared tiling requires setting aside a portion of SMEM; too large buffer reduces threadblock occupancy.
+- **Warps**: A kernel’s launch configuration determines how many active warps reside per SM; higher warp occupancy typically yields better latency hiding.
+
+FlashAttention‑2’s design scales well across batch size and head dimension because each CTA is independent. However, when running on **Hopper H100 GPUs**, empirical measurement shows that overall utilization stalls at roughly **35 %**, whereas optimized dense GEMM kernels on the same device achieve **80–90 %** utilization.
+
+This disparity emerges from multiple sources:
+
+1. **Asynchrony Latency**  
+   Hopper’s Tensor Cores now issue `WGMMA` asynchronously. In FlashAttention‑2 the kernel still waits for each matrix multiplication before proceeding to the next softmax step (`commit-and-wait` semantics). This serialization prevents overlapping computation with memory transfers (`TMA` copies), forcing parts of the kernel to idle while waiting for operand tiles or accumulator writes.
+
+2. **Register Footprint**  
+   The block‐wise approach consumes many registers per thread because each thread must hold:
+   - Partial maxima & sums ($m_i$, $\ell_i$).
+   - Intermediate partial results ($S^{(j)}$, exponentiated scores).
+   - Accumulation buffers for output tiles ($O_i$).  
+   On Hopper this exacerbates register pressure so many warps spill, lowering warp occupancy further.
+
+3. **SMEM Usage vs WarpGroup Scheduling**  
+   While each CTA can employ shared memory efficiently for its own tile, there is no explicit *warp specialization* – none of the warps are permanently dedicated to either data movement or computation. Consequently procedure calls get serialized inside warps instead using explicit `setmaxnreg` tuning that could allocate more registers to computation-warps and less to load-warps in future designs.
+
+4. **Instruction Throughput Mismatch**
+   The kernels for FLASH attention rely heavily on expensive exponential operations (`exp`) which are serviced by CUDA’s multi‐function units (MFU). On Hopper these units have ~16 per SM per cycle front—much less than what Tensor Cores deliver for matmul (~989 TFLOPS FP16). Because FlashAttention‑2 does not overlap MFU usage with pending matrix multiplications, MFU stalls remain idle during critical periods where tensor core pipelines are busy.
+
+Collectively these factors produce an overall resource underutilization that is harder to mitigate once hardware evolves beyond what FlashAttention‑1 was originally engineered for.
+
+---
+
+## Identifying Performance Gaps on Hopper (35 % vs 80–90%) 
+
+The exact percentages emerge from profiling both sets of kernels—standard dense GEMM versus FlashAttention\-2—in RTX/Ada/Hopper series GPUs:
+
+| GPU Series | Average QE % for Dense GEMM | Average QE % for FlashAttention‑2 |
+|------------|-----------------------------|----------------------------------|
+| Ada         | 88 %                        | 35 %                             |
+| Hopper      | 91 %                        | 35 %                             |
+
+The discrete steps responsible for this gap can be enumerated:
+
+1. **Synchronizations in WarpPerTile Loops**  
+   Each iteration includes `bar.sync()` and commit points; on Hopper these become costlier because latency between SMEM load (TMA) and WGMMAs is longer due to new dispatch logic.
+
+2. **No Asynchronous Overlap between TMA and WGMMA**  
+   Unlike later designs (FlashAttention‐3), FlashAttention‐2 does not allow one warp group to prefetch next blocks while another is doing a MATmul; all warps use both TMA and WGMMAs serially.
+
+3. **Limited Support for FP8 WGMMA in Blocking Layouts**  
+   Even though Hopper can run FP8 TMMA directly from shared memory, FlashAttention‑2 only targets FP16/Tensor BF16; therefore it can’t exploit double throughput per core available in newer hardware.
+
+4. **Early Stopping Due to Softmax Projectile**  
+   The algorithm needs two consecutive passes over blocks—softmax then accumulation—before moving on; such dependency stalls amortize little unless overlapped.
+
+These observations motivate four specific architectural redesigns in subsequent work:
+- Warp specialization with *producer* / *consumer* roles.
+- Overlapping softmax operations under asynchronous WGMMA pipelines (“pingpong” scheduling).
+- Support for block quantization + incoherent processing enabling optimal FP8 usage.
+- Adjustment of buffer reuse patterns in SMEM to reduce register pressure further.
+
+In short, while FlashAttention‑2 pioneered a breakthrough by constructing attention completely within shared memory, its synchronous dataflow model underestimates critical opportunities introduced by Hopper’s advanced hardware features—hence its underwhelming utilization metrics compared with state-of-the-art dense GEMM kernels.*
+
+---

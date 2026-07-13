@@ -1,0 +1,113 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 10: Algorithm Walkthrough: Forward and Backward FA-3
+
+# Forward FP16: producer–consumer flow, two-stage overlap, local softmax, epilogue
+
+The FP16 forward pass of FlashAttention-3 (FA-3) is organized around a CTA-level computation that consumes a tile of queries $\mathbf{Q}_i \in \mathbb{R}^{B_r\times d}$ and produces the corresponding tile of outputs $\mathbf{O}_i \in \mathbb{R}^{B_r\times d}$. Each CTA is split into warpgroups with warp-specialization: a producer warpgroup issues TMA loads from global (HBM) into a circular shared-memory (SMEM) buffer, while one or more consumer warpgroups perform the compute on data resident in SMEM (using asynchronous WGMMA for GEMMs). This separation is central to exploiting asynchrony: TMA and WGMMA are distinct hardware units that can operate concurrently, and the kernel explicitly partitions warps so that producers mostly issue TMA (and a few register-level operations) while consumers mainly issue WGMMA and some scalar work.
+
+The high-level control flow follows the pattern in Algorithm 1 of the paper. In initialization the CTA sets up an $s$-stage circular buffer in SMEM and the producer warps issue a TMA to load the query tile $\mathbf{Q}_i$ and then successively load key and value tiles $\{\mathbf{K}_j,\mathbf{V}_j\}$ for $j=0\ldots T_c-1$, each into the buffer stage $(j\ \%\ s)$. The producer commits each load on completion to notify consumers. Because TMA is asynchronous, the producer seldom stalls; it only waits when the circular buffer is full (when consumers have not yet released a stage).
+
+Consumer warpgroups begin by waiting for $\mathbf{Q}_i$ and the first $\mathbf{K}_0$ to be available in SMEM. They allocate registers appropriately (using the Hopper capability to reassign registers across warpgroups) and initialize their local streaming softmax state: the accumulator tile $\mathbf{O}_i \leftarrow \mathbf{0}$, the running denominator-like vector $\ell_i \leftarrow \mathbf{0}$, and the running maximum vector $m_i \leftarrow -\infty$ (all of these are length $B_r$ vectors, one entry per query row in the tile). The consumer then executes the inner loop over key/value blocks.
+
+FA-3 uses a two-stage GEMM-softmax pipeline inside the consumer main loop to overlap expensive tensor-core matmuls (WGMMA) with softmax computations (which include row-wise max, exponentials, and row-wise sums). Concretely, for iteration index $j$ the consumer does the following (conceptually):
+
+1. Launch an asynchronous WGMMA to compute the "next" score block $\mathbf{S}_{\mathrm{next}} = \mathbf{Q}_i \mathbf{K}_j^\top$ (this is the first WGMMA of the iteration). The WGMMA is committed but the code does not immediately wait for its completion.
+
+2. Wait for the required $\mathbf{V}_{j-1}$ tile to be available, then launch an asynchronous WGMMA to accumulate the contribution of the previous probability block: $\mathbf{O}_i \mathrel{+}= \tilde{\mathbf{P}}_{\mathrm{cur}} \mathbf{V}_{j-1}$ (this is the second WGMMA of the iteration), again committed without waiting.
+
+3. After those WGMMA launches, the consumer waits for the first WGMMA (the one computing $\mathbf{S}_{\mathrm{next}}$) to finish. Using the now-available $\mathbf{S}_{\mathrm{next}}$, it updates the running maximum $m_i$, computes the scaled exponentials $\tilde{\mathbf{P}}_{\mathrm{next}} = \exp(\mathbf{S}_{\mathrm{next}} - m_i)$ and updates the running normalization $\ell_i \leftarrow \exp(m_i^{\mathrm{old}}-m_i)\,\ell_i + \mathrm{rowsum}(\tilde{\mathbf{P}}_{\mathrm{next}})$. The consumer also rescales $\mathbf{O}_i$ appropriately when $m_i$ changes (this is the local softmax streaming logic). Finally the code waits for the previously issued accumulation WGMMA to finish and rescales/commits the updated $\mathbf{O}_i$.
+
+This two-stage overlapping breaks the strict intra-iteration dependencies by keeping one score tile ($\mathbf{S}_{\mathrm{cur}}$) and one "next" score tile ($\mathbf{S}_{\mathrm{next}}$) in registers, and by streaming $\tilde{\mathbf{P}}$ tiles through the pipeline. The second WGMMA (accumulating $\tilde{\mathbf{P}}_{\mathrm{cur}} \mathbf{V}_{j-1}$) is overlapped with the softmax computations that use $\mathbf{S}_{\mathrm{next}}$, leveraging the fact that WGMMA is asynchronous on Hopper and can run concurrently with non-tensor-core operations. The net effect is higher Tensor Core utilization and hiding of scalar-operation latency (notably exponentials) under matmuls.
+
+Local softmax here is the streaming softmax described in FlashAttention: rather than materializing full $N\times N$ $\mathbf{S}$ and $\mathbf{P}$ matrices to GMEM, FA-3 maintains the running max $m_i$ and running normalizer $\ell_i$ per row of the query tile and combines block contributions on-the-fly. When a newly computed score block arrives, the algorithm updates $m_i := \max(m_i, \mathrm{rowmax}(\mathbf{S}_{\text{block}}))$ and then computes scaled exponentials $\tilde{\mathbf{P}}_{\text{block}} = \exp(\mathbf{S}_{\text{block}} - m_i)$, and adjusts $\ell_i$ by the formula that factors in the rescaling due to a possible change in $m_i$. This maintains numerical stability by doing exponentials relative to the per-row maximum and keeps softmax state in higher precision (softmax calculations are typically done with FP32 intermediates even when inputs are FP16).
+
+At the end of the loop, after all key/value blocks have been processed, an epilogue rescales $\mathbf{O}_i$ by the final $\ell_i$ (i.e., $\mathbf{O}_i \leftarrow \mathrm{diag}(\ell_i)^{-1} \mathbf{O}_i$) to produce the final output block for the CTA. The algorithm also computes the per-row log normalizer $L_i = m_i + \log(\ell_i)$ (useful for backward or for numerical bookkeeping) and writes $\mathbf{O}_i$ and $L_i$ back to HBM.
+
+Two practical aspects are important: first, compiler instruction reordering must be controlled (the paper reports inspection of SASS to ensure the overlapping schedule survives compilation). Second, register pressure increases because the pipeline stores intermediate score tiles in registers; this affects feasible tile sizes and pipeline depth (a 3-stage pipeline is possible but requires yet more registers).
+
+# Forward FP8: added in-kernel V transpose and accumulator reformat steps
+
+Running the forward pass on FP8 Tensor Cores introduces two families of changes: layout reformatting (to satisfy FP8 WGMMA's k-major operand requirement and to harmonize accumulator/operand layouts across back-to-back WGMMA invocations) and numerical-accuracy mitigations (block quantization and incoherent processing). FA-3 integrates these within the same producer/consumer and pipelining structure, but with extra in-kernel transforms.
+
+Layout challenges arise because FP8 WGMMA accepts only k-major operands from SMEM (i.e., contiguous in the $K$ dimension). Typical model layout is contiguous in the head dimension, not in sequence length, so $\mathbf{V}$ tiles loaded by TMA are not k-major for the second GEMM. To address this without a costly separate pre-processing transpose in GMEM, FA-3 performs an in-kernel tile transpose using warp-level LDSM/STSM primitives (the PTX ldmatrix/stmatrix family) that move 128-byte-granularity tiles between SMEM and registers and can be used to perform a tile-wise transpose. The producer warpgroup performs this in-kernel transpose after loading a $\mathbf{V}$ tile into SMEM; because LDSM/STSM are register-efficient and can be scheduled in the producer's shadow, this transpose can be overlapped with WGMMA work issued by consumers.
+
+A second layout mismatch to handle is the different register ordering of the FP32 accumulator produced by an FP8 WGMMA and the operand register ordering expected by a subsequent FP8 WGMMA (the accumulator is kept in FP32 but the next WGMMA expects FP8 operands arranged in a particular per-thread register order). FA-3 solves this by applying byte-permute register instructions to rearrange the accumulator register sequence into the shape expected by the next WGMMA. Concretely, the implementation permutes 8-byte chunks in the accumulator register sequence according to a pattern such as
+\{ d0 d1 d4 d5 d2 d3 d6 d7 \}
+(replicated across 8-byte groups) so that the logical columns of the $\mathbf{P}$ tile line up with rows of the transposed $\mathbf{V}$ tile produced by the in-kernel transpose. This avoids expensive inter-thread shuffles and aligns register layouts so that the second FP8 WGMMA yields correct outputs.
+
+On the accuracy side, FA-3 uses two complementary techniques that are naturally integrated with the block processing pattern: block quantization and incoherent processing. Block quantization uses a separate FP8 scaling factor per block (e.g., per $B_r\times d$ or $B_c\times d$ tile) rather than one global per-tensor scale. Since FA-3 already processes data by tiles, computing and applying a per-block scale is cheap and can be fused into a prior memory-bound step (for example rotary embedding), yielding minimal extra cost.
+
+Incoherent processing multiplies $\mathbf{Q}$ and $\mathbf{K}$ by a fixed random orthogonal matrix $\mathbf{M}$ (practically implemented as a structured Hadamard-times-signs transform to keep cost $O(d\log d)$ and fuseable into other operations) prior to quantization. Because $\mathbf{M}$ is orthogonal, attention scores remain unchanged: $(\mathbf{Q}\mathbf{M})(\mathbf{K}\mathbf{M})^\top = \mathbf{Q}\mathbf{K}^\top$. The transform spreads out outlier magnitudes across dimensions, making per-block quantization less prone to catastrophic clipping of a few large entries. Both block quantization and incoherent processing are applied at block granularity and fit naturally into the FA-3 pipeline: the producer can compute quantized tiles and write them into SMEM in the layout needed by FP8 WGMMA, while consumer warpgroups simply consume these tiles with the same pipelined schedule as in FP16.
+
+Finally, the FA-3 FP8 kernel must still maintain the streaming softmax state ($m_i$, $\ell_i$, $\mathbf{O}_i$), but with careful bookkeeping for the mixed-precision datapaths: score computations are accumulated in FP32 when necessary, softmax intermediates are held at higher precision (the paper notes keeping intermediate softmax results in FP16/FP32), and final outputs are produced in the desired output precision.
+
+# State maintenance: running m_i, \ell_i, and rescaling of O_i
+
+Central to the fused, streaming attention (both FP16 and FP8 variants) is the per-query-row softmax streaming state: the running maximum $m_i$, the running normalizer $\ell_i$, and the running output tile $\mathbf{O}_i$. These three quantities are maintained on-chip (registers and SMEM) and updated incrementally as each key/value block is processed, enabling exact attention without materializing the full $N\times N$ matrices.
+
+Initialization sets $m_i \leftarrow -\infty$, $\ell_i \leftarrow 0$, and $\mathbf{O}_i \leftarrow \mathbf{0}$. When a new score block $\mathbf{S}^{(j)}$ (computed as $\mathbf{Q}_i \mathbf{K}_j^\top$) arrives, we first compute the row-wise maxima of that block and update $m_i$ to be the elementwise maximum of its previous value and the new block maxima:
+\[
+m_i \leftarrow \max(m_i,\ \mathrm{rowmax}(\mathbf{S}^{(j)})).
+\]
+Because the exponentials in a later step use $(\mathbf{S}^{(j)} - m_i)$ for numerical stability, an increase in $m_i$ requires rescaling the previous running normalizer and previous output contributions. The algorithm applies the numerically stable update
+\[
+\ell_i \leftarrow \exp(m_i^{\mathrm{old}} - m_i)\,\ell_i + \mathrm{rowsum}\big(\exp(\mathbf{S}^{(j)} - m_i)\big),
+\]
+and rescales the running output
+\[
+\mathbf{O}_i \leftarrow \mathrm{diag}\big(\exp(m_i^{\mathrm{old}} - m_i)\big)\,\mathbf{O}_i + \tilde{\mathbf{P}}^{(j)}\mathbf{V}_j,
+\]
+where $\tilde{\mathbf{P}}^{(j)} = \exp(\mathbf{S}^{(j)} - m_i)$ is the block of unnormalized probabilities after shifting by the updated $m_i$. In the pipelined FA-3, the second term is contributed by an asynchronous WGMMA $\tilde{\mathbf{P}}^{(j)}\mathbf{V}_j$ which is overlapped with subsequent softmax computation. The diagonal rescaling of $\mathbf{O}_i$ is done elementwise per row and is typically cheap relative to the GEMMs.
+
+At the end of the inner loop, after all blocks have been processed, the algorithm performs a final normalization:
+\[
+\mathbf{O}_i \leftarrow \mathrm{diag}(\ell_i)^{-1}\,\mathbf{O}_i,
+\]
+and computes the per-row log normalizer
+\[
+L_i = m_i + \log(\ell_i),
+\]
+which may be written out for use in the backward pass or for numerical diagnostics. Throughout these updates FA-3 keeps softmax-related intermediates in higher precision when beneficial (FP32 for the running sums and the log), which reduces numerical error compared to a naive low-precision implementation.
+
+Because $m_i$ and $\ell_i$ are stored on-chip and updated in a streaming fashion, FA-3 avoids global-memory writes/reads of $N\times N$ structures, which is the core flash-attention benefit. The streaming updates fit tightly into the pipelined overlap: the update of $m_i$ and $\ell_i$ uses the newly finished $\mathbf{S}_{\mathrm{next}}$ while the previous accumulation WGMMA finalizes and adds its contribution to $\mathbf{O}_i$.
+
+# Backward pass sketch: recomputation strategy and where overlap applies
+
+The backward pass for multi-head attention requires computing gradients $\mathbf{dV}$, $\mathbf{dP}$, $\mathbf{dS}$, $\mathbf{dQ}$, and $\mathbf{dK}$ from an upstream gradient $\mathbf{dO}$. FA-3 follows the recomputation strategy employed in FlashAttention-2: instead of storing large intermediate matrices such as $\mathbf{S}$ or $\mathbf{P}$ to global memory, FA-3 recomputes the necessary forward quantities per block during the backward pass. This allows the backward kernel to remain memory-light and to similarly exploit on-chip buffering and WGMMA/TMA asynchrony.
+
+The backward flow mirrors the forward block structure. A typical backward sequence for a query tile $\mathbf{Q}_i$ proceeds as follows:
+
+1. Recompute or read the per-block forward softmax state (recomputing the same streaming $m_i$, $\ell_i$, and the per-block $\tilde{\mathbf{P}}$ as needed). Because the forward epilogue produced $L_i = m_i + \log(\ell_i)$, this can be used to stabilize recomputation where helpful.
+
+2. Compute $\mathbf{dV}$ by accumulating $\mathbf{P}^\top \mathbf{dO}$ blockwise. This is a matmul similar to the forward RS-GEMM but with $\mathbf{P}$ or $\tilde{\mathbf{P}}$ appropriately used. These GEMMs can be issued as WGMMA and benefit from asynchronous overlap with other scalar operations.
+
+3. Compute $\mathbf{dP} = \mathbf{dO}\,\mathbf{V}^\top$ blockwise using WGMMA.
+
+4. Apply the vector-Jacobian product for softmax to obtain $\mathbf{dS} = \mathrm{dsoftmax}(\mathbf{dP})$. The dsoftmax operation per row is $\mathbf{d}s = (\mathrm{diag}(p) - p p^\top)\mathbf{d}p$ and involves dot products and elementwise work that are not tensor-core friendly; thus FA-3 overlaps these scalar-intensive softmax-backprop computations with WGMMA launches where possible.
+
+5. Finally, compute $\mathbf{dQ} = \alpha\,\mathbf{dS}\,\mathbf{K}$ and $\mathbf{dK} = \alpha\,\mathbf{dS}^\top\,\mathbf{Q}$ using WGMMA GEMMs.
+
+Because FA-3 can issue asynchronous WGMMA operations, the backward pass can use the same two-stage (or multi-stage) overlap strategy to run GEMMs concurrently with scalar softmax-backprop computations. For instance, while a WGMMA computing $\mathbf{dQ}$ for block $j$ is executing, the kernel can perform the dsoftmax computations for block $j+1$ or launch a WGMMA to accumulate $\mathbf{dV}$ for a different block. The recomputation strategy ensures that the memory footprint stays small, but it also increases compute compared to storing intermediates; FA-3 offsets this by maximizing Tensor Core utilization via overlap.
+
+In summary, the backward pass is a recompute-based blockwise pipeline that mirrors the forward pass, and the same asynchrony and warp-specialization ideas apply: producers load blocks, consumer warpgroups issue asynchronous WGMMA GEMMs and overlap them with the scalar softmax-backprop work, all while keeping streaming state for the backprop softmax arithmetic.
+
+# Causal masking considerations and performance impact
+
+Causal masking (autoregressive attention) changes both the amount of computation and access patterns: for a query position at row $i$ (global index), attention is only computed over keys at positions $\le i$. In a blockwise FA-3 kernel this means that for many (especially early) query blocks, the tail key blocks do not participate, and the inner loop only iterates over the prefix of key blocks that are relevant. The paper notes that with causal masking the FLOP count is roughly halved (on average) and hence raw TFLOPs/s metrics need to account for this by dividing the nominal $4\cdot\text{seqlen}^2\cdot\text{headdim}\cdot\text{nheads}$ count by two for causal scenarios.
+
+Performance-wise, causal masking affects FA-3 in several ways:
+
+1. Reduced parallelism for small sequence lengths or small query blocks: because later query rows need fewer key blocks, there is less work to distribute across warpgroups, potentially lowering occupancy. FA-3's circular buffer and pingpong scheduling mitigate some of this by overlapping producers and consumers and by keeping multiple query tiles in flight, but there is a fundamental reduction in useful matmul work per query row.
+
+2. Register and scheduling trade-offs: with fewer key blocks per query block, the amortization of the softmax overhead against WGMMA may be reduced. The exponential and other scalar operations remain essentially the same per block, so when there are fewer blocks the relative cost of softmax grows and overlapping opportunities shrink, which can lower the realized TFLOPs/s.
+
+3. FP8-specific behavior: because FP8 implementations rely on in-kernel transposes and per-block quantization, causal masking that creates many small partial blocks (e.g., at the diagonal or near sequence boundaries) can lead to less efficient tile fills and slightly worse arithmetic packing. The paper reports that FP8 FA-3 is competitive for large sequence lengths but may lag in small-sequence or heavily causal regimes compared to highly optimized vendor kernels (partly because their FP8 kernel lacked persistent kernel and load-balancing optimizations in the FA-3 experiments).
+
+Empirically, the paper shows that FA-3 still substantially outperforms FlashAttention-2 and standard attention for many causal settings, especially at medium and long sequences. However, the performance delta shrinks for short sequences and under strict causal masks because the algorithm has less work to hide the non-matrix-core latencies.
+
+In practice, FA-3 balances block sizes, number of consumer warps, and pipeline depth to maximize utilization across both causal and non-causal workloads. The design allows switching between FP16 and FP8 implementations with different heuristics for tile sizes and register allocation to adapt to the changed arithmetic intensity and masking patterns.
+
+# Closing remarks
+
+This chapter outlined the forward and backward kernel flow of FlashAttention-3, emphasizing how warp-specialization, asynchronous WGMMA/TMA, two-stage pipelining, and blockwise softmax streaming combine to produce a high-throughput, low-memory-attention primitive. For FP8, additional in-kernel layout transforms (tile transposes and accumulator reformatting) and quantization strategies (block scaling and incoherent orthogonal transforms) are integrated to allow the use of FP8 Tensor Cores while controlling numerical error. The backward pass mirrors the forward in a recompute-style blockwise pipeline, and causal masking reduces available parallelism and affects how effectively softmax can be hidden under GEMMs. Together these design choices explain the empirical gains of FA-3 described in the paper: higher measured TFLOPs/s and improved FP8 numerical accuracy relative to per-tensor FP8 baselines.

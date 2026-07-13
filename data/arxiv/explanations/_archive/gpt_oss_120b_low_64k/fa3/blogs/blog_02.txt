@@ -1,0 +1,246 @@
+\title{Blogs about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+# From FP16 to FP8: Making Attention Faster Without Losing Accuracy  
+
+## Introduction  
+
+Attention is the heart of every Transformer, but its quadratic cost in sequence length makes it the biggest bottleneck in large‑language‑model (LLM) training and inference. The community has already squeezed out most of the speed from **FP16** (half‑precision) using tricks like FlashAttention, which eliminates expensive intermediate reads/writes and fuses the whole attention pipeline into a single GPU kernel.  
+
+Now NVIDIA’s Hopper GPUs expose a new low‑precision format, **FP8**, together with asynchronous Tensor Cores and a dedicated Tensor Memory Accelerator (TMA). In theory FP8 can double the raw matrix‑multiply throughput, but naive quantization brings a lot of numerical noise—especially when LLMs contain outlier activations that are orders of magnitude larger than the typical values.  
+
+**FlashAttention‑3** shows how to cross that chasm. It keeps the same exact‐attention semantics while leveraging FP8’s speed, and it does so by (1) **block quantization**, which scales each tile of Q, K, V separately, and (2) **incoherent processing**, which randomizes the direction of outliers before quantization. The result? Up to 1.5–2× faster attention than FlashAttention‑2 on an H100, and a **2.6× reduction in numerical error** compared with a straightforward FP8 implementation—even when the data contain huge outliers.
+
+Below we walk through why moving from FP16 to FP8 is tricky, how the two techniques above solve those problems, and provide some concrete code snippets you can try today.
+
+---
+
+## 1. Why FP8 Is Not Just “Half the Bits”  
+
+| Format | Exponent bits | Mantissa bits | Approx. dynamic range |
+|-------|---------------|--------------|-----------------------|
+| FP16  | 5             | 10           | ±65 536               |
+| FP8 (e4m3) | 4             | 3            | ±240                  |
+
+- **Dynamic range** drops dramatically: values larger than ~240 overflow to infinity; smaller values underflow to zero.  
+- **Precision** inside that range is also reduced: only three mantissa bits means each step can change by up to ~12 % of the value.
+
+In transformer layers, the matrices **Q**, **K**, and **V** are usually produced by a linear projection followed by an activation (e.g., GELU). Most entries sit near unit scale, but a tiny fraction—often <0.1 %—become outliers after scaling or during the forward pass of very deep models. Those outliers dominate the *attention scores* (`S = Q Kᵀ`) and can cause catastrophic overflow if we blindly cast to FP8.
+
+Consequently, any practical FP8 attention implementation must *adapt* its scaling per tile and must *spread* outlier energy so that a single tile does not contain a dominant spike.
+
+---
+
+## 2. Block Quantization – Scaling per Tile  
+
+### 2.1 The idea  
+
+Instead of computing a single global scaling factor for an entire tensor (the “per‑tensor” approach used in many early FP8 kernels), FlashAttention‑3 divides each input matrix into blocks that match the algorithm’s internal tiling:
+
+- Query block size `B_r × d`  
+- Key / Value block size `B_c × d`
+
+For every block we compute a separate scaling factor:
+
+```python
+# Pseudo‑code used inside FlashAttention‑3
+def block_quantize(tensor, block_rows, block_cols):
+    blocks = []
+    for i in range(0, tensor.shape[0], block_rows):
+        for j in range(0, tensor.shape[1], block_cols):
+            blk = tensor[i:i+block_rows, j:j+block_cols]
+            scale = blk.abs().max() / fp8_max   # fp8_max ≈ 240
+            blk_fp8 = (blk / scale).astype(fp8)
+            blocks.append((blk_fp8, scale))
+    return blocks
+```
+
+Because each block sees its own maximum value, even a single huge entry will only inflate its local scale factor; other entries in the same block stay well‑conditioned.
+
+### 2.2 Why it works  
+
+- **Preserves relative magnitudes** within a tile: softmax later sees correctly scaled scores.
+- **No extra memory traffic**: scaling factors are kept as simple scalars and fused into the GEMM kernels (`fp8 * fp8 → fp32` accumulation).
+- **Fits naturally into FlashAttention’s pipeline**, which already processes data block‑wise.
+
+---
+
+## 3. Incoherent Processing – Randomizing Outliers  
+
+Block quantization reduces overflow but does not eliminate *quantization error*: an outlier may still dominate its tile’s dynamic range, causing loss of precision for all other values in that tile. The solution is to **mix** each block with an orthogonal transformation before quantizing.
+
+### 3.1 Orthogonal “scrambling”  
+
+We multiply Q and K by a random orthogonal matrix `M`:
+
+\[
+\tilde{Q}=Q M,\qquad \tilde{K}=K M
+\]
+
+Since `M Mᵀ = I`, the product remains unchanged:
+
+\[
+\tilde{Q}\,\tilde{K}^{\top}= Q M\, (K M)^{\top}= Q K^{\top}
+\]
+
+Thus attention scores are mathematically identical, but each entry of `\tilde{Q}` (and `\tilde{K}`) becomes a sum of many original entries with random signs—effectively spreading any extreme value across the whole vector.
+
+### 3.2 Efficient implementation  
+
+A full dense orthogonal matrix would be too expensive. FlashAttention‑3 uses a cheap construction:
+
+```python
+def random_orthogonal(d):
+    # Hadamard * Diagonal(±1) trick – O(d log d)
+    H = hadamard_matrix(d)          # fast Walsh–Hadamard transform
+    D = np.diag(np.random.choice([-1, 1], d))
+    return H @ D                    # still orthogonal
+```
+
+The Hadamard transform can be fused with rotary embeddings or other linear layers at negligible extra cost because it is just a series of additions/subtractions.
+
+### 3.3 What “incoherent” means  
+
+The term “incoherent processing” comes from signal processing: after scrambling, any single large coefficient no longer aligns coherently across dimensions; its energy becomes *incoherent* with respect to the basis used for quantization. This dramatically reduces per‑tile max values and improves FP8 fidelity.
+
+---
+
+## 4. Putting It All Together – FlashAttention‑3 Pipeline  
+
+Here is a high‑level view of the forward pass on Hopper:
+
+```cuda
+// Producer warp: async TMA loads Q_i, K_j, V_j into shared memory
+// Consumer warpgroup: two-stage pipelined WGMMA + softmax
+
+// Stage 0 – first Q·Kᵀ GEMM
+S_cur = wgmma(Q_i, K_0);                // async
+
+// Overlap softmax of previous block with next GEMM
+for (int j = 1; j < Tc; ++j) {
+    // launch next GEMM without waiting
+    S_next = wgmma_async(Q_i, K_j);
+
+    // while S_next is computing, finish softmax for S_cur
+    m_i   = max(m_i_old, rowmax(S_cur));
+    P_hat = exp(S_cur - m_i);
+    ell   = exp(m_i_old - m_i) * ell + rowsum(P_hat);
+
+    // launch V_j-1 GEMM using already computed P_hat
+    O_i   = wgmma_async(P_hat, V_{j-1});
+
+    // wait for both async GEMMs before moving on
+    sync();
+    S_cur = S_next;                     // rotate buffers
+}
+```
+
+Key points:
+
+- **Asynchronous Tensor Core writes** (`wgmma_async`) allow us to start the next matrix multiplication while still finishing softmax for the previous block.
+- The *ping‑pong* schedule keeps Tensor Cores busy ~75 % of the time—close to the hardware ceiling on H100.
+- Block‐wise quantization and incoherent processing are applied right before each `wgmma` call; scales are bundled into the GEMM descriptor so there is no extra kernel launch.
+
+The result on an H100 SXM5 GPU:
+
+| Precision | Peak TFLOPs/s (forward) | Utilization |
+|-----------|------------------------|-------------|
+| FP16      | ~740 TFLOPs           | 75 % |
+| FP8       | ~1.2 PFLOPs           | — (theoretical peak doubles) |
+
+Speedups versus FlashAttention‑2 range from **1.5× to 2×** depending on sequence length and head dimension.
+
+---
+
+## 5. Accuracy Wins – Even With Outliers  
+
+The authors measured root‑mean‑square error (RMSE) against a reference FP64 implementation using synthetic data that contains rare massive spikes (`N(0,100)` added with prob 0.001). Results:
+
+| Method                     | RMSE (relative) |
+|----------------------------|-----------------|
+| Standard FP16 attention    | 1.7× higher than FlashAttention‑2/3 |
+| FlashAttention‑2 (FP16)    | baseline |
+| FlashAttention‑3 (FP16)    | same as FA‑2 (softmax kept in FP32) |
+| Baseline FP8 (per‑tensor)  | ≈ 2× higher error |
+| **FlashAttention‑3 FP8** (block + incoherent) | **2.6× lower error** than baseline FP8 |
+
+Thus we get almost **double** the raw throughput *and* keep numerical fidelity well within acceptable limits for training LLMs.
+
+---
+
+## 6. Quick Code Sketch for Developers  
+
+Below is a minimal Python wrapper that demonstrates how you could integrate block quantization and incoherent processing into an existing PyTorch model before calling a custom CUDA kernel (the kernel itself follows the pseudo code above).
+
+```python
+import torch
+import torch.nn.functional as F
+
+def orthogonal_scramble(x):
+    """Apply random orthogonal matrix built from Hadamard & sign flip."""
+    d = x.shape[-1]
+    # generate sign diagonal on GPU
+    signs = torch.randint(0, 2, (d,), device=x.device).float()*2 - 1   # ±1
+    # fast Walsh-Hadamard transform (torch has no built-in; use custom kernel)
+    # here we use torch.ops.myops.wht as placeholder
+    x_hadamard = torch.ops.myops.wht(x)            # O(d log d)
+    return x_hadamard * signs
+
+def block_quantize_fp8(tensor, br=128, bc=128):
+    """Return list of (fp8_block, scale) tuples."""
+    B,R = tensor.shape[:2]
+    blocks = []
+    for i in range(0,B,br):
+        for j in range(0,R,bc):
+            blk = tensor[i:i+br, j:j+bc]
+            scale = blk.abs().max() / 240.0        # fp8_max≈240
+            blk_fp8 = ((blk/scale).clamp(-127.,127.).round()).to(torch.int8)
+            blocks.append((blk_fp8, scale))
+    return blocks
+
+# Example usage inside forward pass:
+def flash_attn_fp8(Q,K,V):
+    # scramble before quantizing
+    Qs = orthogonal_scramble(Q)
+    Ks = orthogonal_scramble(K)
+
+    Q_blocks = block_quantize_fp8(Qs)
+    K_blocks = block_quantize_fp8(Ks)
+    V_blocks = block_quantize_fp8(V)
+
+    # launch custom CUDA kernel that consumes these tiled fp8 blocks,
+    # performs async WGMMA ops and overlapping softmax.
+    O = torch.ops.myflashattention.flash_attention_fp8(
+            Q_blocks, K_blocks, V_blocks,
+            seq_len=Q.shape[0], head_dim=Q.shape[1])
+    return O
+```
+
+*Notes*:
+
+- The actual kernel (`flash_attention_fp8`) lives in CUDA/C++/CUTLASS and implements the producer/consumer warp specialization described earlier.
+- The scaling factors are passed as separate arguments; inside the kernel they are fused into `wgmma` descriptors (`fp8 * fp8 → fp32` accumulation).
+- No extra memory copies are needed because each block stays resident in shared memory while being processed.
+
+---
+
+## 7. When Should You Use FP8?  
+
+- **Inference on long contexts** – If you need >4 k tokens per batch and your model can tolerate slight rounding errors (most generation tasks do), FP8 delivers up to twice the throughput.
+- **Training large LLMs** – Preliminary experiments show stable training when using FP8 for attention together with mixed‑precision Adam optimizer; however you should still keep critical reductions (e.g., loss scaling) in higher precision.
+- **Hardware availability** – Hopper GPUs (H100) expose native FP8 Tensor Cores; older GPUs will fall back to emulated operations with lower speedup.
+
+If your workload is dominated by attention bottlenecks—as is true for retrieval‑augmented generation or code completion over many files—switching from FP16 to FP8 via FlashAttention‑3 can shave seconds off each forward pass without compromising model quality.
+
+---
+
+## Conclusion  
+
+FlashAttention‑3 demonstrates that low‑precision does not have to mean low accuracy. By aligning algorithmic design with modern GPU hardware—using asynchronous Tensor Cores, warp specialization, and clever data layout tricks—we can exploit **FP8**’s raw speed while keeping numerical error under tight control through:
+
+1. **Block quantization**, which adapts scaling locally.
+2. **Incoherent processing**, which randomizes outliers before quantization.
+
+The result is an attention primitive that runs up to *2× faster* than its predecessor while offering *2–3× better numerical fidelity* compared with naïve FP8 implementations. As GPUs continue to add even finer grained instructions and newer low‑precision formats (e.g., FP4), these ideas will form a template for future performance wins across all transformer workloads.
+
+Ready to try it out? The code is open source at  
+`https://github.com/Dao-AILab/flash-attention` – just drop it into your PyTorch or Hugging Face pipeline and watch your long-context models fly!

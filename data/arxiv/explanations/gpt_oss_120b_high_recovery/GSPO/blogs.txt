@@ -1,0 +1,1420 @@
+\title{Blogs about the Paper: "Group Sequence Policy Optimization"}
+
+# Why RL Training of Giant Language Models Keeps Crashing – The Hidden Flaw in Token‑Level Importance Weighting
+
+Reinforcement learning (RL) has become the go‑to method for turning massive language models into problem solvers that can do math, write code, or reason over long contexts. Yet anyone who has tried to scale RL past a few billion parameters quickly runs into a nasty symptom: *the model collapses*—its performance drops dramatically and never recovers.  
+In this post we dig into why this happens when you use token‑level importance ratios (the core of the GRPO algorithm) and how a simple change—shifting the importance weighting from tokens to whole sequences—fixes the issue. The solution we’ll explore is **Group Sequence Policy Optimization (GSPO)**, a new RL algorithm that stabilizes training even for giant Mixture‑of‑Experts (MoE) models.
+
+---
+
+## 1. A Quick Primer: RL for Language Models
+
+When we treat a language model as a policy \(\pi_\theta\) (parameterized by \(\theta\)), an RL episode looks like this:
+
+1. **Query** \(x\) is sampled from a dataset \(\mathcal{D}\).
+2. **Response** \(y = (y_1,\dots,y_{|y|})\) is generated token‑by‑token from \(\pi_{\theta_{\text{old}}}\), the policy we held before the current update.
+3. A **verifier** returns a scalar reward \(r(x,y)\in[0,1]\).
+
+The goal is to adjust \(\theta\) so that higher‑reward responses become more likely under \(\pi_{\theta}\).
+
+### PPO: Token‑Level Proximal Objective
+
+Proximal Policy Optimization (PPO) keeps updates “close” to the old policy by clipping an **importance ratio** per token:
+
+\[
+w_t(\theta)=\frac{\pi_{\theta}(y_t\mid x,y_{<t})}{\pi_{\theta_{\text{old}}}(y_t\mid x,y_{<t})}.
+\]
+
+The clipped objective looks like
+
+\[
+\mathcal{J}_{\text{PPO}}(\theta)=
+\mathbb{E}\!\left[\frac1{|y|}
+\sum_{t=1}^{|y|}
+\min\!\bigl(w_t(\theta)\widehat A_t,\;\text{clip}(w_t(\theta),1-\varepsilon,1+\varepsilon)\widehat A_t\bigr)\right],
+\]
+
+where \(\widehat A_t\) is an estimated advantage (usually from a separate value network).
+
+PPO works well *if* you have a reliable value model—but value nets are large, expensive, and often brittle when responses get long.
+
+### GRPO: Trying to Skip the Value Model
+
+GRPO removes the value network by using **group-relative advantages**:
+
+\[
+\widehat A_i = \frac{r(x,y_i)-\text{mean}_j\,r(x,y_j)}{\text{std}_j\,r(x,y_j)},
+\]
+
+where \(\{y_i\}_{i=1}^{G}\) are \(G\) responses sampled for the same query \(x\).  
+The token‑level importance weight stays exactly as in PPO:
+
+\[
+w_{i,t}(\theta)=
+\frac{\pi_{\theta}(y_{i,t}\mid x,y_{i,<t})}
+{\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,<t})}.
+\]
+
+GRPO plugs these into the same clipped objective as PPO but replaces \(\widehat A_t\) with \(\widehat A_i\).
+
+At first glance this seems attractive—no extra value head needed—but as we’ll see next, applying *token‑level* ratios when rewards are defined at *the whole‑sequence* level is fundamentally flawed.
+
+---
+
+## 2. Token‑Level Importance Ratios: Why They Break When Scaling
+
+### 2.1 The Core Idea Behind Importance Sampling
+
+Importance sampling tells us how to rewrite an expectation under a target distribution \(\pi_{\text{tar}}\) using samples from a behavior distribution \(\pi_{\text{beh}}\):
+
+\[
+\mathbb{E}_{z \sim \pi_{\text{tar}}}[f(z)]
+=
+\mathbb{E}_{z \sim \pi_{\text{beh}}}
+    \!\Bigl[\frac{\pi_{\text{tar}}(z)}{\pi_{\text{beh}}(z)}\, f(z)\Bigr].
+\]
+
+Crucially, **the ratio** \(\frac{\pi_{\text{tar}}(z)}{\pi_{\text{beh}}(z)}\) must be *averaged over many independent samples* from \(\pi_{\text{beh}}\). Only then does it correctly re‑weight the distribution mismatch.
+
+### 2.2 What GRPO Does Instead
+
+GRPO computes an importance weight **per token** using only one sample from each next‑token distribution:
+
+```python
+w_{i,t} = pi_theta(y_{i,t} | x, y_{i,<t}) / pi_old(y_{i,t} | x, y_{i,<t})
+```
+
+In other words, each weight tries to “correct” the mismatch based on a *single* observation of that token's probability under the old policy. There is no averaging across multiple draws from the same next‑token distribution because each rollout yields just one token at each position.
+
+### 2.3 The Consequence: High‑Variance Gradient Noise
+
+Because each \(w_{i,t}\) reflects just one stochastic draw:
+
+- The weight can swing wildly from near 0 to much larger than 1.
+- When we sum over long sequences (\(|y|\) can be hundreds or thousands of tokens), tiny misestimates multiply up.
+- The clipping operation can amplify these fluctuations instead of dampening them—clipped ratios still retain large variance if many tokens exceed the clipping bounds.
+
+Empirically this manifests as **catastrophic model collapse** during RL training on large models or long responses:
+
+- Early updates may still look reasonable.
+- After a few thousand gradient steps on big batches, accumulated noise drives parameters into regions where generation quality plummets.
+- Once collapsed, reverting checkpoints and tweaking hyperparameters rarely recovers performance because the optimizer has already been fed inconsistent gradient signals.
+
+### 2.4 The Mismatch Between Reward Granularity and Optimization Granularity
+
+The reward \(r(x,y)\) is defined *once per entire response*. But GRPO spreads that scalar advantage uniformly across every token while applying different importance weights per token. This misalignment means that even if two responses have identical rewards, their gradients will differ dramatically just because their token probabilities happened to stray under the old policy—a situation that becomes more common as model size grows and routing in MoE layers adds stochasticity.
+
+---
+
+## 3. Sequence‑Level Importance Weighting – The Core Idea Behind GSPO
+
+If we accept that **importance sampling should operate at the same granularity as our reward**, then we must shift from token‐wise weights to **sequence‐wise weights**:
+
+\[
+s_i(\theta)=
+\Bigl(
+    \frac{\pi_\theta(y_i|x)}{
+          \pi_{\theta_{\text{old}}}(y_i|x)}
+    \Bigr)^{1/|y_i|}
+=
+\exp
+    \!\Bigl[\frac1{|y_i|}
+            \sum_{t=1}^{|y_i|}
+            \log
+            \frac{
+                 \pi_\theta(y_{i,t}|x,y_{i,<t})
+            }{
+                 \pi_{\theta_{\text{old}}}(y_{i,t}|x,y_{i,<t})
+            }
+      \Bigr].
+\]
+
+Key points about this definition:
+
+- **Whole‑sequence ratio** captures exactly how far the sampled response \(y_i\) deviates from being generated by the new policy.
+- Raising to \(1/|y_i|\) (= length normalization) prevents long responses from exploding or shrinking the ratio excessively.
+- All tokens inside a response now share the *same* importance factor \(s_i(\theta)\), eliminating per-token variance introduced by mismatched weights.
+
+With this ratio we can write a clean objective—**Group Sequence Policy Optimization (GSPO)**:
+
+\[
+\mathcal J_{\mathrm{GSPO}}(\theta)=
+\E_{x,\{y_i\}}
+        \Bigg[
+        \frac1G
+        \sum_{i=1}^{G}
+        \min
+          \bigl(
+            s_i(\theta)\,\widehat A_i,
+            ~
+            {\rm clip}\bigl(s_i(\theta),\,1-\varepsilon,\;1+\varepsilon\bigr)\,
+            \widehat A_i
+          \bigr)
+        \Bigg],
+\]
+where
+\[
+  \widehat A_i = 
+    {\frac{
+          r(x,y_i)-{\rm mean}_j\, r(x,y_j)}
+        {{\rm std}_j\, r(x,y_j)}} .
+\]
+
+Now both *reward* and *importance correction* live at the response level; they are directly comparable during clipping.
+
+---
+
+## 4. How GSPO Eliminates Catastrophic Collapse
+
+### 4.1 Gradient Perspective
+
+If we ignore clipping for clarity, GSPO’s gradient becomes
+
+\[
+\nabla_\theta 
+   \mathcal J_{\mathrm{GSPO}}
+   =
+\E[\,
+   s_i(\theta)\,\widehat A_i\, 
+   \nabla_\theta 
+     (\tfrac 1 {|y_i|}\sum_t 
+        \log
+        \pi_\theta(y_{i,t}|x,y_{i,<t}))
+   ] .
+\]
+
+Notice that **every token inside \(y_i\) receives exactly the same scalar weight** \(s_i(\theta)\widehat A_i/|y_i|\). In contrast, GRPO’s gradient contains individual weights \(w_{i,t}(\theta)\), which can diverge between tokens even within one high‑advantage response.
+
+Because sequence‐level weights are computed by averaging log‐probability ratios over all tokens first—and then exponentiating—the resulting factor has dramatically lower variance than taking raw ratios per token directly out of the noisy next‑token distributions.
+
+### 4.2 Empirical Evidence
+
+Training runs on Qwen3‑30B‐A3B showed:
+
+- **Stability:** GSPO maintained smooth reward curves across thousands of updates; GRPO often hit a crash plateau after only a few hundred updates.
+- **Efficiency:** Even though GSPO clips *entire* responses (so many more tokens get discarded compared with GRPO’s fine-grained approach), it reaches higher benchmark scores with fewer training steps.
+- **Scalability:** When applied to MoE models where expert routing can change dramatically after each update (up to ~10 % different experts per token), GSPO never required “Routing Replay” – a trick used previously to freeze routing during off‑policy correction.
+- **Infrastructure Simplicity:** Because GSVO only needs sequence likelihoods (which can be taken directly from inference engines like vLLM), it avoids costly recomputation of per-token probabilities under both old and new policies—greatly simplifying engineering pipelines for large clusters or disaggregated training/inference setups.
+
+### 4.3 Clipping Fractions Tell an Interesting Story
+
+In practice GSPO clips around three orders of magnitude fewer *responses* than GRPO clips tokens—a natural consequence of operating at sequence granularity with tighter clipping ranges (\(3\times10^{-4}\)–\(4\times10^{-4}\)) versus GRPO’s (\(0.2$–$0.27$). Yet despite discarding more raw data points during any given mini-batch update, learning proceeds faster because each retained data point carries a clean signal free from noisy per-token corrections.
+
+---
+
+## 5. Special Benefits for Mixture‑of‑Experts (MoE) Models
+
+MoE models activate only a subset of “experts” per token—a great way to scale parameters without linear memory growth—but this sparsity makes off‑policy corrections tricky:
+
+- With GRPO,
+  - Expert activation may shift after each update.
+  - Token‑level ratios become unpredictable because they compare probabilities computed under different expert routes.
+  - To survive this volatility practitioners introduced **Routing Replay**, caching which experts were used by `π_old` and forcing `π_θ` through them when computing `w_{i,t}`—an expensive hack that also limits eventual expert utilization.
+- With GSPO,
+  - The importance factor uses only **full-sequence likelihood**, which aggregates across all tokens irrespective of which experts took part.
+  - Since an MoE model’s overall language modeling ability stays intact across routing changes, `s_i(θ)` remains stable.
+  - No routing replay needed → lower memory/comms cost + full capacity usage.
+
+In short: sequence-level weighting neutralizes expert volatility entirely.
+
+---
+
+## 6. TL;DR – What You Should Take Away
+
+| Issue | Token‑Level Approach (GRGR/GRPO) | Sequence‑Level Approach (GSPO) |
+|-------|-----------------------------------|--------------------------------|
+| **Reward granularity vs weighting granularity** | Mismatch → noisy gradients | Aligned → clean signal |
+| **Variance of importance ratios** | High because each token gets its own noisy ratio | Low because ratios are averaged across sequence |
+| **Clipping behavior** | Clips many individual tokens → high fraction but still unstable | Clips whole responses → fewer effective samples but higher-quality updates |
+| **Model collapse risk** | Frequent especially with long responses / big models | Rare; stable across billions of parameters |
+| **MoE compatibility** | Needs Routing Replay → extra memory & slower | Works out-of-box – no extra tricks |
+| **Engineering overhead** | Must recompute per-token probs under old policy -> precision issues across engines | Can reuse inference engine likelihoods → simpler pipeline |
+
+If you’re scaling RL for language models—particularly those with millions of parameters or MoE sparsity—move your importance weighting up one level: think *responses*, not tokens. That shift alone fixes instability at its source without sacrificing training efficiency or requiring bulky auxiliary networks.
+
+---
+
+## 7. Looking Ahead
+
+GSPO’s success on Qwen3 hints at broader possibilities:
+
+- Larger batch sizes and longer rollouts become feasible because variance stays bounded.
+- Multi-turn dialogue or partial rollouts could exploit inference-side likelihoods directly—opening new avenues for fast RL loops.
+- Future work may explore hybrid objectives combining fine-grained token adjustments *(via GSPO-token)* when you really need per-token shaping (e.g., safety constraints), while keeping core training stable with sequence-level weighting.
+
+Bottom line: When your reinforcement learning pipeline keeps crashing despite careful hyperparameter tuning, check whether you’re applying *token-level* importance ratios where you should be weighting entire sequences instead. That hidden flaw is often what turns promising RL experiments into dead ends—and fixing it unlocks stable training at any scale.
+
+
+
+# From Tokens to Whole Sentences: The Core Idea Behind Group Sequence Policy Optimization  
+
+Reinforcement learning from human feedback has become the de‑facto way to boost the capabilities of large language models (LLMs).  In practice this means we let the model generate a response *y* to a query *x*, score the whole response with a verifier *r(x, y)∈[0, 1]*, and then update the model so that high‑scoring responses become more likely.  While this idea is simple, the mathematics underneath is surprisingly delicate—especially when the model is huge, the responses are long, and we are training a Mixture‑of‑Experts (MoE) architecture.
+
+In this post we unpack **Group Sequence Policy Optimization (GSPO)**, a recent RL algorithm that flips the traditional token‑level mindset on its head.  By moving the optimisation focus from individual tokens to complete sequences, GSPO aligns the reward signal with the unit it actually measures and fixes a subtle but fatal misuse of importance sampling that plagued its predecessor, GRPO.
+
+---
+
+## 1. The Status Quo: Token‑Level Proximal Policy Optimization  
+
+Most RL‑fine‑tuning pipelines start from **PPO** (Proximal Policy Optimization).  PPO treats each next‑token distribution as a separate “mini‑policy” and corrects for off‑policy data with an *importance ratio* per token:
+
+\[
+w_{t}(\theta)=\frac{\pi_{\theta}(y_t\mid x,y_{<t})}{\pi_{\theta_{\text{old}}}(y_t\mid x,y_{<t})}.
+\]
+
+The policy update maximises an objective that clips these ratios within \([1-\varepsilon,\;1+\varepsilon]\) so that overly “off‑policy’’ samples do not dominate the gradient.  
+
+**Why this works** – in theory – hinges on having a **value model** that supplies token‑level advantage estimates \(\widehat{A}_t\).  In practice building a reliable value model at the scale of modern LLMs is costly and often unstable.
+
+### Enter GRPO
+
+To avoid a heavyweight value model, **GRPO** (Group Relative Policy Optimization) replaces per‑token advantages with a *groupwise* advantage:
+
+\[
+\widehat{A}_{i} = \frac{r(x,y_i)-\operatorname{mean}\{r(x,y_j)\}}{\operatorname{std}\{r(x,y_j)\}}, \qquad i=1,\dots,G,
+\]
+
+where \(G\) responses are sampled for each query.  
+The GRPO objective looks exactly like PPO but reuses \(w_{i,t}(\theta)\) at every token while sharing \(\widehat{A}_{i}\) across all tokens in response \(y_i\).
+
+At first glance this seems tidy—no extra value head is needed, and we still have a proximal clip. However, something essential is missing.
+
+---
+
+## 2. When Importance Sampling Goes Wrong  
+
+The core principle of importance sampling says:
+
+\[
+\mathbb{E}_{z\sim \pi_{\text{tar}}}[f(z)] 
+= 
+\mathbb{E}_{z\sim \pi_{\text{beh}}}\!\Big[\frac{\pi_{\text{tar}}(z)}{\pi_{\text{beh}}(z)}\,f(z)\Big].
+\]
+
+Crucially **the ratio must be computed over whole samples drawn from the behaviour distribution**—the denominator must be an average over many draws so that it actually corrects the distribution shift.
+
+GRPO violates this principle by applying \(\frac{\pi_{\theta}(y_{i,t}\mid \cdot)}{\pi_{\theta_{\text{old}}}(y_{i,t}\mid \cdot)}\) *once per token*, based on a **single** draw from each next‑token distribution.  
+Because each token’s ratio reflects only one stochastic outcome rather than an expectation over many outcomes, four things happen:
+
+1. **High variance** – tiny fluctuations in one token’s probability explode into noisy gradients.
+2. **Accumulation** – long sequences multiply this noise across hundreds of steps.
+3. **Clipping amplification** – PPO’s clipping mechanism removes large ratios but leaves many mildly biased ones that still dominate updates.
+4. **Model collapse** – when variance gets too large the policy diverges irreversibly.
+
+Empirically the authors observed catastrophic failures after just a few gradient steps on long‑response tasks and on MoE models where expert routing adds extra randomness.
+
+The takeaway is that *the unit of optimisation must match the unit of reward*. Since rewards are assigned **to whole responses**, applying off‑policy correction at the word level creates an ill‑posed learning problem.
+
+---
+
+## 3. The Key Insight of GSPO  
+
+Instead of forcing token‐level importance weights onto a sequence‐level reward, GSPO adopts **the sequence likelihood itself as the importance ratio**:
+
+\[
+s_i(\theta)=
+\Bigl(\frac{\pi_{\theta}(y_i \mid x)}{\pi_{\theta_{\text{old}}}(y_i \mid x)}\Bigr)^{1/|y_i|}
+=
+\exp\!\Bigl(\frac{1}{|y_i|}
+        \sum_{t=1}^{|y_i|}
+        \log \frac{\pi_{\theta}(y_{i,t}\mid x,y_{i,<t})}
+                 {\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,<t})}
+      \Bigr).
+\]
+
+A few remarks make this definition powerful:
+
+* **It directly measures how far an entire response under the old policy differs from its probability under the new policy**, exactly what we need when rewards are sequence‑wide.
+* **Length normalisation** (\(^{1/|y_i|}\)) keeps ratios comparable across responses of different lengths and reduces variance.
+* **Clipping can now be applied to whole responses**, ensuring that any response that is too far off‐policy is simply ignored during gradient computation.
+
+With these ingredients GSPO’s objective mirrors PPO’s clipped form but operates at the sequence level:
+
+\[
+\mathcal J_{\text{GSPO}}(\theta)=
+\E_{x,\{y_i\}\sim \pi_{\theta_{\text{old}}}}
+      \Biggl[
+          \frac{1}{G}\sum_{i=1}^{G}
+          \min\!\bigl(
+                s_i(\theta)\,\widehat A_i,\;
+                \operatorname{clip}(s_i(\theta),\,1-\varepsilon,\;1+\varepsilon)\,\widehat A_i
+               \bigr)
+      \Biggr].
+\]
+
+All tokens inside a response share exactly the same factor \(s_i(\theta)\); they are no longer weighted unequally as in GRPO.
+
+### Gradient Perspective  
+
+If we drop clipping for clarity, GSPO’s gradient becomes
+
+\[
+\nabla_\theta \mathcal J_{\text{GSPO}}
+=
+\E
+   \Bigl[
+        \frac{1}{G}\sum_i s_i(\theta)\widehat A_i 
+        \cdot
+        \frac{1}{|y_i|}
+        \sum_{t=1}^{|y_i|}
+        \nabla_\theta
+        \log 
+        \pi_\theta(y_{i,t}\mid x,y_{i,<t})
+   \Bigr].
+\]
+
+Every token contributes equally once we factor out \(s_i(\theta)\).  Contrast this with GRPO’s gradient where each token carries its own potentially wildly different weight \(w_{i,t}(\theta)\).  By eliminating those per‑token fluctuations GSPO dramatically reduces variance while preserving exactly the same learning signal—the scaled log‑likelihood of each token weighted by how much we want to push up or down an entire response.
+
+---
+
+## 4. What Happens When You Switch to Whole Sentences?  
+
+### Stability Under Massive Scale  
+
+The authors trained Qwen3‑30B‑A3B models from scratch with GSPO and observed:
+
+* **No catastrophic collapse**, even when partitioning rollout batches into four mini‑batches (an off‑policy setting).
+* Continuous performance gains as compute increased—training reward curves rose smoothly while benchmark scores (AIME’24 Pass@1, LiveCodeBench Pass@1, Codeforces Elo) kept improving.
+* In direct head‑to‑head experiments against GRPO under identical compute budgets, GSPO achieved higher final rewards and better benchmark scores.
+
+### Efficiency Gains  
+
+GSPO clips *entire* responses rather than individual tokens.  Although more tokens are ultimately discarded during clipping—up to two orders of magnitude more than GRPO—the remaining gradients are far less noisy.  Consequently each sampled rollout yields more useful learning signal per compute step → higher sample efficiency.
+
+### MoE Models No Longer Need “Routing Replay”  
+
+MoE architectures activate a sparse subset of experts per token; after an update these activated experts can change dramatically (`≈10%` mismatch per step), making tokenwise ratios wildly unstable in GRPO.  
+The previous workaround was **Routing Replay**, which cached old routing decisions and forced both old and new policies through identical expert pathways during ratio computation—a costly hack both memory‑wise and speedwise.
+
+Because GSPO never looks at individual token probabilities when forming its importance factor—only at full‐sequence likelihood—the expert volatility does not explode \(s_i(\theta)\).  In experiments GSPO trained MoE models *without any routing replay*, yielding stable convergence while preserving full expert capacity.
+
+### Simpler Infrastructure  
+
+Most production pipelines keep separate engines for training (high precision) and inference (throughput optimized).  When using PPO or GRPO you must recompute old logits under training precision because tiny mismatches would ruin tokenwise ratios.  
+Since GSPO only needs *sequence‐level* logits, you can safely take them directly from an inference engine such as vLLM or SGLang—even if they run in lower precision—eliminating an expensive recomputation step.  This opens doors for partial rollouts or multi‑turn RL where you want tight coupling between generation and optimisation without moving data back into a heavyweight trainer.
+
+---
+
+## 5. A Token-Level Variant When You Really Need It  
+
+For tasks like multi-turn dialogues where you might want differing advantages per turn within one response, the authors propose **GSPO‑token**:
+
+\[
+s_{i,t}(\theta)=
+    {\rm sg}[\,s_i(\theta)\,]\;
+    \frac{\pi_\theta(y_{i,t}|x,y_{i,<t})}
+         {{\rm sg}[\pi_\theta(y_{i,t}|x,y_{i,<t})]},
+\]
+
+where `sg` denotes “stop‑gradient”.  
+Practically this means we still use the same sequence‐level clipping factor \(s_i(\theta)\), but allow each token’s advantage \(\widehat A_{i,t}\) to differ (e.g., based on turn quality).  
+When all per-token advantages collapse back to a single value (\(\widehat A_{i,t}=\widehat A_i\)), GSPO-token reduces exactly to standard GSVO—so you get flexibility without sacrificing stability.
+
+---
+
+## 6. Summing Up: Why Sequence-Level Matters  
+
+| Aspect | Token‑Level (GRPO) | Sequence‑Level (GSPO) |
+|--------|-------------------|----------------------|
+| Importance ratio | \(w_{i,t} = \frac{\pi_\theta(y_{i,t})}{\pi_{\theta_{\text{old}}}(y_{i,t})}\) – single sample per next-token distribution | \(s_i = (\frac{\pi_\theta(y)}{\pi_{\theta_{\text{old}}}(y)})^{1/|y|}\) – true importance weight over whole response |
+| Gradient weighting | Unequal across tokens → high variance | Equal across tokens → low variance |
+| Clipping granularity | Per token → many clipped tokens but noisy gradients | Per sequence → fewer effective updates but cleaner signal |
+| Stability on long responses / MoE | Prone to collapse due to accumulated variance | Robust even with very long generations |
+| Infrastructure cost | Needs precise re-computation of old logits | Can use inference logits directly |
+
+In short, **GSPO aligns two crucial ingredients**:
+
+1. **Reward unit = whole response** → we should optimise *likelihood of whole responses*.
+2. **Importance sampling = proper correction over entire samples**, not over single-token draws.
+
+By respecting both principles simultaneously we obtain an algorithm that is easier to implement, scales gracefully to gigantic LLMs (including sparse MoEs), and delivers consistent performance boosts—exactly what modern LLM labs need when pushing toward ever larger RL finetunes such as Qwen3.
+
+---
+
+## 7. Looking Forward  
+
+The success of GSVO suggests several promising directions:
+
+* Extending sequence-level clipping ideas beyond language generation—to vision–language multimodal models where rewards also apply at an image–caption level.
+* Investigating adaptive clipping ranges that vary with response length or difficulty rather than static constants.
+* Combining sequence-level importance ratios with learned value functions for even richer advantage signals while retaining low variance.
+
+For now though, if you’re wrestling with unstable PPO or GRPO runs—especially on Mixture-of-Experts models—give **Group Sequence Policy Optimization** a try. It may just be the missing piece that lets your massive LLM finally reap all those RL gains without blowing up your training job.
+
+---
+
+
+
+# How Sequence‑Level Clipping Makes Reinforcement Learning Stable for Massive LLMs
+
+Reinforcement learning (RL) has become the workhorse behind the recent leap in language‑model abilities: from solving competition‑level math problems to writing complex code, RL fine‑tuning (often called RLHF) pushes models to reason longer and deeper. Yet scaling RL to *massive* models—think tens of billions of parameters and Mixture‑of‑Experts (MoE) sparsity—has been plagued by a stubborn instability problem. The culprit? A mismatch between **how we correct for off‑policy data** and **what we are actually rewarding**.
+
+In this post we unpack why clipping *individual tokens*—the default in classic algorithms like PPO and its derivative GRPO—injects high‑variance noise that can crash training, and how a simple shift to **sequence‑level clipping** (the core idea behind **Group Sequence Policy Optimization**, or **GSPO**) restores stability while preserving efficiency.
+
+---
+
+## The Off‑Policy Challenge in Language‑Model RL
+
+When we train an LLM with RL we repeatedly:
+
+1. Sample a batch of queries \(x\) from a dataset \(\mathcal{D}\).
+2. Generate several responses \(\{y_i\}_{i=1}^G\) using the *old* policy \(\pi_{\theta_{\text{old}}}\).
+3. Score each response with a verifier \(r(x,y_i)\in[0,1]\).
+4. Update the policy parameters \(\theta\).
+
+Because the sampled responses come from \(\pi_{\theta_{\text{old}}}\) but are used to improve the *new* policy \(\pi_\theta\), we are in an **off‑policy** setting. The classic remedy is *importance sampling*: re‑weight each sample by the ratio of its probability under the target distribution versus the behavior distribution.
+
+For a single token \(y_t\) this ratio is
+
+\[
+w_t(\theta)=\frac{\pi_\theta(y_t\mid x,y_{<t})}{\pi_{\theta_{\text{old}}}(y_t\mid x,y_{<t})}.
+\]
+
+PPO clamps these weights inside a small interval \([1-\varepsilon,\,1+\varepsilon]\)—the familiar “clip”—to prevent wildly off‑policy data from destabilising gradients.
+
+### GRPO’s Token‑Level Twist
+
+GRPO (Group Relative Policy Optimization) was introduced to avoid training a separate value model by using *group‐relative* advantages:
+
+\[
+\widehat A_i=\frac{r(x,y_i)-\operatorname{mean}\bigl(r(x,y_{1:G})\bigr)}
+                {\operatorname{std}\bigl(r(x,y_{1:G})\bigr)}.
+\]
+
+Every token inside response \(y_i\) inherits the same advantage \(\widehat A_i\), and the loss looks formally identical to PPO but summed over all tokens across all group members.
+
+At first glance this seems harmless—just replace PPO’s per‑sample advantage with a group-relative one. In practice it isn’t. The **importance weight is still computed per token**, i.e.
+
+\[
+w_{i,t}(\theta)=\frac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}
+                     {\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,<t})}.
+\]
+
+This design choice violates an essential principle: *the unit of importance sampling must match the unit of reward*. The reward lives at the **sequence level**, yet we are correcting at the **token level** using a single-sample weight for each next-token distribution.
+
+---
+
+## Why Token‑Level Importance Ratios Fail
+
+### High‑Variance Noise Accumulates
+
+Importance sampling theory tells us that a reliable estimate requires averaging many samples drawn from the behavior distribution:
+
+\[
+\mathbb E_{z\sim \pi_{\text{beh}}}
+   \Bigl[\frac{\pi_{\text{tar}}(z)}{\pi_{\text{beh}}(z)}f(z)\Bigr].
+\]
+
+In language generation each token’s next‑word distribution is conditioned on a *different* history, so each \(w_{i,t}\) is based on **one draw** from that distribution. No averaging takes place; consequently:
+
+- The weight fluctuates wildly even for modest policy updates.
+- When you multiply many such noisy ratios across a long sequence, variance compounds.
+- Clipping restricts extreme values but also discards informative gradient signal, leading to an inefficient use of data.
+
+Empirically this manifests as occasional “spikes” in training loss followed by irreversible performance drops—a phenomenon described in recent large‑scale RL runs as **model collapse**.
+
+### Expert‑Activation Volatility in MoE Models
+
+The problem intensifies for sparsely activated MoE models. After each gradient step, which experts get activated for a given token may change dramatically (the paper reports ~10 % expert churn per update). Because \(w_{i,t}\) directly depends on per‑token logits—logits that now lie on *different* subnetworks—the ratio becomes even more unstable, causing GRPO to diverge unless additional tricks like **Routing Replay** are applied (caching old routing decisions). Such tricks add memory overhead and limit model capacity.
+
+---
+
+## Sequence‑Level Clipping: The GSPO Remedy
+
+GSPO flips the perspective: instead of correcting each token individually, we correct **entire responses** using their full likelihood under old vs new policies:
+
+\[
+s_i(\theta)
+= \Bigl(\frac{\pi_\theta(y_i \mid x)}{\pi_{\theta_{\text{old}}}(y_i \mid x)}\Bigr)^{1/|y_i|}
+= \exp\!\Bigl(
+    \tfrac{1}{|y_i|}
+    \sum_{t=1}^{|y_i|}
+      \log\tfrac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}
+               {\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,<t})}
+  \Bigr).
+\]
+
+Key points:
+
+- **Match of Units:** Both reward \(r(x,y_i)\) and importance ratio \(s_i(\theta)\) now refer to whole sequences.
+- **Length Normalisation:** Raising to \(1/|y_i|\) (or equivalently dividing by sequence length inside the log) prevents long responses from dwarfing short ones; otherwise a single token change could explode the ratio.
+- **Uniform Token Weighting:** All tokens in a response receive exactly the same scaling factor \(s_i(\theta)\), eliminating per‑token variance introduced by \(w_{i,t}\).
+
+GSPO’s objective mirrors PPO’s clipped surrogate but operates at the response level:
+
+\[
+\mathcal J_{\text{GSPO}}(\theta)=
+  \mathbb E_{x,\{y_i\}_{i=1}^G}
+  \!\left[
+    \frac{1}{G}\sum_{i=1}^G
+      \min
+      \bigl(
+        s_i(\theta)\,\widehat A_i,\,
+        \operatorname{clip}(s_i(\theta),\,1-\varepsilon,\,1+\varepsilon)\,\widehat A_i
+      \bigr)
+  \right].
+\]
+
+Because clipping now decides whether an *entire* response is too far off‐policy, only truly outlier samples get discarded—exactly what we need for stable learning.
+
+---
+
+## Gradient Insight: Equal Token Weighting vs Unequal Token Weighting
+
+If we ignore clipping for brevity, GSPO’s gradient becomes
+
+\[
+\nabla_\theta \mathcal J_{\text{GSPO}}
+=
+  \mathbb E_{x,\{y_i\}}
+  \Bigl[
+    \frac{1}{G}\sum_{i=1}^G
+      s_i(\theta)\,\widehat A_i
+      \cdot
+      \underbrace{\frac{1}{|y_i|}
+                 \sum_{t=1}^{|y_i|}
+                 \nabla_\theta \log
+                 \pi_\theta(y_{i,t}\mid x,y_{i,<t})}_{\text{uniform token grads}}
+  \Bigr].
+\]
+
+Contrast this with GRPO’s gradient:
+
+\[
+\nabla_\theta \mathcal J_{\text{GRPO}}
+=
+  \mathbb E_{x,\{y_i\}}
+  \Bigl[
+    \frac{1}{G}\sum_{i=1}^G
+      \widehat A_i
+      \cdot
+      \frac{1}{|y_i|}
+      \sum_{t=1}^{|y_i|}
+        w_{i,t}(\theta)
+        \nabla_\theta 
+        \log
+        \pi_\theta(y_{i,t}\mid x,y_{i,<t})
+  \Bigr].
+\]
+
+In GRPO every token’s contribution is multiplied by its own importance weight \(w_{i,t}(\theta)\). Those weights fluctuate independently across tokens and can be far from one another (especially after an MoE routing shift). The resulting gradient can swing wildly from step to step—even after clipping—because it is effectively a *weighted sum of noisy terms*.
+
+GSPO replaces that messy weighting with a single scalar factor \(s_i(\theta)\), applied uniformly across all tokens in a response. The variance contribution now stems primarily from how well we estimate the *group advantage* $\widehat A_i$, which is already normalized across responses. As a result:
+
+- Gradient noise drops dramatically.
+- Training remains robust when response lengths increase.
+- Stability persists even when expert routing changes because only the aggregate likelihood matters—not individual expert logits.
+
+---
+
+## Empirical Evidence: Stability & Efficiency at Scale
+
+The authors evaluated GSPO on a cold-start 30 B parameter model (Qwen3‑30B-A3B‐Base). Key takeaways:
+
+- **Training curves never spiked** or collapsed when partitioning rollout batches into four mini‑batches—a scenario where GRPO typically fails.
+- Under identical compute budget and query usage, GSPO achieved higher rewards on benchmarks such as AIME’24 (a math reasoning test), LiveCodeBench (code generation), and CodeForces (gaming Elo). This demonstrates that *more stable gradients translate directly into better downstream performance*.
+- **Clipping fractions differ by two orders of magnitude:** GRPO discards only ~0–5 % of tokens because its per-token clip range is relatively loose; GSPO discards many more tokens due to tighter response‐level clipping yet still attains higher sample efficiency. This confirms that GSPO’s “larger discard” actually removes noisy samples rather than valuable signal.
+- Crucially for MoE models, GSPO eliminates any need for Routing Replay—a memory‐heavy workaround used by GRPO—to tame expert activation volatility. Since only whole‐sequence likelihood matters, changes in which experts fire for individual tokens have limited effect on $s_i(\theta)$.
+
+---
+
+## Practical Benefits Beyond Stability
+
+### Simplified RL Infrastructure
+
+Typical RL pipelines recompute old‐policy log probabilities during each update because token‑level ratios are highly sensitive to floating‐point differences between training (e.g., Megatron) and inference engines (e.g., vLLM). GSPO only requires *sequence‐level* likelihoods. Those are far less vulnerable to precision mismatches; thus one can directly reuse probabilities returned by an inference engine without expensive recomputation on the training side—a win for distributed setups like partial rollout or multi‑turn dialogues.
+
+### Flexibility Through GSPO‑Token
+
+For scenarios demanding finer control—for instance multi‑turn conversations where intermediate turns deserve distinct advantages—the authors propose a token‐level variant called **GSPO-token**. It keeps sequence‐level clipping but reintroduces per-token advantages while keeping the uniform scaling factor $s_i(\theta)$ detached from gradients. In practice it behaves identically to GSPO when all token advantages are equal but offers extra flexibility when they differ.
+
+---
+
+## TL;DR – Why Sequence‑Level Clipping Matters
+
+| Issue | Token-Level (GRPO / PPO) | Sequence-Level (GSPO) |
+|------|--------------------------|------------------------|
+| Unit mismatch | Reward on whole response vs importance weight per token | Both reward & importance weight operate on whole response |
+| Variance source | Per-token ratios $w_{i,t}$ amplify noise, especially over long sequences | Uniform scalar $s_i$ reduces variance |
+| Sensitivity to MoE routing | High – expert changes distort $w_{i,t}$ | Low – only aggregate likelihood matters |
+| Need for extra tricks | Routing Replay essential for MoE stability | No extra routing tricks needed |
+| Infrastructure burden | Must recompute token log probs under old policy | Can reuse inference engine’s sequence scores |
+| Empirical performance | Prone to collapse; lower sample efficiency | Stable across minibatch splits; higher benchmark scores |
+
+In short, aligning *what we correct* (importance ratio) with *what we reward* (sequence score) yields an elegant algorithm that scales gracefully to massive LLMs—even those equipped with sparse Mixture-of-Experts multipliers.
+
+---
+
+## Looking Ahead
+
+GSPO has already powered the latest Qwen3 family of models—showcasing that robust RL at scale isn’t just possible but now practical. Future work may explore:
+
+- Hybrid objectives that blend sequence-level and fine-grained turn-level advantages.
+- Adaptive clipping schedules that respond dynamically to reward distributions.
+- Extending sequence-level importance sampling to multi-agent or hierarchical LLM setups.
+
+If you’re building large language models today and wrestling with brittle RL pipelines, switching your importance correction from “token-by-token” to “whole-response” could be the single most effective stability boost you make. Give GSPO a try—your model might thank you with cleaner gradients and higher scores on those hard benchmarks!
+
+
+
+# Taming Mixture‑of‑Experts (MoE) Models – No More Routing Replay Thanks to GSPO  
+
+*How a simple change from token‑level to sequence‑level importance weighting makes large‑scale RL on sparsely activated language models stable and efficient.*
+
+---
+
+## Why reinforcement learning on MoE models has been hard  
+
+Mixture‑of‑Experts (MoE) architectures achieve massive parameter counts by activating only a tiny subset of “experts” per token. This sparsity gives us impressive capacity–efficiency trade‑offs, but it also introduces **expert‑activation volatility** when we try to fine‑tune the model with reinforcement learning (RL).  
+
+In the context of **Group Relative Policy Optimization (GRPO)**—the token‑level RL algorithm that avoids a value network—the importance weight for each token is  
+
+\[
+w_{i,t}(\theta)=\frac{\pi_{\theta}\bigl(y_{i,t}\mid x,y_{i,<t}\bigr)}{\pi_{\theta_{\text{old}}}\bigl(y_{i,t}\mid x,y_{i,<t}\bigr)} .
+\]
+
+Because an MoE model routes every token through a different set of experts, even a modest policy update can change the activated experts dramatically. Empirically we observed that after a single gradient step roughly **10 % of the experts** activated for a given token differ between $\pi_{\theta_{\text{old}}$} and $\pi_{\theta}$. When these fluctuating activations are plugged into $w_{i,t}(\theta)$, the resulting weights become extremely noisy, which quickly destabilises training and often leads to catastrophic model collapse.
+
+### The ad‑hoc fix: Routing Replay  
+
+To tame this noise researchers introduced **Routing Replay**. The idea is simple: cache the expert routing produced by $\pi_{\theta_{\text{old}}}$ during rollout and *replay* those exact routes when evaluating $\pi_{\theta}$ so that both numerator and denominator in $w_{i,t}(\theta)$ see the same set of experts. While this restores stability in practice, it comes at a steep price:
+
+* **Memory & communication overhead** – caching per‑token routing across large batches can dominate GPU memory.  
+* **Capacity throttling** – forcing the new policy to reuse old routes limits how much the model can explore new expert combinations.  
+* **Implementation complexity** – extra bookkeeping interferes with clean pipeline design and makes distributed training harder.
+
+If only there were a way to avoid these heavy lifts altogether…
+
+---
+
+## The core insight: match reward granularity with off‑policy correction  
+
+RL rewards in language generation are typically **sequence–level**: after producing an answer $y$ to a query $x$, we run a verifier $r(x,y)\in[0,1]$. The classic importance sampling identity tells us that correcting an off‑policy expectation requires a *single* ratio over whole samples:
+
+\[
+\mathbb{E}_{y\sim\pi_{\text{new}}}[f(y)] 
+= \mathbb{E}_{y\sim\pi_{\text{old}}}\!\Bigl[\frac{\pi_{\text{new}}(y)}{\pi_{\text{old}}(y)}\,f(y)\Bigr].
+\]
+
+GRPO instead applies this identity at every token step—an inappropriate granularity when the reward lives at the end of the sequence. The result is high variance that compounds over long responses.
+
+**Group Sequence Policy Optimization (GSPO)** rectifies this mismatch by defining **one importance weight per generated response**:
+
+\[
+s_i(\theta)=\Bigl(\tfrac{\pi_{\theta}(y_i\mid x)}{\pi_{\theta_{\text{old}}}(y_i\mid x)}\Bigr)^{\!1/|y_i|}
+          = \exp\!\Bigl(\tfrac1{|y_i|}\sum_{t=1}^{|y_i|}
+               \log\tfrac{\pi_{\theta}(y_{i,t}\mid x,y_{i,<t})}
+                         {\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,<t})}\Bigr).
+\]
+
+The exponent $1/|y_i|$ performs **length normalization**, keeping $s_i(\theta)$ comparable across responses of different lengths and preventing a few tokens from dominating the ratio.
+
+The **GSPO objective** then mirrors PPO’s clipped surrogate but operates on whole responses:
+
+\[
+\mathcal J_{\text{GSPO}}(\theta)=
+\mathbb E_{x,\{y_i\}_{i=1}^G}
+\Bigl[\tfrac1G \sum_{i=1}^{G}
+   \min\bigl(s_i(\theta)\widehat A_i,\,
+            \operatorname{clip}(s_i(\theta),1-\varepsilon ,1+\varepsilon )\,\widehat A_i\bigr)
+   \Bigr],
+\]
+where $\widehat A_i$ is the *group advantage* obtained by normalizing rewards across the $G$ responses generated for each query:
+
+\[
+\widehat A_i = \frac{
+      r(x,y_i)-\operatorname{mean}\bigl(\!\{r(x,y_j)\}_{j=1}^G\bigr)}
+      {\operatorname{std}\bigl(\!\{r(x,y_j)\}_{j=1}^G\bigr)} .
+\]
+
+Now the clipping decision is made on **entire sequences**, not individual tokens—exactly what we need when our feedback is sequence‐level.
+
+---
+
+## Why sequence‐level weighting neutralizes expert volatility  
+
+Because $s_i(\theta)$ aggregates *all* token probabilities into one scalar before clipping, any individual token’s routing shift contributes only a tiny fraction (scaled by $1/|y_i|$). Even if 10 % of tokens switch experts after an update, their influence on the overall likelihood ratio is diluted by averaging across the whole sentence. Consequently:
+
+* **No dependence on cached routes** – we can compute $\pi_{\theta}(y_i|x)$ directly with the current forward pass; there is nothing special to preserve from $\pi_{\theta_{\text{old}}}$.
+* **Stable importance ratios** – the distribution correction remains well behaved even when some tokens route through radically different experts.
+* **Reduced variance** – by weighting all tokens equally before applying clipping (see Eq. (5) in the paper), GSPO eliminates the noisy token‐wise weight explosion that plagues GRPO.
+
+Empirically this translates into smooth reward curves without any sign of collapse—even for deep MoE transformers such as Qwen3‑30B‐A3B where GRPO would otherwise diverge without Routing Replay.
+
+---
+
+## Experimental confirmation  
+
+The authors fine‑tuned a cold‑start Qwen3‐30B‐A3B model under two setups:
+
+| Setup | Clipping range | Requires Routing Replay? |
+|------|----------------|---------------------------|
+| GRPO | $[0.2,\ 0.27]$ | Yes |
+| GSPO | $[3\times10^{-4},\,4\times10^{-4}]$ | No |
+
+Training used four mini‑batches per rollout batch, a common practice for high GPU utilisation. The results were striking:
+
+* **Training stability:** GSPO never exhibited catastrophic drops; reward curves rose monotonically throughout billions of tokens.
+* **Sample efficiency:** With identical compute budgets and query sets, GSPO achieved higher final rewards on AIME’24 (Pass@1), LiveCodeBench (Pass@1), and CodeForces Elo than GRPO + Routing Replay.
+* **Clipping behaviour:** Although GSPO clipped *more* responses overall—its fraction of clipped tokens was two orders of magnitude larger than GRPO—the resulting gradients were far less noisy because every clipped sample carried a coherent sequence‑level signal rather than an erratic token‑wise one.
+* **MoE robustness:** No expert‐routing cache was needed; training converged smoothly despite obvious changes in per‑token expert assignments across updates.
+
+These findings underpin why recent Qwen3 models attribute most of their RL performance gains to adopting GSPO.
+
+---
+
+## Side benefits: simpler infrastructure and lighter precision requirements  
+
+Because GSPO only needs *sequence‐level likelihoods*, it tolerates modest numerical mismatches between training engines (e.g., Megatron) and inference engines (e.g., SGLang/vLLM). In practice we can feed directly the logits returned by an inference server into the clipping computation without recomputing log probabilities under the heavy training kernels—a boon for:
+
+* **Partial rollout** or multi‑turn RL where latency matters,
+* **Training–inference disaggregated pipelines**, and
+* **Distributed settings** where moving large tensors back to the trainer would be costly.
+
+All together this reduces engineering effort while preserving—or even improving—training throughput.
+
+---
+
+## Takeaway  
+
+GSPO demonstrates that *the right granularity matters.* By aligning off‑policy correction with where rewards are actually given—at the level of whole generated sequences—we obtain an importance sampling estimator that is both theoretically sound and practically robust against MoE’s inherent activation volatility. The consequences are immediate:
+
+1. **Routing Replay becomes obsolete** – no extra memory or communication overhead.
+2. **Training stays stable even for deep sparse models**, enabling larger MoEs without extra tricks.
+3. **RL pipelines shrink** – fewer moving parts mean fewer bugs and faster iteration cycles.
+4. **Performance improves**, as shown on standard math/code benchmarks under identical compute budgets.
+
+If you’re scaling RL on any sparsely activated LLM today—especially MoEs—switching from GRPO (or PPO) to GSPO could be all you need to unlock stable, efficient progress without resorting to ad hoc workarounds like routing replay.
+
+---
+
+### Looking ahead  
+
+The authors envision GSPO as a foundational algorithmic block for future RL scaling efforts. As language models continue growing—in size *and* sparsity—sequence‑level policy optimization may become the default choice whenever rewards are global rather than local. We anticipate more open‐source implementations soon, which will make it easier for research labs and industry teams alike to reap these stability gains without reinventing complex replay mechanisms.
+
+---
+
+
+
+# Boosting Training Efficiency: Why GSPO Learns Faster Even When It Clips More Tokens  
+
+---
+
+## Introduction  
+
+Reinforcement learning from human feedback (RLHF) has become the de‑facto way to push large language models (LLMs) beyond pure next‑token prediction. In practice most RL pipelines rely on a PPO‑style surrogate objective that **clips** an importance weight \(w\) so that updates stay within a trusted region of the old policy \(\pi_{\theta_{\text{old}}}\).  
+
+When scaling up to gigantic models—or when dealing with long generations—this paradigm runs into a subtle but fatal problem: **the unit of importance weighting mismatches the unit of reward**. The reward \(r(x,y)\in[0,1]\) is assigned once per complete response \(y\), yet classic approaches such as Group Relative Policy Optimization (GRPO) apply a separate importance ratio \(w_{i,t}\) for every generated token \(y_{i,t}\). The misalignment inflates variance, especially after the rollout data are split into mini‑batches for multiple gradient steps, and can lead to catastrophic model collapse.  
+
+Group Sequence Policy Optimization (GS P O) addresses this mismatch by moving the importance weight from the token level to the **sequence level**. The surprising side effect—observed repeatedly on Qwen 3 models—is that **GS P O clips a far larger fraction of tokens than GRPO**, yet it consistently achieves **higher sample efficiency** and faster convergence. Below we unpack why discarding “more” data actually makes learning *faster*.
+
+
+
+## From Token‑Level Ratios to Sequence‑Level Ratios  
+
+### What GRPO does  
+
+For each query \(x\), GRPO draws a group of \(G\) responses \(\{y_i\}_{i=1}^G\sim \pi_{\theta_{\text{old}}}(\cdot\,|\,x)\).  
+The **token‑level** importance weight is  
+
+\[
+w_{i,t}(\theta)=
+\frac{\pi_{\theta}\bigl(y_{i,t}\mid x,y_{i,<t}\bigr)}
+     {\pi_{\theta_{\text{old}}}\bigl(y_{i,t}\mid x,y_{i,<t}\bigr)} .
+\]
+
+Every token receives *the same* group advantage  
+
+\[
+\widehat A_i=
+\frac{\,r(x,y_i)-\operatorname{mean}\!\bigl(\{r(x,y_j)\}\bigr)}
+     {\operatorname{std}\!\bigl(\{r(x,y_j)\}\bigr)} ,
+\]
+
+and PPO’s usual surrogate loss clips each \(w_{i,t}\) separately:
+
+\[
+\min\!\Bigl(w_{i,t}(\theta)\widehat A_i,\,
+          \operatorname{clip}(w_{i,t}(\theta),1-\varepsilon,1+\varepsilon)\widehat A_i\Bigr).
+\]
+
+### What GS P O does  
+
+GS P O replaces every token‐wise ratio by a **single sequence‐wise ratio**  
+
+\[
+s_i(\theta)=
+\left(
+   \frac{\pi_{\theta}(y_i\mid x)}
+        {\pi_{\theta_{\text{old}}}(y_i\mid x)}
+\right)^{\!1/|y_i|}
+=
+\exp\!\Bigl(
+   \tfrac1{|y_i|}
+   \sum_{t=1}^{|y_i|}
+   \log\tfrac{\pi_{\theta}(y_{i,t}|x,y_{i,<t})}
+            {\pi_{\theta_{\text{old}}}(y_{i,t}|x,y_{i,<t})}
+   \Bigr).
+\]
+
+The exponentiation by \(1/|y_i|\) **normalizes by length**, keeping \(s_i(\theta)\) roughly comparable across short and long generations.  
+The surrogate loss now looks exactly like PPO’s but applied once per response:
+
+```math
+L_\text{GS\,P\,O}= 
+\E_{x,\{y_i\}}
+   \Bigl[
+      \tfrac1G\sum_{i=1}^{G}
+      \min(s_i(\theta)\widehat A_i,\,
+           \operatorname{clip}(s_i(\theta),1-\varepsilon,1+\varepsilon)\widehat A_i)
+   \Bigr].
+```
+
+In words: *either an entire response stays inside the trust region or it gets capped uniformly*. No individual token receives its own independent scaling.
+
+
+
+## The Role of Clipping  
+
+Both algorithms share the same purpose for clipping—to prevent overly “off‑policy’’ samples from dominating the gradient estimate. However they differ fundamentally in **what gets clipped**:
+
+|                | What gets clipped? | Typical clip interval | Effect on gradients |
+|----------------|--------------------|----------------------|---------------------|
+| **GRPO**       | Every token’s \(w_{i,t}\) | e.g., \(0.8–1.2\) (\(\varepsilon=0.\!2\)) | Many tiny adjustments spread across all tokens |
+| **GS P O**     | Whole response’s \(s_i\) | e.g., \(3\times10^{-4}–4\times10^{-4}\) (\(\varepsilon≈3e{-4}\)) | Either keep full contribution or replace it entirely |
+
+Because \(s_i(\theta)\) aggregates log‑ratios over an entire sequence before taking an exponential root, it tends to *wander farther* from \(1\); consequently a much larger proportion of responses fall outside the narrow interval and get clipped. Empirically researchers observed **two orders of magnitude more clipped tokens** under GS P O than under GRPO.
+
+
+
+## Why More Clipping Can Still Mean Faster Learning  
+
+At first glance discarding a larger share of data sounds counter‑productive. The key insight lies in **what those discarded samples look like**:
+
+1. **High‑variance outliers** – When a response’s probability under the new policy changes dramatically relative to its old probability, its raw importance weight becomes huge or tiny. In GRKO these extreme values stay attached *per token* inside the surrogate loss (after being limited only by a modest clip range), thereby injecting large stochastic fluctuations into each gradient step.
+2. **Uniform weighting inside a response** – In GS P O every token shares exactly the same factor \(s_i^{\,}|y_i|\). If an entire response is deemed too far off policy (*outside* the narrow band), *all* its contributions are replaced by the constant clip value rather than letting any single token dominate through an oversized weight.
+3. **Signal‑to‑noise improvement** – By removing whole responses whose likelihood ratios lie far outside the trusted region we discard precisely those gradients that would have contributed most noise. The remaining un‑clipped set contains comparatively modest ratios whose associated advantages tend to be reliable estimates (they come from locally similar policies). Consequently each accepted sample carries far cleaner information per unit compute.
+4. **Equal per‑token treatment** – After clipping only “good’’ responses survive, their gradients are weighted uniformly across tokens (\(s_i^{\,}|y|\times\nabla_\theta\log \pi_\theta(y_t|\cdot)\)). This uniformity eliminates the uneven amplification seen in Equation (5), where large variations among \(w_{i,t}\)’s cause some tokens’ gradients to blow up while others shrink toward zero—a source known empirically to destabilize long‐sequence training.
+
+Put together these effects explain why *more* aggressive clipping actually yields **higher sample efficiency**: you end up doing *fewer* updates, but each update is much less polluted by variance, allowing faster convergence especially when scaling batch size or rollout length.
+
+
+
+## Empirical Evidence  
+
+The authors evaluated both methods on a cold‑start model derived from **Qwen 3–30B‑A3B–Base** under identical compute budgets:
+
+* Rollout batches were split into four mini‑batches for multiple SGD steps—a setting that magnifies any off‑policy mismatch.
+* Clip ranges were tuned carefully:
+  * **GS P O:** left \(=3\times10^{-4},~\) right \(=4\times10^{-4}\)
+  * **GRPO:** left \(=0.2,\;\) right \(=0.27\)
+
+### Training curves  
+
+* With GTRO the loss curve frequently exhibited spikes before collapsing completely—a symptom traced back to exploding tokenwise ratios.
+* With GS P O training remained smooth throughout thousands of updates; rewards kept rising steadily even when queries were refreshed or generation lengths were extended.
+
+### Benchmark performance  
+
+After comparable compute spend:
+* On AIME’24 (average Pass@1 over 32 samples), LiveCodeBench (Pass@1 over 8 samples), and Codeforces Elo rating,
+* The model trained with GS P O consistently outperformed its GRPo counterpart,
+* Demonstrating that *more aggressive clipping did not hurt* but rather accelerated learning progress.
+
+
+
+### Fraction of clipped tokens  
+
+A diagnostic plot showed that roughly **%90+** of response probabilities fell outside GS P O’s tight band versus < %5 for GRPo’s wider band—a difference spanning two orders of magnitude. Despite discarding so much data early in each iteration, downstream metrics improved faster—a direct illustration that “clipping away” noisy examples outweighs “keeping everything” when those retained examples carry disproportionate variance.
+
+
+
+## Bonus Payoffs  
+
+### MoE models no longer need “Routing Replay”  
+
+Mixture‑of‑Experts architectures switch active experts per token during generation. Under GRPo this swapping caused sudden changes in \(\pi_\theta(y_{t}|·)\), inflating tokenwise ratios dramatically enough that training diverged unless one cached (“replayed”) old routing decisions—a costly workaround called *Routing Replay*. Because GS P O relies solely on whole‐sequence likelihoods—which stay relatively stable even when underlying expert assignments shift—the method sidesteps routing volatility entirely and eliminates the replay buffer overhead.
+
+
+
+### Simpler RL infrastructure  
+
+Traditional pipelines recompute old‐policy logits during training because tiny floating‑point mismatches between training engines (Megatron/GPT‑style kernels) and inference engines (SGLang/vLLM) would otherwise corrupt per‑token ratios. Since GS P O needs only **sequence‐level probabilities**, these numbers prove far more tolerant of precision differences; engineers can now feed directly the likelihood scores returned by an inference server into the loss function without extra recomputation steps, markedly simplifying distributed or multi‑turn RL setups.
+
+
+
+## Takeaway  
+
+GS P O illustrates an elegant principle often overlooked in large‐scale RL fine‑tuning:
+
+> *Match the granularity of your importance correction to the granularity at which you receive reward.*  
+
+By moving from per‑token correction (an ill‑posed estimator prone to accumulated variance) to per‑sequence correction (a proper importance sampler), we obtain a surrogate objective whose clipped region reliably filters out extreme off‑policy samples while preserving clean learning signals inside it. The net effect is a dramatically lower variance estimator—so even though we “throw away” more data during clipping, each surviving update carries substantially higher informational quality, translating into faster convergence and stronger benchmark results.
+
+The empirical record on Qwen 3 models confirms this reasoning: **GS P O delivers stable training, superior sample efficiency, effortless MoE support, and lighter infrastructure demands—all while aggressively clipping more tokens than its predecessor**.
+
+
+
+--- 
+
+*If you’re experimenting with RLHF on massive LLMs or planning MoE deployments, swapping your PPO/GRPo pipeline for a simple sequence‐level surrogate like GS P O could save you weeks of debugging—and push your model’s capabilities further.*
+
+
+
+# Building Simpler RL Pipelines – Using Inference Engines Directly with GSPO  
+
+*Discover how GSPO’s reliance on sequence‑level likelihoods lets you reuse cached probabilities from inference servers (e.g., vLLM or SGLang), cutting down on recomputation overhead and simplifying distributed RL infrastructure.*
+
+---
+
+## 1️⃣ Why Reinforcement Learning for LLMs Usually Needs Two Passes  
+
+When we fine‑tune a massive language model with reinforcement learning (RL), a typical algorithm such as PPO or its token‑based variant GRPO works like this:
+
+1. **Rollout phase** – an **inference** engine generates a handful of responses \(y\) for each query \(x\).  
+2. **Learning phase** – the **training** engine recomputes the *old* policy’s token‑level probabilities \(\pi_{\theta_{\text{old}}}(y_t\mid x,y_{<t})\) so it can form importance weights  
+
+   \[
+   w_{i,t}(\theta)=\frac{\pi_{\theta}(y_{i,t}\mid x,y_{i,<t})}{\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,<t})}
+   \]
+
+   and feed them into the clipped objective.
+
+That second pass is expensive for three reasons:
+
+* **Memory pressure** – storing all token‑wise logits from the rollout consumes gigabytes of RAM for long sequences.
+* **Precision mismatch** – inference engines often run in mixed‑precision (FP16/BF16) while training uses a stricter format, leading to tiny numerical gaps that explode when applied token‑by‑token.
+* **Engineering friction** – distributed setups must shuttle logits between an inference cluster (vLLM, SGLang…) and a training cluster (Megatron), adding latency and code complexity.
+
+All this extra work stems from a *token‑level* importance correction that does not match how we actually score a response—our reward \(r(x,y)\) is assigned **once per sequence**, not per token.
+
+---
+
+## 2️⃣ The Sequence‑Level Insight Behind GSPO  
+
+GSPO flips the script by moving the importance weight from tokens to entire sequences:
+
+\[
+s_i(\theta)=\Bigl(\frac{\pi_{\theta}(y_i\mid x)}{\pi_{\theta_{\text{old}}}(y_i\mid x)}\Bigr)^{1/|y_i|}
+=\exp\!\Bigl(\frac{1}{|y_i|}
+\sum_{t=1}^{|y_i|}
+\log\frac{\pi_{\theta}(y_{i,t}\mid x,y_{i,<t})}
+     {\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,<t})}\Bigr)
+\]
+
+Key properties:
+
+* **Alignment with reward** – Both \(s_i(\theta)\) and the advantage \(\widehat{A}_i\) are defined at the *response* granularity.
+* **Length normalization** – Raising the likelihood ratio to \(1/|y_i|\) bounds \(s_i(\theta)\) in a narrow numeric range regardless of response length, which dramatically dampens variance.
+* **Tolerance to tiny precision errors** – Because we aggregate logs before exponentiation, small per‑token discrepancies average out instead of being amplified token‑by‑token.
+
+Consequently, once we have a *single* scalar \(\log \pi_{\theta}(y_i \mid x)\) per response we can compute \(s_i(\theta)\). No need to keep every token’s probability around us.
+
+---
+
+## 3️⃣ How GSPO Lets You Use Inference Probabilities Directly  
+
+### The traditional pipeline (two passes)
+
+```
+inference → generate y + logits_old
+store y
+training → recompute logits_old + logits_new → compute w_t → gradient
+```
+
+### The GSPO pipeline (single pass)
+
+```
+inference → generate y + logprob_old    ← cached
+store (x, y, logprob_old)
+training →
+    1️⃣ feed y through current model θ → get logprob_new   (just one forward)
+    2️⃣ compute s_i(θ)=exp[(logprob_new - logprob_old)/|y|]
+    3️⃣ apply group advantage Ā_i and clipping → gradient
+```
+
+Because we only need:
+
+* `logprob_old` – already returned by the inference service during rollout,
+* `logprob_new` – a **single** forward call through the *current* model,
+
+the extra “replay” forward pass disappears entirely.  
+
+If your inference cluster already runs in mixed precision, that’s fine: a single averaged log‑probability is robust to those rounding differences. You can even keep `logprob_old` as a plain float32 number without worrying about per‑token truncation errors.
+
+---
+
+## 4️⃣ Practical Changes You’ll See in Your RL Infrastructure  
+
+| Aspect | Before (GRPO/PPO) | After (GSPO) |
+|--------|-------------------|--------------|
+| **Data saved per rollout** | Token‑wise logits (`T × vocab`) | One scalar `log π(y|x)` per response |
+| **Network traffic** | Large tensors moved between services | Tiny metadata packets |
+| **GPU memory during learning** | Additional buffers for old logits | Only standard activations |
+| **Precision handling** | Must re‑compute logits in training precision | Safe reuse of inference‐precision logits |
+| **MoE routing tricks** | Needs “Routing Replay” to stabilize `w_t` | No routing replay needed—sequence likelihood stays stable |
+
+The result is a dramatically slimmer end‑to‑end graph:
+
+```
+[Inference Service] ──► {x, y, logπ_old}
+        │
+        ▼
+[Training Worker] ──► forward(y) under θ → logπ_new
+        │                ──► compute s(θ)
+        ▼                ──► apply clipped objective → update θ
+```
+
+You can now treat your rollout cache as an immutable “experience replay” buffer that any trainer can read without pulling heavy tensors or orchestrating synchronised routing states across GPUs.
+
+---
+
+## 5️⃣ Real World Evidence From Qwen3 Experiments  
+
+The authors of GSPO evaluated a cold‑start Qwen3‑30B model fine‑tuned on millions of queries. Highlights relevant to pipeline simplification:
+
+* **Training stability:** Even when splitting each rollout batch into four mini‑batches (a common source of off‑policy drift), GSPO never exhibited catastrophic collapse—something that routinely happened with GRPO when token‐level importance ratios were mis­estimated.
+* **No Routing Replay:** For Mixture‑of‑Experts models, GRPO required caching expert activations (“Routing Replay”) to avoid volatility; GSPO worked out‐of‑the box because it never looks at per‑token routing decisions.
+* **Efficiency gains:** Under identical compute budgets, GSPO reached higher reward curves on AIME‘24, LiveCodeBench, and CodeForces benchmarks—demonstrating that trimming away redundant passes does not sacrifice performance.
+
+Although the paper does not publish raw timing numbers for each pass, the qualitative claim is clear: by eliminating the second “likelihood recompute” step you free up GPU cycles that are otherwise spent shuffling large tensors between clusters. That translates directly into faster iteration cycles when you spin up thousands of GPU nodes in production.
+
+---
+
+## 6️⃣ Bottom Line – What You Should Do Next  
+
+1️⃣ **Collect sequence‐level log probabilities during rollout**  
+   Most modern inference servers already expose `logits` or `logprob` APIs; ask them for `log π(y|x)` rather than per‐token scores if you want fewer bytes transferred.
+
+2️⃣ **Store them together with your query–response pair**  
+   A simple JSON line (`{"query":…, "response":…, "logp_old":…}`) is enough—no binary blobs needed.
+
+3️⃣ **During each training step**  
+   * Load a minibatch of stored pairs,
+   * Run them through your current policy `θ` once,
+   * Compute `s_i(θ)` using `(logp_new - logp_old)/|y|`,
+   * Apply the clipped objective  
+
+     \[
+     \mathcal{J}_{\text{GSPO}} = 
+     \mathbb{E}\Bigl[\min(s_i\,\widehat A_i,\;\mathrm{clip}(s_i,\!1-\varepsilon,\!1+\varepsilon)\widehat A_i )\Bigr]
+     \]
+
+4️⃣ **Enjoy cleaner code**  
+   No custom “routing replay” hooks, no double forwards on the same batch, no special handling for mixed‐precision mismatches—just plain PyTorch / JAX code that mirrors standard supervised fine‐tuning plus a scalar weighting term.
+
+By aligning the unit of optimization (the entire response) with the unit of reward—and by normalizing importance ratios across sequence length—GSPO lets you treat an inference engine as an ordinary data source rather than a heavyweight prerequisite for RL training. This dramatically reduces engineering overhead while preserving—and even improving—the final model quality.
+
+---  
+
+### TL;DR  
+
+GSPO replaces tokenwise importance weights with a *sequence‐level* ratio \(s_i(\theta)\). That single scalar fully captures how far the new policy deviates from the old one over an entire answer, making it robust against tiny precision differences between inference and training engines. As a result you can reuse cached probabilities straight from vLLM/SGLang without any extra recomputation pass, shrinking memory footprints, cutting network traffic, eliminating MoE routing tricks, and simplifying your distributed RL pipeline—all while keeping—or boosting—the model’s performance on challenging benchmarks. Happy scaling!
+
+
+
+# Real‑World Gains: How GSPO Powered the Breakthrough Performance of Qwen3 Models  
+
+*Case study – from a clean theoretical idea to measurable gains on AIME'24, LiveCodeBench, and Codeforces.*
+
+---
+
+## Introduction  
+
+Reinforcement learning from human feedback (RLHF) has become the go‑to recipe for taking large language models (LLMs) from “good enough” to “state‑of‑the‑art”.  Yet when we push RLHF to massive models—especially sparse Mixture‑of‑Experts (MoE) architectures—the training process can become brittle.  The earlier work **GRPO** tried to sidestep the costly value model used by classic PPO by computing relative advantages across a *group* of responses, but practitioners quickly ran into catastrophic collapse on long generations.
+
+Enter **Group Sequence Policy Optimization (GSPO)**.  By redefining the importance ratio at the *sequence* level instead of per token, GSPO restores statistical correctness, reduces variance, and stabilizes training even for multi‑billion‑parameter MoE models.  This post walks through how those theoretical fixes translate into hard numbers in the newest Qwen3 series.
+
+---
+
+## From Theory to Practice: Sequence‑Level Importance Sampling  
+
+Traditional PPO corrects off‑policy samples with a tokenwise ratio  
+
+\[
+w_{t}(\theta)=\frac{\pi_{\theta}(y_t \mid x,y_{<t})}{\pi_{\theta_{\text{old}}}(y_t \mid x,y_{<t})}.
+\]
+
+GRPO simply reuses this ratio while sharing a single advantage value across an entire response.  The mismatch is subtle but deadly: importance sampling assumes the weight
+\(\frac{\pi_{\text{tar}}(z)}{\pi_{\text{beh}}(z)}\) corrects **averages over many samples** drawn from the behavior distribution.  Applying it to a single token draws from a *single* next‑token distribution—there is no averaging, so the correction becomes high variance noise that compounds over long sequences.
+
+GSPO flips the script by using the *sequence* likelihood ratio
+
+\[
+s_i(\theta)=\Bigl(\frac{\pi_{\theta}(y_i \mid x)}{\pi_{\theta_{\text{old}}}(y_i \mid x)}\Bigr)^{\!\frac{1}{|y_i|}}
+= \exp\!\Bigl(\frac{1}{|y_i|}\sum_{t=1}^{|y_i|}\log\frac{\pi_{\theta}(y_{i,t}\mid x,y_{i,<t})}{\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,<t})}\Bigr).
+\]
+
+Because \(s_i(\theta)\) aggregates over all tokens before clipping, it respects the fact that **the reward itself is assigned to an entire response**.  The resulting objective
+
+\[
+\mathcal{J}_{\text{GSPO}}(\theta)=
+\mathbb{E}_{x,\{y_i\}}\!\Bigl[\frac{1}{G}\sum_{i=1}^G 
+\min\bigl(s_i(\theta)\widehat A_i,\,
+\text{clip}(s_i(\theta),1-\varepsilon,1+\varepsilon)\widehat A_i\bigr)\Bigr]
+\]
+
+mirrors PPO’s spirit while eliminating tokenwise variance.
+
+---
+
+## Stability Wins: Avoiding Model Collapse  
+
+In practice we observed two tell‑tale signs of instability:
+
+1. **Exploding clipping fractions** – GRPO clips ~2 % of tokens at a time; GSPO clips whole responses but discards an order of magnitude more tokens overall (see Figure 2 in the paper).  Paradoxically fewer *useful* gradients remain under GRPO because each retained token carries a noisy weight.
+2. **Catastrophic drift in MoE routing** – after just one gradient step GRPO’s token ratios fluctuate wildly because expert activation changes between \(\pi_{\theta_{\text{old}}}\) and \(\pi_\theta\).  
+
+GSPO’s sequence‐level ratio is indifferent to which experts fire for individual tokens; it only cares about the overall likelihood of the sampled answer.  Consequently:
+
+* Training stays **on‐policy enough** without needing aggressive clipping.
+* **No model collapse** occurs even when rollout lengths exceed 500 tokens.
+* The algorithm remains robust across different clipping ranges (we use \(3\times10^{-4}\)–\(4\times10^{-4}\) versus GRPO’s \(0.2\)–\(0.27\)).
+
+---
+
+## Benchmarks That Matter  
+
+The proof comes from three independent evaluation suites:
+
+| Benchmark | Metric | Evaluation Setup | Result |
+|-----------|--------|------------------|--------|
+| **AIME'24** | Pass@1 (average over 32 samples) | Math problem solving | GSPO consistently surpasses GRPO under identical compute budgets |
+| **LiveCodeBench** (202410–202502) | Pass@1 (average over 8 samples) | Code generation | Higher success rate across all programming languages |
+| **Codeforces** | Elo rating | Competitive programming style prompts | Notable uplift in rating—GSPO reaches levels where GRPO stalls |
+
+The paper does not list absolute numbers, but every curve plotted shows **continuous upward movement** for GSPO while GRPO either plateaus early or crashes entirely.  In other words, *every extra hour of RL compute translates into measurable progress* when using GSPO.
+
+---
+
+## Training Curves – Seeing GS PO in Action  
+
+During RL fine‑tuning of a cold‑start Qwen3‑30B model we partitioned each rollout batch into four mini‑batches (standard practice for hardware utilization).  
+
+* **Reward curve:** GSPO’s average reward rises smoothly throughout training; there is no sudden dip indicating collapse.
+* **Performance curve:** Across all three benchmarks the test metric climbs in lockstep with reward growth.
+* **Clipping fraction:** Even though ~30 % of whole responses are clipped early on, the remaining un‑clipped data drives faster learning than GRPO’s barely clipped tokens—evidence that *quality outweighs quantity* once noise is removed.
+
+These observations confirm that GSPO’s theory—“match unit of optimization with unit of reward” —actually delivers higher sample efficiency.
+
+---
+
+## MoE Done Right – No More Routing Replay  
+
+A major engineering pain point when training MoE LLMs with GRPO was **Routing Replay**:
+
+* Cache the expert routing decisions taken by \(\pi_{\theta_{\text{old}}}\).
+* Force \(\pi_\theta\) to reuse those same routes while computing tokenwise ratios \(w_{i,t}(\theta)\).
+
+Routing Replay saved memory but incurred extra communication and limited experts’ ability to specialize after each step.
+
+GSPO makes Routing Replay obsolete:
+
+* Since only \(\pi_\theta(y_i \mid x)\) matters, variations in expert activation have negligible impact on \(s_i(\theta)\).
+* No extra caches or synchronization barriers are required.
+* MoE models can fully exploit their capacity throughout RL training.
+
+The net effect is a cleaner pipeline that scales cleanly to billions of parameters without sacrificing performance.
+
+---
+
+## Simpler Infrastructure – One Engine to Rule Them All  
+
+In many production settings we run inference on low‑precision engines (e.g., SGLang or vLLM) while RL updates happen in a high‑precision trainer like Megatron.  Traditional tokenwise methods require recomputing old‐policy logits inside the trainer—costly and error prone due to precision mismatches.
+
+GSPO only needs **sequence‐level likelihoods**, which are far more tolerant of such discrepancies:
+
+* We can feed back logits directly from the inference server.
+* This eliminates an entire recompute pass.
+* Benefits accrue especially in multi‑turn or partial rollout scenarios where latency matters.
+
+In short, GSPO aligns algorithmic design with practical system constraints.
+
+---
+
+## Takeaways & Future Directions  
+
+| What we learned | Why it matters |
+|-----------------|----------------|
+| **Sequence-level importance sampling** restores statistical correctness → lower variance → stable updates |
+| **Uniform token weighting within a response** removes noisy per-token amplification → better sample efficiency |
+| **No expert routing gymnastics needed** → MoE models train as easily as dense ones |
+| **Clipping whole responses**, even at tighter thresholds, yields more reliable gradients → faster convergence |
+| **Infrastructure simplification** → inference logits become sufficient input for RL updates |
+
+These points together explain why Qwen3 models trained with GSPO have set new records on challenging math, code, and competitive programming benchmarks.  As RLHF continues to scale toward trillion‑parameter systems, algorithms that respect the *granularity of reward*—just like GSPO does—will be essential building blocks.
+
+The next frontier? Extending sequence-level optimization to multi‑modal agents and exploring adaptive clipping schemes that react dynamically to response length and difficulty.  For now, however, GSPO stands as a concrete bridge between elegant theory and real world gains—exactly what modern LLM research needs.
+
+
+
+# Demystifying Importance Sampling in RL for Language Models
+
+Reinforcement Learning (RL) has become the go‑to tool for polishing large language models (LLMs) into problem‑solving powerhouses. Yet one statistical building block—**importance sampling**—is often mentioned in passing without a clear intuition. In this post we’ll break down what importance sampling really means, why the classic token‑level tricks used by PPO and GRPO can backfire, and how **Group Sequence Policy Optimization (GSPO)** finally gets it right by operating at the *sequence* level.
+
+---
+
+## 1. Importance Sampling in a Nutshell
+
+Imagine you have an urn filled with two kinds of marbles: red ones that occur with probability $p$ and blue ones with probability $1-p$. You’d like to estimate the average value of a function $f$ over a *target* distribution $p$, but you are only allowed to draw marbles from a different *behavior* distribution $q$ (say, you can only draw blue marbles because red ones are hidden).
+
+The trick is to **re‑weight** each sampled marble by $\frac{p(z)}{q(z)}$, where $z$ is the marble you actually drew. Formally,
+
+\[
+\mathbb{E}_{z\sim p}[f(z)] \;=\;
+\mathbb{E}_{z\sim q}\Bigl[\frac{p(z)}{q(z)}\,f(z)\Bigr].
+\]
+
+If you drew many marbles from $q$, the weights $\frac{p(z)}{q(z)}$ collectively correct the mismatch between $q$ and $p$, giving you an unbiased estimate of the target expectation.
+
+Two key takeaways:
+
+1. **Averages matter** – the correction works because we take an expectation over many samples; a single sample’s weight can be wildly noisy.
+2. **Match units** – $f(z)$ should be defined on exactly the same object as $p$ and $q$. If $p$ is over sequences but $f$ evaluates individual tokens, you’ll be mixing apples and oranges.
+
+---
+
+## 2. RL for LLMs: Old Policy vs. New Policy
+
+When we fine‑tune an LLM with RL, we treat the model as a stochastic policy $\pi_\theta$. For any query $x$, it generates a response $y$ with probability
+
+\[
+\pi_\theta(y\mid x)=\prod_{t=1}^{|y|}\pi_\theta(y_t \mid x,y_{<t}).
+\]
+
+During training we usually **sample** responses using an *old* policy $\pi_{\theta_{\text{old}}}$ and then update the parameters toward a *new* policy $\pi_\theta$. The reward function $r(x,y)$ – often a scalar between 0 and 1 – evaluates the whole response $y$. 
+
+To correct for the fact that our data comes from $\pi_{\theta_{\text{old}}}$ rather than $\pi_\theta$, we need an importance weight:
+
+\[
+\frac{\pi_\theta(y\mid x)}{\pi_{\theta_{\text{old}}}(y\mid x)}.
+\]
+
+This is precisely the IS ratio that matches the **unit of reward**, i.e., whole sequences.
+
+---
+
+## 3. Token‑Level Importance Ratios: Why They Fail
+
+### 3.1 What PPO/GRPO Do
+
+Standard Proximal Policy Optimization (PPO) clips *token‑level* ratios
+
+\[
+w_{t}(\theta)=\frac{\pi_\theta(y_t\mid x,y_{<t})}{\pi_{\theta_{\text{old}}}(y_t\mid x,y_{<t})},
+\]
+
+and aggregates them across time steps. GRPO inherits this idea but keeps a single advantage per response while still using $w_{i,t}(\theta)$ for every token:
+
+\[
+w_{i,t}(\theta)=\frac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}{\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,<t})}.
+\]
+
+### 3.2 The Core Mistake
+
+The importance sampling principle requires **averaging** over many draws from the behavior distribution before applying $\frac{\pi_{\text{tar}}}{\pi_{\text{beh}}}$. In GRPO each weight is based on *one* sample from a conditional distribution (the next‑token prediction). That single draw cannot reliably correct for distributional shift; instead it injects high variance into every gradient step.
+
+Because rewards are assigned to entire sequences, weighting gradients token‑by‑token creates a mismatch: we are trying to estimate an expectation over sequences while adjusting each token independently. As sequence length grows—common when fine‑tuning LLMs on code or math—the variance compounds, eventually leading to catastrophic model collapse even after careful hyperparameter tuning.
+
+---
+
+## 4. GSPO’s Sequence‑Level Remedy
+
+### 4.1 The Sequence Ratio
+
+GSPO flips the script by using a **sequence‑level importance ratio**, denoted $s_i(\theta)$:
+
+\[
+s_i(\theta)=\left(\frac{\pi_\theta(y_i \mid x)}{\pi_{\theta_{\text{old}}}(y_i \mid x)}\right)^{\frac{1}{|y_i|}}
+=
+\exp\!\Bigl(\frac{1}{|y_i|}\sum_{t=1}^{|y_i|}
+    \log \frac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}
+               {\pi_{\theta_{\text{old}}}(y_{i,t}\mid x,y_{i,<t})}
+    \Bigr).
+\]
+
+Two design choices deserve attention:
+
+* **Length Normalization** – Raising to $1/|y_i|$ rescales long‐sequence ratios into roughly the same numerical range as short ones, preventing wildly different clipping thresholds for different lengths.
+* **Exponentiation of Log Averages** – By averaging log ratios first, GSPO treats every token’s contribution equally when forming $s_i(\theta)$ while still preserving the correct overall likelihood correction.
+
+### 4.2 Objective and Clipping
+
+With group size $G$ responses per query, GSPO’s objective reads
+
+\[
+\mathcal J_{\text{GSPO}}(\theta)=
+\mathbb E_{x,\{y_i\}}
+\Biggl[
+   \frac1G \sum_{i=1}^{G}
+   \min    
+   \bigl(
+      s_i(\theta)\,\widehat A_i,\,
+      \operatorname{clip}\bigl(s_i(\theta),\,1-\varepsilon,\,1+\varepsilon\bigr)\,\widehat A_i
+   \bigr)
+\Biggr],
+\]
+
+where $\widehat A_i$ is a *group‐based* advantage:
+\[
+\widehat A_i=\frac{
+    r(x,y_i)-
+    \operatorname{mean}\!\bigl(\{r(x,y_j)\}_{j=1}^G\bigr)
+}{
+    \operatorname{std}\!\bigl(\{r(x,y_j)\}_{j=1}^G\bigr)
+}.
+\]
+
+Clipping now operates on **whole responses**, dropping entirely “off‑policy” sequences rather than individual tokens. This aligns nicely with our sequence‐level IS ratio.
+
+### 4.3 Gradient Intuition
+
+When you expand $\nabla_\theta \mathcal J_{\text{GSPO}}$, every token’s log–likelihood gradient receives *the same* multiplier—the normalized sequence ratio times its advantage—so all tokens in a response move together:
+
+\[
+\nabla_\theta \mathcal J_{\text{GSPO}}
+=
+\E[\,
+   s_i(\theta)\,\widehat A_i
+   \cdot
+   \tfrac1{|y_i|}
+   \sum_t\nabla_\theta \log \pi_\theta(y_{i,t}\mid x,y_{i,<t})
+\,].
+\]
+
+Contrast this with GRPO where each token carries its own noisy weight $w_{i,t}(\theta)$. By equalizing token contributions within a sequence, GSPO dramatically reduces variance while still honoring importance sampling theory.
+
+---
+
+## 5. What This Means in Practice
+
+### 5.1 Stability Gains
+
+Empirically, training a Qwen3‑30B model with GSPO never experienced the irreversible collapse that plagued GRPO runs on long responses. The sequence‑level correction stays well behaved even as rollout length increases or when scaling compute aggressively.
+
+### 5? Efficient Use of Data
+
+Despite clipping *far more* tokens under GSPO (up to two orders of magnitude more than GRPO), training efficiency improves. The reason is simple: discarding highly off‑policy whole responses yields cleaner gradient estimates than keeping noisy token‐level contributions.
+
+### 5? MoE Models No Longer Need “Routing Replay”
+
+Mixture‑of‑Experts (MoE) architectures add another source of instability—expert activation can shift dramatically after each update, breaking token‑level ratios. GRPO required “Routing Replay,” where old routing decisions were cached and reapplied during gradient computation—a heavy memory/communication cost.
+
+GSPO sidesteps this entirely because its importance ratio cares only about overall sequence likelihood; expert activation volatility has minimal impact on $\pi_\theta(y|x)$. Consequently MoE models train stably out‑of‑the‑box without extra plumbing.
+
+### 5? Simpler RL Infrastructure
+
+In distributed setups it’s common to recompute old‐policy likelihoods on a training engine to avoid precision mismatches with an inference engine (e.g., Megatron vs SGLang). Since GSPO only needs **sequence** likelihoods—not per‑token scores—it tolerates those discrepancies much better. One can now reuse inference‐engine logits directly in the loss calculation, cutting down engineering overhead especially for multi‑turn or partial rollout pipelines.
+
+---
+
+## 6. TL;DR – The Takeaways
+
+* **Importance sampling works when you match what you weigh with what you reward** – sequences ↔ sequence reward.
+* Token‑level ratios in PPO/GRPO misuse IS because they reweight single draws from conditional distributions, leading to high variance and instability.
+* GSPO introduces a *sequence‐level* IS ratio $s_i(\theta)$ with length normalization; clipping now discards whole responses that are too far off policy.
+* Equal weighting of all tokens inside a response reduces gradient noise dramatically.
+* The method stabilizes training of massive LLMs—including sparse MoE variants—without extra tricks like Routing Replay.
+* Infrastructure becomes cleaner because only sequence likelihoods are needed; inference engines can feed directly into RL loss computations.
+
+By aligning importance sampling properly with the granularity of rewards, GSPO unlocks both safety and scalability for next‑generation language model reinforcement learning. As research pushes toward ever larger models and longer horizons, getting this statistical foundation right will be essential—and now we have a concrete recipe that works in practice.
