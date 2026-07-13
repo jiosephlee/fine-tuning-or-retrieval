@@ -30,6 +30,7 @@ TOP_P=""             # e.g. 0.8; empty leaves the default
 REPETITION_PENALTY=""  # e.g. 1.1 to break LaTeX-structure loops; empty leaves it off
 MIN_P=""             # e.g. 0.05 min-p nucleus (pair with temp ~1.0, top_p off); empty leaves it off
 MAX_TOKENS=""        # per-generation output cap; empty leaves the pipeline default
+COMPACT_PROSE=""      # "1" adds an integrity-focused short-prose constraint
 PAPERS=""            # comma-separated items to target (empty = all items in the domain)
 PARTS="all"          # comma-separated views: stack_exchange,textbook,blog (or all)
 EXCLUDE=""           # comma-separated nodes to avoid (e.g. a flaky dgx0NN)
@@ -47,6 +48,7 @@ while [[ $# -gt 0 ]]; do
         --repetition-penalty) REPETITION_PENALTY="$2"; shift 2 ;;
         --min-p) MIN_P="$2"; shift 2 ;;
         --max-tokens) MAX_TOKENS="$2"; shift 2 ;;
+        --compact-prose) COMPACT_PROSE="$2"; shift 2 ;;
         --papers) PAPERS="$2"; shift 2 ;;
         --parts) PARTS="$2"; shift 2 ;;
         --exclude) EXCLUDE="$2"; shift 2 ;;
@@ -101,6 +103,7 @@ for size in "${MODELS[@]}"; do
         [[ -n "$REPETITION_PENALTY" ]] && SAMPLE_ARG+=(--repetition-penalty "$REPETITION_PENALTY")
         [[ -n "$MIN_P" ]] && SAMPLE_ARG+=(--min-p "$MIN_P")
         [[ -n "$MAX_TOKENS" ]] && SAMPLE_ARG+=(--max-tokens "$MAX_TOKENS")
+        [[ -n "$COMPACT_PROSE" ]] && SAMPLE_ARG+=(--compact-prose "$COMPACT_PROSE")
         PAPERS_ARG=()
         [[ -n "$PAPERS" ]] && PAPERS_ARG=(--item "$PAPERS")
         EXCLUDE_ARG=()

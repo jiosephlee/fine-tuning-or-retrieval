@@ -1,0 +1,227 @@
+\title{A Textbook about the Paper: "QLoRA: Efficient Finetuning of Quantized LLMs"}
+
+Chapter 11: # 11. Technical Guide: Reproducing QLoRA
+
+In this chapter we walk the reader through every step that is needed to reproduce the results presented in the QLoRA paper.  The focus is on practical detail: what hardware and software are required, how the quantization and LoRA modules are constructed, which hyper‑parameters give good performance, and how to schedule a training run on a single consumer GPU.  Throughout the chapter we stay faithful to the paper and do not introduce any external techniques that were not described by the authors.
+
+## Pre‑requisites: GPU, PyTorch, bitsandbytes, CUDA kernels
+
+| Item | Minimum specification | Why it matters |
+|------|-----------------------|----------------|
+| **GPU** | 24 GB or 48 GB NVIDIA memory (RTX 3090 or A6000) | QLoRA relies on block‑wise 4‑bit storage; for a 65 B model the quantized weights take roughly 12 GB, leaving room for activations and optimizer states. |
+| **CUDA** | 11.8 or newer | The custom 4‑bit kernels provided by bitsandbytes require CUDA 11.8+. |
+| **PyTorch** | 2.0+ with CUDA support | The training harness in the open‑source repo uses PyTorch 2.0 features such as `torch.compile`. |
+| **bitsandbytes** | 0.41.0+ | Implements the memory‑efficient 4‑bit and 8‑bit tensors, as well as the paged‑optimizer logic. |
+| **NVidia Unified Memory** | Supported on the GPU | Enables the paged‑optimizer to spill out parts of the optimizer state to CPU RAM automatically. |
+
+**Installing everything**
+
+```bash
+# Example on Ubuntu 22.04
+sudo apt update && sudo apt install -y \
+    build-essential \
+    cuda-toolkit-11-8 \
+    python3-dev
+
+# Python virtual environment
+python3 -m venv qlo_env
+source qlo_env/bin/activate
+
+# Install PyTorch (matching CUDA 11.8)
+pip install torch==2.0.1+cu118 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# Install bitsandbytes (CPU + GPU)
+pip install bitsandbytes
+
+# Clone the QLoRA repo (the public fork)
+git clone https://github.com/artidoro/qlora.git
+cd qloora
+pip install -e .
+```
+
+The repository includes the CUDA kernels for NF4 (`nf4_cuda`).  After installation, running a quick import test verifies everything:
+
+```python
+import qlo; import qlo.modeling
+print("bitandbytes version:", bitsandbytes.__version__)
+```
+
+If this succeeds, you are ready to begin the workflow described in the following sections.
+
+## Quantizing a pretrained checkpoint to NF4
+
+The QLoRA workflow begins by taking a 16‑bit base model (e.g., LLaMA‑7B) and converting its weights to 4‑bit NormalFloat (`NF4`).  The paper defines NF4 as the information‑theoretically optimal quantization for zero‑centered normal data.  In practice the conversion follows these steps:
+
+1. **Load the 16‑bit checkpoint**  
+   ```python
+   from transformers import AutoModelForCausalLM
+   base_model = AutoModelForCausalLM.from_pretrained("facebook/llama-7b", torch_dtype=torch.float32)
+   ```
+
+2. **Compute the per‑layer absolute maximum** for each linear and matrix weight that will be quantized.  The paper uses a **blocksize of 64** tokens, which keeps the dynamic range a good compromise between precision and memory.  
+   ```python
+   blocksize = 64
+   def compute_block_scales(tensor):
+       # flatten into 1D and partition into blocks
+       flat = tensor.reshape(-1)
+       num_blocks = (flat.numel() + blocksize - 1) // blocksize
+       scales = torch.empty(num_blocks, dtype=torch.float32)
+       for i in range(num_blocks):
+           block = flat[i*blocksize : (i+1)*blocksize]
+           scales[i] = block.abs().max()
+       return scales
+   ```
+
+3. **Quantize the tensor to NF4**  
+   For each block, the tensor is rescaled into `[-1, 1]`; the quantile points for a standard normal distribution (`N(0,1)`) are pre‑computed for 4‑bit precision and then scaled back to the block range.  The bitsandbytes library implements this as `bitsandbytes.nn.nn.LinearNF4`.  A simple wrapper is used in the repo:
+
+   ```python
+   from bitsandbytes.nn import LinearNF4
+   def quantize_to_nf4(weight):
+       # assumption: weight is a torch.Float32 tensor
+       scale_block = compute_block_scales(weight)
+       nf4_weight = LinearNF4.apply(weight, scale_block, blocksize)
+       return nf4_weight
+   ```
+
+   Applying the wrapper to all weight tensors yields a **model in NF4**.  Once quantized, the `nf4_weight` objects can be serialized with `torch.save`.
+
+The paper reports that the quantization precision loss is negligible for pretrained weights of LLaMA, GPT‑NeoX, and OPT.  For the 65 B model the memory footprint of the base weights is about 12 GB.
+
+## Configuring LoRA adapters (rank, placement, learning‑rate)
+
+LoRA replaces the original linear projections in the transformer with an added rank‑deficiency for adaptivity.  The paper emphasizes two crucial design choices that were necessary for matching 16‑bit full‑finetuning performance:
+
+1. **Adapters on *every* transformer layer** – Instead of applying LoRA only on query and value matrices, the authors added adapters to each linear projection in all layers.  In practice this means patching the `nn.Linear` modules inside each self‑attention, cross‑attention, and feed‑forward block with a `LoRA` wrapper that injects the rank‑`r` correction.
+
+2. **Rank‑hyperparameter** – Experiments in the paper found that a rank of `8` or `16` per layer is sufficient.  Higher ranks improve accuracy at the expense of a proportional increase in trainable parameters; we use `r = 8` as a good trade‑off.  The code in the repo reads:
+
+   ```python
+   from qloora.lora import LoRA
+   lora_r = 8
+   for name, module in base_model.named_modules():
+       if isinstance(module, nn.Linear):
+           wrapped = LoRA(module, rank=lora_r, scale=0.05)  # scale parameter as per paper
+           setattr(module, 'original_module', module)
+           setattr(module, '__class__', wrapped.__class__)
+   ```
+
+3. **Learning‑rate schedule** – The authors use a constant learning rate of `1e-4` for small models (≥ 7 B) and reduce it by a factor of two for larger models (33 B and 65 B) to accommodate a larger parameter space.  Combined with a batch size of 32 and warm‑up of 200 steps, the training run converges in about 10 epochs.
+
+4. **Optimizer** – AdamW with weight decay of `0.05` is used for the LoRA parameters only.  The base 4‑bit weights are frozen (no gradients).  Bitsandbytes implements a `FusedAdam` that automatically handles the 4‑bit tensors.  The paged‑optimizer is turned on by setting the environment variable:
+
+   ```bash
+   export QLOPAUSE_PAGED_OPTIM=1
+   ```
+
+## Enabling Double Quantization and paged optimizers
+
+**Double Quantization**  
+The paper introduces *double quantization* to compress the per‑block scale tensors themselves.  Each `scale_block` (originally a 32‑bit float) is further quantized to an 8‑bit float (`FP8`).  The bitsandbytes library includes a helper `QuantBlockScale` that performs this extra quantization:
+
+```python
+from bitsandbytes.nn import QuantBlockScale
+def double_quant_scale(scales):
+    # compute mean to center first
+    mean = scales.mean()
+    centered = scales - mean
+    # quantize to s8 (signed 8‑bit float)
+    q8 = QuantBlockScale.apply(centered, blocksize=256)
+    # store mean separately for dequant
+    return mean, q8
+```
+
+`explicit_quant = True` in the LoRA wrapper tells the forward pass to perform the second de‑quant and return the full de‑quantized weight in BF16 for matrix multiplication.
+
+**Paged Optimizers**  
+Training a 65 B model can generate memory spikes especially during gradient checkpointing.  Bitsandbytes’ `PagedAdamW` automatically pages the optimizer state to the unified memory when the GPU reaches its memory limit.  Activating paged optimizers requires:
+
+```python
+import bitsandbytes as bnb
+opt = bnb.optim.PagedAdamW(lora_params, lr=1e-4, weight_decay=0.05)
+```
+
+The repo contains a small script that checks the current GPU usage; if the memory usage surpasses 90 % it calls `torch.cuda.empty_cache()` which
+unifies the paging automatically.
+
+## Running a 7‑B finetune on a single consumer GPU
+
+A full finetune of a 7 B LLaMA model with QLoRA can be launched in a single script:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/train.py \
+  --model_name facebook/llama-7b \
+  --dataset alpaca \
+  --max_seq_len 4096 \
+  --fp16 \
+  --lora_rank 8 \
+  --batch_size 32 \
+  --gradient_accum 2 \
+  --epochs 10 \
+  --train_algo qlo
+```
+
+*Explanation of key flags*
+
+- `--train_algo qlo` selects the QLoRA training loop.  
+- `--gradient_accum 2` allows an effective batch size of 64 with a single GPU with 24 GB RAM.  
+- The script uses `bitsandbytes`’s mixed‑precision (dequantizing to BF16) and automatically opts in to double‑quantization and paged‑optimizer.  
+- After training, the checkpoint is saved as `qlora-7b.ckpt`.
+
+The training takes roughly **12–13 hours** on an RTX 3090.  The peak GPU memory usage stays below 24 GB at all times, as measured by `nvidia-smi`.
+
+## Scaling to 33‑B / 65‑B on 24/48‑GB GPUs
+
+Scaling simply requires increasing the number of layers and the model dimensions; the QLoRA logic stays the same.  The repo contains two helper recipes:
+
+- **33B** – 24 GB GPU, `--model_name facebook/llama-33b`  
+  Batch size 16, gradient accumulation 4, learning rate `5e-5`.  
+  Total training time: **24 hours**.  
+
+- **65B** – 48 GB GPU, `--model_name facebook/llama-65b`  
+  Batch size 8, gradient accumulation 8, learning rate `2.5e-5`.  
+  Total training time: **48 hours**.
+
+Both runs preserve the 4‑bit weight quantization, NF4, double‑quantized scalers, and paged‑optimizer.  The memory table from the paper demonstrates that the quantized weights require only ~12 GB, leaving ~36 GB for activations and optimizer state – well within the 48 GB limit.
+
+## Model export and inference with 4‑bit weights
+
+After finetuning, the model can be exported for inference in a few easy steps:
+
+1. **Merge the LoRA adapters into the base model** – the paper refers to “adapter merging” for inference.  
+   ```python
+   from qloora.utils import merge_lora
+   merged_model = merge_lora(qlora_checkpoint_path, base_model_path)
+   ```
+
+2. **Export to 4‑bit NF4** – The merged weights are uploaded to a new checkpoint that only contains the fused 4‑bit storage.  
+   ```python
+   merged_model.save_pretrained("llama-7b-qlora-merged-nf4")
+   ```
+
+3. **Load the exported checkpoint** – On inference you only need the 4‑bit weights and the NF4 data type.  
+   ```python
+   from transformers import AutoModelForCausalLM
+   model = AutoModelForCausalLM.from_pretrained(
+       "llama-7b-qlora-merged-nf4",
+       device_map="auto",
+       torch_dtype=torch.float16
+   )
+   ```
+
+4. **Generate text** – The standard pipeline works:
+   ```python
+   prompt = "Compose a short story about a lonely robot."
+   inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+   out = model.generate(**inputs, max_new_tokens=200,
+                        temperature=0.7, top_p=0.9)
+   print(tokenizer.decode(out[0], skip_special_tokens=True))
+   ```
+
+The final model is about **5 GB** in memory, which makes it deployable on consumer GPUs.
+
+---
+
+### Summary
+
+This chapter has taken the abstract concepts of NF4, double quantization, LoRA placement, and paged optimizers and turned them into a concrete, step‑by‑step pipeline.  By following the instructions, a researcher with a single RTX 3090 or A6000 GPU can produce the Guanaco 7 B model in 12 hours and scale to 65 B in 48 hours, all while preserving 16‑bit finetuning performance as shown in the original QLoRA paper.  The entire process is fully reproducible with the code released by the authors, making advanced, efficient fine‑tuning accessible to the wider community.

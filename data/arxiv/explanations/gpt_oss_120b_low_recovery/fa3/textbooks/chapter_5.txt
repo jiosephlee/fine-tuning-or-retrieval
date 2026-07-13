@@ -1,0 +1,207 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 5: # Algorithmic Building Blocks of FlashAttention‑3  
+
+In this chapter we dissect the engineering innovations that make **FlashAttention‑3** substantially faster than its predecessors on modern NVIDIA Hopper GPUs.  We start from the most elementary view of attention—splitting the query, key, and value tensors into tiles—then gradually build up the complete software pipeline.  Each component is presented with informal pseudocode, followed by a detailed, intuition‑driven explanation of why the design works on the underlying hardware.  The goal is to give the reader a clear mental model of how asynchronous execution, warp specialization, and low‑precision arithmetic are woven together to achieve near‑peak throughput.
+
+---
+
+## Block Decomposition of \(Q\), \(K\), \(V\)
+
+The self‑attention computation for a single head can be written as  
+
+\[
+\mathbf{S}= \alpha\,\mathbf{Q}\mathbf{K}^{\!\top},\qquad   
+\mathbf{P}= \operatorname{softmax}(\mathbf{S}),\qquad  
+\mathbf{O}= \mathbf{P}\mathbf{V},
+\]
+
+where \(\mathbf{Q},\mathbf{K},\mathbf{V}\in\mathbb{R}^{N\times d}\) and \(\alpha=1/\sqrt{d}\).  Direct evaluation of \(\mathbf{S}\) requires an \(N\times N\) matrix, which quickly exceeds the capacity of fast on‑chip memory as the sequence length \(N\) grows.  FlashAttention‑3 therefore partitions the matrices along the sequence dimension into *blocks* that fit comfortably in shared memory (SMEM).
+
+We denote the **query block size** by \(B_{r}\) and the **key/value block size** by \(B_{c}\).  The query matrix is sliced into  
+
+\[
+\mathbf{Q}_{i}\; \in\; \mathbb{R}^{B_{r}\times d}, \qquad i=1,\dots,T_{r},\qquad T_{r}= \Big\lceil\frac{N}{B_{r}}\Big\rceil,
+\]
+
+and the key and value matrices are sliced analogously into  
+
+\[
+\mathbf{K}_{j},\mathbf{V}_{j}\;\in\; \mathbb{R}^{B_{c}\times d},\qquad 
+j=1,\dots,T_{c},\qquad T_{c}= \Big\lceil\frac{N}{B_{c}}\Big\rceil .
+\]
+
+Each pair \((\mathbf{Q}_{i},\mathbf{K}_{j})\) defines a *score tile*  
+
+\[
+\mathbf{S}_{i}^{(j)} = \alpha\,\mathbf{Q}_{i}\mathbf{K}_{j}^{\!\top}\in\mathbb{R}^{B_{r}\times B_{c}} .
+\]
+
+The corresponding contribution to the output is obtained by multiplying the softmax‑normalized scores with the matching value tile \(\mathbf{V}_{j}\).  Because a single CTA (cooperative thread array) can hold only a few such tiles in SMEM, the algorithm proceeds **in a streaming fashion**, loading one query tile and a sequence of key/value tiles, performing all arithmetic for that query tile, then moving to the next query tile.  This tiling eliminates the need to write the full \(\mathbf{S}\) and \(\mathbf{P}\) matrices to global memory, a decisive factor for bandwidth‑bound workloads.
+
+---
+
+## Warp‑Specialized Producer‑Consumer Pipeline with a Circular SMEM Buffer
+
+A Hopper SM contains 132 streaming multiprocessors (SMs), each of which can run many warps (32‑thread groups) concurrently.  FlashAttention‑3 exploits this parallelism by **splitting the CTA into two warp‑groups**:
+
+1. **Producer warp‑group** – responsible solely for moving data from global memory (HBM) into SMEM using the Tensor Memory Accelerator (TMA).  
+2. **Consumer warp‑group** – performs all arithmetic (matrix‑multiply‑accumulate, softmax, and accumulation of the output) using the asynchronous warp‑group‑wide matrix‑multiply‑accumulate instruction (WGMMA).
+
+The two groups communicate through a **circular buffer** of \(s\) stages in SMEM.  Each stage holds one query tile, one key tile, and one value tile.  The buffer is “circular” because once a stage has been consumed, the producer may overwrite it with the next tile, avoiding any explicit deallocation.
+
+A high‑level pseudocode sketch of the CTA‑level algorithm (without intra‑warp overlapping) is reproduced here for clarity:
+
+```text
+if (warpgroup == producer) {
+    load Q_i from global memory via TMA → SMEM
+    for j = 0 … T_c−1:
+        wait until stage (j mod s) is free
+        load K_j, V_j via TMA → SMEM (stage j mod s)
+        signal consumers that K_j, V_j are ready
+}
+else {   // consumer warpgroup
+    O_i ← 0, ℓ_i ← 0, m_i ← −∞
+    wait until Q_i is in SMEM
+    for j = 0 … T_c−1:
+        wait until K_j, V_j are in SMEM
+        S_ij ← WGMMA( Q_i , K_jᵀ )                // SS‑GEMM
+        // local softmax reduction
+        m_old ← m_i
+        m_i   ← max( m_old , rowmax(S_ij) )
+        P̃_ij ← exp( S_ij − m_i )
+        ℓ_i   ← exp( m_old − m_i )·ℓ_i + rowsum(P̃_ij)
+        // accumulate output
+        O_i   ← diag( exp( m_old − m_i ) )⁻¹·O_i
+                 + P̃_ij·V_j                         // RS‑GEMM
+        release stage (j mod s) to producer
+    endfor
+    O_i ← diag(ℓ_i)⁻¹·O_i ;   L_i ← m_i + log(ℓ_i)
+    write O_i , L_i back to global memory
+}
+```
+
+**Why this works**:  
+* The producer never stalls on arithmetic; TMA calls are *asynchronous* and can be queued while the consumer is busy with a WGMMA.  Conversely, the consumer never issues memory loads; it simply waits on a binary flag that the producer writes after each TMA completes.  By dedicating whole warps to each role, the compiler can allocate more registers to the consumer (which needs many for GEMM) and only a single thread in the producer (which only triggers the DMA).  The circular buffer guarantees that at most \(s\) tiles occupy SMEM simultaneously, allowing the programmer to tune \(s\) to match the latency of TMA versus the latency of WGMMA on the target GPU.
+
+---
+
+## Ping‑Pong Scheduling Across Warp‑Groups to Hide Softmax Latency
+
+Even with the producer–consumer split, the **softmax reduction** remains a potential bottleneck.  The softmax step consists of element‑wise exponentials, row‑wise reductions, and a few scaling operations—all of which execute on the CUDA cores (the “scalar” part of the SM) and have a dramatically lower throughput than the Tensor Cores that drive the GEMMs.  On an H100, FP16 matrix multiplications deliver roughly 989 TFLOP/s whereas the exponential unit provides only about 3.9 TFLOP/s; consequently, the softmax can consume a non‑trivial fraction of the total cycle budget.
+
+FlashAttention‑3 mitigates this by **interleaving two warp‑groups** (let us call them WG0 and WG1) in a *ping‑pong* fashion.  The idea is simple: while WG0 is performing the first GEMM of iteration \(j\) (computing \(\mathbf{S}_{i}^{(j)}\)), WG1 concurrently executes the softmax for the *previous* iteration \(j-1\).  After both finish, the roles swap for the next iteration.  The choreography is enforced by explicit barrier instructions (`bar.sync`) placed at the boundaries of the two GEMM calls.
+
+Visually, the timeline looks like:
+
+```
+time →   |---- WG0 GEMM ----|   |---- WG1 GEMM ----|   |---- WG0 GEMM ----|
+          |--- WG1 Softmax --|   |--- WG0 Softmax --|   |--- WG1 Softmax --|
+```
+
+Because the softmax of iteration \(j-1\) depends only on the score tile \(\mathbf{S}_{i}^{(j-1)}\), which has already been produced, it can be scheduled **as soon as the preceding GEMM finishes**, without waiting for the next GEMM to start.  The two warp‑groups therefore keep the Tensor Cores saturated while the CUDA cores are kept busy with exponentials in parallel, dramatically raising overall utilization from the 35 % observed for FlashAttention‑2 to roughly 75 % for FlashAttention‑3 in FP16.
+
+---
+
+## Two‑Stage GEMM‑Softmax Pipelining Within a Warp‑Group
+
+The ping‑pong scheme described above operates across *different* warp‑groups.  Within a single warp‑group we can further improve overlap by pipelining the **two GEMM operations** that appear in the standard attention loop:
+
+1. **Score GEMM** (`SS‑GEMM`): \(\mathbf{S} = \alpha\,\mathbf{Q}\mathbf{K}^{\!\top}\).  
+2. **Output GEMM** (`RS‑GEMM`): \(\mathbf{O} \mathrel{+=} \mathbf{P}\mathbf{V}\).
+
+Naïvely, the softmax must finish before the second GEMM can begin, because the softmax supplies the probability matrix \(\mathbf{P}\).  However, the *next* score GEMM does **not** depend on the current softmax; it only needs the next key tile.  By keeping a copy of the previous softmax result in registers, we can launch the next score GEMM *before* we finish processing the current softmax, and simultaneously launch the current output GEMM *before* we finish the softmax for the *next* tile.  This yields a **two‑stage pipeline** where each iteration overlaps three activities:
+
+1. **Stage A** – launch `SS‑GEMM` for tile \(j\) (asynchronous WGMMA).  
+2. **Stage B** – while Stage A proceeds, compute softmax on the *previous* score tile and update the running output accumulator.  
+3. **Stage C** – launch `RS‑GEMM` that consumes the softmax of tile \(j-1\) and the value tile \(j-1\) (also asynchronous).
+
+The consumer‑only pseudocode embodying this pipeline is:
+
+```text
+// Initialization
+load Q_i and K_0 → SMEM
+S_cur ← WGMMA(Q_i, K_0ᵀ)          // launch, do not wait
+wait for S_cur
+softmax_and_rescale(S_cur)        // produce P̃_cur, update m_i, ℓ_i, O_i
+
+for j = 1 … T_c−1:
+    // 1. Launch next score GEMM
+    load K_j → SMEM
+    S_next ← WGMMA(Q_i, K_jᵀ)      // asynchronous
+
+    // 2. Launch output GEMM for previous tile
+    load V_{j-1} → SMEM
+    O_i ← WGMMA(P̃_cur, V_{j-1})   // asynchronous
+
+    // 3. Wait for the score GEMM to finish, then softmax
+    wait for S_next
+    softmax_and_rescale(S_next)    // produce P̃_next, update accumulators
+
+    // 4. Wait for output GEMM to finish, then rescale O_i
+    wait for previous WGMMA
+    O_i ← rescale(O_i, m_i, m_old)
+
+    // 5. Rotate buffers
+    P̃_cur ← P̃_next
+    S_cur ← S_next
+endfor
+
+// Final iteration: process last V tile
+load V_{T_c−1} → SMEM
+O_i ← WGMMA(P̃_cur, V_{T_c−1})   // asynchronous
+wait for final WGMMA
+final rescaling of O_i
+```
+
+**Intuition behind the overlap**:  
+*The score GEMM is the most expensive operation* (hundreds of TFLOP/s).  By issuing it one iteration ahead, its latency is effectively hidden behind the much cheaper softmax work.  Conversely, the output GEMM can be issued one iteration *behind* because it only needs the probability tile already computed.  The result is a steady state where every clock tick the Tensor Cores are busy with a GEMM, while the CUDA cores are intermittently busy with softmax.  Empirically this raises measured throughput from roughly 570 TFLOP/s to 620–640 TFLOP/s for FP16, head dimension 128, and sequence length 8192.
+
+---
+
+## Extension to Three‑Stage Pipelining (Design Trade‑offs)
+
+The two‑stage pipeline already yields a substantial speedup, but the same reasoning can be extended to a **three‑stage pipeline**.  The extra stage would overlap the *second* output GEMM with the *softmax* of the *next‑next* tile, effectively staggering the three GEMM calls (score, output of tile \(j\), output of tile \(j+1\)) across three successive iterations.
+
+In principle, the schedule would look like:
+
+1. Issue `SS‑GEMM` for tile \(j\).  
+2. Issue `RS‑GEMM` for tile \(j-1\).  
+3. Issue `RS‑GEMM` for tile \(j-2\) (using the softmax already computed for tile \(j-2\)).  
+
+However, each additional stage inflates **register pressure** because more intermediate score tiles and probability tiles must be kept live simultaneously.  The registers per thread already scale with the product \(B_{r}\times B_{c}\) for the score tile, and adding a second pending score tile roughly doubles this requirement.  On Hopper, each thread can allocate at most 256 registers; exceeding this limit forces spilling to local memory, which dramatically erodes the performance gains from deeper pipelining.
+
+Consequently, the three‑stage design is a *tuning knob* rather than a universal improvement: for small block sizes (e.g., \(B_{r}=32, B_{c}=64\)) the extra registers may be affordable, and the deeper pipeline can push utilization a few percent higher.  For larger blocks—often preferable for higher arithmetic intensity—the register budget becomes the limiting factor and the two‑stage pipeline remains the optimal choice.  The original FlashAttention‑3 implementation therefore defaults to two stages, exposing the three‑stage variant as an experimental option in the code base.
+
+---
+
+## Handling Causal Masking and Attention Variants (MQA, GQA)
+
+The core pipeline described above assumes *full* (non‑causal) attention, where every query may attend to all keys.  **Causal masking** introduces a triangular sparsity pattern: for query index \(i\) only keys with index \(\le i\) are valid.  Implementing this constraint within a tile‑wise algorithm requires two modest modifications:
+
+1. **Dynamic truncation of key/value tiles** – when processing a query block \(\mathbf{Q}_{i}\), the algorithm must ignore any key tile \(\mathbf{K}_{j}\) that lies completely beyond the current diagonal.  For the *partial* tile that straddles the diagonal, the producer loads the whole tile but the consumer masks out the invalid rows before feeding them to the score GEMM.  Because the mask is a simple binary pattern, it can be fused into the WGMMA instruction (using the predicate registers) without extra memory traffic.
+
+2. **Reduced number of iterations** – the inner loop runs only up to \(j = i\) (or the tile‑wise equivalent), halving the effective work for long sequences.  This reduction is automatically captured in the tile counts \(T_{c}\) and \(T_{r}\) when the algorithm computes the block indices.
+
+Beyond causal masking, several recent Transformer variants alter the relationship between queries, keys, and values:
+
+* **Multi‑Query Attention (MQA)** replicates the query matrix for every head but shares a *single* key and value matrix across heads.  In FlashAttention‑3 the producer warp‑group loads the shared \(\mathbf{K},\mathbf{V}\) tiles once per CTA and reuses them for all head‑specific consumer warp‑groups.  The per‑head query tiles are still processed independently, preserving the same tile‑wise pipeline.
+
+* **Grouped Query Attention (GQA)** groups a subset of heads to share keys and values while maintaining distinct queries per head.  The implementation generalizes the MQA approach: each group of heads launches its own consumer warp‑group, but all groups read the same key/value tiles via the same TMA streams.  The circular buffer thus contains *grouped* key/value tiles, and synchronization is performed at the group granularity.
+
+Both MQA and GQA benefit from the same **producer‑consumer asynchrony** because the producer’s work (loading the shared tiles) is amortized across many consumers, increasing the effective memory‑bandwidth utilisation.  Since the softmax reduction is performed *per‑head*, the additional per‑head state (the running max \(m_i\) and scaling factor \(\ell_i\)) resides in registers dedicated to each consumer warp‑group, incurring negligible overhead.
+
+---
+
+### Summary
+
+FlashAttention‑3 assembles a suite of algorithmic tricks that map the mathematical structure of attention onto the asynchronous, warp‑specialized execution model of Hopper GPUs:
+
+1. **Tile‑wise decomposition** limits on‑chip memory usage and enables streaming.
+2. **Producer‑consumer warp specialization** separates data movement (TMA) from heavy arithmetic (WGMMA), allowing both to run concurrently.
+3. **Ping‑pong scheduling** overlaps softmax with GEMM across warp‑groups, hiding the low‑throughput exponentiation stage.
+4. **Two‑stage GEMM‑softmax pipelining** further buries softmax latency inside the GEMM pipeline, maximizing Tensor Core occupancy.
+5. **Optional three‑stage pipelines** trade additional register pressure for marginal throughput gains.
+6. **Mask handling and attention variants** are accommodated with minimal extra logic, preserving the high efficiency of the core pipeline.
+
+Together, these components transform the naïve \(O(N^{2})\) attention operation into a bandwidth‑friendly, compute‑bound kernel that approaches the theoretical limits of the H100 GPU, delivering up to 740 TFLOP/s in FP16 and nearly 1.2 PFLOP/s in FP8 while retaining numerical fidelity.  The remainder of this textbook will build upon these building blocks to explore back‑propagation, low‑precision error analysis, and system‑level integration of FlashAttention‑3 into modern deep‑learning frameworks.

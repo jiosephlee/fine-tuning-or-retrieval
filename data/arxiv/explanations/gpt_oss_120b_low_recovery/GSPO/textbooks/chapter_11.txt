@@ -1,0 +1,80 @@
+\title{A Textbook about the Paper: "Group Sequence Policy Optimization"}
+
+Chapter 11: # Practical Implications for RL Infrastructure
+
+Reinforcement learning (RL) for large language models (LLMs) is typically carried out in a distributed setting where separate software stacks are responsible for training and inference.  Training engines such as **Megatron‑LM** or **DeepSpeed** are tuned for high‑throughput kernel fusion, mixed‑precision computation, and fine‑grained gradient synchronization.  Inference engines, on the other hand, such as **vLLM** or **SGLang**, are built around fast token‑wise decoding, aggressive caching, and often operate at a different floating‑point precision (e.g., bfloat16 versus fp16).  This separation creates a **precision mismatch**: the likelihood values of a sampled response computed during training may differ numerically from those computed during inference, even when the underlying model weights are identical.  In traditional RL pipelines that rely on token‑level importance ratios, such as GRPO, this discrepancy can be fatal because the algorithm demands an exact ratio of the old‑policy likelihood to the new‑policy likelihood for every token.  Any subtle divergence, for example caused by rounding error or different kernel implementations, propagates directly into the importance weights \(w_{i,t}(\theta)\) and consequently corrupts the gradient estimate.
+
+## Precision Mismatch Between Training and Inference Engines
+
+To understand why the mismatch matters, recall the definition of the token‑level importance ratio used in GRPO:
+\[
+w_{i,t}(\theta) \;=\; 
+\frac{\pi_{\theta}\!\bigl(y_{i,t}\mid x, y_{i,<t}\bigr)}
+     {\pi_{\theta_{\text{old}}}\!\bigl(y_{i,t}\mid x, y_{i,<t}\bigr)} .
+\]
+Both the numerator and the denominator are probabilities obtained from the autoregressive policy.  In practice, each probability is the result of a softmax over a large vocabulary, and the softmax is computed in reduced precision for speed.  Even a tiny numeric perturbation of order \(10^{-7}\) in the log‑probability can shift the ratio from a benign value close to 1 to a value that triggers aggressive clipping, because the clipping mechanism only guards against large deviations of the **ratio**, not against small systematic biases.  When the same response is evaluated by two distinct engines—training engine for \(\pi_{\theta}\) and inference engine for \(\pi_{\theta_{\text{old}}}\)—the two sets of log‑probabilities are not guaranteed to be identical.  This inconsistency was observed empirically in the original GRPO experiments: the token‑level importance ratios exhibited high variance, which, after being multiplied by the per‑token advantages, led to noisy gradients and, eventually, to catastrophic model collapse.
+
+## Using Inference‑Engine Likelihoods Directly in GSPO
+
+Group Sequence Policy Optimization eliminates the reliance on token‑level ratios.  Its core importance ratio is defined at the **sequence level**:
+\[
+s_{i}(\theta) \;=\;
+\left(
+\frac{\pi_{\theta}(y_i \mid x)}
+     {\pi_{\theta_{\text{old}}}(y_i \mid x)}
+\right)^{\!1/|y_i|}
+\;=\;
+\exp\!\Bigl(\tfrac{1}{|y_i|}
+      \sum_{t=1}^{|y_i|}\!
+      \log \frac{\pi_{\theta}(y_{i,t}\mid x, y_{i,<t})}
+               {\pi_{\theta_{\text{old}}}(y_{i,t}\mid x, y_{i,<t})}
+      \Bigr).
+\]
+The ratio now aggregates the likelihood of **the entire response** \(y_i\) under the old and new policies, and then normalizes by the response length.  This design has two immediate practical consequences:
+
+1. **Robustness to per‑token numerical noise.**  The exponential averaging smooths out tiny deviations in individual token probabilities.  If a single token’s probability differs slightly between engines, its contribution to the overall exponent is divided by the length \(|y_i|\); the impact on \(s_i(\theta)\) is therefore negligible.
+
+2. **Freedom to reuse inference‑engine likelihoods.**  Because the algorithm only requires \(\pi_{\theta_{\text{old}}}(y_i \mid x)\), we can compute the likelihood with the **same engine that generated the sample** (typically an inference engine).  There is no need to re‑evaluate each token with a training‑engine implementation of the softmax.  In effect, the inference pass that produced the rollout simultaneously yields the quantity needed for the importance ratio.
+
+Thus, GSPO lifts the strict precision alignment constraint that plagued GRPO.  In practice, we observe that the sequence‑level ratios remain stable even when the old‑policy likelihoods are obtained from a different binary with distinct kernel ordering or reduced‑precision arithmetic.
+
+## Benefits for Partial Rollouts and Multi‑Turn RL
+
+Complex RL workflows for LLMs often involve **partial rollouts** (e.g., generating only the first few tokens of a response) or **multi‑turn dialogues**, where the agent must condition on its own previous outputs.  In these scenarios the system typically interleaves inference and training many times per batch:
+
+- **Partial Rollouts:**  
+  After generating a prefix, the system may pause to compute a reward (e.g., via a verifier) before completing the response.  If the same prefix needs to be re‑evaluated under the old policy for importance weighting, a token‑level algorithm would require a full recomputation of each token’s likelihood, dramatically increasing latency.
+
+- **Multi‑Turn RL:**  
+  Each turn creates a new query–response pair, and the policy may be updated after every turn.  The old‑policy likelihoods for the entire dialogue history must be recovered repeatedly, which, under a token‑level scheme, forces the training engine to re‑run the entire decoding pipeline.
+
+GSPO sidesteps both problems.  Since the importance ratio depends only on the **overall** probability of the sampled sequence, we can obtain it in one pass at the moment the sample is generated.  No extra forward passes are needed later.  Moreover, the same approach naturally extends to multi‑turn settings: the likelihood of the **concatenated** dialogue up to a given turn is just another sequence likelihood, and the same length‑normalized ratio can be applied.  Consequently, the engineering effort required to stitch together inference and training phases is dramatically reduced, and the overall wall‑clock time per RL iteration shrinks.
+
+## Memory and Communication Savings
+
+Token‑level importance weighting incurs two hidden costs in a distributed training environment:
+
+1. **Memory Footprint:**  
+   To compute \(w_{i,t}(\theta)\) for every token, the system must retain the old policy’s per‑token log‑probabilities until the gradient step is performed.  For long responses (hundreds of tokens) and large batches, this storage can dominate GPU memory, forcing the use of smaller batch sizes or more aggressive gradient accumulation.
+
+2. **Network Traffic:**  
+   In a model‑parallel or pipeline‑parallel configuration, each token’s probability may reside on a different device.  Communicating all token‑level likelihoods from the inference engine to the training engine (or vice‑versa) creates a substantial bandwidth burden, especially when the rollout batch is split across many workers.
+
+GSPO’s sequence‑level ratios replace a vector of per‑token weights with a **single scalar** per sampled response.  The memory required to store the old‑policy likelihood collapses from \(\mathcal{O}(|y_i|)\) to \(\mathcal{O}(1)\) per sample.  Likewise, the communication volume is reduced by the same factor, because only one floating‑point number (or its log) per response needs to be transmitted.  In practice, this reduction translates into:
+
+- The ability to increase the **group size** \(G\) without exceeding memory limits, thereby improving sample efficiency.  
+- Lower **all‑reduce** costs for gradient synchronization, as fewer auxiliary tensors need to be aggregated.  
+- A simpler **pipeline** where the inference worker can emit both the sampled text and its aggregated likelihood in a single message, eliminating a round‑trip for recomputation.
+
+These savings are especially pronounced for **Mixture‑of‑Experts (MoE)** models, where each token may trigger a distinct subset of experts across many physical devices.  By abstracting away token‑level routing information, GSPO avoids the need for the **Routing Replay** technique that GRPO required to stabilize MoE training.  Consequently, the system can fully exploit the sparsity and capacity of MoE architectures without incurring extra memory for cached routing maps or extra communication to align the old and new routing configurations.
+
+## Summary
+
+The shift from token‑level to sequence‑level importance weighting, embodied in Group Sequence Policy Optimization, yields concrete engineering advantages:
+
+1. **Tolerance to precision mismatches** between training and inference engines, because the length‑normalized sequence ratio smooths out per‑token numerical noise.  
+2. **Direct reuse of inference‑engine likelihoods**, eliminating the need for costly recomputation of token probabilities under the training engine.  
+3. **Simplified handling of partial rollouts and multi‑turn RL**, as a single scalar per sampled dialogue suffices for importance correction.  
+4. **Reduced memory consumption and network traffic**, enabling larger batch sizes, higher expert counts in MoE models, and overall more efficient utilization of hardware.
+
+These practical implications have been borne out in the empirical evaluations presented in the paper: GSPO trains stably at scale, converges without auxiliary stabilization tricks such as Routing Replay, and delivers higher sample efficiency despite clipping a larger fraction of tokens.  By aligning the unit of optimization (the sequence) with the unit of reward (also the sequence), GSPO not only resolves the statistical shortcomings of prior methods but also streamlines the engineering pipeline required for large‑scale RL of language models.

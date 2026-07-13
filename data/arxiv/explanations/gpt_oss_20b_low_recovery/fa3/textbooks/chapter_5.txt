@@ -1,0 +1,132 @@
+\title{A Textbook about the Paper: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"}
+
+Chapter 5: # Optimizing Low‑Precision Attention with FP8
+
+Deep learning practitioners increasingly need to run Transformer models on hardware that delivers the highest *throughput per watt*. on NVIDIA Hopper GPUs, the Tensor Cores provide a special instruction set that can multiply a FP8 matrix by a FP8 matrix and accumulate in FP32 at twice the throughput of a conventional FP16 matrix‑multiply. Unfortunately, FP8’s dramatically reduced mantissa (3 bits) and exponent (4 bits) taxes numerical accuracy, especially for the soft‑max‑heavy attention computations that dominate large‑language‑model pipelines. This chapter explores the obstacles presented by FP8, and the two key techniques—*block‑wise quantization* and *incoherent processing*—that FlashAttention‑3 uses to revive accuracy without sacrificing its expressive speedup.
+
+---
+
+## FP8 Geometry: Floating‑Point Format, Dynamic Range, and Quantization Granularity
+
+FP8 is a *binary8* format. The concise layout:
+
+```
+| sign | 4‑bit exponent | 3‑bit mantissa |
+```
+
+The 4‑bit exponent, in two’s‑complement bias of 7, gives an exponent range of \(-7\) to \(+8\). The 3‑bit mantissa yields only eight distinct significand values (0‑7). Consequently, FP8 can represent numbers roughly in \([3.71\times10^{-5}, 35.423)\). Compared to FP16’s \([6.10\times10^{-5}, 65504]\) and BF16’s \([1.19\times10^{-38}, 3.39\times10^{38}]\), FP8’s dynamic range is about one–tenth of FP16 and exponentially smaller than BF16. In the context of attention, this limits the precision with which we can store the intermediate scores \(\mathbf{S}= \mathbf{Q}\mathbf{K}^{\top}\), the per‑row maxima used for the soft‑max stability trick, and the soft‑max probabilities \(\mathbf{P}\).
+
+Because FP8 has such few distinct values, a naive *per‑tensor* quantization scheme—where a single scale factor is applied to an entire tensor—often results in a catastrophic loss of precision for a small fraction of *outlier* entries that lie dozens of standard deviations away from the bulk of the distribution. The quantization error for such outliers can propagate through the exponentiated soft‑max, leading to wildly distorted attention weights. To manage this, we *reduce* the range that a given quantization scheme operates over by segmenting the tensor into many small *blocks* and quantizing each block independently. This introduces an additional coefficient per block, giving the algorithm the tight flexibility needed to accommodate local spiking features.
+
+---
+
+## Layout Constraints for k‑Major WGMMA: In‑Kernel Transpose Using LDSM/STSM
+
+FlashAttention‑3’s forward pass performs two consecutive GEMMs per block pair:
+1. \(\mathbf{S}_{i}^{(j)} \gets \mathbf{Q}_{i}\mathbf{K}_{j}^{\top}\)  
+2. \(\widetilde{\mathbf{P}}_{i}^{(j)} \mathbf{V}_{j}\)
+
+On Hopper, the WGMMA instruction that issues these GEMMs can accept either *mn‑major* or *k‑major* layout for FP16 operands, but for FP8 it only supports *k‑major* operands. In practice, this limitation arises from the internal associate of the Tensor Core’s address calculations: the first operand’s stride in the innermost dimension (the "k" dimension in M×K × N×K multiplication) must be one so that the hardware can fetch contiguous memory. While the query matrix \(\mathbf{Q}\) is naturally laid out in k‑major form, \(\mathbf{V}\) is usually stored transposed: its outermost dimension is *sequence length* rather than the head dimension. Therefore, before we can feed \(\mathbf{V}\) to the second WGMMA we must rearrange the memory layout from *m‑major* to *k‑major*.
+
+Rather than performing a global transpose on the entire \(\mathbf{V}\) tensor in host memory—which would double the memory traffic and degrade inference throughput—FlashAttention‑3 incurs the penalty in‑kernel, on‑chip, with the *load‑matrix* (LDSM) and *store‑matrix* (STSM) PTX primitives. These instructions allow a warp to load an \(8\times 8\) tile of FP8 values from shared memory into registers, then copy it back in transposed order. Because each warp loaded 128 B (64 entries × 2 B per FP8 entry) it could trivially perform an 8×8 tile transpose while staying within register pressure budgets. The key recipes are:
+
+| Step | Instruction | Purpose |
+|------|-------------|---------|
+| 1 | `ldmatrix.sync.aligned.m16n16.x4.shared.v4f8[v][0:3]` | Load a 4×16 FP8 block into registers as eight 8‑bit elements per thread, contiguous in the *k* dimension. |
+| 2 | `stmatrix.sync.aligned.m16n16.x4.shared.v4f8[v][0:3]` | Store the registers back to SMEM but with transposed strides. |
+
+With this lightweight in‑kernel transpose, the *k‑major* requirement is satisfied on the second WGMMA without any extra global‑memory traffic.
+
+---
+
+## Accumulator vs. Operand Layout Transformation
+
+In the WGMMA instruction, the accumulation buffer resides in register file (RMEM) in a distinct layout from the operand tiles. For FP8, the accumulator layout is *block‑wise* in two 4×4 fragments: the first 16 entries occupy 16 registers across 4 threads, the second 16 entries occupy the next 16 registers. The operand layout, on the other hand, is packed in *row‑major* fragments: each thread holds eight 8‑bit values in consecutive registers.
+
+During a forward pass, we execute two successive FP8 WGMMAs:
+
+1. \(\mathrm{SS\_GEMM}\): \(\mathbf{S}\) accumulation.  
+2. \(\mathrm{RS\_GEMM}\): \(\widetilde{\mathbf{P}}\mathbf{V}\) accumulation.
+
+Because the accumulator layout of the first WGMMA does not match the operand layout of the second, Sanity dictates a rearrangement after the first multiplication and before the second. The set of registers that hold the first \(\mathbf{S}\) fragment are permuted as
+
+\[
+\{\, d_{0},d_{1},d_{4},d_{5},d_{2},d_{3},d_{6},d_{7}\,\}.
+\]
+
+This permuting operation is performed with byte‑permute PTX instructions (`byte_perm`), which reshuffle registers within a 32‑bit word. By aligning the rotated fragments with the layout expected by the OP operand, we avoid costly register shuffles across warps. The resulting tile can then be directly multiplied against the *transposed* \(\mathbf{V}\) fragment, and the result is correctly added into the output accumulator.
+
+The upshot is that we leverage full FP8 throughput without incurring a mapping penalty, staying wholly within the bounds of the GPU’s instruction set.
+
+---
+
+## Block‑wise Quantization: Per‑Block Scaling Factors
+
+An *attention scoring block* is defined by the index pair \((i,j)\), indexing a query block \(\mathbf{Q}_{i}\) and a key block \(\mathbf{K}_{j}\). In FP8, a single global scaling factor for a tensor can produce a huge quantization error when the tensor contains both typical entries (±１) and a few extreme outliers. To mitigate this, FlashAttention‑3 adopts a *block‑wise* scaling strategy:
+
+- For each block of \(\mathbf{Q}\), \(\mathbf{K}\), or \(\mathbf{V}\) we compute a **local** scale factor \(s\) by taking the maximum absolute value:
+  \[
+  s_{\mathbf{Q}_{i}} = \max |\,\mathbf{Q}_{i}\,|,\qquad
+  s_{\mathbf{K}_{j}} = \max |\,\mathbf{K}_{j}\,|,\qquad
+  s_{\mathbf{V}_{j}} = \max |\,\mathbf{V}_{j}\,|.
+  \]
+- We then quantize each element in the block as:
+  \[
+  \widehat{x} = \operatorname{quantize}_{e4m3}\!\left( \frac{x}{s} \right).
+  \]
+
+Because each block uses its own scale, we keep the quantization range bounded to a few standard deviations for the vast majority of the entries, while outliers that saturate the 8‑bit range still incur a smaller relative error in the scaled domain.
+
+The block‑wise scales can be pre‑computed and fused into a *right‑before‑attention* kernel (for example, a rotary‑embedding pass). The resulting scale factors are tiny in number (one per block) and can be broadcast from the L1 cache without incurring significant latency.
+
+The final, *quantized* block is then directly loaded into shared memory and fed to the FP8 WGMMA via TMA, preserving all the throughput gains offered by the Tensor Cores.
+
+---
+
+## Incoherent Processing: Random Orthogonal Projections to Even Out Outliers
+
+Even after block‑wise scaling, the distribution of values within some blocks may still exhibit *right‑skew* because the neural network has learned to exploit rare large activations. To *de‑skew* the block distribution, we apply a *random orthogonal projection* to both \(\mathbf{Q}\) and \(\mathbf{K}\) before quantization:
+
+\[
+\mathbf{Q}^{\prime} = \mathbf{Q}\,\mathbf{M},\qquad
+\mathbf{K}^{\prime} = \mathbf{K}\,\mathbf{M},
+\]
+
+where \(\mathbf{M}\in \mathbb{R}^{h_d\times h_d}\) is a random orthogonal matrix built as the product of diago‑al \(\pm 1\) matrices and a Hadamard matrix. Because \(\mathbf{M}\) satisfies \(\mathbf{M}\mathbf{M}^{\top}= \mathbf{I}\), we have
+
+\[
+\mathbf{Q}^{\prime}\mathbf{K}^{\prime \top}
+  = (\mathbf{Q}\mathbf{M})(\mathbf{K}\mathbf{M})^{\top}
+  = \mathbf{Q}\mathbf{K}^{\top},
+\]
+
+preserving the original attention scores. Crucially, the *product* \(\mathbf{Q} \mathbf{K}^{\top}\) is invariant, but each individual vector in the projection space is a random linear combination of the original coordinates. This *mixes* large outlier coordinates into multiple entries, lowering their magnitude and evenly distributing the tail mass. In effect, we are *incoherently* processing the data: the orthogonal projection is oblivious to the semantic meaning the network would otherwise assign to the outlier features.
+
+The projection step is performed *just before* quantization, and, thanks to the linearity of matrix‑multiplication, it can be fused with the rotary‑embedding or other pre‑processing kernels so that no additional GPU kernel launch is required. Moreover, because the orthogonal matrix comprises only \(\pm 1\) and a Hadamard transform, the multiplication costs \(O(d\log d)\), which is negligible compared to the full two GEMMs executed by the Tensor Cores.
+
+---
+
+## Accuracy vs. Speed Trade‑offs: Benchmarks and Error Analysis
+
+The *cost* of adding the two accuracy‑preserving stages—block quantization and orthogonal projection—is both a *tiny* increase in register pressure and a modest memory traffic due to storing a handful of per‑block scalars. Yet, the *benefit* is dramatic:
+
+| Mode | FP8 TFLOPs/s (H100) | Accuracy (RMSE vs. FP64) |
+|------|---------------------|--------------------------|
+| Baseline FP8 (per‑tensor scaling) | 1020 | 3.17× higher error |
+| FlashAttention‑3 FP8 (block + incoherent) | 1080 | 2.6× lower error |
+
+The table demonstrates that we barely sacrifice any throughput to achieve a factor‑of‑two error reduction in a full transformer forward pass. The *reduced error* is critical for training stability, as large numerical errors in the attention output can drive unstable gradients that deteriorate the convergence of LLMs.
+
+Crucially, the *soft‑max* step is executed in full 32‑bit precision. While the intermediates (\(\mathbf{S}\), \(\widetilde{\mathbf{P}}\)) are stored in FP8, the per‑row maximum, normalization factors, and final soft‑max probabilities are all accumulated in FP32 registers. This hybrid scheme ensures that the exponentiation’s dynamic range is not bottlenecked by FP8’s limited exponent bits.
+
+---
+
+## Take‑Away Summary
+
+1. **FP8 Geometry** imposes a tight dynamic range that mandates *per‑block scaling* to avoid catastrophic quantization of outliers.  
+2. **Hardware‑level layout constraints** (k‑major input for FP8 WGMMA) are resolved by *in‑kernel transpose* with LDSM/STSM, incurring no host‑to‑device traffic.  
+3. **Accumulator–operand layout mismatch** is addressed with register‑level permutations, allowing back‑to‑back FP8 WGMMAs without shuffle.  
+4. **Block‑wise quantization and incoherent random orthogonal projection** jointly control the distribution of activations, drastically reducing RMSE on a reference FP64 attention baseline.  
+5. The *speed preservation* is enviably high: an FP8-aware FlashAttention‑3 implementation attains 1.2‑PFLoPs/s on Hopper while keeping the algorithmic precision on par with its FP16 counterpart.  
+
+These ideas illuminate how the inner‑kernel design of attention must be rethought when migrating to the next generation of low‑precision hardware. By combining fine‑grained quantization, disruptive layout transformations, and subtle data‑mixing, FlashAttention‑3 achieves both the *throughput* and *numerical fidelity* required for state‑of‑the‑art long‑context transformer workloads.
