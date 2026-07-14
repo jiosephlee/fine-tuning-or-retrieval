@@ -75,10 +75,26 @@ for source in arxiv legal medical; do
         echo "Incomplete E35 explanation corpus: $explanation_root has $item_count items; expected 12" >&2
         exit 1
     fi
+
+    for domain_path in "$explanation_root"/*; do
+        [[ -d "$domain_path" ]] || continue
+        domain="$(basename "$domain_path")"
+        paraphrased_root="$PROJECT_ROOT/data/$source/paraphrased/$domain"
+        if [[ ! -d "$paraphrased_root" ]]; then
+            echo "Missing E35 paraphrase corpus: $paraphrased_root" >&2
+            exit 1
+        fi
+        for ((paraphrase_idx = 0; paraphrase_idx < NUM_PARAPHRASED; paraphrase_idx++)); do
+            if [[ ! -f "$paraphrased_root/$paraphrase_idx.tex" && ! -f "$paraphrased_root/$paraphrase_idx.txt" ]]; then
+                echo "Missing E35 paraphrase $paraphrase_idx for $source/$domain in $paraphrased_root" >&2
+                exit 1
+            fi
+        done
+    done
 done
 
 if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
-    echo "E35 preflight passed: $DOCUMENT_MATCH_INSERT_EXPLANATION_MODEL (12 items in each domain)"
+    echo "E35 preflight passed: $DOCUMENT_MATCH_INSERT_EXPLANATION_MODEL and $NUM_PARAPHRASED flat-layout paraphrases for all 36 domains"
     exit 0
 fi
 
