@@ -4,6 +4,8 @@
 
 ## Reviewer T6jM
 
+Thank you for your feedback. We have performed additional experiments, would like to report these results, and respond to your comments to clarify key issues.
+
 - **Weakness:** "The set of data is so small to fit into a single batch. Moreover, most of the batch is made of content restricted to a limited set of topics. Both conditions are far from real pre-training where sampling occurs into a much larger and heterogeneous distribution."
   - Response: run the experiment again with batch size 2048
 
@@ -36,12 +38,31 @@
 
 ## Reviewer YQYf
 
-- **Weakness:** "The experiments are primarily conducted on technical papers and medical corpora. As a result, it remains unclear whether the observed effects generalize across broader domains or are specific to these specialized datasets."
-  - While we agree that it's possible to extend to more domains, (1) the cost-effective feasibility of our experiments, in which we have 36+ domains, relies on the fact that these domains are relatively small (e.g., 10,000+ tokens) and (2) self-contained & new from the distribution. With all LLMs having pre-training distributions that cover 2024, etc., we find that not many domains have generated open-access documents that are (1) packaged in a relatively self-contained manner and (2) generate new knowledge.
-  - Further, we also find our study, compared to previous studies like Chang et al., to be much more diverse, covering three complex domains (versus their focus on biographical facts alone).
+Thank you for your feedback and review. We respond to your comments below to clarify key issues.
 
-- **Weakness:** Practical takeaways — "While the paper provides valuable insights into knowledge acquisition during pre-training, it would have been even more impactful if the authors had connected these findings to practical recommendations or empirical studies on foundation model training, such as pre-training strategies, post-training methodologies, or curriculum design. Such discussions would provide more actionable guidance for practitioners."
-  - We wish to highlight that we have recommended "the nuanced point of paraphrasing" and "the importance of auxiliary views" as data augmentation for practical takeaways; if the reviewer is desiring full recipes, we find that the point of this paper is to scientifically determine the relevance of this, and so figuring out the exact recipes that would incorporate this is outside the scope of this paper.
+- **Weakness:** "The experiments are primarily conducted on technical papers and medical corpora. As a result, it remains unclear whether the observed effects generalize across broader domains or are specific to these specialized datasets. Since collecting data from more diverse domains appears feasible, validating the findings on a wider range of corpora would be a valuable direction for future work."
+  > We agree that validating our findings on additional domains is a valuable direction to strengthen the generalization of our results. One point we failed to sufficiently highlight and we would like to elaborate on, however, is that our corpus is substantially more diverse than what is common in controlled studies of knowledge acquisition. Because these studies must verify that the target knowledge is absent from pre-training to isolate it from confounding factors, they have relied on narrow corpora: synthetic biographies [1], GPT-4-generated fictional-entity descriptions [2], fictitious name–description pairs [3], entity-centric Wikipedia articles about recent films and people [4], atomic facts from Wikidata triples (e.g., "Where is [X] located?") [5], and recent sports events [6]. Against this backdrop, we cover three qualitatively distinct domains: computer science papers, U.S. federal appellate opinions, and PubMed case reports, with 36 documents and ~6,900 probes plus ~4,800 MCQA variants, exceeding the scale and domain diversity of these prior works while retaining their level of experimental control.
+  > On feasibility, extending to further domains is less straightforward than it may appear, because our controlled setting imposes strict requirements on candidate documents. Each must be (1) verifiably absent from the pre-training corpus (we restrict to post-cutoff documents and confirm zero matches via the Infini-gram index), (2) genuinely *new* knowledge rather than restatements of established material, (3) self-contained enough that probes have a tractable ground truth that can be referenced, and (4) short enough (~10K tokens) for single-batch injection to remain tractable across many experiments on large models. Few open-access domains regularly produce documents meeting all four criteria; the three we chose (research papers, judicial opinions, case reports) are among the ones that do. Other candidate domains exist but many fall under fictional or biographical genres; as briefly noted in our introduction, the representation of such atomic facts is comparatively trivial, so we intentionally avoided these domains. That said, we recognize there are other promising domains that may satisfy our criteria, such as patent applications, and we agree that validating our findings on them is valuable future work, which we will note in the paper.
+  >
+  > [1] Physics of Language Models: Part 3.1, Knowledge Storage and Extraction
+  >
+  > [2] How Do Large Language Models Acquire Factual Knowledge During Pretraining?
+  >
+  > [3] The Reversal Curse: LLMs Trained on "A is B" Fail to Learn "B is A"
+  >
+  > [4] Instruction-tuned Language Models are Better Knowledge Learners
+  >
+  > [5] Does Fine-Tuning LLMs on New Knowledge Encourage Hallucinations?
+  >
+  > [6] Injecting New Knowledge into Large Language Models via Supervised Fine-Tuning
+
+
+- **Weakness:** "While the paper provides valuable insights into knowledge acquisition during pre-training, it would have been even more impactful if the authors had connected these findings to practical recommendations or empirical studies on foundation model training, such as pre-training strategies, post-training methodologies, or curriculum design. Such discussions would provide more actionable guidance for practitioners."
+  > We wish to highlight that our Discussion section does offer practical recommendations: applying paraphrasing when data is scarce while recognizing that its benefit is conditional on batch size, augmenting training data with auxiliary views (especially for scientific domains where such views do not yet exist), and continuing pre-training on prerequisite knowledge to close foundational gaps. If more specific recipes are what is desired, we see the goal of this paper as scientifically isolating whether and how these data-representation choices matter; determining the exact recipes that incorporate them at scale requires a different kind of experimentation and is outside the scope of this paper, though we agree it is a natural next step that our findings help motivate. 
+  > During the rebuttal, we've ran additional experimetns that could align with your desire for more rpactical insights from the paper. One of expeirments ablated the model that generates the auxiliary views; we find that each model performs well on a particular metric and the dominant factor is that the performance does not depend on model capabilties, but each model produces a unique auxiliary view that benefits the model differnetrlt; in additiona to the fact that this synsthetc data augmentation strategy does not strongly depend on the strenght of the teacher model but functions as a general technique as long as the model is capable of generating an auxiliary view. Further, we find that there is a natural diversity factor in synthetic data augmentaiton in which various models can be used to provide unique auxiliary views that come with unique advnatages that can be unified together; We plan to include the specific detaisl of this ablation in the expeirment and provide a discussion on synthetic data augmentation in the final manuscript.
+
+- **Reproducibility:** 
+  > While ARR does not allow links to be included in responses, we have now prepared a repository containing our code and datasets, which we will include in the final manuscript. The appendix also provides hyperparameters and detailed descriptions of how we collected the data and designed the pipeline. We would appreciate any specific feedback on what would further improve the reproducibility of our paper.
 
 ## Reviewer XstK (not yet addressed)
 

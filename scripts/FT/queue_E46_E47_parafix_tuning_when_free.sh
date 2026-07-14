@@ -1,8 +1,9 @@
 #!/bin/bash
 
-# Rerun of the para9 scale-0.5 experiments (formerly E41/E42) after the
+# Rerun of the para9 doc-match scale-0.5 experiment (formerly E41) after the
 # paraphrase-subfolder fix: legal/medical paraphrases now load from the flat
-# data/{source}/paraphrased/{domain}/ layout.
+# data/{source}/paraphrased/{domain}/ layout. E47 was removed from this queue
+# (handed off to run elsewhere).
 
 set -euo pipefail
 
@@ -46,8 +47,4 @@ echo "$(date -Is) Starting E46"
 PUSH_TO_HUB_CPT_ID="${E46_PUSH_TO_HUB_CPT_ID:-e46-olmo2-7b-para9-docmatch-scale0_5-parafix-20260713}" \
     bash E46_paraphrase_training_doc_match_scale0_5.sh
 
-echo "$(date -Is) Starting E47"
-PUSH_TO_HUB_CPT_ID="${E47_PUSH_TO_HUB_CPT_ID:-e47-olmo2-7b-para9-expl-scale0_5-parafix-20260713}" \
-    bash E47_granular_explanations_scale0_5.sh
-
-echo "$(date -Is) Completed E46-E47"
+echo "$(date -Is) Completed E46"
