@@ -367,7 +367,7 @@ launch_server() {
     --port "${VLLM_PORT}"
     --data-parallel-size "${DATA_PARALLEL_SIZE}"
     --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}"
-    --max-model-len 16384
+    --max-model-len 36864
     --gpu-memory-utilization 0.95
     --max-num-seqs "${MAX_NUM_SEQS}"
     --max-num-batched-tokens 8192

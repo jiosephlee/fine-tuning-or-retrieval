@@ -83,10 +83,17 @@ def normalize_label(value: str) -> str:
     return match.group(1).upper()
 
 
+# vLLM behind LiteLLM wraps JSON-mode output in markdown fences.
+_JSON_FENCE_RE = re.compile(r"\A\s*```(?:json)?\s*(.*?)\s*```\s*\Z", re.DOTALL)
+
+
 def parse_answer(protocol: str, content: str) -> tuple[str | None, str]:
     """Return (answer, parse_status) without using a semantic judge."""
     if protocol != "constrained":
         raise ValueError(f"Unsupported answer protocol: {protocol!r}")
+    fence_match = _JSON_FENCE_RE.match(content or "")
+    if fence_match:
+        content = fence_match.group(1)
     try:
         payload = json.loads(content)
     except (TypeError, json.JSONDecodeError):
@@ -239,6 +246,47 @@ def _usage_dict(completion: Any) -> dict[str, int | None]:
     }
 
 
+def _streamed_completion(
+    client: OpenAI, params: dict[str, Any]
+) -> tuple[str, str | None, str | None, dict[str, int | None]]:
+    """Stream a completion and reassemble it client-side.
+
+    The LiteLLM proxy sits behind an nginx gateway that times out long
+    non-streaming responses (504), and 32k-token reasoning generations exceed
+    that limit. Streaming keeps bytes flowing so the connection stays alive.
+    """
+    stream = client.chat.completions.create(
+        **params, stream=True, stream_options={"include_usage": True}
+    )
+    parts: list[str] = []
+    refusal: str | None = None
+    finish_reason: str | None = None
+    usage: dict[str, int | None] = {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "reasoning_tokens": None,
+    }
+    for chunk in stream:
+        chunk_usage = getattr(chunk, "usage", None)
+        if chunk_usage is not None:
+            details = getattr(chunk_usage, "completion_tokens_details", None)
+            usage = {
+                "prompt_tokens": getattr(chunk_usage, "prompt_tokens", None),
+                "completion_tokens": getattr(chunk_usage, "completion_tokens", None),
+                "reasoning_tokens": getattr(details, "reasoning_tokens", None),
+            }
+        if not chunk.choices:
+            continue
+        choice = chunk.choices[0]
+        delta = getattr(choice, "delta", None)
+        if delta is not None:
+            if getattr(delta, "content", None):
+                parts.append(delta.content)
+            refusal = getattr(delta, "refusal", None) or refusal
+        finish_reason = getattr(choice, "finish_reason", None) or finish_reason
+    return "".join(parts).strip(), finish_reason, refusal, usage
+
+
 def _retry_delay(exc: Exception, attempt: int) -> float:
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None)
@@ -275,17 +323,22 @@ def evaluate_one(
     started = time.time()
     for attempt in range(1, max_attempts + 1):
         try:
-            completion = client.chat.completions.create(
-                **_request_params(model, protocol, question)
-            )
-            choice = completion.choices[0]
-            message = choice.message
-            content = (message.content or "").strip()
-            refusal = getattr(message, "refusal", None)
+            params = _request_params(model, protocol, question)
+            if model.provider == "openai":
+                completion = client.chat.completions.create(**params)
+                choice = completion.choices[0]
+                message = choice.message
+                content = (message.content or "").strip()
+                refusal = getattr(message, "refusal", None)
+                finish_reason = getattr(choice, "finish_reason", None)
+                usage = _usage_dict(completion)
+            else:
+                content, finish_reason, refusal, usage = _streamed_completion(
+                    client, params
+                )
             answer, parse_status = parse_answer(protocol, content)
             if refusal:
                 answer, parse_status = None, "refusal"
-            finish_reason = getattr(choice, "finish_reason", None)
             if finish_reason == "length":
                 answer, parse_status = None, "truncated"
             return {
@@ -306,7 +359,7 @@ def evaluate_one(
                 "parse_status": parse_status,
                 "finish_reason": finish_reason,
                 "response_content": content,
-                "usage": _usage_dict(completion),
+                "usage": usage,
                 "attempts": attempt,
                 "elapsed_seconds": round(time.time() - started, 3),
                 "terminal": True,
