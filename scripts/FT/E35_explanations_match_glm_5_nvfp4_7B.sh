@@ -31,7 +31,10 @@ cd "$SCRIPT_DIR"
 mkdir -p logs
 
 MODEL_ID="${MODEL_ID:-allenai/OLMo-2-1124-7B}"
-CONDA_ENV="${CONDA_ENV:-openrlhf}"
+E35_ENV_ROOT="${E35_ENV_ROOT:-/vast/projects/myatskar/design-documents/conda_env}"
+CONDA_ENV="${CONDA_ENV:-$E35_ENV_ROOT/tuning}"
+PYTHON_PACKAGE_OVERLAY="${PYTHON_PACKAGE_OVERLAY:-$E35_ENV_ROOT/e35_e28_overlay}"
+E35_REQUIRE_REPRO_ENV="${E35_REQUIRE_REPRO_ENV:-1}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 NUM_EPOCHS="${NUM_EPOCHS:-100}"
 NUM_PARAPHRASED="${NUM_PARAPHRASED:-9}"
@@ -118,6 +121,55 @@ if command -v module >/dev/null 2>&1; then
 fi
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
+
+if [[ -n "$PYTHON_PACKAGE_OVERLAY" ]]; then
+    if [[ ! -d "$PYTHON_PACKAGE_OVERLAY" ]]; then
+        echo "Missing Python package overlay: $PYTHON_PACKAGE_OVERLAY" >&2
+        exit 1
+    fi
+    export PYTHONPATH="$PYTHON_PACKAGE_OVERLAY${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
+# Record the numerical stack in the Slurm log and optionally fail fast unless
+# it matches the E28 environment whose base-model probe metrics were validated.
+python -u - "$E35_REQUIRE_REPRO_ENV" <<'PY'
+import sys
+
+import accelerate
+import flash_attn
+import torch
+import transformers
+import trl
+
+versions = {
+    "python": ".".join(map(str, sys.version_info[:3])),
+    "torch": torch.__version__,
+    "cuda": torch.version.cuda,
+    "transformers": transformers.__version__,
+    "trl": trl.__version__,
+    "accelerate": accelerate.__version__,
+    "flash_attn": flash_attn.__version__,
+}
+print("E35 runtime: " + ", ".join(f"{key}={value}" for key, value in versions.items()))
+
+if sys.argv[1] == "1":
+    expected = {
+        "python": "3.12.13",
+        "torch": "2.10.0+cu130",
+        "cuda": "13.0",
+        "transformers": "5.13.1",
+        "trl": "1.8.0",
+        "accelerate": "1.14.0",
+        "flash_attn": "2.8.3",
+    }
+    mismatches = [
+        f"{key}: got {versions[key]!r}, expected {value!r}"
+        for key, value in expected.items()
+        if versions[key] != value
+    ]
+    if mismatches:
+        raise SystemExit("E35 reproducibility environment mismatch:\n" + "\n".join(mismatches))
+PY
 
 RUN_ID="${RUN_ID:-${SLURM_JOB_ID:-$(date +%Y%m%d_%H%M%S)}}"
 TORCHRUN_LOG_DIR="${TORCHRUN_LOG_DIR:-logs/E35_expl_match_glm_5_nvfp4_${RUN_ID}}"
