@@ -7,34 +7,31 @@
 Thank you for your feedback. We have performed additional experiments, would like to report these results, and respond to your comments to clarify key issues.
 
 - **Weakness:** "The set of data is so small to fit into a single batch. Moreover, most of the batch is made of content restricted to a limited set of topics. Both conditions are far from real pre-training where sampling occurs into a much larger and heterogeneous distribution."
-  - Response: run the experiment again with batch size 2048
+  - Response: We sure to clarify the statement "the set of data is so small to fit into a single batch". We would like to first clarify that the size of our batch for our main experiment is 256 where each chunk has a sequence length of 4096 tokens where at each training step the model is passed 1,048,576; while we we recognize that this is not the same condition as pre-training, we are not far from it. Olmo2 for the 7B model utilizes a abtch size of 1024 with a sequence length of 4096 tokens, only 4times larger than ours. Further, while we do insert a very homogenous distribution of documents concenring, law, computerscience, and medicine for 70% of the abtch, the other 30% is general itnernret data, the same that OLMO2 uses for their pretraining data. Thus, our experiments are much closer to the pre-training condition than the author may have understood. 
+  - However, recognzie that it is still not the same, and as the author noted in a spearat ecomment the optimizer state is also not taken direfctly from pretraining, which tecnically puts us in the continued pretarning regime. To support the generalization of our results to have legiamte sceitntific iplications on pre-training, we repeated our main experiment in a true pre-training setting, where we've taken the OLMO training codebase and taken a checkpoint and its optimizer to replicate the exact same experiment but with the exact same data that OLMO2 used in pret-traiing and th exact same optimizer. We see that the results are the same where .... We see that parahasing does actaully a bit wrose in these settings and this is predicabtl explained by the parahrasing laws our paper has uncovered where paraphrasing does worse at larger abtch sizes.
 
 - **Weakness:** "Fixing the token budget is necessary for fair comparison. However, upsampling paraphrasing and source in order to match the same budget of the auxiliary views introduces a significant amount of duplicates in the batch, especially in the source setting. Duplication has been known to harm pre-training, and may explain such a strong performance gap. It also explains why overfitting occurs sooner than in auxiliary views."
-  - The ceiling saturation argument from Figure 1.
-  - Replot the results with the x-axis as # of source documents.
-  - We believe these concerns are less significant than one may think, since the advantage of auxiliary views should be contrasted with "paraphrasing," where we have much less repetition.
-  - Duplication has never been bad, it's only been inefficient; duplication only helps.
-  - Repeating the Auxiliary View experiment with no oversampling (both lr4e-5 and lr8e-5) & comparing against para49 (does actually worse; explained by paraphrasing laws).
+  - First, before we dicsuss empirical results, we awnat to push back on the notion that duplication has "harmed" pretraining. The prevailing notion in the literature is that duplication is actually good (e.g. see repetition) but it is merely inefficient and compute should be spent on seeing new tokens to maimize use of compute (e.g. see https://aclanthology.org/2022.acl-long.577.pdf ) and its harmful effect that is encourages vebratim memorization (but that is only good in our setting where our factual probes check for near-verbatim questions). However, it's still quite possibe and likely taht sufficient reperition does actaully harm the model and cause overfitting.
+  - The ceiling saturation argument from Figure 1. -> We see that in figure 1 that we can check if our "results hold" with less tokens by simply examining the graph at a earlier timestep where it would have seeen the documents less and thus overfit less. We see that already at 20 steps that the auxiliary views exceeds both paraphrasing and source and both of the other cnoditions quickly saturate. While one could fframe this as source is overfitting, we are not concerned with whether source is overfit by the end or not, but the "ceiling of source" and how well it can do. We see that source does not do verty well and then collapse but it just faces a lower ceiling to begin with compared to auxiliary view. By design, the strenght of auxiliary views, is that it is a strong way to "augment the data" allowing the model to go past the "source only ceiling" and learn to exceed it with sufficient training stpes. We agree that on a low compute setting, auxiliary views wouldn't necessarily be better as they do similar in the beginning of training. Furthermore, we don't do better than just source but also paraphrase, which is meant to prevent the overfitting from source.
+  - One possible counterargument to the above is that once we upsample tokens, the density of similar tokens seen in each batch increases which may put source at an inherent disadvantage. While we still thinkg the "ceiling argument holds", it's possible that the density prevents source from reaching its ceiling. Thus we repeat our experiemnts at lower densities, 0.5 and 0, where 0.5 is the 0.5 of the axuliwray views are inserted and thus the upsamplins is done only 50% of the degree. Then 0, is where we keep the single document insertions at each batch, but then we take out certain document insertions and just put in auxilairy views instead which is the most advversarial as we're giving it much less exposure to the source document. We see that while the gap diminishes, auxiliary views still have an advntage. Furthermore, the more important aspect is that source does not ever do better with lower densities. IT only does wrose, showing that source actaully benefits from much duplication but it does much much better with axulixary views, and is a much ebtter way to augment data to acquire some particualr knowledge.
 
 - **Weakness:** "The setup studies continual learning, rather than pre-training. Learning may occur differently, since in continual pre-training the optimizer state is missing."
-  - This is something that we thought about for a while. One, we recognize that our paper is bifurcated in the sense we aim to clarify pre-training, but the actual setting of our experiments is continued pre-training in which we were not able to exactly continue the optimizer state. We leaned towards the second due to the fact that this is the setting that all practitioners need to take on to adapt LLMs via continued pre-training (as most models do not make this available). In terms of semantics, we would frame continued pre-training as a subset of pre-training that is still relevant. But that doesn't change your critique, as it lessens the generalization of our findings to non-continued pre-training. We will clarify the scope of our paper as continued pre-training.
-  - We will modify the text accordingly to clarify that our results are mainly for continued pre-training.
+  - This is something that we thought about for a while. One, we recognize that our paper is bifurcated in the sense we aim to clarify pre-training, but the actual setting of our experiments is continued pre-training in which we were not able to exactly continue the optimizer state. We wish to highlight that  this setting is important as is the setting that all practitioners need to take on to adapt LLMs via continued pre-training (as most models do not make this available). But that doesn't change your critique, as it lessens the generalization of our findings to non-continued pre-training. 
+  - Thus, as stated in an earlier above, we've repeated our main experiment on the true pre-training condition, and see that our results hold.
 
 - **Weakness:** "Auxiliary views are synthetic, from strong LLMs. The gains may partly reflect indirect distillation from a strong teacher."
   - We would like to clarify that the LLM that generated the actual synthetic text itself is gpt-5-mini. While this is likely a stronger model than OLmo2-7B itself, we avoided this confounding factor as much as possible.
   - Second, we actually want to argue that this "teacher" aspect is inherent to the nature of auxiliary views. In society, it is often a "teacher" who already understands this concept with some level of mastery and helps explain this to a "student." Whether it is human (which we have a specific ablation for as well) or not, we find that this aspect is inherent to the nature of auxiliary views, and it helps argue why pre-training is originally so effective to begin with.
-  - But it is true that having a "teacher model" is likely necessary for this idea to work.
+  - But it is true that most of these advantages of axuliary views could be tied to the fact that we have a really good model and perhaps our results don't hold as well with weaker models;
     - Results:
       - Plot teachers against model size
       - Another axis is "pretraining distribution or not"
       - Plot against "accuracy on our evals"
-      - Include Olmo2-Instruct
-    - Our findings are still interesting regardless of distillation.
+    - Our findings are still interesting regardless of distillation as we reveal a fasctingiant gdnyamic where factual recall increases.
 
 - **Weakness:** "The analysis is limited to a single family of LLMs. However, this is a minor weakness."
-  - Tested the effectiveness of auxiliary view generation across different models.
-  - Tested training under different models (Qwen-2.5-7B).
-  - More LLM families tested: GLM-5.2 & gpt-oss-120b & gpt-oss-20b for auxiliary view generation.
+  - As noted above, we've tested the effectiveness of auxiliary view generation across different models.
+  - Also Tested training under different models (Qwen-2.5-7B) adn see the smae results regarding auixliary views; we also plan to include the mechanistic analysis on these models to where we see similar mechanistic behaviors though slightly different. 
 
 ## Reviewer YQYf
 
@@ -74,144 +71,83 @@ Thank you for your feedback and review. We respond to your comments below to cla
 
 ## Misc
 
-- **Paraphrasing laws (as a table):** More paraphrasing harms at larger batch sizes, and helps at smaller batch sizes.
-- **Release of code and dataset:** Upload the GitHub repo to an anonymous repo – Shu. Look over review comments – Yidi.
-- **Highlight the strengths of our paper:**
-  - We test more papers and probes than previous studies like Chang et al.
-  - We are the first to present this notion of auxiliary views — "something from the conclusion"...
-- **Experiments to run:**
-  - Generating Auxiliary Views with gpt-oss-120B, gpt-oss-20B, Qwen-3.6-32B, GLM-5.2-NVFP4, GLM-5.1-NVFP4, DeepSeek-V4 Flash
-    - Run four new training runs with these auxiliary views
-    - Plot the runs
-  - Repeating the source, paraphrase, and aux with Qwen-2.5-7B
-  - Repeating the source, paraphrasing, aux experiment with no upsampling
   - Re-run prior knowledge ordering experiments + contextual views vs. prior knowledge experiments
 
-## Result Tables (LaTeX)
+## Result Tables
 
-All numbers below are aggregates over all 36 domains (arxiv + legal + medical) unless noted.
-Metric conventions: Factual = knowledge probes v14 (short targets, cloze log-prob) and factual MCQA v15 (5-shot);
-Inference = inference probes v11 (reviewed, cloze log-prob) and inference MCQA v14 (5-shot).
-"Final" = end of the 100-step training/injection window.
+All numbers below are aggregates over all 36 domains (arxiv + legal + medical) unless noted. Factual evaluation uses the v14 cloze probes and v15 five-shot MCQA probes; inference evaluation uses the reviewed v11 cloze probes and v14 five-shot MCQA probes. “Final” denotes the end of the 100-step training window. Higher values are better for every metric, including log-probability. Bold marks the best result in each column.
 
-### Table A: True continued pretraining with the OLMo framework (addresses T6jM "continual learning vs. pre-training" + optimizer-state concern)
+### Table A: True continued pretraining with the OLMo framework
 
-OLMo-2 7B resumed mid-pretraining from checkpoint step 925,000 **with optimizer state and the original data stream/LR schedule** (global batch 1024, seq len 4096); domain data injected into the tail of each global batch for 100 optimizer steps (the exact analogue of our 100-epoch v9 runs). Runs live in `/data1/joseph/olmo-runs/peteish7-{source-docmatch,para9-docmatch,para9-granular}-step925000`; numbers parsed from each run's wandb summary (step 925,100). Note the probe evaluator is our OLMo-native reimplementation (same probe files; constrained-decoding MCQA), so absolute values are close but not bit-identical to the HF-harness numbers in Tables B/C.
+OLMo-2 7B resumed mid-pretraining from checkpoint step 925,000 with optimizer state and the original data stream and learning-rate schedule (global batch 1,024; sequence length 4,096). Domain data was injected for 100 optimizer steps.
 
-```latex
-\begin{table}[t]
-\centering
-\caption{Knowledge acquisition during \emph{true} continued pretraining. OLMo-2 7B is resumed
-from intermediate checkpoint step $925{,}000$ with its optimizer state, original pretraining data
-stream, and original LR schedule (global batch $1024$). Domain data is injected into each global
-batch for $100$ steps, mirroring our main experimental conditions. Auxiliary views still yield the
-largest gains, confirming that our findings are not an artifact of the optimizer-state-free
-continued-pretraining setup.}
-\label{tab:olmo-native-injection}
-\begin{tabular}{l cc cc}
-\toprule
-& \multicolumn{2}{c}{Factual} & \multicolumn{2}{c}{Inference} \\
-\cmidrule(lr){2-3} \cmidrule(lr){4-5}
-Condition & Log Prob & MCQA Acc. & Log Prob & MCQA Acc. \\
-\midrule
-Pretrained model (step $925$k)        & $-16.30$ & $0.343$ & $-14.79$ & $0.413$ \\
-Source (doc-matched)                  & $-10.00$ & $0.372$ & $-12.85$ & $0.421$ \\
-Paraphrases (doc-matched)             & $-10.33$ & $0.375$ & $-12.53$ & $0.417$ \\
-Auxiliary views                       & $\mathbf{-9.56}$  & $\mathbf{0.403}$ & $\mathbf{-10.82}$ & $\mathbf{0.492}$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-```
+| Condition | Factual log prob. | Factual MCQA acc. | Inference log prob. | Inference MCQA acc. |
+|---|---:|---:|---:|---:|
+| Pretrained model (step 925k) | -16.30 | 0.343 | -14.79 | 0.413 |
+| Source (document-matched) | -10.00 | 0.372 | -12.85 | 0.421 |
+| Para. 9 (document-matched) | -10.33 | 0.375 | -12.53 | 0.417 |
+| Auxiliary views | **-9.56** | **0.403** | **-10.82** | **0.492** |
 
-Companion scale result from the earlier source-only injection runs (6 arxiv domains, factual probes only; no doc-matching): MCQA integration of injected knowledge emerges with scale even in true pretraining.
+### Table B: Effect of reducing token-matching upsampling
 
-```latex
-\begin{table}[t]
-\centering
-\caption{Source-only injection during true continued pretraining at two model scales (6 arxiv
-domains; factual probes only). Cloze log-prob improves similarly at both scales, but MCQA accuracy
-only improves at 7B --- fast recall, slow integration into reasoning, consistent with our main
-results.}
-\label{tab:olmo-native-scale}
-\begin{tabular}{l cc cc}
-\toprule
-& \multicolumn{2}{c}{Baseline} & \multicolumn{2}{c}{After injection (100 steps)} \\
-\cmidrule(lr){2-3} \cmidrule(lr){4-5}
-Model & Log Prob & MCQA Acc. & Log Prob & MCQA Acc. \\
-\midrule
-OLMo-2 1B (resumed at step $950$k) & $-20.27$ & $0.192$ & $-12.79$ & $0.195$ \\
-OLMo-2 7B (resumed at step $925$k) & $-17.48$ & $0.298$ & $-11.92$ & $0.331$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-```
+The scale-1.0 rows are the original document-matched runs used in the model-scaling plots. The scale-0.5 runs halve both the auxiliary-view track and the Source/Para. 9 content inserted to match that track. In the final block, Source and Para. 9 receive no matched upsampling, while legacy v2 replaces up to half of the paraphrase-tail with auxiliary-view chunks; it is therefore a replacement control, not an exact scale-0.0 continuation. Bold marks the best result within each regime. The scale-0.5 Auxiliary inference-MCQA result is omitted because that run used a zero-shot prompt while the Source and Para. 9 runs used five-shot prompts; a common re-evaluation is needed.
 
-### Table B: Auxiliary-view generation across generator models (addresses T6jM "distillation" + XstK "closed-source LLMs / more families")
+| Matching regime | Condition | Factual log prob. | Factual MCQA acc. | Inference log prob. | Inference MCQA acc. |
+|---|---|---:|---:|---:|---:|
+| 1.0 (original) | Source | -12.57 | 0.365 | -14.55 | 0.413 |
+| 1.0 (original) | Para. 9 | -11.69 | 0.377 | -13.30 | 0.425 |
+| 1.0 (original) | Auxiliary views | **-11.09** | **0.398** | **-11.67** | **0.450** |
+| 0.5 | Source | -12.32 | 0.362 | -14.21 | 0.391 |
+| 0.5 | Para. 9 | -11.95 | 0.375 | -13.40 | 0.401 |
+| 0.5 | Auxiliary views | **-11.26** | **0.396** | **-11.75** | — |
+| No matched upsampling (replacement; legacy v2) | Source | -13.04 | 0.362 | -14.35 | 0.379 |
+| No matched upsampling (replacement; legacy v2) | Para. 9 | -12.51 | 0.370 | -13.27 | **0.382** |
+| No matched upsampling (replacement; legacy v2) | Auxiliary views | **-12.41** | **0.373** | **-12.83** | 0.370 |
 
-7B OLMo-2 runs E26--E35: same para9 + granular-explanation schedule as the original run, with the auxiliary-view *content* regenerated by each model (`para9_docmatch_expl_insertexplanations_*`). Original = gpt-5-mini custom explanations (E3, canonical re-eval `reeval_v3`); E26--E34 values are final-step (step 100) training-callback evals on the identical probe set. E35 (GLM-5-NVFP4) is still training as of 2026-07-13.
+### Table C: Auxiliary-view generation across generator models
 
-```latex
-\begin{table}[t]
-\centering
-\caption{Effect of the auxiliary-view generator model. All runs share the identical training
-schedule and token budget on OLMo-2 7B; only the model generating the auxiliary views changes.
-Open-weight generators, including ones far smaller than gpt-5-mini's likely scale (e.g.
-gpt-oss-20b, Gemma-4 12B), recover most of the gain over the pretrained baseline, indicating the
-benefit of auxiliary views is not mere distillation from one strong closed teacher.}
-\label{tab:aux-view-generators}
-\begin{tabular}{ll cc cc}
-\toprule
-& & \multicolumn{2}{c}{Factual} & \multicolumn{2}{c}{Inference} \\
-\cmidrule(lr){3-4} \cmidrule(lr){5-6}
-Generator & Access & Log Prob & MCQA Acc. & Log Prob & MCQA Acc. \\
-\midrule
-None (pretrained OLMo-2 7B)     & ---    & $-16.54$ & $0.337$ & $-15.20$ & $0.367$ \\
-\midrule
-gpt-5-mini (original)           & closed & $\mathbf{-11.09}$ & $\mathbf{0.398}$ & $-11.67$ & $\mathbf{0.450}$ \\
-gpt-5-mini (low reasoning)      & closed & $-12.02$ & $0.397$ & $\mathbf{-11.65}$ & $0.429$ \\
-gpt-5-mini (high reasoning)     & closed & $-12.01$ & $0.390$ & $-11.73$ & $0.429$ \\
-gpt-5.4-mini (low reasoning)    & closed & $-12.10$ & $0.392$ & $-11.86$ & $0.413$ \\
-gpt-5.4-mini (high reasoning)   & closed & $-12.03$ & $0.391$ & $-11.90$ & $0.410$ \\
-gpt-oss-20b (low reasoning)     & open   & $-12.16$ & $0.390$ & $-12.21$ & $0.419$ \\
-gpt-oss-120b (low reasoning)    & open   & $-12.27$ & $0.389$ & $-12.26$ & $0.413$ \\
-Gemma-4 12B IT                  & open   & $-12.23$ & $0.381$ & $-12.64$ & $0.410$ \\
-Gemma-4 31B IT (NVFP4)          & open   & $-12.22$ & $0.377$ & $-12.52$ & $0.413$ \\
-GLM-5.2                         & open   & $-12.73$ & $0.378$ & $-12.87$ & $0.394$ \\
-GLM-5 (NVFP4)                   & open   & \multicolumn{4}{c}{\emph{run in progress}} \\
-\bottomrule
-\end{tabular}
-\end{table}
-```
+The generator rows use the same OLMo-2 7B training schedule and token budget; only the auxiliary-view generator changes. The pretrained model and document-matched Para. 9 condition are included as reference baselines.
 
-### Table C: Reasoning effort of the generator (low vs. high)
+| Generator or baseline | Access | Factual MCQA acc. | Inference MCQA acc. |
+|---|---|---:|---:|
+| None (pretrained OLMo-2 7B) | — | 0.337 | 0.366 |
+| Para. 9 (document-matched baseline) | — | 0.377 | 0.425 |
+| gpt-5-mini (original) | closed | 0.398 | **0.450** |
+| GLM-5.2 | open-weight | 0.396 | 0.413 |
+| gpt-5-mini (low reasoning) | closed | **0.402** | 0.416 |
+| gpt-5-mini (high reasoning) | closed | 0.399 | 0.429 |
+| gpt-5.4-mini (low reasoning) | closed | 0.394 | 0.410 |
+| gpt-5.4-mini (high reasoning) | closed | 0.396 | 0.401 |
+| gpt-oss-20B (low reasoning) | open-weight | 0.401 | 0.416 |
+| gpt-oss-120B (low reasoning) | open-weight | 0.394 | 0.422 |
+| Gemma-4 12B IT | open-weight | 0.391 | 0.413 |
+| Gemma-4 31B IT  | open-weight | 0.383 | 0.413 |
+| GLM-5  | open-weight | 0.385 | 0.419 |
 
-Subset of Table B contrasting reasoning effort per generator family. Reasoning effort has essentially no effect --- if anything, low reasoning is marginally better --- suggesting auxiliary-view quality does not hinge on expensive test-time compute by the teacher.
+### Table D: Reasoning effort of the generator
 
-```latex
-\begin{table}[t]
-\centering
-\caption{Low vs.\ high reasoning effort for auxiliary-view generation (OLMo-2 7B, identical
-schedule and token budget). Higher teacher reasoning effort does not improve knowledge
-acquisition.}
-\label{tab:aux-view-reasoning-effort}
-\begin{tabular}{ll cc cc}
-\toprule
-& & \multicolumn{2}{c}{Factual} & \multicolumn{2}{c}{Inference} \\
-\cmidrule(lr){3-4} \cmidrule(lr){5-6}
-Generator & Reasoning & Log Prob & MCQA Acc. & Log Prob & MCQA Acc. \\
-\midrule
-gpt-5-mini   & low  & $-12.02$ & $0.397$ & $-11.65$ & $0.429$ \\
-gpt-5-mini   & high & $-12.01$ & $0.390$ & $-11.73$ & $0.429$ \\
-\midrule
-gpt-5.4-mini & low  & $-12.10$ & $0.392$ & $-11.86$ & $0.413$ \\
-gpt-5.4-mini & high & $-12.03$ & $0.391$ & $-11.90$ & $0.410$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-```
+The low/high results are mixed, showing no consistent advantage from higher reasoning.
 
-### Provenance of the numbers
+| Generator | Reasoning | Factual log prob. | Factual MCQA acc. | Inference log prob. | Inference MCQA acc. |
+|---|---|---:|---:|---:|---:|
+| gpt-5-mini | low | -11.19 | **0.402** | **-11.47** | 0.416 |
+| gpt-5-mini | high | **-11.17** | 0.399 | -11.56 | **0.429** |
+| gpt-5.4-mini | low | -11.30 | 0.394 | -11.78 | 0.410 |
+| gpt-5.4-mini | high | -11.26 | 0.396 | -11.80 | 0.401 |
 
-- Table A: wandb summaries of `/data1/joseph/olmo-runs/peteish7-{source,para9}-docmatch-step925000` and `peteish7-para9-granular-step925000` (`average/*_average` keys, step 925,100; baseline = step 925,000 row). Scale table: `peteish7-inject-step925000-full` (step 925,100) and `peteish1-inject-step950000-full` (step 950,100), `eval/probes/*` keys averaged over the 6 domains.
-- Tables B/C: `results/FT/full/7b/para9_docmatch_expl_insertexplanations_*/.../eval_bundles/inf_mcqa_v14` (final step 100) and, for the original, `.../para9_expl_textbooks+stackexchange+blogs_cyclefull/.../E3_granular_explanations_all_domains/eval_bundles/reeval_v3`. Baseline row = step-0 callback values (matches base-model `reeval_v4_mcqa_v15`: 0.337).
-- Extraction scripts: `scripts/analysis/parse_olmo_wandb.py` (run with the `tuning` env) and `scripts/analysis/extract_rr_metrics.py`.
+### Table E: Qwen-2.5-7B replication
+
+| Condition | Factual log prob. | Factual MCQA acc. | Inference log prob. | Inference MCQA acc. |
+|---|---:|---:|---:|---:|
+| Pretrained model | -15.31 | 0.440 | -15.02 | 0.478 |
+| Source | -15.48 | 0.489 | -18.82 | 0.512 |
+| Para. 9 | -13.28 | 0.516 | -16.24 | 0.559 |
+| Auxiliary views | **-10.98** | **0.548** | **-12.74** | **0.562** |
+
+## Internal provenance — do not post
+
+- Table A: wandb summaries of `/data1/joseph/olmo-runs/peteish7-{source,para9}-docmatch-step925000` and `/data1/joseph/olmo-runs/peteish7-para9-granular-step925000` at step 925,100; baseline is step 925,000.
+- Table B: scale 1.0 uses the original E1/E2/E3 document-matched runs configured in `scripts/plotting/plot_inference_mcqa_scaling.py` and their `reeval_v3` bundles. Scale 0.5 uses E40/E46/E47; E47 used `formatted_question` for inference MCQA, whereas E40/E46 used `formatted_question_5shot`, so that cell is withheld. The replacement rows use the clean local E23/E24/E25 bundles; exclude the earlier slurm runs and every `_para9_corrupeted` counterpart.
+- Tables C and D: the E2 Para. 9 and E3 auxiliary-view final-checkpoint reevaluations plus the clean July 14 E26–E35 bundles under `results/FT/full/7b/`. Exclude every directory containing `_para9_corrupeted`. E33 and E34 use `para9_docmatch_expl_insertexplanations_gemma_4_12b_it` and `para9_docmatch_expl_insertexplanations_gemma_4_31b_nvfp4`.
+- Table E: E39–E41 under `results/FT/full/Qwen_Qwen2.5-7B/`.
+- Run `conda run --no-capture-output -n tuning python scripts/analysis/extract_rr_metrics.py /tmp/rr_metrics.json` to reproduce Tables C–E. E26–E35 and E39–E41 are non-null, contain all 36 domains at step 100, and end at step 100. Step-0 baselines agree within the OLMo and Qwen run groups. E3’s final-checkpoint reevaluation is stored with a step-0 label and is excluded from the step-100 check.

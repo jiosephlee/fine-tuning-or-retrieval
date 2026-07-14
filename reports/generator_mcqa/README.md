@@ -3,10 +3,13 @@
 This benchmark measures the auxiliary-view generator conditions from E26--E35
 on the same factual v15 and inference v14 five-shot MCQA probes used by the
 downstream training runs. It records factual and inference accuracy separately
-for two answer protocols:
+using one answer-only protocol:
 
 - `constrained`: a JSON-schema answer restricted to A--E.
-- `reasoned`: free reasoning followed by `Final answer: (X)`.
+
+Reasoning models still use the configured reasoning effort internally. The
+benchmark does not request a visible rationale because that changes the output
+task without providing a clean reasoning-versus-no-reasoning comparison.
 
 The main output is `accuracies.csv`. Per-question resumable state and vLLM logs
 live outside the repository under `/local/joseph/generator_mcqa/`.
@@ -27,8 +30,8 @@ scripts/run_generator_mcqa_benchmark.sh --local-only
 scripts/run_generator_mcqa_benchmark.sh --models gpt_oss_20b_low glm_5_nvfp4
 ```
 
-Every normal run first evaluates one factual and one inference item under both
-protocols in the isolated smoke-state directory. Repeating a command skips
+Every normal run first evaluates one factual and one inference item in the
+isolated smoke-state directory. Repeating a command skips
 terminal records and retries only incomplete requests.
 
 ## GLM-5.2 through LiteLLM
@@ -56,7 +59,7 @@ Copy the resulting `glm_5_2_nvfp4/` directory back and validate/import it:
   --state-root /local/joseph/generator_mcqa/state
 ```
 
-The import checks all 9,674 records against the current model ID, protocol,
+The import checks all 4,837 records against the current model ID, protocol,
 family, question ID, and prompt hash before updating `accuracies.csv`.
 
 ## Correlation report

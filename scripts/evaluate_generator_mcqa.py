@@ -47,12 +47,6 @@ CONSTRAINED_SYSTEM_PROMPT = (
     "questions are demonstrations. Think as needed, then return only a JSON "
     "object with an `answer` field containing one uppercase letter from A to E."
 )
-REASONED_SYSTEM_PROMPT = (
-    "Solve the final multiple-choice question. The preceding five answered "
-    "questions are demonstrations. Reason freely, then end your response with "
-    "exactly one separate line of the form `Final answer: (X)`, replacing X "
-    "with one uppercase letter from A to E. Write nothing after that line."
-)
 ANSWER_SCHEMA: dict[str, Any] = {
     "type": "json_schema",
     "json_schema": {
@@ -68,7 +62,6 @@ ANSWER_SCHEMA: dict[str, Any] = {
         },
     },
 }
-FINAL_ANSWER_RE = re.compile(r"^Final answer:\s*\(([A-E])\)\s*[.!]?$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -92,25 +85,18 @@ def normalize_label(value: str) -> str:
 
 def parse_answer(protocol: str, content: str) -> tuple[str | None, str]:
     """Return (answer, parse_status) without using a semantic judge."""
-    if protocol == "constrained":
-        try:
-            payload = json.loads(content)
-        except (TypeError, json.JSONDecodeError):
-            return None, "invalid_json"
-        if not isinstance(payload, dict):
-            return None, "invalid_schema"
-        try:
-            return normalize_label(payload.get("answer", "")), "parsed"
-        except ValueError:
-            return None, "invalid_schema"
-
-    lines = [line.strip() for line in (content or "").strip().splitlines() if line.strip()]
-    if not lines:
-        return None, "empty"
-    match = FINAL_ANSWER_RE.fullmatch(lines[-1])
-    if not match:
-        return None, "missing_final_answer_line"
-    return match.group(1).upper(), "parsed"
+    if protocol != "constrained":
+        raise ValueError(f"Unsupported answer protocol: {protocol!r}")
+    try:
+        payload = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return None, "invalid_json"
+    if not isinstance(payload, dict):
+        return None, "invalid_schema"
+    try:
+        return normalize_label(payload.get("answer", "")), "parsed"
+    except ValueError:
+        return None, "invalid_schema"
 
 
 def _probe_paths(probes_root: Path, family: str) -> list[Path]:
@@ -223,11 +209,7 @@ def _request_params(model: GeneratorModel, protocol: str, question: ProbeQuestio
         "messages": [
             {
                 "role": "system",
-                "content": (
-                    CONSTRAINED_SYSTEM_PROMPT
-                    if protocol == "constrained"
-                    else REASONED_SYSTEM_PROMPT
-                ),
+                "content": CONSTRAINED_SYSTEM_PROMPT,
             },
             {"role": "user", "content": question.prompt},
         ],
@@ -241,8 +223,9 @@ def _request_params(model: GeneratorModel, protocol: str, question: ProbeQuestio
     if model.provider == "vllm":
         params["temperature"] = 0.0
         params["seed"] = 0
-    if protocol == "constrained":
-        params["response_format"] = ANSWER_SCHEMA
+    if protocol != "constrained":
+        raise ValueError(f"Unsupported answer protocol: {protocol!r}")
+    params["response_format"] = ANSWER_SCHEMA
     return params
 
 
@@ -555,7 +538,7 @@ def write_summary(state_root: Path, summary_path: Path, probes_root: Path) -> No
                 "family": family,
             }
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "completion_token_cap": COMPLETION_TOKEN_CAP,
         "protocols": list(PROTOCOLS),
         "families": list(FAMILIES),

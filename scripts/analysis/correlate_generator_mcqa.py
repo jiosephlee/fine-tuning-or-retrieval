@@ -43,8 +43,6 @@ DOWNSTREAM_LABELS = {
 ACCURACY_FIELDS = (
     "constrained_factual_accuracy",
     "constrained_inference_accuracy",
-    "reasoned_factual_accuracy",
-    "reasoned_inference_accuracy",
 )
 
 OUTPUT_FIELDS = (
@@ -178,31 +176,27 @@ def calculate_correlations(
     accuracies: Mapping[str, Mapping[str, float]],
     downstream: Mapping[str, Mapping[str, float]],
 ) -> list[dict[str, Any]]:
-    """Calculate factual-to-factual and inference-to-inference correlations."""
+    """Calculate constrained factual and inference same-family correlations."""
     rows: list[dict[str, Any]] = []
-    for protocol in ("constrained", "reasoned"):
-        for family, direct_suffix, downstream_field in (
-            ("factual", "factual_accuracy", "fact_mcqa"),
-            ("inference", "inference_accuracy", "inf_mcqa"),
-        ):
-            direct = [
-                accuracies[model][f"{protocol}_{direct_suffix}"]
-                for model in EXPECTED_MODELS
-            ]
-            trained = [downstream[model][downstream_field] for model in EXPECTED_MODELS]
-            pearson_r, pearson_p = pearsonr(direct, trained)
-            spearman_rho, spearman_p = spearmanr(direct, trained)
-            rows.append(
-                {
-                    "protocol": protocol,
-                    "family": family,
-                    "n": len(EXPECTED_MODELS),
-                    "pearson_r": float(pearson_r),
-                    "pearson_p": float(pearson_p),
-                    "spearman_rho": float(spearman_rho),
-                    "spearman_p": float(spearman_p),
-                }
-            )
+    for family, direct_field, downstream_field in (
+        ("factual", "constrained_factual_accuracy", "fact_mcqa"),
+        ("inference", "constrained_inference_accuracy", "inf_mcqa"),
+    ):
+        direct = [accuracies[model][direct_field] for model in EXPECTED_MODELS]
+        trained = [downstream[model][downstream_field] for model in EXPECTED_MODELS]
+        pearson_r, pearson_p = pearsonr(direct, trained)
+        spearman_rho, spearman_p = spearmanr(direct, trained)
+        rows.append(
+            {
+                "protocol": "constrained",
+                "family": family,
+                "n": len(EXPECTED_MODELS),
+                "pearson_r": float(pearson_r),
+                "pearson_p": float(pearson_p),
+                "spearman_rho": float(spearman_rho),
+                "spearman_p": float(spearman_p),
+            }
+        )
     return rows
 
 

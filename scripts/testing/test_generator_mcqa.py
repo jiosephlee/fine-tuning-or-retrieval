@@ -51,6 +51,9 @@ def _state_record(
 
 
 class LabelAndParserTests(unittest.TestCase):
+    def test_only_constrained_protocol_is_configured(self):
+        self.assertEqual(PROTOCOLS, ("constrained",))
+
     def test_normalize_label_accepts_only_a_through_e(self):
         self.assertEqual(evaluator.normalize_label("A"), "A")
         self.assertEqual(evaluator.normalize_label(" (b) "), "B")
@@ -73,18 +76,9 @@ class LabelAndParserTests(unittest.TestCase):
             (None, "invalid_schema"),
         )
 
-    def test_reasoned_parser_requires_the_last_nonempty_line(self):
-        self.assertEqual(
-            evaluator.parse_answer(
-                "reasoned", "Reasoning can be arbitrary.\n\nFinal answer: (d)"
-            ),
-            ("D", "parsed"),
-        )
-        self.assertEqual(
-            evaluator.parse_answer("reasoned", "The answer is probably (D)."),
-            (None, "missing_final_answer_line"),
-        )
-        self.assertEqual(evaluator.parse_answer("reasoned", ""), (None, "empty"))
+    def test_unknown_protocol_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported answer protocol"):
+            evaluator.parse_answer("reasoned", '{"answer": "D"}')
 
 
 class ProbeDiscoveryTests(unittest.TestCase):
@@ -114,30 +108,24 @@ class RequestParameterTests(unittest.TestCase):
             with self.subTest(model_key=model_key):
                 model = MODEL_BY_KEY[model_key]
                 constrained = evaluator._request_params(model, "constrained", question)
-                reasoned = evaluator._request_params(model, "reasoned", question)
-
-                for params in (constrained, reasoned):
-                    self.assertEqual(params["max_completion_tokens"], COMPLETION_TOKEN_CAP)
-                    self.assertEqual(params["reasoning_effort"], effort)
-                    self.assertNotIn("max_tokens", params)
-                    self.assertNotIn("temperature", params)
+                self.assertEqual(
+                    constrained["max_completion_tokens"], COMPLETION_TOKEN_CAP
+                )
+                self.assertEqual(constrained["reasoning_effort"], effort)
+                self.assertNotIn("max_tokens", constrained)
+                self.assertNotIn("temperature", constrained)
                 self.assertEqual(constrained["response_format"], evaluator.ANSWER_SCHEMA)
-                self.assertNotIn("response_format", reasoned)
 
-    def test_vllm_uses_greedy_max_tokens_and_only_constrains_schema_protocol(self):
+    def test_vllm_uses_greedy_max_tokens_and_structured_output(self):
         model = MODEL_BY_KEY["gpt_oss_20b_low"]
         question = _question()
         constrained = evaluator._request_params(model, "constrained", question)
-        reasoned = evaluator._request_params(model, "reasoned", question)
-
-        for params in (constrained, reasoned):
-            self.assertEqual(params["max_tokens"], COMPLETION_TOKEN_CAP)
-            self.assertEqual(params["temperature"], 0.0)
-            self.assertEqual(params["seed"], 0)
-            self.assertEqual(params["reasoning_effort"], "low")
-            self.assertNotIn("max_completion_tokens", params)
+        self.assertEqual(constrained["max_tokens"], COMPLETION_TOKEN_CAP)
+        self.assertEqual(constrained["temperature"], 0.0)
+        self.assertEqual(constrained["seed"], 0)
+        self.assertEqual(constrained["reasoning_effort"], "low")
+        self.assertNotIn("max_completion_tokens", constrained)
         self.assertEqual(constrained["response_format"], evaluator.ANSWER_SCHEMA)
-        self.assertNotIn("response_format", reasoned)
 
 
 class ExecutionSafetyAndResumeTests(unittest.TestCase):
@@ -260,6 +248,7 @@ class SummaryAggregationTests(unittest.TestCase):
             with summary_path.open(newline="", encoding="utf-8") as handle:
                 row = next(csv.DictReader(handle))
             self.assertEqual(row["status"], "complete")
+            self.assertNotIn("reasoned_factual_accuracy", row)
             for protocol in PROTOCOLS:
                 for family in expected_counts:
                     prefix = f"{protocol}_{family}"
@@ -267,6 +256,12 @@ class SummaryAggregationTests(unittest.TestCase):
                     self.assertEqual(int(row[f"{prefix}_correct"]), 1)
                     self.assertEqual(int(row[f"{prefix}_total"]), 2)
                     self.assertEqual(int(row[f"{prefix}_invalid"]), 1)
+
+            manifest = json.loads(
+                summary_path.with_name("run_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(manifest["protocols"], ["constrained"])
 
             partition = evaluator.state_path(
                 state_root, model.key, "constrained", "factual"

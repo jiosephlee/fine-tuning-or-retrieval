@@ -104,8 +104,16 @@ def inference_mcqa_reeval_run_path(
     if reeval_canonical != run_path and find_latest_run(os.path.join(reeval_canonical, reeval_dir)):
         return reeval_canonical
     if reeval_canonical != run_path:
+        print(
+            "Warning: inf_mcqa_v13_legal bundle missing (deleted in the 2026-05 results "
+            f"migration); falling back to the regular bundle for {run_path}"
+        )
         return run_path
     if (Path(run_path) / "eval_bundles").is_dir():
+        print(
+            "Warning: inf_mcqa_v13_legal bundle missing (deleted in the 2026-05 results "
+            f"migration); falling back to the regular bundle for {run_path}"
+        )
         return run_path
 
     parts = Path(run_path).parts

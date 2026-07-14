@@ -131,7 +131,7 @@ if len(MODEL_BY_KEY) != len(MODELS):
     raise RuntimeError("Duplicate generator benchmark model key")
 
 
-PROTOCOLS = ("constrained", "reasoned")
+PROTOCOLS = ("constrained",)
 FAMILIES = ("factual", "inference")
 EXPECTED_COUNTS = {"factual": 4515, "inference": 322}
 COMPLETION_TOKEN_CAP = 8192

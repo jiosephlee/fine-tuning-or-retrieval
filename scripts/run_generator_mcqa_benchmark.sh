@@ -52,7 +52,7 @@ usage() {
 Usage: scripts/run_generator_mcqa_benchmark.sh [OPTIONS]
 
 Run the generator MCQA benchmark, resuming completed state automatically.
-Every normal run performs a one-question-per-family/protocol smoke test before
+Every normal run performs a one-question-per-family answer-only smoke test before
 the full evaluation. Local vLLM models are served and evaluated sequentially.
 
 Options:
@@ -331,6 +331,7 @@ run_evaluation() {
   local -a command=(
     "${PYTHON}" "${EVALUATOR}"
     --model-key "${model}"
+    --protocols constrained
     --state-root "${state_root}"
     --summary-path "${SUMMARY_PATH}"
     --max-workers "${workers}"

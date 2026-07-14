@@ -33,8 +33,6 @@ class GeneratorMcqaCorrelationTests(unittest.TestCase):
                         "model_key": model_key,
                         "constrained_factual_accuracy": value,
                         "constrained_inference_accuracy": value,
-                        "reasoned_factual_accuracy": value,
-                        "reasoned_inference_accuracy": value,
                     }
                 )
 
@@ -48,7 +46,7 @@ class GeneratorMcqaCorrelationTests(unittest.TestCase):
             }
         path.write_text(json.dumps(document), encoding="utf-8")
 
-    def test_complete_panel_writes_four_same_family_correlations(self):
+    def test_complete_panel_writes_two_constrained_same_family_correlations(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             accuracies = root / "accuracies.csv"
@@ -61,14 +59,12 @@ class GeneratorMcqaCorrelationTests(unittest.TestCase):
 
             with output.open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
-            self.assertEqual(len(rows), 4)
+            self.assertEqual(len(rows), 2)
             self.assertEqual(
                 [(row["protocol"], row["family"]) for row in rows],
                 [
                     ("constrained", "factual"),
                     ("constrained", "inference"),
-                    ("reasoned", "factual"),
-                    ("reasoned", "inference"),
                 ],
             )
             for row in rows:
