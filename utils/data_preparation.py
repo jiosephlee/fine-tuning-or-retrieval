@@ -484,12 +484,14 @@ def prepare_training_mix(
     times_explanations = strategy_args.get("times_explanations", 1)
     semi_cleaned_version = strategy_args.get("semi_cleaned", None)
     use_raw = strategy_args.get("use_raw", False)
-    # Generator-model namespacing: synthetic texts live under
-    # data/{source}/{explanations|paraphrased}/{model_slug}/{domain}/. Default to the
+    # Generator-model namespacing: explanations live under
+    # data/{source}/explanations/{model_slug}/{domain}/. Default to the
     # migrated 'gpt_5_mini_custom' bucket; fall back to the legacy flat path if the slugged
     # directory is absent so pre-migration data still loads.
+    # Paraphrases live directly under data/{source}/paraphrased/{domain}/ (flat layout);
+    # an explicit paraphrase_model slug still selects data/{source}/paraphrased/{slug}/{domain}/.
     explanation_model_slug = strategy_args.get("explanation_model") or "gpt_5_mini_custom"
-    paraphrase_model_slug = strategy_args.get("paraphrase_model") or "gpt_5_mini_custom"
+    paraphrase_model_slug = strategy_args.get("paraphrase_model") or None
 
     def _synthetic_dir(
         kind: str,
@@ -746,7 +748,10 @@ def prepare_training_mix(
         # Load Paraphrases
         paraphrased_chunks_by_doc = []
         if num_paraphrased_texts > 0:
-            paraphrased_dir = _synthetic_dir('paraphrased', paraphrase_model_slug, domain_source, domain)
+            if paraphrase_model_slug:
+                paraphrased_dir = _synthetic_dir('paraphrased', paraphrase_model_slug, domain_source, domain)
+            else:
+                paraphrased_dir = f'../../data/{domain_source}/paraphrased/{domain}/'
             if os.path.isdir(paraphrased_dir):
                 for i in range(num_paraphrased_texts):
                     para_path = _find_shuffled_paraphrase_path(domain_source, domain, i, paraphrased_dir)
